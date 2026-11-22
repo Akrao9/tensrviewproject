@@ -134,6 +134,54 @@ No limit is adopted on this page. Lane D adds one test and reports what it shows
 - **What it asserts:** the valid batch is eventually stored. The sender advances only across bytes the server confirmed stored or explicitly refused for that exact range. A range that was neither stays pending and is sent again.
 - If the sender fails it, the fix is in `flight.py`, which is lane F's file: lane D reports and does not edit it.
 
+## Wave AG: four findings of the trial merge, fixed on the author's word of Nov 21, 2026 ("Yes, fix all four")
+
+Sections 8 to 11 were added at the trial merge (`trial/af-wave`, `3c1df61`). Each lane merges `trial/af-wave` into its branch first. Ownership is as in the table above. Where a section corrects an earlier one, it says so.
+
+## 8. A router recorded with no tokens (AUD-1 of the correctness audit)
+
+**The fault**, run on the trial tree: a model trained in `eval()` mode with reentrant activation checkpointing has every router's counts recorded as 0 on every step (and, under full capture, no block statistics). Both engines read the MoE kinds as `not_configured` and the run as `healthy`. The same model in train mode reports `moe_imbalance`.
+
+**The capture (lane B).** A training step's forward is counted also when the modules are in eval mode and the forward runs without gradients as reentrant checkpointing runs it. An evaluation forward is still not counted. Lane B finds what tells the two apart (the step has a backward and an optimizer step; the recomputation inside backward is the same forward) and says in its notes what it chose and what it cannot tell apart. Where a step's forward cannot be counted, the record does not carry zeros as if they were read: the router is left out of that record's `moe`, by the mechanism the capture already has for a router it did not read, and no new record key is added. Regressions: the audit's reproducer (`wave-af-proof-correctness-audit/f1_evalmode_reentrant.py` in the notes folder) gives the counts of its train-mode control; the same under full capture gives the block statistics; an evaluation forward under `no_grad` in eval mode between steps is still not counted; capture on and off give the same final parameters.
+
+**The readers, both engines (lanes C and D), for captures already written and for whatever the capture still cannot read.** A router that the records name and whose counts are 0 on every record was not read:
+
+| The records | `moe_imbalance`, `starved_experts` | `not_checked` |
+|---|---|---|
+| Every router named has only zero counts (`every_router_recorded_with_no_tokens`, new) | `unavailable`, where the base says `not_configured` | One entry `{"check": "moe_routing", "kinds": ["moe_imbalance", "starved_experts"], "routers": [...], "reason": ...}`, the routers sorted by name |
+| Some routers have only zero counts, others were read (`one_router_with_no_tokens_beside_one_that_was_read`, new) | Judged on the routers that were read, as on the base | The same entry, naming only the routers not read |
+| Every router was read on at least one record (`routers_that_were_read`, pin) | As on the base | No such entry |
+
+- The run state is what the existing rule gives a run with an `unavailable` kind; it is not `healthy` in the first row. If the existing rule would still give `healthy`, the lane reports and builds nothing more.
+- A router with zero counts on some records and counts on others is as on the base: this section is about a router never read.
+- The entry reaches the all-ranks views with its ranks, by section 2's rule, and the MCP tools.
+- Cases: `sdk/tests/fixtures/wave_af/cases_ag.json`, three cases whose `today` is both engines' answer on `3c1df61` (they agree). Lane C turns them into tests of the Python detectors and lane D of the Rust detectors, offline and in the live report.
+
+## 9. Several refused batches in a row (D5; RS10)
+
+**The fault** (lane D's `test_several_refused_batches_then_a_valid_batch_then_a_reconnect`, a strict expected failure on the trial tree): `Ingest::confirm_refusal` names a refused range from the stream's accepted end, else the rank's last acknowledged offset, and reads the batch's claimed start only when nothing was ever acknowledged for the rank. After one confirmed refusal, the next refused batch is named from the last stored acknowledgement, the sender cannot confirm a range that does not start at its offset, and it sends that batch for the rest of the run.
+
+**The target (lane D).** The server keeps, per rank, the end of the last refusal it confirmed. A refused batch whose claimed start equals that end is named from it. The claim is then a position the server itself named, never the sender's word alone. A refusal whose confirmation was lost moves nothing, as now. Across a restart the kept end follows the rule RS10's restart fix already uses for the acknowledged offset; if it cannot be kept across a restart, the lane says what a sender then sees and tests it.
+
+- The expected-failure mark is removed and the test passes: three refused batches in a row, then a valid batch, then a reconnect; the valid batch is stored; the sender advances only across bytes confirmed stored or refused for that exact range.
+- The one-refusal test and RS10's acceptance tests pass unchanged.
+
+## 10. A negative `attempt`, `rank` or `step` at the sender and at live ingest
+
+This section corrects section 1's rows "Live ingest" and "The sender reading its own `.jsonl` file", and its paragraph "The difference that stays", for these three values.
+
+**The faults**, run on the base and on the trial tree. A line with a negative `attempt` or `rank` is refused by the server with its whole batch and no range, and the sender sends that batch for the rest of the run, with nothing after it stored. A negative `step` is acknowledged, stored and judged by the live server, and the readers then refuse that store by name.
+
+**The sender (lane F).** `rows_to_send` does not send a line whose `rank`, `attempt` or `step` is negative: it is skipped and counted in `skipped_lines`, as a line whose key cannot be stored already is, and the lines after it are sent. The first such line is said once on stderr, naming the line and the field; the base's silent skip of a non-integer key is said the same way. A `schema_version` the server does not read is still sent, for the server to count (RS10, unchanged). Nothing raises into training. Regression with a real server: the file of lane F's probe with a negative `attempt`, and one with a negative `rank`, each store every valid line; `close()` returns True.
+
+**Live ingest (lane D).** A batch holding a negative `step` is refused whole with `invalid_argument`, as a batch holding a negative `attempt` is, and nothing of it is stored. The server's own stores and reports are then always readable by section 1's readers. Regression: the probe that stored `part--0000003--0000002.parquet` on the trial tree stores nothing and acknowledges nothing for that batch, and the next valid batch is stored.
+
+**The difference that stays, corrected.** Offline, a file with such a record is refused as a whole. Live, a row with a null key or an unread `schema_version` is refused and counted, and a batch with a negative `attempt` or `step` is refused whole; the SDK's own sender never sends the latter.
+
+## 11. Entered with the above, no code
+
+Lane E enters, once the code is in the trial tree: the sentences the lanes left for the documents, section 10's corrected paragraph, and two stated behaviours from the audit, each checked against the code first: with `auto_step=False` the gradient norms are read at `session.step()`, so `zero_grad()` goes after it (AUD-2); a checkpoint load inside one attempt is recorded and compared but judged by no detector (AUD-3).
+
 ## Not on this page
 
 The live report's trend memoization follows lane D's changes above, and the incremental Rust watcher follows the integration of the reader and detector changes. Each gets its own acceptance, as the plan states it, when it starts.

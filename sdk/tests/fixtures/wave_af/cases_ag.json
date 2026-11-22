@@ -1,0 +1,9993 @@
+{
+ "base": "3c1df61 (trial/af-wave)",
+ "cases": {
+  "every_router_recorded_with_no_tokens": {
+   "expected": {
+    "moe_imbalance": "unavailable",
+    "not_checked_has": "moe_routing",
+    "not_checked_routers": [
+     "blocks.0.router",
+     "blocks.1.router"
+    ],
+    "run_state_is_not": "healthy",
+    "starved_experts": "unavailable"
+   },
+   "given": {
+    "records": [
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 0
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 1
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 2
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 3
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 4
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 5
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 6
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 7
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 8
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 9
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 10
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 11
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 12
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 13
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 14
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 15
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 16
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 17
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 18
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 19
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 20
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 21
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 22
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 23
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 24
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 25
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 26
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 27
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 28
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 29
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 30
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 31
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 32
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 33
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 34
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 35
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 36
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 37
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 38
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 39
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 40
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 41
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 42
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 43
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 44
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 45
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 46
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 47
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 48
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 49
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 50
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 51
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 52
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 53
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 54
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 55
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 56
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 57
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 58
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 59
+     }
+    ]
+   },
+   "says": "Every record names two routers and every count is 0 (a model trained in eval mode with reentrant checkpointing, on the base). Nothing was read, so the two MoE kinds are unavailable and one not_checked entry names the routers; the run is not healthy by omission.",
+   "section": 8,
+   "status": "new",
+   "today": {
+    "incident_kinds": [],
+    "moe_imbalance": "not_configured",
+    "not_checked_checks": [],
+    "run_state": "healthy",
+    "starved_experts": "not_configured"
+   }
+  },
+  "one_router_with_no_tokens_beside_one_that_was_read": {
+   "expected": {
+    "not_checked_has": "moe_routing",
+    "not_checked_routers": [
+     "blocks.0.router"
+    ]
+   },
+   "given": {
+    "records": [
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        9,
+        3,
+        2,
+        3,
+        8,
+        1,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7769948059359302,
+        "entropy": 1.8271199282758606,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 0
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        6,
+        2,
+        2,
+        3,
+        7,
+        5,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8586479668525808,
+        "entropy": 1.9270452832828995,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 1
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        4,
+        1,
+        2,
+        10,
+        2,
+        2,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7715369925841534,
+        "entropy": 1.8200708822615168,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 2
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        6,
+        4,
+        0,
+        2,
+        7,
+        6,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7680912948845892,
+        "entropy": 1.8155948623281128,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 3
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        2,
+        2,
+        6,
+        2,
+        2,
+        3,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8424251469197058,
+        "entropy": 1.9079710745910359,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 4
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        5,
+        0,
+        4,
+        8,
+        1,
+        1,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6832597140343606,
+        "entropy": 1.6985613047986785,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 5
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        5,
+        2,
+        3,
+        7,
+        5,
+        0,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.8256463208855712,
+        "entropy": 1.8878527615749323,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 6
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        5,
+        1,
+        4,
+        9,
+        1,
+        0,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7049815118967347,
+        "entropy": 1.729857840906155,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 7
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        9,
+        2,
+        1,
+        1,
+        13,
+        2,
+        0,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.5864804642766106,
+        "entropy": 1.545825621245186,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 8
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        5,
+        2,
+        3,
+        5,
+        2,
+        2,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8947260199624124,
+        "entropy": 1.968203811160335,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 9
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        11,
+        3,
+        1,
+        4,
+        5,
+        1,
+        3,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7850403139817395,
+        "entropy": 1.8374213345522152,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 10
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        14,
+        2,
+        0,
+        3,
+        8,
+        2,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.5594580074799245,
+        "entropy": 1.4986547339778282,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 11
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        2,
+        2,
+        2,
+        8,
+        4,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8120827988167222,
+        "entropy": 1.8712885666470043,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 12
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        2,
+        2,
+        3,
+        7,
+        3,
+        2,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8720128403126985,
+        "entropy": 1.9424904116275064,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 13
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        1,
+        2,
+        3,
+        8,
+        2,
+        3,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8207520004716624,
+        "entropy": 1.8819072564467167,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 14
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        6,
+        0,
+        1,
+        10,
+        3,
+        2,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7272504743144438,
+        "entropy": 1.7609572122755388,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 15
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        1,
+        0,
+        6,
+        8,
+        5,
+        1,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7090346471023363,
+        "entropy": 1.7355906555990848,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 16
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        5,
+        3,
+        4,
+        2,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8406048069131908,
+        "entropy": 1.9058079036834747,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 17
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        4,
+        0,
+        2,
+        11,
+        4,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6371611227429106,
+        "entropy": 1.6287088262277232,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 18
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        3,
+        2,
+        4,
+        8,
+        2,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7268436672843408,
+        "entropy": 1.7603976789838782,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 19
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        6,
+        1,
+        4,
+        10,
+        1,
+        1,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7654689357719232,
+        "entropy": 1.812174896661026,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 20
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        2,
+        1,
+        3,
+        9,
+        3,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7845779887122715,
+        "entropy": 1.8368322419275376,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 21
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        9,
+        1,
+        2,
+        2,
+        8,
+        4,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7687877901094335,
+        "entropy": 1.816501238476148,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 22
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        12,
+        5,
+        1,
+        3,
+        7,
+        1,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6513696653603858,
+        "entropy": 1.6507635860802778,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 23
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        9,
+        3,
+        1,
+        4,
+        9,
+        0,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6856411900602774,
+        "entropy": 1.7020407070276533,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 24
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        4,
+        0,
+        3,
+        8,
+        4,
+        0,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.7015454611697562,
+        "entropy": 1.7249719657993725,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 25
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        4,
+        1,
+        6,
+        6,
+        3,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7226887283559282,
+        "entropy": 1.7546648642909484,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 26
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        0,
+        1,
+        1,
+        9,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.5978502484635415,
+        "entropy": 1.56502656465832,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 27
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        4,
+        2,
+        4,
+        8,
+        2,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8570897959674093,
+        "entropy": 1.9252289552317132,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 28
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        5,
+        1,
+        5,
+        4,
+        2,
+        2,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8709175875428908,
+        "entropy": 1.9412336168679807,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 29
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        3,
+        1,
+        3,
+        10,
+        3,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7947896735309059,
+        "entropy": 1.8497637807530931,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 30
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        4,
+        2,
+        3,
+        6,
+        3,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7960652506564776,
+        "entropy": 1.8513674183689934,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 31
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        4,
+        2,
+        5,
+        6,
+        2,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.8003644028401375,
+        "entropy": 1.8567533902055484,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 32
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        9,
+        4,
+        1,
+        4,
+        5,
+        2,
+        2,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8454879296452651,
+        "entropy": 1.9116001549382926,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 33
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        4,
+        4,
+        2,
+        3,
+        6,
+        2,
+        1,
+        10
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8142968728297165,
+        "entropy": 1.8740112708462258,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 34
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        5,
+        0,
+        3,
+        8,
+        3,
+        1,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7526329029008366,
+        "entropy": 1.7952638588767236,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 35
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        3,
+        3,
+        8,
+        2,
+        2,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8589458344196572,
+        "entropy": 1.9273921261392744,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 36
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        2,
+        2,
+        2,
+        9,
+        3,
+        2,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.831021786400236,
+        "entropy": 1.8943422742976153,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 37
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        0,
+        4,
+        5,
+        5,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7797733568843258,
+        "entropy": 1.8306895720612293,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 38
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        6,
+        2,
+        3,
+        2,
+        8,
+        5,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7814619656406372,
+        "entropy": 1.8328527429687904,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 39
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        3,
+        1,
+        6,
+        7,
+        1,
+        1,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7401695257627937,
+        "entropy": 1.7785655115277066,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 40
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        1,
+        4,
+        6,
+        4,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8431890471175418,
+        "entropy": 1.9088774507390711,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 41
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        6,
+        4,
+        2,
+        3,
+        5,
+        4,
+        1,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887192541815004,
+        "entropy": 1.9597482922681837,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 42
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        4,
+        2,
+        1,
+        12,
+        1,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.5915354489133632,
+        "entropy": 1.5544078748586077,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 43
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        3,
+        2,
+        2,
+        8,
+        5,
+        1,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8406048069131908,
+        "entropy": 1.9058079036834747,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 44
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        1,
+        1,
+        6,
+        5,
+        3,
+        2,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8197240627168648,
+        "entropy": 1.8806540374423066,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 45
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        13,
+        3,
+        2,
+        5,
+        7,
+        0,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.593037802629865,
+        "entropy": 1.5569444077746708,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 46
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        6,
+        2,
+        4,
+        8,
+        0,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6382603804608876,
+        "entropy": 1.6304325826288886,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 47
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        9,
+        0,
+        1,
+        5,
+        5,
+        4,
+        0,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6519603189253377,
+        "entropy": 1.651669962228313,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 48
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        6,
+        1,
+        1,
+        4,
+        10,
+        2,
+        1,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7323514773462301,
+        "entropy": 1.7679468217279943,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 49
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        4,
+        3,
+        0,
+        4,
+        10,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7075025416816412,
+        "entropy": 1.7334274846915236,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 50
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        2,
+        0,
+        5,
+        8,
+        3,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6789739041941528,
+        "entropy": 1.6922689568140883,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 51
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        10,
+        4,
+        0,
+        3,
+        8,
+        2,
+        0,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6542917437284729,
+        "entropy": 1.6552396060136818,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 52
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        9,
+        1,
+        0,
+        3,
+        8,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6585515855226809,
+        "entropy": 1.661729118736365,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 53
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        1,
+        1,
+        3,
+        6,
+        5,
+        0,
+        11
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6839425958460498,
+        "entropy": 1.6995602525967348,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 54
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        6,
+        2,
+        2,
+        5,
+        10,
+        3,
+        0,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7530541439046012,
+        "entropy": 1.795823392168384,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 55
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        3,
+        3,
+        5,
+        4,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887997036505944,
+        "entropy": 1.9606546684162192,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 56
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        2,
+        1,
+        1,
+        2,
+        7,
+        7,
+        1,
+        11
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.6866289554061024,
+        "entropy": 1.703480314993594,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 57
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        1,
+        2,
+        4,
+        6,
+        5,
+        0,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.764082587134007,
+        "entropy": 1.8103621443649556,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 58
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        1,
+        3,
+        9,
+        2,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.0,
+        "entropy": 0.0,
+        "routed_tokens": 0
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7769948059359302,
+        "entropy": 1.8271199282758606,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 59
+     }
+    ]
+   },
+   "says": "blocks.0.router is all zeros on every record and blocks.1.router was read. The kinds are judged on the router that was read, as on the base, and the entry names the one that was not.",
+   "section": 8,
+   "status": "new",
+   "today": {
+    "incident_kinds": [
+     "moe_imbalance"
+    ],
+    "moe_imbalance": "checked",
+    "not_checked_checks": [],
+    "run_state": "unhealthy",
+    "starved_experts": "checked"
+   }
+  },
+  "routers_that_were_read": {
+   "expected": {
+    "incident_kinds": [
+     "moe_imbalance"
+    ],
+    "moe_imbalance": "checked",
+    "not_checked_checks": [],
+    "run_state": "unhealthy",
+    "starved_experts": "checked"
+   },
+   "given": {
+    "records": [
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        2,
+        4,
+        3,
+        5,
+        8,
+        2,
+        3
+       ],
+       "blocks.1.router": [
+        9,
+        3,
+        2,
+        3,
+        8,
+        1,
+        1,
+        5
+       ]
+      },
+      "moe_source": {
+       "blocks.0.router": {
+        "form": "scores",
+        "point": "requested"
+       },
+       "blocks.1.router": {
+        "form": "scores",
+        "point": "requested"
+       }
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9026364863731989,
+        "entropy": 1.9770061729088613,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7769948059359302,
+        "entropy": 1.8271199282758606,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 0
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        3,
+        4,
+        5,
+        2,
+        8,
+        4,
+        3
+       ],
+       "blocks.1.router": [
+        6,
+        2,
+        2,
+        3,
+        7,
+        5,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9195041759803297,
+        "entropy": 1.9955208483090643,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8586479668525808,
+        "entropy": 1.9270452832828995,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 1
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        2,
+        4,
+        6,
+        2,
+        5,
+        5,
+        5,
+        3
+       ],
+       "blocks.1.router": [
+        8,
+        4,
+        1,
+        2,
+        10,
+        2,
+        2,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9351861715222388,
+        "entropy": 2.012431886093367,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7715369925841534,
+        "entropy": 1.8200708822615168,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 2
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        6,
+        2,
+        4,
+        5,
+        7,
+        4,
+        1
+       ],
+       "blocks.1.router": [
+        6,
+        4,
+        0,
+        2,
+        7,
+        6,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887192541815004,
+        "entropy": 1.9597482922681837,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7680912948845892,
+        "entropy": 1.8155948623281128,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 3
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        6,
+        0,
+        4,
+        4,
+        8,
+        6,
+        2,
+        2
+       ],
+       "blocks.1.router": [
+        8,
+        2,
+        2,
+        6,
+        2,
+        2,
+        3,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7876568030566355,
+        "entropy": 1.840748728569281,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8424251469197058,
+        "entropy": 1.9079710745910359,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 4
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        2,
+        4,
+        9,
+        4,
+        6,
+        1,
+        2
+       ],
+       "blocks.1.router": [
+        10,
+        5,
+        0,
+        4,
+        8,
+        1,
+        1,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8401845282969626,
+        "entropy": 1.9053078069537024,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6832597140343606,
+        "entropy": 1.6985613047986785,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 5
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        4,
+        2,
+        4,
+        4,
+        8,
+        6,
+        1
+       ],
+       "blocks.1.router": [
+        5,
+        5,
+        2,
+        3,
+        7,
+        5,
+        0,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8731063484357304,
+        "entropy": 1.9437436306319162,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.8256463208855712,
+        "entropy": 1.8878527615749323,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 6
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        1,
+        2,
+        6,
+        5,
+        7,
+        4,
+        5,
+        2
+       ],
+       "blocks.1.router": [
+        8,
+        5,
+        1,
+        4,
+        9,
+        1,
+        0,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8709175875428908,
+        "entropy": 1.9412336168679807,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7049815118967347,
+        "entropy": 1.729857840906155,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 7
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        2,
+        1,
+        4,
+        4,
+        8,
+        6,
+        7
+       ],
+       "blocks.1.router": [
+        9,
+        2,
+        1,
+        1,
+        13,
+        2,
+        0,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7519510434466734,
+        "entropy": 1.7943574827286881,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.5864804642766106,
+        "entropy": 1.545825621245186,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 8
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        7,
+        2,
+        5,
+        4,
+        4,
+        3,
+        4,
+        3
+       ],
+       "blocks.1.router": [
+        7,
+        5,
+        2,
+        3,
+        5,
+        2,
+        2,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.941745655035421,
+        "entropy": 2.0194214955458225,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8947260199624124,
+        "entropy": 1.968203811160335,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 9
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        2,
+        1,
+        5,
+        5,
+        5,
+        9,
+        3,
+        2
+       ],
+       "blocks.1.router": [
+        11,
+        3,
+        1,
+        4,
+        5,
+        1,
+        3,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8388382565376172,
+        "entropy": 1.9037041693378018,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7850403139817395,
+        "entropy": 1.8374213345522152,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 10
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        4,
+        7,
+        3,
+        2,
+        5,
+        3,
+        3
+       ],
+       "blocks.1.router": [
+        14,
+        2,
+        0,
+        3,
+        8,
+        2,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.934338925102374,
+        "entropy": 2.0115255099453315,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.5594580074799245,
+        "entropy": 1.4986547339778282,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 11
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        3,
+        1,
+        6,
+        2,
+        8,
+        5,
+        3
+       ],
+       "blocks.1.router": [
+        5,
+        2,
+        2,
+        2,
+        8,
+        4,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8662394593865331,
+        "entropy": 1.9358476450314257,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8120827988167222,
+        "entropy": 1.8712885666470043,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 12
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        1,
+        3,
+        0,
+        4,
+        7,
+        12,
+        3,
+        2
+       ],
+       "blocks.1.router": [
+        7,
+        2,
+        2,
+        3,
+        7,
+        3,
+        2,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6744809980024924,
+        "entropy": 1.6856297659731232,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8720128403126985,
+        "entropy": 1.9424904116275064,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 13
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        2,
+        3,
+        2,
+        4,
+        6,
+        7,
+        4,
+        4
+       ],
+       "blocks.1.router": [
+        8,
+        1,
+        2,
+        3,
+        8,
+        2,
+        3,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9186711369076049,
+        "entropy": 1.994614472161029,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8207520004716624,
+        "entropy": 1.8819072564467167,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 14
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        3,
+        1,
+        6,
+        5,
+        8,
+        6,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        6,
+        0,
+        1,
+        10,
+        3,
+        2,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7687877901094338,
+        "entropy": 1.8165012384761483,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7272504743144438,
+        "entropy": 1.7609572122755388,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 15
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        5,
+        3,
+        5,
+        4,
+        6,
+        4,
+        2
+       ],
+       "blocks.1.router": [
+        8,
+        1,
+        0,
+        6,
+        8,
+        5,
+        1,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9526621214802334,
+        "entropy": 2.03094656149357,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7090346471023363,
+        "entropy": 1.7355906555990848,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 16
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        7,
+        3,
+        1,
+        3,
+        8,
+        7,
+        3,
+        0
+       ],
+       "blocks.1.router": [
+        7,
+        5,
+        3,
+        4,
+        2,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7453611442330477,
+        "entropy": 1.7855551209801621,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8406048069131908,
+        "entropy": 1.9058079036834747,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 17
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        3,
+        5,
+        3,
+        6,
+        5,
+        4,
+        1
+       ],
+       "blocks.1.router": [
+        8,
+        4,
+        0,
+        2,
+        11,
+        4,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9200188131434979,
+        "entropy": 1.9960803816007249,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6371611227429106,
+        "entropy": 1.6287088262277232,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 18
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        3,
+        5,
+        2,
+        7,
+        3,
+        4,
+        5
+       ],
+       "blocks.1.router": [
+        10,
+        3,
+        2,
+        4,
+        8,
+        2,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.934338925102374,
+        "entropy": 2.0115255099453315,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7268436672843408,
+        "entropy": 1.7603976789838782,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 19
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        7,
+        1,
+        0,
+        5,
+        9,
+        6,
+        2,
+        2
+       ],
+       "blocks.1.router": [
+        5,
+        6,
+        1,
+        4,
+        10,
+        1,
+        1,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7179065524251359,
+        "entropy": 1.7480256734499835,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7654689357719232,
+        "entropy": 1.812174896661026,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 20
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        7,
+        3,
+        4,
+        2,
+        4,
+        9,
+        2,
+        1
+       ],
+       "blocks.1.router": [
+        7,
+        2,
+        1,
+        3,
+        9,
+        3,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8240246897156783,
+        "entropy": 1.885886755405464,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7845779887122715,
+        "entropy": 1.8368322419275376,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 21
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        2,
+        1,
+        6,
+        5,
+        8,
+        2,
+        4
+       ],
+       "blocks.1.router": [
+        9,
+        1,
+        2,
+        2,
+        8,
+        4,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8570897959674093,
+        "entropy": 1.9252289552317132,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7687877901094335,
+        "entropy": 1.816501238476148,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 22
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        3,
+        5,
+        3,
+        6,
+        6,
+        2,
+        2
+       ],
+       "blocks.1.router": [
+        12,
+        5,
+        1,
+        3,
+        7,
+        1,
+        0,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.922011125153301,
+        "entropy": 1.9982435525082858,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6513696653603858,
+        "entropy": 1.6507635860802778,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 23
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        1,
+        6,
+        3,
+        8,
+        3,
+        3,
+        4
+       ],
+       "blocks.1.router": [
+        9,
+        3,
+        1,
+        4,
+        9,
+        0,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8824269928476385,
+        "entropy": 1.9543623204316287,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6856411900602774,
+        "entropy": 1.7020407070276533,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 24
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        2,
+        0,
+        4,
+        10,
+        9,
+        4,
+        0
+       ],
+       "blocks.1.router": [
+        5,
+        4,
+        0,
+        3,
+        8,
+        4,
+        0,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6413864715920703,
+        "entropy": 1.635318457735671,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.7015454611697562,
+        "entropy": 1.7249719657993725,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 25
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        1,
+        5,
+        2,
+        6,
+        6,
+        2,
+        5
+       ],
+       "blocks.1.router": [
+        10,
+        4,
+        1,
+        6,
+        6,
+        3,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8810130337706215,
+        "entropy": 1.9527586828157282,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7226887283559282,
+        "entropy": 1.7546648642909484,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 26
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        2,
+        4,
+        3,
+        7,
+        6,
+        4,
+        1
+       ],
+       "blocks.1.router": [
+        10,
+        0,
+        1,
+        1,
+        9,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887192541815004,
+        "entropy": 1.9597482922681837,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.5978502484635415,
+        "entropy": 1.56502656465832,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 27
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        6,
+        2,
+        2,
+        4,
+        6,
+        5,
+        4,
+        3
+       ],
+       "blocks.1.router": [
+        5,
+        4,
+        2,
+        4,
+        8,
+        2,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9293201296438577,
+        "entropy": 2.0061395381087768,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8570897959674093,
+        "entropy": 1.9252289552317132,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 28
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        7,
+        1,
+        5,
+        5,
+        7,
+        5,
+        1,
+        1
+       ],
+       "blocks.1.router": [
+        7,
+        5,
+        1,
+        5,
+        4,
+        2,
+        2,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.80294797892066,
+        "entropy": 1.8599761911345425,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8709175875428908,
+        "entropy": 1.9412336168679807,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 29
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        4,
+        4,
+        3,
+        6,
+        8,
+        1,
+        2
+       ],
+       "blocks.1.router": [
+        5,
+        3,
+        1,
+        3,
+        10,
+        3,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8731063484357304,
+        "entropy": 1.9437436306319162,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7947896735309059,
+        "entropy": 1.8497637807530931,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 30
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        3,
+        3,
+        6,
+        5,
+        6,
+        1,
+        3
+       ],
+       "blocks.1.router": [
+        8,
+        4,
+        2,
+        3,
+        6,
+        3,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9070574468481319,
+        "entropy": 1.981892048015644,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7960652506564776,
+        "entropy": 1.8513674183689934,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 31
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        2,
+        1,
+        2,
+        5,
+        8,
+        7,
+        3,
+        4
+       ],
+       "blocks.1.router": [
+        7,
+        4,
+        2,
+        5,
+        6,
+        2,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8406048069131908,
+        "entropy": 1.9058079036834747,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.8003644028401375,
+        "entropy": 1.8567533902055484,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 32
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        8,
+        3,
+        5,
+        4,
+        3,
+        5,
+        3,
+        1
+       ],
+       "blocks.1.router": [
+        9,
+        4,
+        1,
+        4,
+        5,
+        2,
+        2,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887997036505944,
+        "entropy": 1.9606546684162192,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8454879296452651,
+        "entropy": 1.9116001549382926,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 33
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        2,
+        2,
+        0,
+        7,
+        7,
+        8,
+        5,
+        1
+       ],
+       "blocks.1.router": [
+        4,
+        4,
+        2,
+        3,
+        6,
+        2,
+        1,
+        10
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7239595300356378,
+        "entropy": 1.7564217557802466,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8142968728297165,
+        "entropy": 1.8740112708462258,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 34
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        2,
+        2,
+        6,
+        6,
+        8,
+        4,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        5,
+        0,
+        3,
+        8,
+        3,
+        1,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7876568030566355,
+        "entropy": 1.840748728569281,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7526329029008366,
+        "entropy": 1.7952638588767236,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 35
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        3,
+        3,
+        3,
+        7,
+        8,
+        2,
+        2
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        3,
+        3,
+        8,
+        2,
+        2,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.879722494585811,
+        "entropy": 1.9512927733760324,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8589458344196572,
+        "entropy": 1.9273921261392744,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 36
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        3,
+        1,
+        4,
+        6,
+        10,
+        3,
+        2
+       ],
+       "blocks.1.router": [
+        5,
+        2,
+        2,
+        2,
+        9,
+        3,
+        2,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8229897103184972,
+        "entropy": 1.8846299606459382,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.831021786400236,
+        "entropy": 1.8943422742976153,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 37
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        1,
+        4,
+        2,
+        5,
+        4,
+        11,
+        2,
+        3
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        0,
+        4,
+        5,
+        5,
+        1,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7979824273535703,
+        "entropy": 1.8537728390448573,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7797733568843258,
+        "entropy": 1.8306895720612293,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 38
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        2,
+        2,
+        6,
+        6,
+        7,
+        3,
+        2
+       ],
+       "blocks.1.router": [
+        6,
+        2,
+        3,
+        2,
+        8,
+        5,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8891137681321339,
+        "entropy": 1.9619114631757448,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7814619656406372,
+        "entropy": 1.8328527429687904,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 39
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        0,
+        3,
+        3,
+        9,
+        7,
+        3,
+        3
+       ],
+       "blocks.1.router": [
+        10,
+        3,
+        1,
+        6,
+        7,
+        1,
+        1,
+        3
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7845779887122715,
+        "entropy": 1.8368322419275376,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7401695257627937,
+        "entropy": 1.7785655115277066,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 40
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        3,
+        2,
+        6,
+        4,
+        7,
+        3,
+        3
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        1,
+        4,
+        6,
+        4,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.928478197655634,
+        "entropy": 2.0052331619607413,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8431890471175418,
+        "entropy": 1.9088774507390711,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 41
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        5,
+        2,
+        5,
+        5,
+        7,
+        4,
+        1
+       ],
+       "blocks.1.router": [
+        6,
+        4,
+        2,
+        3,
+        5,
+        4,
+        1,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.892792666506663,
+        "entropy": 1.9660406402527741,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887192541815004,
+        "entropy": 1.9597482922681837,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 42
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        1,
+        4,
+        2,
+        4,
+        9,
+        5,
+        3
+       ],
+       "blocks.1.router": [
+        10,
+        4,
+        2,
+        1,
+        12,
+        1,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8612876764748384,
+        "entropy": 1.9301148303384958,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.5915354489133632,
+        "entropy": 1.5544078748586077,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 43
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        3,
+        4,
+        3,
+        5,
+        3,
+        7,
+        3
+       ],
+       "blocks.1.router": [
+        7,
+        3,
+        2,
+        2,
+        8,
+        5,
+        1,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9517990424523959,
+        "entropy": 2.030040185345535,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8406048069131908,
+        "entropy": 1.9058079036834747,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 44
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        2,
+        3,
+        6,
+        5,
+        7,
+        2,
+        3
+       ],
+       "blocks.1.router": [
+        7,
+        1,
+        1,
+        6,
+        5,
+        3,
+        2,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9114458856181752,
+        "entropy": 1.9867184865605383,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8197240627168648,
+        "entropy": 1.8806540374423066,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 45
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        1,
+        1,
+        5,
+        3,
+        6,
+        8,
+        6,
+        2
+       ],
+       "blocks.1.router": [
+        13,
+        3,
+        2,
+        5,
+        7,
+        0,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8160602426827098,
+        "entropy": 1.876174441753787,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.593037802629865,
+        "entropy": 1.5569444077746708,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 46
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        2,
+        4,
+        4,
+        5,
+        8,
+        1,
+        3
+       ],
+       "blocks.1.router": [
+        10,
+        6,
+        2,
+        4,
+        8,
+        0,
+        0,
+        2
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.878617558449192,
+        "entropy": 1.9500359786165067,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6382603804608876,
+        "entropy": 1.6304325826288886,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 47
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        1,
+        1,
+        3,
+        2,
+        9,
+        8,
+        4,
+        4
+       ],
+       "blocks.1.router": [
+        9,
+        0,
+        1,
+        5,
+        5,
+        4,
+        0,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7831542310998951,
+        "entropy": 1.8350159138763513,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6519603189253377,
+        "entropy": 1.651669962228313,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 48
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        2,
+        4,
+        5,
+        4,
+        6,
+        3,
+        3
+       ],
+       "blocks.1.router": [
+        6,
+        1,
+        1,
+        4,
+        10,
+        2,
+        1,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9526621214802334,
+        "entropy": 2.03094656149357,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7323514773462301,
+        "entropy": 1.7679468217279943,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 49
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        3,
+        2,
+        6,
+        6,
+        9,
+        0,
+        1
+       ],
+       "blocks.1.router": [
+        4,
+        3,
+        0,
+        4,
+        10,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7397994619450478,
+        "entropy": 1.7780654147979342,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7075025416816412,
+        "entropy": 1.7334274846915236,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 50
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        3,
+        4,
+        4,
+        4,
+        6,
+        6,
+        4,
+        1
+       ],
+       "blocks.1.router": [
+        8,
+        2,
+        0,
+        5,
+        8,
+        3,
+        0,
+        6
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.9214953735370518,
+        "entropy": 1.9976840192166252,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6789739041941528,
+        "entropy": 1.6922689568140883,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 51
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        2,
+        3,
+        3,
+        6,
+        6,
+        6,
+        1
+       ],
+       "blocks.1.router": [
+        10,
+        4,
+        0,
+        3,
+        8,
+        2,
+        0,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.8848328542648186,
+        "entropy": 1.9570850246308504,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.6542917437284729,
+        "entropy": 1.6552396060136818,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 52
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        2,
+        4,
+        6,
+        5,
+        7,
+        1,
+        3
+       ],
+       "blocks.1.router": [
+        9,
+        1,
+        0,
+        3,
+        8,
+        2,
+        1,
+        8
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887192541815004,
+        "entropy": 1.9597482922681837,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6585515855226809,
+        "entropy": 1.661729118736365,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 53
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        2,
+        2,
+        1,
+        4,
+        6,
+        10,
+        5,
+        2
+       ],
+       "blocks.1.router": [
+        5,
+        1,
+        1,
+        3,
+        6,
+        5,
+        0,
+        11
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7993591408892334,
+        "entropy": 1.8554965954460227,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6839425958460498,
+        "entropy": 1.6995602525967348,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 54
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        0,
+        5,
+        2,
+        6,
+        2,
+        11,
+        3,
+        3
+       ],
+       "blocks.1.router": [
+        6,
+        2,
+        2,
+        5,
+        10,
+        3,
+        0,
+        4
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7275701089435441,
+        "entropy": 1.7613966267819345,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7530541439046012,
+        "entropy": 1.795823392168384,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 55
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        4,
+        1,
+        3,
+        4,
+        8,
+        11,
+        1,
+        0
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        3,
+        3,
+        5,
+        4,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6653706556624369,
+        "entropy": 1.6720305250127199,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.887997036505944,
+        "entropy": 1.9606546684162192,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 56
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        2,
+        1,
+        8,
+        2,
+        11,
+        3,
+        0
+       ],
+       "blocks.1.router": [
+        2,
+        1,
+        1,
+        2,
+        7,
+        7,
+        1,
+        11
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.6710205625970751,
+        "entropy": 1.6804860439048712,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.6866289554061024,
+        "entropy": 1.703480314993594,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 57
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        5,
+        1,
+        4,
+        6,
+        5,
+        9,
+        0,
+        2
+       ],
+       "blocks.1.router": [
+        7,
+        1,
+        2,
+        4,
+        6,
+        5,
+        0,
+        7
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.7503708009982729,
+        "entropy": 1.7922537483830152,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 1,
+        "dead_frac": 0.125,
+        "diversity": 0.764082587134007,
+        "entropy": 1.8103621443649556,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 58
+     },
+     {
+      "attempt": 1,
+      "grad_norm": null,
+      "grad_norms": {},
+      "layers": {},
+      "lr": [
+       0.01
+      ],
+      "moe": {
+       "blocks.0.router": [
+        6,
+        0,
+        4,
+        0,
+        8,
+        5,
+        6,
+        3
+       ],
+       "blocks.1.router": [
+        8,
+        3,
+        1,
+        3,
+        9,
+        2,
+        1,
+        5
+       ]
+      },
+      "moe_stats": {
+       "blocks.0.router": {
+        "dead_experts": 2,
+        "dead_frac": 0.25,
+        "diversity": 0.7166037821031341,
+        "entropy": 1.7462093453987972,
+        "routed_tokens": 32
+       },
+       "blocks.1.router": {
+        "dead_experts": 0,
+        "dead_frac": 0.0,
+        "diversity": 0.7769948059359302,
+        "entropy": 1.8271199282758606,
+        "routed_tokens": 32
+       }
+      },
+      "moe_top_k": {
+       "blocks.0.router": 2,
+       "blocks.1.router": 2
+      },
+      "rank": 0,
+      "run_id": "f1",
+      "schema_version": 1,
+      "step": 59
+     }
+    ]
+   },
+   "says": "The same model in train mode: counts on every record. Judged as on the base, with no moe_routing entry.",
+   "section": 8,
+   "status": "pin",
+   "today": {
+    "incident_kinds": [
+     "moe_imbalance"
+    ],
+    "moe_imbalance": "checked",
+    "not_checked_checks": [],
+    "run_state": "unhealthy",
+    "starved_experts": "checked"
+   }
+  }
+ },
+ "contract": "WAVE_AF_CONTRACT.md"
+}
