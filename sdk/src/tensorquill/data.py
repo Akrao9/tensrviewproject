@@ -715,9 +715,10 @@ def _read_model(model: Any) -> list[tuple[str, list[int], str, int | None]]:
     Each module is checked before anything of it is called. Its parameters and buffers are read
     with `torch.nn.Module.named_parameters` and `named_buffers`, not recursing, duplicates kept (as
     `state_dict()` writes a tied weight under each name); a buffer named in the module's
-    `_non_persistent_buffers_set` is left out, and a module without that set lists no buffer. Its
-    children are `torch.nn.Module.named_children`, which lists a module held twice by one parent
-    once; `state_dict()` would name it twice."""
+    `_non_persistent_buffers_set` is left out. A module that has buffers and not that set is not
+    read (`model_not_readable`): which of its buffers are saved cannot be told. Its children are
+    read from its own `_modules` table, as `state_dict()` walks them, so a module held twice by one
+    parent is named twice (`named_children` would name it once)."""
     if not isinstance(model, torch.nn.Module):
         raise _NotReadable
     out: list[tuple[str, list[int], str, int | None]] = []
@@ -726,16 +727,22 @@ def _read_model(model: Any) -> list[tuple[str, list[int], str, int | None]]:
     def walk(prefix: str, module: Any) -> None:
         if _replaces_walk(module):
             raise _NotReadable
+        own = vars(module)
+        children = own.get("_modules")
+        if not isinstance(children, dict):
+            raise _NotReadable
         on_path.add(id(module))
         for name, parameter in torch.nn.Module.named_parameters(module, recurse=False, remove_duplicate=False):
             out.append((prefix + name, list(parameter.shape), "p" if parameter.requires_grad else "f", id(parameter)))
-        not_saved = vars(module).get("_non_persistent_buffers_set")
-        if isinstance(not_saved, (set, frozenset)):
-            for name, buffer in torch.nn.Module.named_buffers(module, recurse=False, remove_duplicate=False):
-                if name not in not_saved:
-                    out.append((prefix + name, list(buffer.shape), "b", None))
-        for name, child in torch.nn.Module.named_children(module):
-            if id(child) not in on_path:  # a module that holds itself: state_dict() would not end
+        buffers = list(torch.nn.Module.named_buffers(module, recurse=False, remove_duplicate=False))
+        not_saved = own.get("_non_persistent_buffers_set")
+        if buffers and not isinstance(not_saved, (set, frozenset)):
+            raise _NotReadable
+        for name, buffer in buffers:
+            if name not in not_saved:
+                out.append((prefix + name, list(buffer.shape), "b", None))
+        for name, child in list(children.items()):
+            if child is not None and id(child) not in on_path:  # a module that holds itself: state_dict() would not end
                 walk(f"{prefix}{name}.", child)
         on_path.discard(id(module))
 
@@ -824,9 +831,14 @@ class _Match:
     def __init__(self, key: str | None, mapping: Mapping[Any, Any], shapes: dict[str, list[int]],
                  model: dict[str, tuple[list[int], str, int | None]]) -> None:
         self.key, self.mapping, self.shapes = key, mapping, shapes
+        # The side on which two names became one when made comparable ("checkpoint" or "model"):
+        # such a match is never compared, since which of the two a name stands for cannot be told.
+        self.collides: str | None = None
         self.entry = {}  # comparable name -> the entry's own key
         for raw in shapes:
             self.entry.setdefault(_strip_wrappers(raw), raw)
+        if len(self.entry) < len(shapes):
+            self.collides = "checkpoint"
         self.model = {name: name for name in model}  # comparable name -> the model's name
         self.prefix: dict[str, str] | None = None
         self.matched = sum(name in self.model for name in self.entry)
@@ -859,14 +871,19 @@ class _Match:
             return
         side, _, path = best[1]
         if side == 0:
+            before = len(self.entry)
             self.entry = {}
             for raw in self.shapes:
                 name = _strip_wrappers(raw)
                 self.entry.setdefault(name[len(path):] if name.startswith(path) else name, raw)
+            if len(self.entry) < before:
+                self.collides = "checkpoint"
         else:
             self.model = {}
             for name in model:
                 self.model.setdefault(name[len(path):] if name.startswith(path) else name, name)
+            if len(self.model) < len(model):
+                self.collides = "model"
         self.matched = sum(name in self.model for name in self.entry)
         self.prefix = {"side": "checkpoint" if side == 0 else "model", "removed": path}
 
@@ -953,12 +970,22 @@ def tensor_coverage(
     names: dict[str, tuple[list[int], str, int | None]] = {}
     for name, shape, kind, identity in rows:
         names.setdefault(_strip_wrappers(name), (shape, kind, identity))
+    if len(names) < len(rows):  # two of the model's names are one once a wrapper is removed
+        return _unavailable("ambiguous", collides="model"), None
+
+    def compared(match: _Match, by: str) -> tuple[dict[str, Any], _Match | None]:
+        """A comparison, unless two names became one on either side: then which name a tensor
+        stands for cannot be told, and nothing is said of the model's entry."""
+        if match.collides is not None:
+            return _unavailable("ambiguous", collides=match.collides, closest=match.closest()), None
+        return _compared(match, by, names), match
+
     # Rule 1: the loader named the entry (`model_state=`, the Lightning adapter): the very mapping
     # given to `load_state_dict`, found among the entries by identity.
     if isinstance(model_state, Mapping):
         match = _Match(_key_of(state, model_state), model_state, _entry_shapes(model_state, loose=True) or {}, names)
         if match.passes():
-            return _compared(match, "loader", names), match
+            return compared(match, "loader")
         return _unavailable("names_differ", closest=match.closest()), match
     matches = [_Match(key, mapping, shapes, names) for key, mapping, shapes in _entries(state)]
     passing = [m for m in matches if m.passes()]
@@ -966,14 +993,14 @@ def tensor_coverage(
     if len(conventional) == 1:  # rule 2: the key says which entry is looked at, its names whether it is compared
         match = conventional[0]
         if _holds_half(match, names):
-            return _compared(match, "name", names), match
+            return compared(match, "name")
         return _unavailable("weak_match", closest=match.closest()), None
     if len(conventional) > 1:  # rule 3
         return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in conventional)), None
     if len(passing) == 1:  # rule 4
         match = passing[0]
         if _holds_half(match, names):
-            return _compared(match, "names", names), match
+            return compared(match, "names")
         return _unavailable("weak_match", closest=match.closest()), None
     if len(passing) > 1:  # rule 5
         return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in passing)), None
