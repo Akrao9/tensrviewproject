@@ -4431,6 +4431,13 @@ impl RankDetectors {
         self.measurements.blocks()
     }
 
+    /// How many times a report of these detectors found a series' trend (`gradient_trend`, or one
+    /// module's of `attention_trends`). A series with no new point since the last report is not
+    /// found again (wave AF): the count says what each report computed, for tests and diagnosis.
+    pub fn trend_computations(&self) -> u64 {
+        self.measurements.trend_computations()
+    }
+
     /// The rank's `skipped_updates` (contract section 1), present only when a row carried
     /// `step_skipped_by`: written in the report beside `not_checked`.
     pub fn skipped_updates(&self) -> Option<Value> {

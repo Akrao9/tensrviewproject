@@ -818,6 +818,20 @@ impl Ingest {
         runs.len()
     }
 
+    /// How many times the reports of a rank's detectors found a series' trend
+    /// (`RankDetectors::trend_computations`), or None while the rank holds no detectors. Counted
+    /// per detectors: a rebuild from the store starts again from 0. For tests and diagnosis; it
+    /// waits for the rank's buffer, so a flush of the rank in progress finishes first.
+    pub async fn trend_computations(&self, run_id: &str, rank: i32) -> Option<u64> {
+        let key = (run_id.to_string(), rank);
+        let buffer = self.buffers.lock().unwrap().get(&key).cloned()?;
+        let buffer = buffer.lock().await;
+        buffer
+            .detectors
+            .as_ref()
+            .map(crate::detect::RankDetectors::trend_computations)
+    }
+
     /// Arrow bytes waiting in memory across all ranks.
     pub fn buffered_bytes(&self) -> usize {
         self.used.load(Ordering::SeqCst)

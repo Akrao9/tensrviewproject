@@ -250,3 +250,131 @@ mod replica_maps {
         assert!(!result["replica_drift"].as_array().unwrap().is_empty(), "{result}");
     }
 }
+
+// --- the live report's trend memoization ---------------------------------------------------------
+
+mod trend_memo {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use super::super::lane_ad8_tests::stored;
+    use super::super::{judge, report, RankDetectors, Thresholds};
+
+    const BLOCKS: [&str; 4] = ["gradient_trend", "attention_trends", "update_trends", "weight_jumps"];
+
+    /// A rank's rows at `steps`: a total norm on each step when `norms`, update sizes on each, and a
+    /// probe of three attention modules every tenth step when `probes` (module `a.2` only every
+    /// fortieth), so parts differ in which series receive points.
+    fn rows(steps: std::ops::Range<i64>, norms: bool, probes: bool) -> Vec<Value> {
+        steps
+            .map(|step| {
+                let x = step as f64;
+                let wobble = 1.0 + ((step * 37) % 21) as f64 / 100.0;
+                let mut record = json!({"attempt": 1, "step": step, "update_rms": {"w": 1e-3 * wobble}});
+                if norms {
+                    record["grad_norm"] = json!((1.0 + x / 50.0) * wobble);
+                }
+                if probes && step % 10 == 0 {
+                    let mut attention =
+                        json!({"a.0": {"max_logit": [2.0 + x / 20.0]}, "a.1": {"max_logit": [3.0 * wobble]}});
+                    if step % 40 == 0 {
+                        attention["a.2"] = json!({"max_logit": [1.0 + x / 7.0]});
+                    }
+                    record["probe"] = json!({"attention": attention});
+                }
+                record
+            })
+            .collect()
+    }
+
+    /// The parts of a run, each with what its rows give: some with every series, some with norms only,
+    /// some with nothing a trend reads, and the first ones too short for any trend (absent blocks).
+    fn parts() -> Vec<Vec<Value>> {
+        vec![
+            rows(0..4, true, true),
+            rows(4..8, false, false),
+            rows(8..30, true, true),
+            rows(30..45, false, false),
+            rows(45..70, true, false),
+            rows(70..120, true, true),
+            rows(120..130, false, true),
+            rows(130..140, false, false),
+            rows(140..200, true, true),
+        ]
+    }
+
+    fn usual() -> Arc<Thresholds> {
+        Arc::default()
+    }
+
+    /// The memoized live report equals, at every part, the report of detectors that read every row
+    /// so far afresh, which find every trend once, as the base found them at every report. That
+    /// includes the parts where a block is absent (too few points). Each report finds a trend again
+    /// only for the series that received a point since the last: the count grows by exactly the
+    /// series that changed, and by none after a part with nothing a trend reads.
+    #[test]
+    fn the_memoized_report_is_the_unmemoized_one_at_every_part_and_finds_only_changed_series_again() {
+        let mut live = RankDetectors::new(&usual());
+        let mut so_far: Vec<Value> = Vec::new();
+        let mut absent = 0;
+        let mut last = live.trend_computations();
+        for (index, part) in parts().into_iter().enumerate() {
+            let before = |series: &str, records: &[Value]| -> usize {
+                match series {
+                    "gradient" => records.iter().filter(|r| r.get("grad_norm").is_some()).count(),
+                    module => records
+                        .iter()
+                        .filter(|r| r["probe"]["attention"].get(module).is_some())
+                        .count(),
+                }
+            };
+            let changed: Vec<&str> = ["gradient", "a.0", "a.1", "a.2"]
+                .into_iter()
+                .filter(|series| before(series, &part) > 0)
+                .collect();
+            let had: Vec<&str> = ["gradient", "a.0", "a.1", "a.2"]
+                .into_iter()
+                .filter(|series| before(series, &so_far) > 0 || before(series, &part) > 0)
+                .collect();
+            live.append(1, &stored(&part));
+            so_far.extend(part);
+            let memoized = report("memo", 0, &live, 0);
+            let fresh = report("memo", 0, &judge(0, &[stored(&so_far)], &usual()).unwrap(), 0);
+            assert_eq!(memoized, fresh, "part {index}");
+            absent += BLOCKS.iter().filter(|block| memoized.get(**block).is_none()).count();
+            // A report finds the trend of every series the part gave a point, and of none other. The
+            // first report finds every series it has.
+            let expected = if index == 0 { had.len() } else { changed.len() };
+            let now = live.trend_computations();
+            assert_eq!(now - last, expected as u64, "part {index}: changed {changed:?}");
+            // A report made again with no new row finds nothing again.
+            assert_eq!(report("memo", 0, &live, 0), memoized);
+            assert_eq!(live.trend_computations(), now, "part {index}, the report made again");
+            last = now;
+        }
+        assert!(absent > 0, "some part has an absent block");
+    }
+
+    /// The gradient series is cleared when clipping begins: the trend found before is not taken for
+    /// the new series, though it may have as many points.
+    #[test]
+    fn a_series_cleared_at_the_switch_to_clipping_is_found_again() {
+        let mut live = RankDetectors::new(&usual());
+        let mut so_far: Vec<Value> = rows(0..12, true, false);
+        live.append(1, &stored(&so_far));
+        let before = report("memo", 0, &live, 0);
+        assert_eq!(before["gradient_trend"]["series"], "grad_norm");
+        let clipped: Vec<Value> = (12..24)
+            .map(|step| json!({"attempt": 1, "step": step, "grad_norm": 1.0, "clip_grad_norm": 5.0 + step as f64}))
+            .collect();
+        live.append(1, &stored(&clipped));
+        so_far.extend(clipped);
+        let after = report("memo", 0, &live, 0);
+        assert_eq!(after["gradient_trend"]["series"], "clip_grad_norm");
+        assert_eq!(
+            after,
+            report("memo", 0, &judge(0, &[stored(&so_far)], &usual()).unwrap(), 0)
+        );
+    }
+}

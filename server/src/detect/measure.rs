@@ -24,6 +24,7 @@
 //!   ratio so far, and `weight_jumps` the previous weight check's norms and each tensor's largest
 //!   change so far. Both are bounded by the number of parameters.
 
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -90,11 +91,20 @@ fn by(a: f64, b: f64) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
-/// One series of steps and values.
+/// A trend found for a series of a given length (`None` when the series had no trend).
+type Found = (usize, Option<serde_json::Map<String, Value>>);
+
+/// One series of steps and values, with the trend last found for it.
+///
+/// The trend is memoized (wave AF, after lane D's server changes): a series only grows at its end
+/// between [`clear`](Self::clear)s, so its length says which points the trend was found from, and a
+/// report finds the trend again only for a series that received a point since. A series that did
+/// receive one needs the whole calculation again: the median of its first third moves as it grows.
 #[derive(Default)]
 struct Series {
     steps: Vec<i64>,
     values: Vec<f64>,
+    found: RefCell<Option<Found>>,
 }
 
 impl Series {
@@ -106,6 +116,22 @@ impl Series {
     fn clear(&mut self) {
         self.steps.clear();
         self.values.clear();
+        self.found.replace(None);
+    }
+
+    /// [`trend`] of the series, found again only when it has points it did not have when it was
+    /// last found; `computed` counts the times it is.
+    fn trend(&self, scratch: &mut Vec<f64>, computed: &Cell<u64>) -> Option<serde_json::Map<String, Value>> {
+        let n = self.values.len();
+        if let Some((at, found)) = self.found.borrow().as_ref() {
+            if *at == n {
+                return found.clone();
+            }
+        }
+        computed.set(computed.get() + 1);
+        let found = trend(&self.steps, &self.values, scratch);
+        self.found.replace(Some((n, found.clone())));
+        found
     }
 }
 
@@ -145,6 +171,9 @@ pub(super) struct Measurements {
     previous: Option<(i64, HashMap<String, Option<f64>>)>,
     jumps: HashMap<String, Jump>,
     scratch: Vec<f64>,
+    /// How many times a report found a series' trend (each call of [`trend`] at report time), for
+    /// the test that a report finds no trend again for a series with no new point.
+    computed: Cell<u64>,
 }
 
 impl Measurements {
@@ -276,7 +305,7 @@ impl Measurements {
 
     /// The block `gradient_trend`, or None under [`TREND_MIN`] points.
     fn gradient_trend(&self, scratch: &mut Vec<f64>) -> Option<Value> {
-        let mut found = trend(&self.gradient.steps, &self.gradient.values, scratch)?;
+        let mut found = self.gradient.trend(scratch, &self.computed)?;
         let series = if self.clips { "clip_grad_norm" } else { "grad_norm" };
         found.insert("series".into(), json!(series));
         Some(Value::Object(found))
@@ -289,7 +318,7 @@ impl Measurements {
             .attention
             .iter()
             .filter_map(|(module, series)| {
-                let mut found = trend(&series.steps, &series.values, scratch)?;
+                let mut found = series.trend(scratch, &self.computed)?;
                 let growth = found["growth"].as_f64();
                 found.insert("module".into(), json!(module));
                 Some((growth, module.as_str(), found))
@@ -349,6 +378,11 @@ impl Measurements {
             })
             .collect();
         Some(json!({"checks": self.checks, "parameters": self.jumps.len(), "largest": largest}))
+    }
+
+    /// How many times a report found a series' trend, since these measurements were made.
+    pub(super) fn trend_computations(&self) -> u64 {
+        self.computed.get()
     }
 
     /// The blocks the rows hold, by their report keys, in the page's order.
