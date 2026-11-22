@@ -1,6 +1,6 @@
 # GPU run sheet for step 5 of the v1 plan
 
-Written Nov 22, 2026 against the harness wave's code commit `909dad6` (wave AI; the bug list's section 14). **Nothing here has run on a GPU.** Every command was read from the scripts on that commit, and the three lanes that wrote the new harnesses gave their own lines (`lane-ai1.md`, `lane-ai2.md`, `lane-ai3.md` in the side-session notes).
+Written Nov 22, 2026 against the harness wave's code commit `195ed27` (wave AI; the bug list's section 14), with the author's terms of that day for the run: smoke the first-use branches first; measure the loader delay with capture off and on before any fix; the fault-injection pass rule; the DDP wrapper's graph breaks shown in a control run and an instrumented one; the Granite gate scored by its original criteria. **Nothing here has run on a GPU.** Every command was read from the scripts on that commit, and the three lanes that wrote the new harnesses gave their own lines (`lane-ai1.md`, `lane-ai2.md`, `lane-ai3.md` in the side-session notes).
 
 The "CPU" column says what was done on this Mac (macOS, CPU, PyTorch 2.15, offline): *dry-run* means the same script ran to its stated exit status with `--toy`, `--cpu` or a stand-in in place of the real model, router or NCCL; *refused* means the script stopped as it should without a GPU; *never run* means that branch of the script has executed nowhere. A CPU dry run shows that a harness starts, makes its checks and writes its files. Only the GPU run establishes the claim.
 
@@ -50,6 +50,32 @@ run() { name=$1; shift; echo "$ $*" > $OUT/$name.log; "$@" >> $OUT/$name.log 2>&
 
 `$OUT/` (`tensorquill-out/v1-gpu-<revision>/` at the repository root; `.gitignore` has `tensorquill-out/`) on the GPU machine: one `<name>.log` and one folder per name below, `RESULTS.txt` with each name's exit status, and a first file `ENVIRONMENT.txt` holding the output of the "Before anything" lines. Each new harness also writes a small result file under its `--out` (`gate.json`, `paired_dtype.json`, `coverage.json`, `system.json`, `result.json`, `tensorquill_comparison.json`). The folder is copied back whole. Nothing is entered in the bug list or the benchmarks file except from it. Each claim made from it carries: command, hardware, PyTorch and CUDA versions, the raw capture, the expected outcome, the observed outcome.
 
+## 0. Smoke first: the branches that have never run
+
+Before anything expensive. Results go to `$OUT/smoke/` and are **never scored**: a smoke line shows only that a branch starts, loads what it needs and writes its files on this machine. If one stops, fix the environment (or report the harness) before the scored runs; do not read a result from it. None of these could be dry-run on the Mac without installing or downloading, so **every line here is never run**.
+
+```bash
+mkdir -p $OUT/smoke
+# 1. the wandb.watch arm, never executed anywhere: first on the toy, then on Granite (one round, 50 + 50 steps)
+run smoke-wandb-toy     python examples/granite_compiler_gate.py --out $OUT/smoke/wandb-toy --toy --arms off,tensorquill,wandb --rounds 1 --warmup 50 --steps 50
+run smoke-gate-granite  python examples/granite_compiler_gate.py --out $OUT/smoke/gate-granite --arms off,tensorquill,wandb,neuraldbg --rounds 1 --warmup 50 --steps 50 --neuraldbg-path ../../NeuralDBG
+# 2. both real models and the dataset load (Granite and WikiText-2 are loaded by the line above too)
+run smoke-load-granite  python examples/gpu_probe_coverage.py --out $OUT/smoke/load-granite --model ibm-granite/granite-3.0-1b-a400m-base --steps 50 --probe-every 50
+run smoke-load-smollm2  python examples/gpu_probe_coverage.py --out $OUT/smoke/load-smollm2 --steps 50 --probe-every 50
+# 3. the NCCL environment: two GPUs, then the Flight Recorder variables with NCCL's dump on timeout
+run smoke-nccl-2        python -m torch.distributed.run --nproc-per-node=2 examples/replica_check.py --out $OUT/smoke/nccl-2
+run smoke-fr-nccl       python examples/flight_recorder_hang_check.py --out $OUT/smoke/fr-nccl --nproc 2 --skip-rank 1
+# 4. the nvidia-smi field names the system check asks for, and nvidia-ml-py
+nvidia-smi --query-gpu=temperature.gpu,clocks.sm,power.draw,enforced.power.limit,memory.total,memory.used,ecc.errors.uncorrected.volatile.total,ecc.errors.corrected.volatile.total --format=csv,noheader,nounits | tee $OUT/smoke/nvidia-smi-fields.txt
+python -c "import pynvml; pynvml.nvmlInit(); print(pynvml.nvmlSystemGetDriverVersion())" | tee $OUT/smoke/nvml.txt
+# 5. in the second environment (PyTorch 2.10 to 2.13): the campaign's imports and TensorQuill on that PyTorch
+python -c "import torch, tensorquill, lm_resiliency; print(torch.__version__, torch.version.cuda, tensorquill.__file__)" | tee $OUT/smoke/fault-injection-env.txt
+run smoke-fi-seeded     python examples/seeded_failures.py --case both --out $OUT/smoke/fi-seeded
+```
+
+- **What to look for:** `smoke-wandb-toy` and `smoke-gate-granite`: the `wandb` arm's state is `measured` (offline mode: no account, no network), not `not_run` or `error`; NeuralDBG on Granite finishes inside the arm timeout. The two load lines: exit 0, which needs the checkpoints and WikiText-2 in the cache. `smoke-nccl-2`: exit 0. `smoke-fr-nccl`: **a dump from every rank, the sleeping one too**; exit 3 with "no dump" here means the scored Flight Recorder run will be not proven, so settle the NCCL variables first. The `nvidia-smi` line: a row of values, no "Field ... is not a valid field". `smoke-fi-seeded`, run in the second environment: TensorQuill's seeded cases pass on that PyTorch, which has never been tried.
+- A smoke that fails is entered in `RESULTS.txt` like any line and reported; it is not rerun silently.
+
 ## 1. One GPU
 
 | Name | Command | Expected | CPU |
@@ -68,7 +94,18 @@ run() { name=$1; shift; echo "$ $*" > $OUT/$name.log; "$@" >> $OUT/$name.log 2>&
 | system-check | `run system-check python examples/gpu_system_check.py --out $OUT/system-check` | TensorQuill's data wait equals a known injected sleep and the script's own timer; its CUDA memory equals `torch.cuda` and `nvidia-smi`; its NVML readings equal `nvidia-smi` sampled alongside, within stated tolerances | dry-run: exit 3, data wait checked, CUDA and NVML not proven. The `nvidia-smi` field names have never run: a rejected field gives exit 3 with the error |
 | granite-collapse | `run granite-collapse python examples/moe_dogfood.py --out $OUT/granite-collapse --collapse-layer <N>` | routing collapse reported on layer N in the final round; N is chosen and written in `ENVIRONMENT.txt` before the run | refused (needs CUDA with BF16) |
 
-**To watch in `system-check`:** on CPU, with a 50-step flush, step 100 spent 30 to 60 ms longer in the loader's `next()` than its sleep in every run with TensorQuill on and in none with it off. The cause is not established (bug list, section 14). Every step over the slack is listed in `system.json` with both timers: read it on the GPU run.
+### The loader delay: measured with capture off and on, before any fix
+
+```bash
+run loader-delay python examples/loader_delay_check.py --out $OUT/loader-delay
+```
+
+- **Open, and to be measured here before a fix lane starts (the author, Nov 22).** On CPU, with TensorQuill on and a 50-step flush, one step of a run spends tens of milliseconds longer in the loader's `next()` than the loader's sleep; with TensorQuill off none does.
+- **What the line keeps:** three rounds, capture off and capture on in fresh processes, the same loop as `system-check`. For every step of every arm and round: the injected sleep, the time in `next()`, the step's whole time, and for the `on` arm TensorQuill's own `data_wait` and `step_time` (`loader_delay.json`, `arm-<arm>-r<round>.json`). The flush-boundary steps are reported by name, **step 100 among them**, for both arms; so are the worst delay per arm with its step and round, every step over 15 ms, the slowest rest of a step, and each garbage collection of 1 ms or more with the thread it ran on.
+- **Nothing is judged:** exit 0 means both arms were measured.
+- **What CPU showed (PyTorch 2.15, macOS; not a GPU result):** in 5 of 5 `on` rounds one generation-2 garbage collection of 78 to 95 ms ran on TensorQuill's writer thread at a flush boundary (step 150 in this loop; `system-check`'s own loop shows its delay at step 100, 36 and 62 ms in two runs), while the training thread was in `next()` and waited for it. The `off` arm had no collection at all. That is evidence of a cause, on one machine. It is not a fix and not a GPU measurement.
+- **How it is reported:** the worst delay (this line, both arms) **beside** the preregistered median overhead (section 2). A passing median does not explain the spike, and the spike is reported whatever the median says. The toy loop's own step-time overhead in `loader_delay.json` is labelled as such and is not the preregistered figure.
+- `system-check` still lists every step over its slack with both timers in `system.json`.
 
 ## 2. The Granite compiler gate, four arms
 
@@ -81,7 +118,9 @@ run profile-full python examples/profile_overhead.py --out $OUT/profile-full --c
 ```
 
 - **The arms:** capture off, TensorQuill router-only, NeuralDBG, `wandb.watch`. Each runs in a fresh process with the same model, the same batches, 50 warm-up and 200 timed steps, three paired rounds, the order rotating by round. `gate.json` holds every arm and round, the failing and absent ones too, with what each tool observes and how often it samples.
-- **Pass line, for the TensorQuill arm:** median overhead 1% or less against capture off (per round, on mean step time, so the flush steps count); zero graph breaks; zero recompiles after warm-up; zero CUDA-graph skips under `reduce-overhead`; every step recorded and every router's assignments summing to tokens × top-k.
+- **Pass line, for the TensorQuill arm, the original criteria unchanged:** median overhead 1% or less against capture off (per round, on mean step time, so the flush steps count); **zero graph breaks**; zero recompiles after warm-up; zero CUDA-graph skips under `reduce-overhead`; every step recorded and every router's assignments summing to tokens × top-k. The three breaks of DDP's wrapper (section 4) are another run's observation and allow nothing here.
+- **Reported beside the pass line, never scored:** the slowest timed step of every arm and round with how far it is over that round's median step (`worst_step_by_round`; every step's time is `step_ms` in `arm-<arm>-r<round>.json`), for capture off and on alike; and the overhead as `moe_dogfood.py` printed it on earlier GPU runs (each arm's median round, then the ratio), said aloud if it falls on the other side of 1% from the scored figure. **Which of the two figures is "the preregistered median" is one line for the author to confirm:** the harness scores the paired-round one, as the plan's "three paired rounds" reads.
+- **This loop has no data loader** (the batches are made before timing), so it cannot show a delay in `next()`. A pause of the training thread would show here as a slow step. The loader delay is section 1's `loader-delay`.
 - **Statuses to expect:** an arm whose package is absent is `not_run`, never passed. A run without CUDA graphs is `not_proven` (exit 3). Granite under `reduce-overhead` may skip CUDA graphs in every arm, capture off included (`moe_dogfood.py` notes it on an RTX PRO 6000 with PyTorch 2.14.1): then the cause is the model, and the second line gives the other criteria with skips "not checked".
 - **CPU:** dry-run with `--toy` (12 arm processes; off, TensorQuill and NeuralDBG measured; `wandb` `not_run`). **The `wandb` arm has never run:** it is written from wandb's documented calls. NeuralDBG has never run on Granite and will be slow (hooks with several host reads on every leaf module); raise `--arm-timeout` if an arm passes an hour.
 - `moe_dogfood.py` (two arms, in one process) is kept for `granite-collapse`; the gate is the new script.
@@ -121,6 +160,9 @@ run lightning-fsdp-flat  python examples/lightning_check.py --out $OUT/lightning
 # Hugging Face Trainer under DDP, torch_compile, 2 GPUs
 run trainer-ddp-fp16     torchrun --nproc-per-node 2 --master-port 29541 examples/trainer_ddp_check.py --out $OUT/trainer-ddp-fp16
 run trainer-ddp-bf16     torchrun --nproc-per-node 2 --master-port 29542 examples/trainer_ddp_check.py --out $OUT/trainer-ddp-bf16 --precision bf16
+# the same two runs with no TensorQuill callback: Dynamo's graph breaks per rank, for the control side
+run trainer-ddp-fp16-control torchrun --nproc-per-node 2 --master-port 29543 examples/trainer_ddp_check.py --out $OUT/trainer-ddp-fp16-control --control
+run trainer-ddp-bf16-control torchrun --nproc-per-node 2 --master-port 29544 examples/trainer_ddp_check.py --out $OUT/trainer-ddp-bf16-control --precision bf16 --control
 # Megatron's own TopKRouter, one GPU, capacity dropping off, on, and on with padding
 run megatron-routing     python examples/megatron_routing_check.py --out $OUT/megatron-routing            # installed megatron-core; or add --megatron /path/to/Megatron-LM
 run megatron-position    python examples/megatron_routing_check.py --out $OUT/megatron-routing-position --drop-policy position
@@ -130,7 +172,7 @@ run megatron-position    python examples/megatron_routing_check.py --out $OUT/me
 - **`Trainer` checks:** one capture per rank; steps equal the `Trainer`'s `global_step`; the mean over ranks of the recorded loss equals the loss the `Trainer` logged; each rank's clip norm equals its logged `grad_norm`; under `fp16`, each rank's recorded skip equals Accelerate's own flag step by step; spike and probe as in `trainer_check.py`.
 - **Megatron check:** the top-k map before dropping is read from Megatron's own `apply_router_token_dropping` and the map after from what the router returned; TensorQuill's per-expert counts must equal kept, padding, and their sum equal what the dispatcher sends, with dropping off, on, and on with padding. Guards make each arm fail if nothing was dropped or padded where it must be.
 - **CPU:** Lightning DDP dry-run on two CPU processes (exit 0); FSDP refused by Lightning 2.6.6 itself without CUDA (exit 2), so **both FSDP lines have never run**; the `Trainer` under DDP dry-run on two processes, eager and `aot_eager` (exit 0); the Megatron check dry-run against **a stand-in router with Megatron's own dropping code**, read from the clone. **Megatron's `TopKRouter` itself has never run**: its package needs `triton` and its gating needs CUDA.
-- **For the author to decide when the result is in:** under DDP, Dynamo breaks three times inside `DistributedDataParallel.forward` itself (a control run without TensorQuill showed the same three). `trainer_ddp_check.py` counts and prints them and does not fail on them; every other break fails. The rule matches reason text seen on PyTorch 2.15 with `aot_eager`; Inductor under DDP was not run.
+- **The DDP wrapper's graph breaks (the author, Nov 22: documented as observed in both control and instrumented runs).** Under DDP, Dynamo breaks inside `DistributedDataParallel.forward` itself: three times on CPU with PyTorch 2.15 and `aot_eager`, the same reasons and counts with and without TensorQuill (a test holds the two equal). On the GPU the `-control` lines give the count without TensorQuill and the checked lines the count with it, per rank, in each `result.json` (`ddp_wrapper_breaks`, `other_breaks`). The checked run fails on any break outside the wrapper; the wrapper's are reported, not failed. **If the two runs' counts differ, report it: the difference would be TensorQuill's.** Inductor under DDP has never run. The Granite gate (section 2) keeps its zero-break line.
 - **If Lightning FSDP records no steps or no gradients:** stop and report. That would be the SDK's to fix, not the harness's.
 - TensorQuill records per-expert counts only, so "dropped" in the Megatron check is derived from Megatron's pre-drop map. Reporting drops itself would be an SDK change, not asked for.
 
@@ -155,7 +197,9 @@ run fault-injection-compare python examples/fault_injection_check.py --artifact-
 ```
 
 - **What it does:** runs their campaign unchanged, with a TensorQuill session attached on every rank, and keeps the captures beside their `injection.json`. The comparison reads only `injection.json` as ground truth (never their own localization) and credits a TensorQuill report only with the exact rank and an iteration inside the injection's window.
-- **Expected:** per injection, found, partial or missed, with every false report listed, in `tensorquill_comparison.json`. Exit 0 only if every occurrence is found with no false report. **What counts as a pass on this campaign is the author's call:** add `--measure` to record without gating. `torchrun` may exit non-zero if their own tool misses something; the artifacts are still written, so run the comparison anyway.
+- **The pass rule (the author, Nov 22):** an occurrence is found only when TensorQuill names the exact injected rank within the iteration window of `injection.json`. The campaign passes if every occurrence is found with no false report (exit 0); otherwise it fails (exit 1). **Partials, misses and false reports are published whatever the verdict**: they are all in `tensorquill_comparison.json`, whose `status` is the strict verdict. Missing ground truth or an incomplete run is **not proven** (exit 3): no `injection.json`, no `completed_iterations`, an injection still pending when the campaign ended, a rank's capture missing or ending before the campaign's last iteration. The scored line carries no `--measure`.
+- **The environment:** the campaign's own (PyTorch 2.10 to 2.13). The entry script writes its exact versions on rank 0, inside that environment (`tensorquill/attach.json`: PyTorch, CUDA, NCCL, Python, TensorQuill), and the comparison carries them into the result as `campaign_environment`. Quote that with the result.
+- `torchrun` may exit non-zero if their own tool misses something; the artifacts are still written, so run the comparison anyway.
 - **To expect:** delay faults are probably misses (no server is attached); TensorQuill's hooks also fire during their replay forwards, which may add reports. Both are results to read, not to filter.
 - **CPU:** the comparison and the wrapper dry-run on **a stub campaign of ours with a constructed `injection.json`** (exit 0, 3 of 3 found). **The real campaign has never run**, and TensorQuill has never run on PyTorch below 2.15 here (CI covers 2.6 and 2.9).
 
@@ -171,9 +215,17 @@ A disposition for B5, B7, B11, B12, B13, B15, B16 and B20 from `experiments/trai
 
 After the runs, on the same revision: the audit's fifth pass over the captures in `$OUT`.
 
+## What the report of the run carries
+
+- For the overhead claim: the preregistered median overhead (section 2's scored figure, with each round) **and** the worst delay, for capture off and on: `loader-delay`'s worst step and its step-100 rows, and the gate's slowest step per arm and round. Neither replaces the other.
+- For fault injection: found, partial, missed and false reports with their counts, the verdict, and the campaign environment's exact PyTorch version.
+- For the DDP `Trainer`: the wrapper's graph-break count in the control run and in the instrumented run, per rank.
+- Every smoke line's exit status, apart from the scored results.
+
 ## What is ready, and what is not
 
-- **Ready to execute as written:** sections 1 to 6.
+- **Order:** section 0 (smoke, never scored), then sections 1 to 6.
+- **Ready to execute as written:** sections 0 to 6.
 - **Written and never executed anywhere, so the first GPU run is also the harness's first run:** the `wandb` arm; NeuralDBG on Granite; Lightning FSDP; fp16 and Inductor under DDP; Megatron's own router; NCCL's dump on timeout; the real fault-injection campaign; every real-model load.
 - **Needs the author first:** the job of section 8; which of section 7's cases need a GPU.
 - Nothing from the earlier sheet's list is left without a script.

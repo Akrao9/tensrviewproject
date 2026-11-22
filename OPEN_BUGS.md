@@ -394,7 +394,7 @@ Also corrected, as stale text: section 12's head (it said `main` was at `76a3b5d
 
 ## 14. Wave AI: the GPU proof harnesses
 
-**Not in `main` when this was written.** `main` is at `6c36976`. The code is the tree `trial/ai-wave` at `909dad698e08d1bbc5f2969ca820b7f3bc551a2a`, cut from `main`; this section, the plan's entry and the run sheet are a documents-only commit on top of it. Nothing is pushed. Not counted in the table at the top. **Nothing in this section ran on a GPU.**
+**In `main` since the author's word of Nov 22 ("Fast-forward local main to 6e5005b"), except the part headed "After the author's terms for the run" below, which is on `trial/ai-wave` only.** When this was written `main` was at `6c36976`. The code is the tree `trial/ai-wave` at `909dad698e08d1bbc5f2969ca820b7f3bc551a2a`, cut from `main`; this section, the plan's entry and the run sheet are a documents-only commit on top of it. Nothing is pushed. Not counted in the table at the top. **Nothing in this section ran on a GPU.**
 
 **Why.** Preparing the GPU session showed that several proofs of the approved plan had no script. The author, Nov 22, 2026: "Write the missing GPU proof harnesses in three parallel lanes, reuse the existing examples, and gate the merged result once. ... 'Unverified' is an appropriate outcome when a dependency, hardware limitation, or actual run prevents verification. A missing harness is something you can fix now, before paying for GPU time."
 
@@ -437,3 +437,39 @@ Also corrected, as stale text: section 12's head (it said `main` was at `76a3b5d
 - The live-agent proof: the harness is ready and waits for the author's sign-in to `claude`.
 - D10, the independent real job, and which TrainCheck cases need a GPU.
 - Everything a first GPU run will exercise for the first time: the `wandb` arm, NeuralDBG on Granite, Lightning FSDP, fp16 and Inductor under DDP, Megatron's own router, NCCL's dump on timeout, the real fault-injection campaign, every real-model load.
+
+### After the author's terms for the run (Nov 22, second set)
+
+**Not in `main`.** `main` is at `6e5005b` (fast-forwarded on the author's word; its release server rebuilt, protocol 4, selected by the SDK). The code below is `trial/ai-wave` at `195ed279f2fbef7c32409fb9ae519da00d0063b4`, examples and their tests only; this part of the section, the plan's line and the run sheet are a documents-only commit on top. Nothing is pushed. **Nothing here ran on a GPU.**
+
+**The terms.** "Keep the loader delay open and measure it on the GPU before starting another fix lane. Preserve per-step timings for capture off and on, including step 100, and report both the worst delay and the preregistered median overhead. A passing median alone doesn't explain the spike." "An occurrence is found only when TensorQuill identifies the exact injected rank within the iteration window in injection.json. The campaign passes if every occurrence is found with no false reports. Publish partials, misses and false reports even if that target is missed. Missing ground truth or an incomplete run gets not proven. Use the campaign's compatible PyTorch environment and record its exact version." "Keep the three DDP graph breaks documented as observed in both control and instrumented runs. Score the separate Granite zero-break compiler gate by its original criteria. Before the expensive runs, smoke-test the first-use branches, especially wandb.watch, real model loading and the NCCL environment."
+
+**What the harnesses lacked for those terms, and now have** (12 new tests):
+
+| Term | Gap found | Change |
+|---|---|---|
+| Per-step timings, capture off and on | `gpu_system_check.py` has no capture-off arm and kept only the steps over its slack and a five-step sample | New `loader_delay_check.py`: off and on in fresh processes, three rounds, every step's sleep, time in `next()` and whole time kept for both arms, TensorQuill's own `data_wait` and `step_time` beside them in the `on` arm; the flush-boundary steps (step 100) named; the worst delay per arm; each garbage collection of 1 ms or more with its thread. A measurement: nothing judged |
+| Worst delay beside the median | The compiler gate kept `step_ms` in each arm's file and reported no worst step | `worst_step_by_round` per arm; `moe_dogfood.py`'s overhead figure (each arm's median round, then the ratio) beside the scored one (the median of the paired rounds), said aloud when the two fall on different sides of 1%. The pass line is unchanged |
+| The fault-injection rule | Under `--measure` the result's `status` read PASS with misses; a run without `completed_iterations` skipped the completeness check; no PyTorch version was recorded | `status` is the strict verdict whatever the exit rule; no `completed_iterations`, or a record still `pending`, is not proven; the entry script writes the campaign environment's exact versions in `attach.json`, carried into the result |
+| DDP breaks in both runs | `trainer_ddp_check.py` had no control arm: the "same three without TensorQuill" was one hand run on CPU | `--control`: no TensorQuill callback, the wrapper's breaks and every other written per rank. A test holds the control's and the checked run's wrapper breaks equal on two CPU ranks under `aot_eager` |
+| Smoke first | No smoke lines | The run sheet's new section 0, results apart in `$OUT/smoke/`, never scored. Never run: each needs a package, a model or NCCL this Mac lacks |
+
+**The loader delay: what CPU now shows. Still open, no fix started.** With the new script (PyTorch 2.15, macOS, 5 `on` rounds and 5 `off`): in every `on` round one generation-2 garbage collection of 78 to 95 ms ran on the `tensorquill-writer` thread at a flush boundary (step 150 in that loop) while the training thread was in `next()`, which waited 74 to 76 ms over its sleep. The `off` rounds had no collection of any generation. `gpu_system_check.py`'s own loop, run twice the same hour, showed its delay at step 100 as before (62 and 36 ms). So the earlier "no TensorQuill thread was busy when sampled" was wrong about what to look for: the pause is the interpreter's collector, triggered on TensorQuill's thread by what TensorQuill allocates, and it holds the interpreter lock. This is one machine and a toy model; how long a full collection takes depends on how many objects the process holds, which a real job changes. The GPU run measures it (`loader-delay`); a fix lane starts only after that, on the author's word. One raw result is kept (`wave-ai-loader-delay/cpu-2-rounds.json` in the side-session notes).
+
+**For the author, one line:** the gate scores the median of the three paired rounds' overheads, as the plan's "three paired 200-step rounds" reads; `moe_dogfood.py`, which gave the earlier GPU figures, printed the ratio of each arm's median round. Both are written. Which is "the preregistered median" is the author's to confirm; nothing was changed in the scoring.
+
+**The exit gate, run alone on `195ed279f2fbef7c32409fb9ae519da00d0063b4`**, Nov 22, 2026, 17:37 to 18:17, load average 3.3 at both ends, tree unchanged and no server left at the end. Logs: `wave-ai-exit-gate/on-195ed27/` in the side-session notes.
+
+| Stage | Exit | Result |
+|---|---|---|
+| `cargo build --release`; `cargo test`; `cargo test --no-default-features --lib` | 0, 0, 0 | protocol 4; 350 passed, 6 ignored; 260 passed, 3 ignored |
+| Both `cargo clippy ... -D warnings` lines, `cargo fmt --check` | 0, 0, 0 | |
+| The full SDK suite, alone, with this tree's rebuilt binary | 0 | 5,697 passed, 6 skipped, in 36 min 16 s (5,685 on `909dad6`) |
+| The compact fixture | 0 | 10,446 bytes; both summaries equal the full evidence's |
+| `replica_check.py` on 2, 3 and 8 CPU ranks, both arms, files and a live server, and 3 ranks without NumPy | 0 | 13 runs, all 13 `verdict.json` at code 0 with 0 failures |
+| Gate 1's `harness.py build` against the build on `f5ee53e` | 0 | 127 files each; no other file differs; the 14 recordings the same by content |
+| Gate 1, bake-off and TrainCheck tests | 0, 0, 0 | 71, 37 and 18 passed |
+
+**Housekeeping, on the author's "also clear old files servers and storage":** no server was running. The 26 worktrees of waves AD to AI other than `trial-ai-wave` were removed (each clean, without `--force`) and their 35 branches deleted with `-d` (every one an ancestor of `main`). Scratch output already copied to the side-session notes was deleted. About 67 GB freed. Kept: the notes folder, the live-agent harness, the gate scripts.
+
+**Open after this.** The loader delay (measured on the GPU first). The author's line on the two overhead figures. The live-agent proof and D10, both the author's and apart from the GPU run. The push: held until the GPU environment is ready, then the exact SHA is brought for approval, Linux CI runs, and the proofs run on the CI-green revision.
