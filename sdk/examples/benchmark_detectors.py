@@ -3,7 +3,7 @@
     cd sdk
     pip install -e '.[flight]'
     python examples/benchmark_detectors.py            # 64 ranks, 10,000 steps: about 6 minutes, 3 GB of disk
-    python examples/benchmark_detectors.py --quick    # 4 ranks, 600 steps: about half a minute
+    python examples/benchmark_detectors.py --quick    # 4 ranks, 600 steps: under a minute
 
 The plan (Step 14) ports the detectors to Rust only if the Python worker needs more than
 250 ms per 50-step flush across 64 ranks, or one CPU core in steady state. This script
@@ -12,7 +12,8 @@ measures that. It needs no GPU and no server.
 1. **A real capture gives the record shapes.** A small MoE shaped like the Granite
    benchmark (24 blocks, 32 experts, top-8, 219 parameters) trains for 105 steps under
    `tensorquill.init(..., capture="full")`, with the weight check, clipped gradient norm,
-   logged loss and replica spread that a distributed run records. The records from the
+   logged loss, and the scheduled replica observation (`replica`, under a one-rank Gloo
+   process group) that a distributed run given `replica_group=` records. The records from the
    second weight check on, which carry `weights_unchanged`, are the templates.
 2. **A synthetic store in the server's layout.** `runs/<run_id>/rank=<r>/attempt=<a>/
    part-<min:08>-<max:08>.parquet`, written with `tensorquill.flight.records_to_batch`,
@@ -166,15 +167,24 @@ def capture_template(blocks: int, experts: int, top_k: int) -> dict[str, Any]:
     from tensorquill.capture import Router
     from tensorquill.sink import MemorySink
 
+    import torch.distributed as dist
+
     torch.manual_seed(0)
     model, vocab = _build_model(blocks, experts, top_k)
     sink = MemorySink()
     routers = {
         f"model.layers.{i}.block_sparse_moe.router": Router(experts, top_k=top_k) for i in range(blocks)
     }
+    # A process group of one rank on Gloo, so the session records the scheduled replica observation
+    # (`replica`) that a data-parallel run given `replica_group=` records every `replica_every` steps.
+    # The observation is each rank's own and issues no collective.
+    own_group = not dist.is_initialized()
+    if own_group:
+        folder = tempfile.mkdtemp(prefix="tq-bench-pg-")
+        dist.init_process_group("gloo", init_method=f"file://{folder}/store", rank=0, world_size=1)
     session = tensorquill.init(
         model, run_id=RUN_ID, every=FLUSH_STEPS, sink=sink, capture="full", routers=routers,
-        heartbeat_seconds=None,
+        heartbeat_seconds=None, replica_group=dist.group.WORLD, replica_every=FLUSH_STEPS,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     steps = 2 * FLUSH_STEPS + 5
@@ -185,10 +195,11 @@ def capture_template(blocks: int, experts: int, top_k: int) -> dict[str, Any]:
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         session.log(loss=loss.detach())
-        if (step + 1) % FLUSH_STEPS == 0:  # what a DDP run records on its replica-check steps
-            session.record_replica_spread(torch.zeros(len(session.replica_names), 3, dtype=torch.float64))
         optimizer.step()
     session.close()
+    if own_group:
+        dist.destroy_process_group()
+        shutil.rmtree(folder, ignore_errors=True)
     records = sink.records
     checks = [i for i, r in enumerate(records) if "weights_unchanged" in r]
     if not checks:
@@ -259,9 +270,13 @@ def synth_record(template: dict[str, Any], variant: int, rank: int, step: int) -
     if check:
         grown = 1.0 + 1e-4 * step / template["check_every"]
         record["weight_norms"] = {name: v * grown * jit(1.0, 1e-5) for name, v in base["weight_norms"].items()}
-        for key in ("weights_unchanged", "optimizer_ownership", "replica_spread"):
+        for key in ("weights_unchanged", "optimizer_ownership", "replica"):
             if key in base:
                 record[key] = json.loads(json.dumps(base[key]))
+        if "replica" in record and "replica_group" in template:
+            # Every rank's observation names the whole group, as on a data-parallel run, with the
+            # same fingerprints on every rank: the replicas agree, so the run stays healthy.
+            record["replica"]["group"] = list(template["replica_group"])
     return record
 
 
@@ -305,8 +320,10 @@ def _write_task(args: tuple[str, int, int, int, list[int]]) -> int:
 def write_store(
     store: Path, template: dict[str, Any], ranks: int, steps: int, workers: int
 ) -> dict[str, Any]:
-    """Write `ranks` x `steps` records as 50-step Parquet parts and return the manifest."""
+    """Write `ranks` x `steps` records as 50-step Parquet parts and return the manifest. The
+    template is given the store's ranks as its replica group (`replica_group`), in place."""
     store.mkdir(parents=True, exist_ok=True)
+    template["replica_group"] = list(range(ranks))
     (store / "template.json").write_text(json.dumps(template))
     variants = min(VARIANTS, ranks)
     tasks = [

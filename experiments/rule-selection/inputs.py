@@ -10,12 +10,33 @@ from __future__ import annotations
 import glob
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 WORKTREE = HERE.parents[1]
-MAIN = Path("/Users/ak/Documents/tensrview/tensrviewproject")
+
+
+def main_checkout() -> Path:
+    """The checkout that holds the entries with `root` "main" (files kept out of git there):
+    `TENSORQUILL_MAIN_CHECKOUT` when it is set, else the main working tree of this repository
+    (the folder holding git's common directory, so a worktree finds its main checkout), else
+    this checkout."""
+    named = os.environ.get("TENSORQUILL_MAIN_CHECKOUT")
+    if named:
+        return Path(named).expanduser().resolve()
+    try:
+        found = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=HERE, capture_output=True,
+                               text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return WORKTREE
+    common = (HERE / found).resolve()
+    return common.parent if common.name == ".git" else WORKTREE
+
+
+MAIN = main_checkout()
 GENERATED = HERE / "generated"  # ignored: what the two generator entries wrote
 LIST = json.loads((HERE / "allowlist.json").read_text())
 ENTRIES = {entry["id"]: entry for entry in LIST["inputs"]}

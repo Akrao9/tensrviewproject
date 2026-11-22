@@ -65,7 +65,6 @@ STARVE_WINDOWS = [25, 50, 100]
 STALL_STEPS = [2, 3, 5]
 NEVER = 10**9  # a sustain no excursion reaches
 NOT_SWEEP = ("-probe", "-pytest")  # TrainCheck run folders that are not configurations of the sweep
-PYTHON = Path("/Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python")
 
 # The collapse seeded in the Granite job (`install_collapse`, allowlist `role_by_rule`): its steps
 # before it are the healthy part, for every rule here.
@@ -151,7 +150,7 @@ def generate(entry: dict) -> str | None:
     script = inputs.WORKTREE / args[0]
     env = {**os.environ, "PYTHONPATH": str(inputs.WORKTREE / "sdk" / "src"),
            "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
-    python = str(PYTHON if PYTHON.exists() else sys.executable)
+    python = sys.executable  # the interpreter this script runs under, as the published command gives it
     with tempfile.TemporaryDirectory() as tmp:
         extra = ["--out", str(Path(tmp) / "out")] if "seeded_failures" in args[0] else []
         done = subprocess.run([python, str(script), *args[1:], *extra], cwd=tmp, env=env,
