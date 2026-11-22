@@ -50,6 +50,7 @@ from . import compact as _compact
 from . import compare as _compare
 from . import manifest as _manifest
 from . import runs as _runs
+from .identity import MalformedRecordError, check as check_identity, in_file
 from .sink import read_end_marker
 from .evidence import (
     ALL_RANKS_VIEW,
@@ -190,14 +191,17 @@ def _complete_lines(path: Path) -> tuple[list[dict[str, Any]], int]:
         raise ToolError(f"{path} cannot be read ({error}).") from None
     records: list[dict[str, Any]] = []
     skipped = 0
-    for line in data[: data.rfind(b"\n") + 1].splitlines():
+    for number, line in enumerate(data[: data.rfind(b"\n") + 1].splitlines(), 1):
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except ValueError:
             record = None
-        if isinstance(record, dict) and "step" in record:
+        if isinstance(record, dict):
+            # A whole record whose identity is not valid, a step missing among them, refuses the
+            # capture (WAVE_AF_CONTRACT.md, section 1); it is not a torn line.
+            check_identity(record, in_file(path, number))
             records.append(record)
         else:
             skipped += 1
@@ -297,9 +301,14 @@ class Source:
             try:
                 try:
                     return load_records(path, all_attempts=True), 0
+                except MalformedRecordError:
+                    raise
                 except ValueError:  # a job that is still running may be in the middle of a line
                     records, skipped = _complete_lines(path)
                     return load_records(records, all_attempts=True), skipped
+            except MalformedRecordError as error:
+                # The error's own text: the field, the value and the line (section 1).
+                raise ToolError(str(error)) from None
             except OSError as error:
                 raise ToolError(f"{path} cannot be read ({error}).") from None
             except (TypeError, KeyError) as error:
@@ -375,6 +384,8 @@ class Source:
             def read() -> list[dict[str, Any]]:
                 try:
                     return load_records(where, rank=picked)
+                except MalformedRecordError as error:
+                    raise ToolError(str(error)) from None  # the field, the value, the part and row
                 except ImportError:
                     raise ToolError(
                         "reading a store's step records needs pyarrow (the SDK's `flight` extra), which is not"
@@ -603,7 +614,9 @@ def _not_checked(opened: Mapping[str, Any]) -> list[dict[str, Any]]:
     if opened["shape"] == "rank":
         return listed
     by_text: dict[str, dict[str, Any]] = {}
-    for entry in evidence.get("ranks") or ():
+    # A rank's entries are on its entry of `ranks` (a store's reports) or in `not_checked_by_rank`
+    # (the view `combine_rank_evidence` builds, EV-02): both are `{"rank", "not_checked"}`.
+    for entry in [*(evidence.get("ranks") or ()), *(evidence.get("not_checked_by_rank") or ())]:
         for item in entry.get("not_checked") or () if isinstance(entry, dict) else ():
             if isinstance(item, dict):
                 held = by_text.setdefault(json.dumps(item, sort_keys=True, default=str), {**item, "ranks": []})
@@ -738,7 +751,10 @@ def _rank_dropped(dropped: Mapping[str, Any] | None, rank: int) -> dict[str, Any
 # reads; and the routing source of part 7 (`moe_source`, a router's `form` and `point`).
 MEASUREMENT_BLOCKS = ("gradient_trend", "attention_trends", "update_trends", "weight_jumps")
 EVIDENCE_BLOCKS = ("skipped_updates", "skipped_updates_by_rank", "checkpoint_tensors", "checkpoint_tensors_by_rank",
-                   *MEASUREMENT_BLOCKS)
+                   *MEASUREMENT_BLOCKS,
+                   # The all-ranks view's: each judged rank's measurements and routing source, with its
+                   # rank (WAVE_AF_CONTRACT.md, section 2, EV-04).
+                   *(f"{name}_by_rank" for name in MEASUREMENT_BLOCKS), "moe_source_by_rank")
 # Of a kind's entry in `kind_checks`, what `kinds` (names by value) leaves out: the parameters a
 # stall did not judge for want of their gradient, and the replica observations' coverage. And the
 # entry's `note` when it is the words for a rank with no peer (contract, section 2); a kind's other
@@ -748,15 +764,20 @@ EVIDENCE_BLOCKS = ("skipped_updates", "skipped_updates_by_rank", "checkpoint_ten
 # (`stalled_weights.parameters_not_judged_by_rank`, part 5) and the modules an activation kind did
 # not judge (`modules_not_judged`, part 7).
 KIND_CHECK_KEYS = ("parameters_not_judged", "parameters_not_judged_by_rank", "modules_not_judged", "coverage",
-                   "starting_state")
+                   "starting_state",
+                   # A run's entry, where its ranks differ in them (EV-03).
+                   "modules_not_judged_by_rank", "starting_state_by_rank")
 # The blocks an incident's own answer carries, by its kind: what bears on reading that incident.
 _SKIPS = ("skipped_updates", "skipped_updates_by_rank")
 INCIDENT_BLOCKS = {
     "resume_incomplete": ("checkpoint_tensors", "checkpoint_tensors_by_rank"),
     **{kind: _SKIPS for kind in ("non_finite", "update_spike", "stalled_weights", "loss_scale_trouble")},
-    "grad_spike": (*_SKIPS, "gradient_trend"),
-    "update_spike": (*_SKIPS, "update_trends", "weight_jumps"),
-    **{kind: ("attention_trends",) for kind in ("attention_collapse", "attention_uniform", "attention_logit_growth")},
+    "grad_spike": (*_SKIPS, "gradient_trend", "gradient_trend_by_rank"),
+    "update_spike": (*_SKIPS, "update_trends", "weight_jumps", "update_trends_by_rank", "weight_jumps_by_rank"),
+    **{kind: ("attention_trends", "attention_trends_by_rank")
+       for kind in ("attention_collapse", "attention_uniform", "attention_logit_growth")},
+    # A router's incident in the all-ranks view: the ranks' routing sources (one rank's is `moe_source`).
+    **{kind: ("moe_source_by_rank",) for kind in ("moe_imbalance", "starved_experts")},
 }
 
 # What a reader shows for a score (DETECTOR_RULES_CONTRACT.md, part 1): the number to one decimal place,
@@ -1635,6 +1656,8 @@ def compare_runs(source: Source, arguments: Mapping[str, Any]) -> dict[str, Any]
     try:
         result = _compare.compare_runs(*wanted, source=folder, project=project, rank=rank, paths=False,
                                        read_parts=False)
+    except MalformedRecordError as error:
+        raise ToolError(str(error)) from None  # the error's own text (section 1)
     except (ValueError, OSError, RuntimeError) as error:
         # A run that is not there, a name that fits several runs (the message lists their IDs),
         # or records that cannot be read.

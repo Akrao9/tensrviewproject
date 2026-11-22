@@ -24,7 +24,11 @@ def store(tmp_path_factory):
 def test_the_template_is_a_real_capture_with_the_weight_check_fields(store):
     _, template, _ = store
     check, plain = template["check"], template["plain"]
-    assert {"weight_norms", "weights_unchanged", "replica_spread", "optimizer_ownership"} <= set(check)
+    # The scheduled replica observation a run given `replica_group=` records (lane AF-E: it was the
+    # explicit gather's `replica_spread` from a table of zeros, which no scheduled check records).
+    assert {"weight_norms", "weights_unchanged", "replica", "optimizer_ownership"} <= set(check)
+    assert "replica_spread" not in check and "replica" not in plain
+    assert check["replica"]["signature"] == "fold64-v1" and len(check["replica"]["params"]) == template["parameters"]
     assert "weight_norms" not in plain
     assert len(check["moe"]) == SHAPE["blocks"] and len(next(iter(check["moe"].values()))) == SHAPE["experts"]
     assert template["check_phase"] == check["step"] % template["check_every"]
@@ -42,6 +46,12 @@ def test_the_store_has_the_servers_layout_and_reads_back_as_the_records_written(
     assert one[99] == json.loads(json.dumps(expected))
     # A run of healthy records: no detector fires.
     assert evidence.build_evidence(one)["incidents"] == []
+    # Each rank's observation names the store's ranks as its group, and every rank's agrees.
+    observed = [r for r in one if "replica" in r]
+    assert observed and all(r["replica"]["group"] == [0, 1, 2] for r in observed)
+    every = [r for rank in range(3) for r in evidence.load_records(path / "runs" / bd.RUN_ID / f"rank={rank}")]
+    compared = evidence.compare_replicas(every)
+    assert compared["replica_drift"] == [] and compared["steps"], compared
 
 
 def test_a_timed_update_builds_what_watch_builds(store, tmp_path):

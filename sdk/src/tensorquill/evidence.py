@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import manifest as _manifest
+# A record's identity fields (WAVE_AF_CONTRACT.md, section 1): checked where records are loaded,
+# before either engine is chosen, by lane F's one check (`identity.check`).
+from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part
 from .sink import read_end_marker
 from .data_checks import (
     CHANGES_LISTED,
@@ -866,8 +869,9 @@ def grads_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[str
     entry a kind would read "nothing found" for a parameter that was never looked at. The kinds
     the entry lists (`GRADS_NOT_READ_KINDS`) are `unavailable`; `stalled_weights` stays checked
     and names the parameters it did not judge (`name_gradients_not_judged`); a finding on what
-    was read always stands; and the run is `degraded`, as for any entry. The server writes no
-    such entry yet; `build_evidence` adds this one to a report that has none.
+    was read always stands; and the run is `degraded`, as for any entry. This is the Python
+    detectors' rule; under the Rust ones the server's report gives the same entry, and
+    `build_evidence` takes it as the server wrote it (wave AF: no second pass adds this one).
     """
     first: dict[str, tuple[int, str]] = {}
     for record in records:
@@ -2309,22 +2313,34 @@ def load_records(
     `rank` keeps one rank's records. When a job resumed from an earlier checkpoint under
     the same run ID, the records the later attempt replaced are left out (see
     `resolve_attempts`); `all_attempts=True` returns everything that was written.
+
+    Every record read is checked first, whatever its rank (`identity.check`): a record whose
+    `schema_version`, `rank`, `attempt` or `step` is not valid raises `MalformedRecordError`,
+    which names the field, the value, and the file and line, the part and row, or the place in
+    the list (WAVE_AF_CONTRACT.md, section 1). Nothing is judged from such an input.
     """
     if isinstance(source, (str, Path)):
         path = Path(source)
         if path.is_dir():
             # One rank at a time: a run of many ranks never has to fit in memory at once.
             records = [
-                r for part in _parquet_parts(path, rank) for r in _read_part(part)
+                r for part in _parquet_parts(path, rank) for r in _checked_part(part)
                 if rank is None or r.get("rank", 0) == rank
             ]
         elif path.suffix == ".parquet":
-            records = _read_part(path)
+            records = _checked_part(path)
         else:
-            lines = path.read_text(encoding="utf-8").splitlines()
-            records = [json.loads(line) for line in lines if line.strip()]
+            records = []
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if line.strip():
+                    record = json.loads(line)
+                    check_identity(record, in_file(path, number))
+                    records.append(record)
     else:
-        records = [dict(item) for item in source]
+        records = []
+        for index, item in enumerate(source):
+            check_identity(item, in_list(index))
+            records.append(dict(item))
     if rank is not None:
         records = [r for r in records if r.get("rank", 0) == rank]
     return records if all_attempts else resolve_attempts(records)
@@ -2339,7 +2355,7 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
     data = Path(path).read_bytes()
     records: list[dict[str, Any]] = []
     left_out = 0
-    for line in data.splitlines():
+    for number, line in enumerate(data.splitlines(), 1):  # `number`: the line in the file, from 1
         if not line.strip():
             continue
         try:
@@ -2347,6 +2363,9 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
         except ValueError:
             record = None
         if isinstance(record, dict):
+            # A whole record whose identity is not valid refuses the file (section 1): it is not a
+            # torn line, which is left out and counted.
+            check_identity(record, in_file(path, number))
             records.append(record)
         else:
             left_out += 1
@@ -2681,6 +2700,14 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
     return sorted(found, key=order)
 
 
+def _checked_part(path: Path) -> list[dict[str, Any]]:
+    """`_read_part`, each row's identity checked (`identity.check`) with the part and its row."""
+    rows = _read_part(path)
+    for row, record in enumerate(rows):
+        check_identity(record, in_part(path, row))
+    return rows
+
+
 def _read_part(path: Path) -> list[dict[str, Any]]:
     try:
         import pyarrow.parquet as pq
@@ -2785,10 +2812,17 @@ class _Tail:
     read and has changed (its size, time or file) or is gone. Before, such a file was read on from
     where it was, or not at all, and the evidence went on showing rows the source no longer holds.
 
-    The limit: a rewrite in place that keeps the same file, at least the same length, and the same
-    first and last CHECKED_BYTES (4 KiB) of what was read is not detected, and the watcher goes on
-    reading from its offset. A file cut to empty is read again but holds no record, so the watcher
-    still writes nothing for it and the last evidence file stays as it was."""
+    A `.jsonl` file whose modification time (`st_mtime_ns`) changed while it did not grow since the
+    last read is read again from the start too (WAVE_AF_CONTRACT.md, section 3, EV-07): a rewrite in
+    place of the same length and the same ends. An append, which also moves the time, grows the file
+    and is still read as an append, from the offset. A `touch` that changes no byte is read again
+    and gives the same records.
+
+    The limit: a rewrite in place that keeps the same file, at least the same length, the same
+    first and last CHECKED_BYTES (4 KiB) of what was read, and the same modification time (or one
+    that also grows the file) is not detected, and the watcher goes on reading from its offset. A
+    file cut to empty is read again but holds no record, so the watcher still writes nothing for it
+    and the last evidence file stays as it was."""
 
     CHECKED_BYTES = 4096  # at the start of a `.jsonl` file, and before the end of what was read
 
@@ -2800,10 +2834,13 @@ class _Tail:
         self._seen: set[Path] = set()
         self._stats: dict[Path, tuple[int, int, int]] = {}  # each part read: its size, time and file
         self._file: tuple[int, int] | None = None  # the `.jsonl` file read: its device and file
+        # Its size and modification time at the last read, from the handle it was read through (EV-07).
+        self._size_and_time: tuple[int, int] | None = None
         self._head = b""  # the first bytes read, and the last ones
         self._last = b""
         self.left_out = 0  # whole lines that were not a JSON object (lane U7, Nov 19, 2026)
         self.restarts = 0  # how often what was read was read again from the start
+        self._lines = 0  # the lines of the `.jsonl` file read so far: a refusal names the next ones by number
 
     def _restart(self) -> None:
         self.records = []
@@ -2811,8 +2848,10 @@ class _Tail:
         self._seen = set()
         self._stats = {}
         self._file = None
+        self._size_and_time = None
         self._head = self._last = b""
         self.left_out = 0
+        self._lines = 0
         self.restarts += 1
 
     @staticmethod
@@ -2831,6 +2870,13 @@ class _Tail:
             found = self.source.stat()
             if (found.st_dev, found.st_ino) != self._file or found.st_size < self._offset:
                 return True
+            if self._size_and_time is not None:
+                size, mtime = self._size_and_time
+                if found.st_mtime_ns != mtime and found.st_size <= size:
+                    # Written to since the last read without growing: rewritten in place (EV-07). The
+                    # size compared is the file's at that read, not what was read of it, so a last
+                    # line finished since is an append.
+                    return True
             with self.source.open("rb") as file:
                 head = file.read(len(self._head))
                 file.seek(self._offset - len(self._last))
@@ -2856,7 +2902,7 @@ class _Tail:
             for part in parts:
                 if part not in self._seen:  # a part is written once and never changed
                     stat = self._stat(part)
-                    new.extend(_read_part(part))
+                    new.extend(_checked_part(part))  # each row's identity (section 1)
                     self._seen.add(part)
                     self._stats[part] = stat if stat is not None else (-1, -1, -1)
         elif self.source.exists():
@@ -2867,17 +2913,24 @@ class _Tail:
                 file.seek(self._offset)
                 data = file.read()
                 found = os.fstat(file.fileno())
+            # What the file was when read, whole lines or none: what a later look compares with (EV-07).
+            self._size_and_time = (found.st_size, found.st_mtime_ns)
             end = data.rfind(b"\n") + 1  # a last line with no newline is still being written
-            for line in data[:end].splitlines():
+            whole = data[:end].splitlines()
+            for number, line in enumerate(whole, self._lines + 1):
                 if line.strip():
                     try:
                         record = json.loads(line)
                     except ValueError:
                         record = None
                     if isinstance(record, dict):
+                        # Checked as it is read, once (section 1): a record not valid refuses the file,
+                        # and the watcher writes and replaces nothing for it.
+                        check_identity(record, in_file(self.source, number))
                         new.append(record)
                     else:
                         self.left_out += 1  # a line torn by a killed process: counted, and said
+            self._lines += len(whole)
             if end:
                 if not self._offset:
                     self._file = (found.st_dev, found.st_ino)
@@ -4475,9 +4528,10 @@ def watch(
     them, do not change them in place.
 
     A `.jsonl` file cut short, replaced or rewritten under the watcher is read again from the start,
-    and so is a store whose parts read have changed or are gone (`_Tail`). The limit: a rewrite in
-    place that keeps the same file, at least the same length, and the same first and last 4 KiB of
-    what was read is not detected, and the watcher goes on from its offset. A file cut to empty still
+    and so is a store whose parts read have changed or are gone (`_Tail`); a rewrite in place of the
+    same length is seen by the file's modification time. The limit: a rewrite in place that keeps
+    the same file, at least the same length, the same first and last 4 KiB of what was read and the
+    same modification time is not detected, and the watcher goes on from its offset. A file cut to empty still
     writes nothing: the last evidence file is left as it was until the file holds a record again.
 
     The five thresholds (`overload_threshold`, `drift_tolerance`, `starve_window`,
@@ -5052,14 +5106,48 @@ def _run_parameters_not_judged(check: dict[str, Any], by_rank: Mapping[int, Mapp
     `parameters_not_judged_by_rank` (rank, as a string, to its list) when the judged ranks' lists
     differ. A judged rank without the key judged every parameter it read: its list is empty, and
     it is in the map only through that difference, by its absence."""
-    lists = {rank: sorted({str(name) for name in found.get("parameters_not_judged") or ()})
+    _run_names_not_judged(check, by_rank, "parameters_not_judged")
+
+
+def _run_names_not_judged(check: dict[str, Any], by_rank: Mapping[int, Mapping[str, Any]], key: str) -> None:
+    """The run's entry names what some rank's entry names under `key` (`parameters_not_judged`, or
+    an activation kind's `modules_not_judged`, EV-03): the sorted union, and `<key>_by_rank` (rank,
+    as a string, to its list) when the judged ranks' lists differ, a rank without the key counting
+    as an empty list."""
+    lists = {rank: sorted({str(name) for name in found.get(key) or ()})
              for rank, found in by_rank.items() if isinstance(found, Mapping)}
     union = sorted({name for names in lists.values() for name in names})
     if not union:
         return
-    check["parameters_not_judged"] = union
+    check[key] = union
     if len({tuple(names) for names in lists.values()}) > 1:
-        check["parameters_not_judged_by_rank"] = {str(rank): names for rank, names in sorted(lists.items()) if names}
+        check[f"{key}_by_rank"] = {str(rank): names for rank, names in sorted(lists.items()) if names}
+
+
+def _run_starting_state(check: dict[str, Any], by_rank: Mapping[int, Mapping[str, Any]]) -> None:
+    """The run's `moe_imbalance` entry names the routers some rank's entry lists as still in their
+    starting state (EV-03; rules contract, part 3): `starting_state`, one `{"router", "samples"}`
+    for each router named, with the fewest samples any rank gives it, in the order the ranks name
+    them, and `starting_state_by_rank` (rank, as a string, to its list) when the judged ranks'
+    lists differ. `enough_history` is then false for the run, as it is for the rank. Not on an
+    entry that is `unavailable`, as a rank's is not."""
+    lists = {rank: [dict(item) for item in found.get("starting_state") or () if isinstance(item, Mapping)]
+             for rank, found in by_rank.items() if isinstance(found, Mapping)}
+    if not any(lists.values()) or check.get("value") == "unavailable":
+        return
+    merged: dict[str, dict[str, Any]] = {}
+    for rank in sorted(lists):
+        for item in lists[rank]:
+            name = str(item.get("router"))
+            held = merged.get(name)
+            fewer = held is not None and _count(item.get("samples")) and (
+                not _count(held.get("samples")) or item["samples"] < held["samples"])
+            if held is None or fewer:
+                merged[name] = {"router": item.get("router"), "samples": item.get("samples")}
+    check["starting_state"] = list(merged.values())
+    check["enough_history"] = False
+    if len({json.dumps(items, sort_keys=True, default=str) for items in lists.values()}) > 1:
+        check["starting_state_by_rank"] = {str(rank): items for rank, items in sorted(lists.items()) if items}
 
 
 def _cross_rank_check(kind: str, brings: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
@@ -5093,6 +5181,10 @@ def run_kind_checks(
         for kind in SERVER_KINDS
     }
     _run_parameters_not_judged(checks[GRADS_NOT_READ_NAMED], {rank: found[GRADS_NOT_READ_NAMED] for rank, found in rank_checks.items()})
+    # What `_run_check` leaves out of a rank's entry and the run's must say, with its ranks (EV-03).
+    for kind in LAYERS_NOT_READ_KINDS:
+        _run_names_not_judged(checks[kind], {rank: found[kind] for rank, found in rank_checks.items()}, "modules_not_judged")
+    _run_starting_state(checks["moe_imbalance"], {rank: found["moe_imbalance"] for rank, found in rank_checks.items()})
     checks.update({kind: dict(check) for kind, check in others.items()})
 
     def brings(has: Any, kind: str) -> dict[int, dict[str, Any]]:
@@ -5287,6 +5379,11 @@ def combine_rank_evidence(
             {n: per_rank[n].get("skipped_updates") for n in judged})) else {}),
         **({"checkpoint_tensors_by_rank": blocks} if (blocks := _checkpoint_tensors_by_rank(
             {n: per_rank[n].get("checkpoint_tensors") for n in judged})) else {}),
+        # How each rank's observations were made and what it measured, with its rank (EV-04), and
+        # what each rank did not check (EV-02): only where a rank has them.
+        **_rank_blocks({n: per_rank[n] for n in judged}),
+        **({"not_checked_by_rank": unchecked} if (unchecked := _not_checked_by_rank(
+            {n: per_rank[n].get("not_checked") for n in judged})) else {}),
         # The rows the server dropped and the batches it refused, as the all-ranks view's `watchdog`
         # block gives them (L22, lane AD1): only when the status holds such counts, so the
         # evidence of a run that dropped and refused none is what it was.
@@ -5351,6 +5448,36 @@ def _skipped_updates_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
     own, and a rank without the key has a capture written before it."""
     return [{"rank": number, "skipped_updates": dict(skips)} for number, skips in sorted(found.items())
             if isinstance(skips, Mapping)]
+
+
+#: The blocks of one rank's evidence or report that say how its observations were made, or what
+#: they measured, carried into the all-ranks view as `<block>_by_rank` (WAVE_AF_CONTRACT.md,
+#: section 2, EV-04): each rank's are its own, so they are not added up or merged.
+RANK_BLOCKS = ("moe_source", *MEASUREMENT_BLOCKS)
+
+
+def _rank_blocks(found: Mapping[int, Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """`{"<block>_by_rank": [{"rank", "<block>"}, ...]}` for each of `RANK_BLOCKS` that some judged
+    rank's evidence or report in `found` has, by rank, each block copied unchanged, as
+    `skipped_updates_by_rank` carries its key (EV-04). No key for a block no rank has, so a view
+    whose ranks have none is what it was."""
+    blocks: dict[str, list[dict[str, Any]]] = {}
+    for key in RANK_BLOCKS:
+        entries = [{"rank": number, key: copy.deepcopy(dict(block))} for number, own in sorted(found.items())
+                   if isinstance(own, Mapping) and isinstance(block := own.get(key), Mapping) and block]
+        if entries:
+            blocks[f"{key}_by_rank"] = entries
+    return blocks
+
+
+def _not_checked_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
+    """Each judged rank's own `not_checked` entries, for the all-ranks view built from one evidence
+    per rank (`combine_rank_evidence`), which has no `ranks` list to put them on (EV-02):
+    `{"rank", "not_checked"}` for each rank that lists any, by rank, its entries unchanged. The
+    view a store's reports give keeps them on each rank's entry of `ranks`, as before."""
+    return [{"rank": number, "not_checked": [dict(item) for item in items if isinstance(item, Mapping)]}
+            for number, items in sorted(found.items())
+            if isinstance(items, (list, tuple)) and any(isinstance(item, Mapping) for item in items)]
 
 
 def _checkpoint_tensors_by_rank(found: Mapping[int, Any]) -> list[dict[str, Any]]:
@@ -5623,6 +5750,8 @@ def _all_ranks_evidence(
             {n: looks[n]["report"].get("skipped_updates") for n in judged})) else {}),
         **({"checkpoint_tensors_by_rank": blocks} if (blocks := _checkpoint_tensors_by_rank(
             {n: looks[n]["report"].get("checkpoint_tensors") for n in judged})) else {}),
+        # Each judged rank's `moe_source` and four measurements from its current report (EV-04).
+        **_rank_blocks({n: looks[n]["report"] for n in judged}),
         "ranks": entries,
         **({"not_checked": not_checked} if not_checked else {}),
         **({"flight_recorder": recorder_summary} if recorder_summary else {}),
@@ -7323,14 +7452,11 @@ def _build_evidence(
             dict(item) for item in report.get("not_checked") or ()
             if isinstance(item, dict) and item.get("check") not in ("flight_recorder", "traincheck")
         ]
-        grads_unread = grads_not_read_not_checked(records)
-        if grads_unread is not None and not any(item.get("check") == "gradients" for item in not_checked):
-            # The server does not read `grads_not_read` yet (L23): said here, as the Python path says it.
-            not_checked.append(grads_unread)
-            for kind in grads_unread["kinds"]:
-                held = rank_checks[kind]
-                rank_checks[kind] = _unavailable(grads_unread, **{key: held[key] for key in (
-                    "records", "records_needed", "enough_history", "needs") if key in held})
+        # Unread gradients (`grads_not_read`, L23) are the server's to decide here: it writes the
+        # `gradients` entry, makes its kinds `unavailable` and names `parameters_not_judged`, as it
+        # names `modules_not_judged` and `starting_state`. Before wave AF a second pass here added
+        # Python's entry to a report that had none, for a server that did not read the key yet
+        # (WAVE_AF_CONTRACT.md, section 2, "the stale post-pass"): one rule, the server's.
     else:
         # The detectors that read every record are kept in states (`_Incremental`): `watch` keeps one
         # between looks and feeds it each look's new records; a single read starts one here.
@@ -7405,8 +7531,9 @@ def _build_evidence(
         rank_checks = kind_checks(
             input_counts(records), not_checked, starve_window=starve_window, update_window=update_window)
         _name_starting_state(rank_checks, judged["starting"])
-    name_gradients_not_judged(rank_checks, not_checked)
-    name_modules_not_judged(rank_checks, not_checked)
+        # The Python detectors' own: under the Rust ones the server's report names them (above).
+        name_gradients_not_judged(rank_checks, not_checked)
+        name_modules_not_judged(rank_checks, not_checked)
     status = read_watchdog(watchdog if watchdog is not None else _watchdog_beside(source))
     # A status is expected where a server stores the run (a directory of its parts, or one
     # part) or when one was named. A local file or a list of records has no server to miss.
@@ -8509,11 +8636,31 @@ def _all_ranks_summary(evidence: Mapping[str, Any]) -> str:
         for item in evidence.get("not_checked", ())
         if item["check"] != "resume_lr"
     ]
+    # Each judged rank's own (EV-02), once for each entry with the ranks that list it.
+    lines += [f"Not checked {_on_ranks(ranks)} ({item.get('check')}): {item.get('reason')}"
+              for item, ranks in rank_not_checked(evidence) if item.get("check") != "resume_lr"]
     lines += _source_lines(evidence)
     applied = thresholds_line(evidence)  # only when a threshold applied is not the default
     if applied:
         lines.append(applied)
     return "\n".join(lines)
+
+
+def rank_not_checked(evidence: Mapping[str, Any]) -> list[tuple[dict[str, Any], list[int]]]:
+    """The judged ranks' own `not_checked` entries in an all-ranks view, each once with the ranks
+    that list it, in the order they are first listed: from each rank's entry of `ranks` (a store's
+    reports) and from `not_checked_by_rank` (`combine_rank_evidence`). Empty when no rank lists any."""
+    held: dict[str, tuple[dict[str, Any], list[int]]] = {}
+    sources = [*(evidence.get("ranks") or ()), *(evidence.get("not_checked_by_rank") or ())]
+    for entry in sources:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("rank"), int):
+            continue
+        for item in entry.get("not_checked") or ():
+            if isinstance(item, Mapping):
+                found = held.setdefault(json.dumps(item, sort_keys=True, default=str), (dict(item), []))
+                if entry["rank"] not in found[1]:
+                    found[1].append(entry["rank"])
+    return [(item, sorted(ranks)) for item, ranks in held.values()]
 
 
 def _class_line(incidents: Iterable[Mapping[str, Any]]) -> str | None:
@@ -8925,6 +9072,8 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             traincheck=args.traincheck, compact_window=args.compact_window, trigger=args.trigger,
             detectors=args.detectors or "auto",  # nothing runs here, so no binary is asked for
         )
+    except MalformedRecordError:
+        raise  # said by `main`, never as a usage error (this view reads no step record today)
     except ValueError as error:
         parser.error(str(error))
     if written is None and not args.watch:
@@ -8932,6 +9081,18 @@ def _main_all_ranks(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
 
 def main() -> None:
+    """`python -m tensorquill` and the `tensorquill` console script. An input holding a record whose
+    identity field is not valid (`MalformedRecordError`, WAVE_AF_CONTRACT.md, section 1) ends the
+    command with status 2 and one line, `tensorquill: error: <what, and where>`, and no traceback,
+    with either engine and for every verb: nothing was judged and no evidence file was written."""
+    try:
+        _main()
+    except MalformedRecordError as error:
+        print(f"tensorquill: error: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(2) from None
+
+
+def _main() -> None:
     # Two verbs come before the path: `runs` (list the runs of a folder or store) and `compare`.
     # The first argument alone decides, whatever is on disk, so the same command means the same
     # thing everywhere; a file or folder with one of those names is read as `./runs` or
@@ -9122,8 +9283,9 @@ def main() -> None:
                 detectors=detectors,
             )
         except (RuntimeError, ValueError) as error:
-            # The Rust path's own refusals: a binary that fails, thresholds its rules refuse.
-            if detectors != "rust":
+            # The Rust path's own refusals: a binary that fails, thresholds its rules refuse. A record
+            # that is not valid is said by `main`, as with the Python detectors.
+            if detectors != "rust" or isinstance(error, MalformedRecordError):
                 raise
             parser.error(str(error))
         return
@@ -9155,7 +9317,7 @@ def main() -> None:
             traincheck=args.traincheck, detectors=detectors, run_manifest=args.input, records_file=args.input,
         )
     except (RuntimeError, ValueError) as error:
-        if detectors != "rust":
+        if detectors != "rust" or isinstance(error, MalformedRecordError):
             raise
         parser.error(str(error))
     if left_out:

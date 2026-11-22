@@ -27,6 +27,7 @@ part" has the measurements). They are read when `first_divergence` is called.
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 import statistics
@@ -81,6 +82,12 @@ _IDENTITY_KEYS = ("schema_version", "run_id", "rank", "attempt", "step")
 #: `moe_refused` and `update_not_read` into `not_checked` entries, which `compare`'s part 2
 #: shows; it has none for `grads_not_read` yet.
 _NOTE_KEYS = ("moe_refused", "update_not_read", "grads_not_read")
+#: Record keys that say how an observation was made, each a map from a module or router to what
+#: the capture said of it, once (DETECTOR_RULES_CONTRACT.md, part 7): `layers_not_read` (module to
+#: why it could not be read) and `moe_source` (router to its `form` and `point`). They are not
+#: series and are in no list of series (WAVE_AF_CONTRACT.md, section 2, EV-01: they were listed
+#: under `left_out.not_compared`). Where the two runs differ in one, `provenance_differs` says so.
+_PROVENANCE_KEYS = ("layers_not_read", "moe_source")
 
 # Ties at the first step go to the series nearest the start of the step's own work: a block's
 # output changes before the loss computed from it and the gradients computed from that, and the
@@ -168,8 +175,10 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
 class _Run:
     """One rank's series of one run: `series[id][step] = value`."""
 
-    def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False) -> None:
+    def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False,
+                 label: str = "A") -> None:
         from .evidence import run_of
+        from .identity import check, in_list
 
         self.series: dict[str, dict[int, float]] = {}
         self.about: dict[str, dict[str, Any]] = {}
@@ -179,12 +188,17 @@ class _Run:
         self.ranks_seen: set[Any] = set()
         self.wall_clock: set[str] = set()
         self.not_compared: set[str] = set()
+        # What the kept records said under each of `_PROVENANCE_KEYS`: each name's first entry.
+        self.provenance: dict[str, dict[str, Any]] = {key: {} for key in _PROVENANCE_KEYS}
         self.records = 0
         # Every run ID of the rank's rows, read from every row and not its first and last, before any
         # row is resolved away (WAVE_AE_CONTRACT.md, section 5): "" for a row that names none.
         self.every_run_id: set[str] = set()
         own: list[Mapping[str, Any]] = []
-        for record in records:
+        for index, record in enumerate(records):
+            # Every record, whatever its rank, before any is read (WAVE_AF_CONTRACT.md, section 1): one
+            # that cannot be placed in a rank, an attempt and a step refuses the input.
+            check(record, f"{in_list(index)}, run {label}")
             record_rank = record.get("rank", 0)
             self.ranks_seen.add(record_rank)
             if record_rank != rank or record.get("step") is None:
@@ -214,7 +228,11 @@ class _Run:
         for key, value in record.items():
             if key in _IDENTITY_KEYS or key in _NOTE_KEYS or value is None:
                 continue
-            if key in WALL_CLOCK_KEYS:
+            if key in _PROVENANCE_KEYS:
+                if isinstance(value, Mapping):
+                    for name, said in value.items():
+                        self.provenance[key].setdefault(str(name), copy.deepcopy(said))
+            elif key in WALL_CLOCK_KEYS:
                 self.wall_clock.add(key)
             elif key in ("grad_norm", "clip_grad_norm"):
                 self._put("grad_norm", None if key == "grad_norm" else "clipped", None, step, value)
@@ -444,7 +462,10 @@ def first_divergence(
     later attempt replaced (a job that resumed from an earlier checkpoint rolled them back) are
     left out and not read as the run's (lane AC4, Nov 20, 2026). Rows resolved already are read
     as they are: only a run ID whose attempts' step ranges overlap is resolved, so resolving
-    again changes nothing. Rows with no step are not step records and are skipped.
+    again changes nothing. Every row of either input, of any rank, is checked first
+    (`identity.check`, WAVE_AF_CONTRACT.md, section 1): one whose `schema_version`, `rank`,
+    `attempt` or `step` is not valid, a row with no step among them, raises `MalformedRecordError`,
+    which names its place in its list and the run (`run A` or `run B`).
 
     `resolved=True` says the rows are resolved already, as `compare` gives them (each rank's
     files resolved in the attempts' own order, `resolve_attempts_across`): they are read as
@@ -476,7 +497,7 @@ def first_divergence(
     - `runs.a` / `runs.b` hold `replaced_records`, the rows of that rank a later attempt
       replaced and that were left out, only when there were some.
     """
-    a, b = _Run(records_a, rank, resolved), _Run(records_b, rank, resolved)
+    a, b = _Run(records_a, rank, resolved, "A"), _Run(records_b, rank, resolved, "B")
     common = sorted(a.steps & b.steps)
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -499,6 +520,9 @@ def first_divergence(
             "wall_clock": sorted(a.wall_clock | b.wall_clock),
             "not_compared": sorted(a.not_compared | b.not_compared),
         },
+        # How the runs' observations were made, where the two differ (EV-01): only then, so a
+        # result of runs that agree in it, or that never say it, is what it was.
+        **({"provenance_differs": differs} if (differs := _provenance_differs(a, b)) else {}),
     }
 
     def no_answer(reason: str) -> dict[str, Any]:
@@ -668,6 +692,14 @@ def first_divergence(
     return result
 
 
+def _provenance_differs(a: "_Run", b: "_Run") -> dict[str, dict[str, Any]]:
+    """`{key: {"a": ..., "b": ...}}` for each of `_PROVENANCE_KEYS` in which the two runs' kept
+    records said something different, each side as the map its records said (each name's first
+    entry), None for a side that never said it. Empty when they agree, or neither says it."""
+    return {key: {"a": a.provenance[key] or None, "b": b.provenance[key] or None}
+            for key in _PROVENANCE_KEYS if a.provenance[key] != b.provenance[key]}
+
+
 def divergence_summary(result: Mapping[str, Any]) -> str:
     """A few lines for a person: the answer, what was compared, and what was not."""
     lines = [str(result.get("reason", ""))]
@@ -687,4 +719,10 @@ def divergence_summary(result: Mapping[str, Any]) -> str:
     left_out = (result.get("left_out") or {}).get("wall_clock") or []
     if left_out:
         lines.append(f"Left out as wall-clock readings: {', '.join(left_out)}.")
+    differs = result.get("provenance_differs") or {}
+    if differs:
+        words = {"layers_not_read": "which modules the capture could not read",
+                 "moe_source": "how the routers' counts were read"}
+        lines.append("The runs differ in " + " and in ".join(words.get(key, key) for key in differs)
+                     + f" ({', '.join(differs)}): what is compared was not observed the same way in both.")
     return "\n".join(line for line in lines if line)

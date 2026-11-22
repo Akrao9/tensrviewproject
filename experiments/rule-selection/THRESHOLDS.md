@@ -3,8 +3,10 @@
 To run it again, from the repository's root:
 
 ```bash
-cd experiments/rule-selection && /Users/ak/Documents/tensrview/tensrviewproject/.venv/bin/python measure_thresholds.py
+cd experiments/rule-selection && ../../.venv/bin/python measure_thresholds.py
 ```
+
+The interpreter is the project's `.venv` at the repository's root; a git worktree has none, so give the main checkout's. The generated captures are made with the interpreter the script runs under. The entries whose `root` is `main` (the nanoMoE captures) are read from the main checkout: `TENSORQUILL_MAIN_CHECKOUT` when it is set, else the repository's main working tree as git names it. The `file` entries are the author's recordings under `~/Downloads/runs/`. An input that is absent is listed as not read, with why, and the run goes on.
 
 It prints every table below in full, one row per record set, and writes the same numbers to `generated/thresholds.json` (ignored). It takes about two minutes. If the two toy captures are missing, it makes them first with the allowlist's own commands, offline, into `generated/`. It reads the TrainCheck sweep from `experiments/traincheck-bugs/out/` in this checkout. Add `--traincheck-from <a checkout that has it>` to read it from another checkout, or `--no-traincheck` to measure without it. If there is no sweep and neither option is given, it stops with an error. It also stops with an error (`SweepError`) if the sweep read is not the intended one (see below).
 
