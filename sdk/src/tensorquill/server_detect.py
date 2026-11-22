@@ -185,17 +185,31 @@ def resolve_detectors(
 def records_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
     """One rank's records as the Arrow IPC stream `tensorquill-server detect` reads, in
     `stream_order`: grouped by attempt in the order the attempts first appear, each attempt's
-    rows in step order, rows of one step in the order given."""
+    rows in step order, rows of one step in the order given. A record whose identity fields are
+    not valid raises `identity.MalformedRecordError` (see `_stream`)."""
+    return _stream(records)
+
+
+def _stream(records: Iterable[Mapping[str, Any]]) -> bytes:
+    """`records` as an Arrow IPC stream of `flight_schema()`, in `stream_order`. Each record's
+    identity fields are checked first, in the order given (`identity.check`, `WAVE_AF_CONTRACT.md`
+    section 1): one that is not valid raises `identity.MalformedRecordError` naming its position
+    in `records`, and nothing is judged."""
+    from .identity import check, in_list
+
+    listed = list(records)
+    for index, record in enumerate(listed):
+        check(record, in_list(index))
     try:
         import pyarrow as pa
     except ImportError as error:
         raise RuntimeError("the Rust detectors read Arrow: pip install 'tensorquill[flight]'") from error
-    from .flight import flight_schema, record_to_row
+    from .flight import _row, flight_schema
 
     rows = [
         # Records written without a run ID still have to travel in the column.
-        record_to_row(record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""})
-        for record in stream_order(records)
+        _row(record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""})
+        for record in stream_order(listed)
     ]
     schema = flight_schema()
     out = io.BytesIO()
@@ -301,23 +315,8 @@ def stream_order(records: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]
 
 def run_stream(records: Iterable[Mapping[str, Any]]) -> bytes:
     """The records of every rank of one run as the Arrow IPC stream `tensorquill-server detect
-    --run` reads, in `stream_order` (as `records_stream` orders one rank)."""
-    try:
-        import pyarrow as pa
-    except ImportError as error:
-        raise RuntimeError("the Rust detectors read Arrow: pip install 'tensorquill[flight]'") from error
-    from .flight import flight_schema, record_to_row
-
-    rows = [
-        record_to_row(record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""})
-        for record in stream_order(records)
-    ]
-    schema = flight_schema()
-    out = io.BytesIO()
-    with pa.ipc.new_stream(out, schema) as writer:
-        for start in range(0, len(rows), _BATCH_ROWS):
-            writer.write_batch(pa.RecordBatch.from_pylist(rows[start:start + _BATCH_ROWS], schema=schema))
-    return out.getvalue()
+    --run` reads, in `stream_order` (as `records_stream` orders one rank), with the same check."""
+    return _stream(records)
 
 
 def server_run_report(
