@@ -514,8 +514,26 @@ def test_clipping_inside_a_compiled_step_does_not_recompile_at_every_step():
 
     control, _, _ = run(False)
     graphs, clips, truth = run(True)
-    assert graphs == control and sum(graphs[1:]) == 0, (graphs, control)
+    assert sum(graphs[1:]) == 0 and sum(control[1:]) == 0, (graphs, control)  # on every PyTorch: nothing after the first step
     assert clips == pytest.approx(truth, rel=1e-5)
+
+    # The first step against the control. Where PyTorch compiles `clip_grad_norm_` itself (2.14 on), the
+    # watched step compiles as many graphs as the control. Where it cannot (2.6 to 2.10 break on
+    # `_group_tensors_by_device_and_dtype` and compile nothing for the clip), TensorQuill's own reading of
+    # the pre-clipping norm is the one graph compiled there, once: one more than the control, never more
+    # (measured on PyTorch 2.6 and accepted by the author as a documented difference, Nov 23, 2026).
+    def clip_alone() -> int:
+        torch._dynamo.reset()
+        plain = nn.Linear(4, 1)
+        plain(torch.randn(2, 4)).sum().backward()
+        counters.clear()
+        torch.compile(lambda: torch.nn.utils.clip_grad_norm_(plain.parameters(), 1.0), backend="eager")()
+        made = counters["stats"]["unique_graphs"]
+        torch._dynamo.reset()
+        return made
+
+    extra = 0 if clip_alone() >= 1 else 1
+    assert graphs[0] == control[0] + extra, (graphs, control, extra)
 
 
 def test_a_fullgraph_compiled_clip_no_longer_raises_into_training_at_the_recompile_limit():

@@ -251,6 +251,7 @@ def test_fr_two_imports_at_once_leave_stdout_and_stderr_as_they_were(tmp_path):
     process's `sys.stdout` and `sys.stderr` swapped for buffers; two at once, ordered A in, B in,
     A out, B out, left both swapped for A's buffers. Run in a fresh process, with the builder
     module made to hold each import at `build_db` until both have come in."""
+    pytest.importorskip("torch.distributed.flight_recorder.components.builder")  # PyTorch 2.10 or later
     directory = _fr_desync(tmp_path)
     script = textwrap.dedent(f"""
         import sys, threading, types, importlib
