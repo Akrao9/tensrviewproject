@@ -866,6 +866,17 @@ fn non_finite_gradients<'a>(columns: &'a Columns, row: usize) -> Vec<&'a str> {
     bad
 }
 
+/// The `grad_norms` entries a row's column could not hold, as they travel in `extra_json` under
+/// `grad_norms` (`WAVE_AJ_CONTRACT.md` section 1), or None when it has none. `extra_json` is
+/// parsed only on a row that names the key.
+fn refused_gradients(columns: &Columns, row: usize) -> Option<Value> {
+    let extra = text(columns.extra, row).filter(|extra| extra.contains("\"grad_norms\""))?;
+    match serde_json::from_str::<Value>(extra).ok()? {
+        Value::Object(mut extra) => extra.remove("grad_norms"),
+        _ => None,
+    }
+}
+
 /// The columns the detectors read. A column that is missing or of another type reads as
 /// absent on every row: the server stores whatever columns a sender has.
 struct Columns<'a> {
@@ -2240,14 +2251,11 @@ impl Updates {
             .as_ref()
             .filter(|before| before.attempt == attempt)
             .and_then(|before| shared_largest(&own, largest, before).map(|sides| (before, sides)));
-        // A row whose `grad_norms` lost an entry the column cannot hold (it travels in `extra_json`,
-        // `WAVE_AJ_CONTRACT.md` section 1) has a typed map that is not the whole record's: its
-        // norms are not used to split, so a comparison with it on either side takes the whole
-        // totals, as Python's `_split_totals` does with the record's own value (the author, Nov 22).
-        let refused = text(columns.extra, row)
-            .filter(|extra| extra.contains("\"grad_norms\""))
-            .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
-            .is_some_and(|extra| extra.get("grad_norms").is_some());
+        // A row whose `grad_norms` refused an entry has a typed map that is not the whole record's:
+        // its norms are not used to split, so a comparison with it on either side takes the whole
+        // totals (the author, Nov 22). A refused entry stored as null ends the split already (a
+        // norm that is not finite); one only in `extra_json` (a name Arrow cannot encode) ends it here.
+        let refused = refused_gradients(columns, row).is_some();
         let grads: Option<Vec<(String, f64)>> = columns.grad_norms.as_ref().filter(|_| !refused).and_then(|norms| {
             let entries = norms.row(row);
             (!entries.is_empty()).then(|| {
@@ -3323,6 +3331,16 @@ impl Stalled {
                 // It cannot be newly stalled on the row that shows it changing, so marking
                 // it here is the same as Python's marking before the stall check.
                 weight.changed |= !same;
+            }
+        }
+        // A refused gradient (`WAVE_AJ_CONTRACT.md` section 1) is a gradient listed with no value,
+        // as Python reads the raw `true`: its streak resets. One stored as null was reset above; a
+        // name Arrow cannot encode is only in `extra_json`, and is reset here.
+        if let Some(Value::Object(refused)) = refused_gradients(columns, row) {
+            for name in refused.keys() {
+                let weight = self.weights.slot(usize::MAX, name);
+                weight.streak = 0;
+                weight.changed |= !unchanged.contains(name.as_str());
             }
         }
         if !evidence {
