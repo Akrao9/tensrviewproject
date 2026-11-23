@@ -26,7 +26,7 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 - Its raw value still travels in `extra_json`: `{"good": NaN, "bad": null}` in the column, `{"grad_norms": {"bad": true}}` beside it. This holds even when every entry is refused.
 - So in both engines an update comparison where either side has a refused gradient takes the whole-total fallback (Rust's `shared_totals` ends on a non-finite norm; Python's `_split_totals` on a value `_finite` refuses).
 - A stalled weight's streak resets on it in both engines. `non_finite` still names a NaN sibling.
-- A name Arrow cannot encode cannot sit in the column even as null. It travels only in `extra_json`.
+- A name Arrow cannot encode cannot sit in the column even as null. It travels only in `extra_json`. For that form, Rust reads `extra_json`'s `grad_norms` (AJ-3's `refused_gradients`, `28444b1`), so the whole-total fallback and the streak's reset hold there too. One side effect: a whole `grad_norms` map in `extra_json` from an older sender now resets the streak for every name in it, as Python does on the raw values.
 - The other five maps leave a refused entry out of the column, so it is absent.
 
 **When the map is not split.** If the value is not an object, or (outside `grad_norms`) no entry is held, the whole value goes to `extra_json` and the column is null, as before. A map that loses every entry is never sent as an empty typed map.
@@ -94,7 +94,7 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
   - A record whose `step_skipped` is true is left out. It enters no parameter's baseline and gives no ratio.
   - That holds whoever reported the skip.
   - It also holds on a partial skip (`step_skipped_part`), because no record names which optimizer applied its update to a parameter. Every parameter of such a step is unjudged there, as `update_spike` reads it.
-- Shared cases: AJ-2's `FULL_SKIP`, `SKIPS_FIRST`, `PARTIAL_SKIP` and `CALLER_SKIP`, copied into `cases.json` once committed.
+- Shared cases: AJ-2's `FULL_SKIP`, `SKIPS_FIRST`, `PARTIAL_SKIP` and `CALLER_SKIP` (`876f627`), plus only-skipped-updates, in `cases.json` as `a7_*`.
 
 ## 7. `weight_jumps` across a resume (A10, decided Nov 22; lanes AJ-2 and AJ-3)
 
@@ -106,7 +106,7 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
   - Two consecutive weight checks are compared only within one attempt.
   - The first check after a reload starts the comparison again, and `checks` still counts every weight check.
   - A weight check is a record whose `weight_norms` holds at least one value the float64 column carries (a null counts).
-- Shared cases: AJ-2's `RELOAD` and `RELOAD_ONLY`, copied into `cases.json` once committed.
+- Shared cases: AJ-2's `RELOAD` and `RELOAD_ONLY` (`876f627`), in `cases.json` as `a10_reload_then_jump` and `a10_reload_only`.
 
 ## 8. Open between AJ-2 and AJ-3
 
