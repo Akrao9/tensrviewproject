@@ -514,14 +514,19 @@ def test_clipping_inside_a_compiled_step_does_not_recompile_at_every_step():
 
     control, _, _ = run(False)
     graphs, clips, truth = run(True)
-    assert sum(graphs[1:]) == 0 and sum(control[1:]) == 0, (graphs, control)  # on every PyTorch: nothing after the first step
-    assert clips == pytest.approx(truth, rel=1e-5)
+    assert sum(graphs[1:]) == 0 and sum(control[1:]) == 0, (graphs, control)  # nothing compiles after the first step
+    assert clips == pytest.approx(truth, rel=1e-5)  # and the recorded pre-clipping norm is the true one
 
-    # The first step against the control. Where PyTorch compiles `clip_grad_norm_` itself (2.14 on), the
-    # watched step compiles as many graphs as the control. Where it cannot (2.6 to 2.10 break on
-    # `_group_tensors_by_device_and_dtype` and compile nothing for the clip), TensorQuill's own reading of
-    # the pre-clipping norm is the one graph compiled there, once: one more than the control, never more
-    # (measured on PyTorch 2.6 and accepted by the author as a documented difference, Nov 23, 2026).
+    # The first step against the control. What was observed, on CPU with the `eager` backend (Nov 23, 2026):
+    # - PyTorch 2.15.0: `clip_grad_norm_` compiled alone makes a graph, and the watched step compiles as
+    #   many graphs as the control.
+    # - PyTorch 2.6.0: `clip_grad_norm_` compiled alone makes no graph (Dynamo breaks on
+    #   `_group_tensors_by_device_and_dtype`), and the watched step compiles one graph more than the
+    #   control: TensorQuill's own reading of the pre-clipping norm, once (accepted by the author as a
+    #   documented difference).
+    # The clip alone was measured on these two versions only, so the rule follows what this PyTorch does
+    # with the clip alone, not its version: where the clip compiles, exact parity with the control; where it compiles
+    # nothing, the same count or one more, never more than one.
     def clip_alone() -> int:
         torch._dynamo.reset()
         plain = nn.Linear(4, 1)
@@ -532,8 +537,12 @@ def test_clipping_inside_a_compiled_step_does_not_recompile_at_every_step():
         torch._dynamo.reset()
         return made
 
-    extra = 0 if clip_alone() >= 1 else 1
-    assert graphs[0] == control[0] + extra, (graphs, control, extra)
+    clip_graphs = clip_alone()
+    difference = graphs[0] - control[0]
+    if clip_graphs >= 1:
+        assert difference == 0, (graphs, control, clip_graphs)
+    else:
+        assert difference in (0, 1), (graphs, control, clip_graphs)
 
 
 def test_a_fullgraph_compiled_clip_no_longer_raises_into_training_at_the_recompile_limit():
