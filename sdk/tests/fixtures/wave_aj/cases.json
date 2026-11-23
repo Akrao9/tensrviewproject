@@ -96,7 +96,8 @@
      "ts": 0.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -108,7 +109,8 @@
      "ts": 1.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -120,7 +122,8 @@
      "ts": 2.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -132,7 +135,8 @@
      "ts": 3.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -144,7 +148,8 @@
      "ts": 4.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": "nan"
+      "good": "nan",
+      "bad": null
      }
     }
    ],
@@ -152,7 +157,8 @@
     "step": 4,
     "typed": {
      "grad_norms": {
-      "good": "nan"
+      "good": "nan",
+      "bad": null
      }
     },
     "extra": {
@@ -260,7 +266,8 @@
      "ts": 0.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -272,7 +279,8 @@
      "ts": 1.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -284,7 +292,8 @@
      "ts": 2.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -296,7 +305,8 @@
      "ts": 3.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -308,7 +318,8 @@
      "ts": 4.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": "nan"
+      "good": "nan",
+      "bad": null
      }
     }
    ],
@@ -316,7 +327,8 @@
     "step": 4,
     "typed": {
      "grad_norms": {
-      "good": "nan"
+      "good": "nan",
+      "bad": null
      }
     },
     "extra": {
@@ -424,7 +436,8 @@
      "ts": 0.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -436,7 +449,8 @@
      "ts": 1.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -448,7 +462,8 @@
      "ts": 2.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -460,7 +475,8 @@
      "ts": 3.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": 1.0
+      "good": 1.0,
+      "bad": null
      }
     },
     {
@@ -472,7 +488,8 @@
      "ts": 4.0,
      "grad_norm": 1.0,
      "grad_norms": {
-      "good": "nan"
+      "good": "nan",
+      "bad": null
      }
     }
    ],
@@ -480,7 +497,8 @@
     "step": 4,
     "typed": {
      "grad_norms": {
-      "good": "nan"
+      "good": "nan",
+      "bad": null
      }
     },
     "extra": {
@@ -824,7 +842,7 @@
   },
   {
    "name": "grad_norms_every_entry_refused",
-   "about": "No entry held: the whole map travels in extra_json and the column is null, as before",
+   "about": "Every grad_norms entry refused: each stays in the column as null (a gradient listed with no value), its raw value in extra_json",
    "paths": [
     "row",
     "python",
@@ -878,7 +896,10 @@
      "attempt": 1,
      "step": 0,
      "ts": 0.0,
-     "grad_norm": 1.0
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": null
+     }
     },
     {
      "schema_version": 1,
@@ -887,7 +908,10 @@
      "attempt": 1,
      "step": 1,
      "ts": 1.0,
-     "grad_norm": 1.0
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": null
+     }
     },
     {
      "schema_version": 1,
@@ -896,13 +920,18 @@
      "attempt": 1,
      "step": 2,
      "ts": 2.0,
-     "grad_norm": 1.0
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": null
+     }
     }
    ],
    "row": {
     "step": 0,
     "typed": {
-     "grad_norms": null
+     "grad_norms": {
+      "bad": null
+     }
     },
     "extra": {
      "grad_norms": {
@@ -3876,6 +3905,1889 @@
      ]
     },
     "raises": false
+   }
+  },
+  {
+   "name": "moe_count_past_int64_beside_collapsed_router",
+   "about": "Arrow refuses one router's counts (past int64): that router is absent, the collapsed one is found, on every path (AJ-2)",
+   "paths": [
+    "row_sender",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    "extra": {
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ]
+     }
+    },
+    "moved": [
+     "moe"
+    ]
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "moe_imbalance",
+      "step": 0,
+      "layer": 1,
+      "router": "good"
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers",
+    "rust_sdk": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers (the SDK's sample guard reads Python's router list)"
+   }
+  },
+  {
+   "name": "replica_spread_past_float_beside_drift",
+   "about": "A float overflow under one parameter's spread: refused alone, the drifting parameter beside it is found (AJ-2)",
+   "paths": [
+    "row_sender",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_past_float_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w": [
+       10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,
+       0.0,
+       0.0
+      ],
+      "v": [
+       0.01,
+       0.0,
+       0.0
+      ]
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_past_float_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "v": [
+       0.01,
+       0.0,
+       0.0
+      ]
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "replica_spread": {
+      "v": [
+       0.01,
+       0.0,
+       0.0
+      ]
+     }
+    },
+    "extra": {
+     "replica_spread": {
+      "w": [
+       10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,
+       0.0,
+       0.0
+      ]
+     }
+    },
+    "moved": [
+     "replica_spread"
+    ]
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "replica_drift",
+      "step": 0,
+      "parameters": [
+       "v"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2: a spread entry that is not a list of floats is not judged and raises nothing"
+   }
+  },
+  {
+   "name": "moe_string_then_valid_router_layer_order",
+   "about": "A5: a refused moe entry reserves no layer number; the router first registers at its first held entry (AJ-2)",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "ts": 15.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "ts": 16.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "ts": 17.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "ts": 18.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "ts": 19.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "ts": 15.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "ts": 16.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "ts": 17.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "ts": 18.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "ts": 19.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    "extra": {
+     "moe": {
+      "bad": "x"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "moe_imbalance",
+      "step": 5,
+      "layer": 2,
+      "router": "bad"
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers; a router first registers (takes its layer number) at its first held entry"
    }
   },
   {

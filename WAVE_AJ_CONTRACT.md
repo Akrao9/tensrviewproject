@@ -9,7 +9,7 @@ Base: `trial/ai-wave` at `212205d`. Read by lanes AJ-1 (`flight.py`, `server_det
 - The rest of the map stays in the column.
 - Before this, one such entry sent the whole map to `extra_json`, so the Rust detectors missed the rest.
 
-**What a column holds** is what `flight.py`'s converter for it takes, plus Arrow's check on the sender's strict path:
+**What a column holds** is what `flight.py`'s converter for it takes, plus Arrow's check. That check runs on every path: the sender's (`rows_to_send`) and the raw `detect` stream (`server_detect._stream`, through `flight.rows_batch`). Before, a value only Arrow refuses made the raw path raise.
 
 | Column | An entry is held when it is |
 |---|---|
@@ -20,9 +20,16 @@ Base: `trial/ai-wave` at `212205d`. Read by lanes AJ-1 (`flight.py`, `server_det
 
 Every other entry is refused. This includes `true`, any other string (`"NaN"` too), a `null` under the list maps or `moe_top_k`, an integer too large for its type, and a name Arrow cannot encode.
 
-**Where refused entries go.** They travel in `extra_json` under the record's own key, holding only those entries. For example, `{"grad_norms": {"bad": true}}` sits beside the typed `grad_norms` column `{"good": NaN}`.
+**Where refused entries go.** They travel in `extra_json` under the record's own key, holding only those entries. For example, `{"moe": {"bad": "x"}}` sits beside the typed `moe_counts` column `{"good": [100, 0, 0, 0]}`.
 
-**When the map is not split.** If the value is not an object, or no entry is held, the whole value goes to `extra_json` and the column is null, as before. A map that loses every entry is never sent as an empty typed map.
+**`grad_norms` keeps a refused entry in the column as null** (the author, Nov 22, through AJ-3). The entry is a gradient listed with no value, which is how Python reads the raw `true` or string.
+- Its raw value still travels in `extra_json`: `{"good": NaN, "bad": null}` in the column, `{"grad_norms": {"bad": true}}` beside it. This holds even when every entry is refused.
+- So in both engines an update comparison where either side has a refused gradient takes the whole-total fallback (Rust's `shared_totals` ends on a non-finite norm; Python's `_split_totals` on a value `_finite` refuses).
+- A stalled weight's streak resets on it in both engines. `non_finite` still names a NaN sibling.
+- A name Arrow cannot encode cannot sit in the column even as null. It travels only in `extra_json`.
+- The other five maps leave a refused entry out of the column, so it is absent.
+
+**When the map is not split.** If the value is not an object, or (outside `grad_norms`) no entry is held, the whole value goes to `extra_json` and the column is null, as before. A map that loses every entry is never sent as an empty typed map.
 
 **Reading a row back.** `row_to_record` merges `extra_json[key]` into the typed map. So `row_to_record(record_to_row(r)) == r` holds for every shared case.
 
@@ -36,7 +43,7 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 
 ## 2. What both engines read
 
-**Refused entries are absent to every detector**, as if the entry were not in the record.
+**Refused entries are absent to every detector**, as if the entry were not in the record. The exception is `grad_norms`, where a refused entry reads as a listed gradient with no value, as `null` does (section 1).
 - Rust reads only the typed columns. Its cross-rank replica reader (`replica.rs`) falls back to `extra_json["replica_spread"]` only when the column is null.
 - **Python must read the same** (AJ-2, `evidence.py`): an entry the table above would refuse is skipped, and nothing is raised.
 
@@ -61,7 +68,7 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 - Any other refused entry (a string, a number too large) still sends the whole `scalars` map to `extra_json`.
 - This is unchanged in wave AJ, and listed as open.
 
-**`server_detect._stream`** (the raw `detect` path) builds rows without Arrow's check, as before. A value only Arrow refuses (for example a `moe_top_k` of 2**40) is caught on the sender's path, not there.
+**`records_to_batch` and the raw `detect` stream** now build rows as before and redo with Arrow's check only the rows Arrow refuses. A valid record's row is unchanged, and a key column Arrow refuses still raises.
 
 ## 4. The watcher across a resume (A1)
 
@@ -92,3 +99,8 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 - Only a jump inside the new attempt is listed.
 - This applies to `weight_jumps` only.
 - Shared cases: added by AJ-2 and AJ-3.
+
+## 8. Open between AJ-2 and AJ-3
+
+- **A held `replica_spread` entry `[]`.** Rust's replica reader counts it as covered, with no drift. AJ-2 proposes that it not count as gathered coverage. One side changes, and the shared case `replica_spread_empty_and_string_beside_drift` asks only for the drifting parameter.
+- **AJ-3's `update_spike` case** (whole totals kept when one side has a refused gradient) is added to `cases.json` when AJ-3 sends it.
