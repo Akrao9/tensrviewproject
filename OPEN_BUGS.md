@@ -560,9 +560,38 @@ Merged `--no-ff` one at a time, to `76e2e5d`.
 **A7's limit, accepted for v1 by the author:** "the SDK records that one of two updates was skipped, but cannot identify which parameters were updated." On a partial multi-optimizer skip (`step_skipped` with `step_skipped_part`), both engines leave every parameter of that step unjudged, the one whose update did happen included. No wire field is added in this wave.
 
 **Still open after wave AJ.**
-- The oversized integer in `extra_json` (contract section 8): being fixed in lane AJ-3 on the author's terms before the v1 fast-forward.
 - `[5, -3]` under `moe` (a negative count with a positive sum) is judged by both engines as it stands: a detector-policy question, not decided.
 - `scalars` keeps lane W3's rule: a refused entry other than a Boolean still sends the whole `scalars` map to `extra_json`.
 - The rules fixture's generator (`make_cases.py` run as a script) fails an internal assertion, on `5f6c11b` too, so before this wave; its `cases.json` is unchanged.
 - B1 to B3, recorded above for calibration.
+
+### Wave AJ, the oversized integer and the final gate (Nov 22)
+
+**Not in `main`** (`931dfb6`). Nothing is pushed. The gated code commit is `trial/ai-wave` at `3490c425e0095079aac5d55a9787c8dcd7bb729b`; this part of the section and the run sheet's line are documents on top.
+
+**The author's terms:** "One `10**400` value can make Rust discard every `extra_json` field on that row. Preserve the original integer for Python round-trip reading, treat it as unreadable where a float measurement is required, and keep valid sibling fields available to Rust. Use the existing ignored regression and add a live-server check: a valid replica observation beside the oversized integer must still be judged. Verify that Python reads the integer back exactly."
+
+**The fix (lane AJ-3, `3a21796` failing tests, `2410130` the fix; merged at `3490c42`).** One reader of `extra_json` for every detector (`server/src/detect/extra_json.rs`), used by all nine places that parsed it. A text `serde_json` refuses is parsed again with each number outside a string that overflows a float read as the text "a number too large for a float", so that one value is unreadable and every other key of the row is read. The sender is unchanged, so the integer still travels as written. No crate feature was added (`arbitrary_precision` would have changed how every number the server reads is held); the protocol number and the Arrow schema are unchanged. The ignored regression of the cross-rank reader is turned on.
+
+**Checked by the coordinator on `3490c42`** (`detector-audit/oversized_check.py`, `a3_probe.py`, `final_checks.py`, with their `*-on-3490c42.txt` outputs):
+- Python reads `10**400` back exactly, as an integer: through `row_to_record(record_to_row(r))`, and from a capture file through `load_records`.
+- Raw Rust (`server_run_report`) gives the same `replica` object for two ranks' records with the integer in `extra_json` as without it: drift on parameter `b` at step 99. A live server fed by `send_file` gives the same with as without, and agrees with raw Rust on `steps` and `replica_drift`.
+- A3: with a real NaN under `good` beside `True`, and beside a string, Python, raw Rust, the SDK in Rust mode and the live server each report `non_finite` naming `good`. The `None` control and the no-sibling control give the same.
+- A9: `weight_jumps.checks` is 2 in Python, raw Rust and the SDK's Rust mode on the malformed-only `weight_norms` case.
+- A7 and A10: Python, raw Rust and the SDK's Rust mode each equal the shared cases' written values on `a7_full_skip`, `a7_skips_first`, `a7_caller_skip`, `a7_partial_skip`, `a7_only_skipped_updates`, `a10_reload_then_jump` and `a10_reload_only` (24 comparisons with A9's three, none failed).
+- The 281 lane tests pass as ordinary tests.
+
+**The final isolated gate, on `3490c425e0095079aac5d55a9787c8dcd7bb729b`**, 22:33 to 23:16, the three lanes idle, tree unchanged and no server left at the end. Logs: `wave-aj-exit-gate-on-3490c42/` in the side-session notes. Earlier runs kept: `wave-aj-exit-gate-first-run-76e2e5d/` (one failure) and `wave-aj-exit-gate-on-00efae9/` (passing).
+
+| Stage | Exit | Result |
+|---|---|---|
+| `cargo build --release`; `cargo test`; `cargo test --no-default-features --lib` | 0, 0, 0 | protocol 4, binary sha256 `1d22d8a614d0e4e4`; 375 passed, 6 ignored; 285 passed, 3 ignored |
+| Both `cargo clippy ... -D warnings` lines, `cargo fmt --check` | 0, 0, 0 | |
+| The full SDK suite, alone, with this tree's rebuilt binary | 0 | 5,978 passed, 6 skipped, none under an expected-failure mark, in 37 min 57 s (5,697 on `5f6c11b`) |
+| The compact fixture | 0 | under 12,000 bytes; both summaries equal the full evidence's |
+| `replica_check.py` on 2, 3 and 8 CPU ranks, both arms, files and a live server, and 3 ranks without NumPy | 0 | 13 runs, all 13 at code 0 |
+| Gate 1's `harness.py build` against the build on `f5ee53e` | 0 | 127 files each; no other file differs; the 14 recordings the same by content |
+| Gate 1, bake-off and TrainCheck tests | 0, 0, 0 | 71, 37 and 18 passed |
+
+**Open after this**, with the list above (the negative `moe` count with a positive sum; `scalars`' whole-map rule; the rules generator's old assertion; B1 to B3 for calibration; A7's accepted limit): the loader pause, to be measured in Colab first; the push, held for the author's review of this candidate; then Linux CI on the pushed SHA before any scored GPU run; the two- and eight-GPU proofs; the live-agent sign-in and D10, the author's.
 
