@@ -1,0 +1,7880 @@
+{
+ "contract": "WAVE_AJ_CONTRACT.md",
+ "how_to_read": [
+  "Base trial/ai-wave 212205d. The rule is WAVE_AJ_CONTRACT.md.",
+  "paths: row = record_to_row and row_to_record; row_sender = rows_to_send with flight_schema() (Arrow's check); python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_sdk = build_evidence(detectors='rust'); live_server = a release server fed by flight.send_file, the rank's incidents.json once its last_step is the last step sent.",
+  "Every engine path: for records it must give what it gives for clean_records, and nothing may raise. clean_records are the same records with every refused entry removed (a map left with none removed as a key), except under grad_norms, where a refused entry is replaced by null, as the column holds it. For grad_norms cases the Rust paths read the same typed row for both, so expect carries the check there.",
+  "row: at row.step, the typed column holds exactly row.typed[key] (null: the column is null; non-finite numbers written as the sink's strings) and extra_json holds exactly row.extra (null: extra_json is null); row_to_record(record_to_row(r)) == r for every record; row.moved, when given, is what rows_to_send adds to moved.",
+  "expect.incidents: the incidents in order, each matched on the fields given (parameters: the names of the incident's parameters). expect.run_state applies to python and rust_sdk only (rust_raw and incidents.json have none). expect.moe_routing_not_checked: the routers of not_checked's moe_routing entry, null for no entry. expect.weight_jumps and expect.update_trends: matched on the fields given (largest and lowest on their first entries' given fields).",
+  "thresholds, when given, are passed to every engine path (build_evidence's keyword arguments, server_report's thresholds). clean_records null: no clean control; the case's expect is explicit (expect.update_spike: [step, grad_norm, grad_norm_before] of each update_spike incident, to 9 places).",
+  "needs: the paths that cannot pass until that lane's change is in (measured on 212205d with the clean records). The integrated gate runs every path.",
+  "expect.blocks: each named block must equal the value given exactly (null: the block is absent). The A7 and A10 cases are lane AJ-2's (876f627), with schema_version and ts added so the row round trip holds."
+ ],
+ "cases": [
+  {
+   "name": "nan_beside_true",
+   "about": "A3: a real NaN under one parameter, true under another",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": true
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_true",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    }
+   ],
+   "row": {
+    "step": 4,
+    "typed": {
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "bad": true
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "non_finite",
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   }
+  },
+  {
+   "name": "nan_beside_string",
+   "about": "A3: a real NaN under one parameter, a string under another",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "text"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "text"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "text"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "text"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": "text"
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_string",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    }
+   ],
+   "row": {
+    "step": 4,
+    "typed": {
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "bad": "text"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "non_finite",
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   }
+  },
+  {
+   "name": "nan_beside_nan_spelled_NaN",
+   "about": "A3: the spelling \"NaN\" is not the sink's \"nan\": refused alone",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "NaN"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "NaN"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "NaN"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": "NaN"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": "NaN"
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_nan_spelled_NaN",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    }
+   ],
+   "row": {
+    "step": 4,
+    "typed": {
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "bad": "NaN"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "non_finite",
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   }
+  },
+  {
+   "name": "nan_beside_null",
+   "about": "Control: null is held by a float map (stored as null), as before",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0,
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_beside_null",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    }
+   ],
+   "row": {
+    "step": 4,
+    "typed": {
+     "grad_norms": {
+      "good": "nan",
+      "bad": null
+     }
+    },
+    "extra": null
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "non_finite",
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   }
+  },
+  {
+   "name": "nan_alone",
+   "about": "Control: no sibling",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan"
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "nan_alone",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "good": "nan"
+     }
+    }
+   ],
+   "row": {
+    "step": 4,
+    "typed": {
+     "grad_norms": {
+      "good": "nan"
+     }
+    },
+    "extra": null
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "non_finite",
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   }
+  },
+  {
+   "name": "grad_norms_every_entry_refused",
+   "about": "Every grad_norms entry refused: each stays in the column as null (a gradient listed with no value), its raw value in extra_json",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "grad_norms_every_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "grad_norms_every_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "grad_norms_every_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": true
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "grad_norms_every_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "grad_norms_every_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": null
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "grad_norms_every_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "bad": null
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "grad_norms": {
+      "bad": null
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "bad": true
+     }
+    }
+   },
+   "expect": {
+    "incidents": [],
+    "run_state": "healthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   }
+  },
+  {
+   "name": "moe_string_beside_collapsed_router",
+   "about": "A5: a string under moe beside a router that sends every token to one expert",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    "extra": {
+     "moe": {
+      "bad": "x"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "moe_imbalance",
+      "step": 0,
+      "layer": 1,
+      "router": "good"
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers",
+    "rust_sdk": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers (the SDK's sample guard reads Python's router list)"
+   }
+  },
+  {
+   "name": "moe_top_k_string_beside_good",
+   "about": "A3 on moe_top_k: a string beside a held top-k",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": "two"
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_string_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    "extra": {
+     "moe_top_k": {
+      "bad": "two"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "moe_imbalance",
+      "step": 0,
+      "layer": 1,
+      "router": "good"
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers",
+    "rust_sdk": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers"
+   }
+  },
+  {
+   "name": "moe_counts_summing_to_zero",
+   "about": "A2: [5, -5] is stored (int64 holds it) but not judged (its counts sum to 0)",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_counts_summing_to_zero",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     },
+     "moe_top_k": {
+      "r0": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe": {
+      "r0": [
+       5,
+       -5
+      ]
+     }
+    },
+    "extra": null
+   },
+   "expect": {
+    "incidents": [],
+    "run_state": "degraded",
+    "moe_routing_not_checked": [
+     "r0"
+    ],
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A2): a sample is judged only when its counts sum above 0, as in Rust"
+   }
+  },
+  {
+   "name": "replica_spread_empty_and_string_beside_drift",
+   "about": "A4 and A3: [] is held and has no spread, a string is refused, the drifting parameter is found",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_empty_and_string_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w_drift": [
+       0.01,
+       0.0,
+       0.0
+      ],
+      "w_empty": [],
+      "w_text": "i"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_empty_and_string_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w_drift": [
+       0.01,
+       0.0,
+       0.0
+      ],
+      "w_empty": [],
+      "w_text": "i"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_empty_and_string_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w_drift": [
+       0.01,
+       0.0,
+       0.0
+      ],
+      "w_empty": [],
+      "w_text": "i"
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_empty_and_string_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w_drift": [
+       0.01,
+       0.0,
+       0.0
+      ],
+      "w_empty": []
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_empty_and_string_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w_drift": [
+       0.01,
+       0.0,
+       0.0
+      ],
+      "w_empty": []
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_empty_and_string_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w_drift": [
+       0.01,
+       0.0,
+       0.0
+      ],
+      "w_empty": []
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "replica_spread": {
+      "w_drift": [
+       0.01,
+       0.0,
+       0.0
+      ],
+      "w_empty": []
+     }
+    },
+    "extra": {
+     "replica_spread": {
+      "w_text": "i"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "replica_drift",
+      "step": 0,
+      "parameters": [
+       "w_drift"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A4): [] has no spread and raises nothing"
+   }
+  },
+  {
+   "name": "weight_norms_one_non_number",
+   "about": "A3 on weight_norms: one non-number beside a parameter that jumps",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_one_non_number",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0,
+      "bad": "x"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_one_non_number",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0,
+      "bad": "x"
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_one_non_number",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "ts": 20.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0,
+      "bad": "x"
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_one_non_number",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_one_non_number",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_one_non_number",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "ts": 20.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     }
+    }
+   ],
+   "row": {
+    "step": 20,
+    "typed": {
+     "weight_norms": {
+      "w": 50.0
+     }
+    },
+    "extra": {
+     "weight_norms": {
+      "bad": "x"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [],
+    "run_state": "healthy",
+    "moe_routing_not_checked": null,
+    "weight_jumps": {
+     "checks": 3,
+     "parameters": 1,
+     "largest": [
+      {
+       "name": "w",
+       "step": 20,
+       "previous_step": 10,
+       "ratio": 50.0
+      }
+     ]
+    },
+    "raises": false
+   }
+  },
+  {
+   "name": "weight_norms_only_entry_refused",
+   "about": "A9: a map with no held entry is not a weight check, in both engines",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_only_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_only_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 50,
+     "ts": 50.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 2.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_only_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 100,
+     "ts": 100.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": "not_a_number"
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_only_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_only_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 50,
+     "ts": 50.0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 2.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "weight_norms_only_entry_refused",
+     "rank": 0,
+     "attempt": 1,
+     "step": 100,
+     "ts": 100.0,
+     "grad_norm": 1.0
+    }
+   ],
+   "row": {
+    "step": 100,
+    "typed": {
+     "weight_norms": null
+    },
+    "extra": {
+     "weight_norms": {
+      "w": "not_a_number"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [],
+    "run_state": "healthy",
+    "moe_routing_not_checked": null,
+    "weight_jumps": {
+     "checks": 2,
+     "parameters": 1,
+     "largest": [
+      {
+       "name": "w",
+       "step": 50,
+       "previous_step": 0,
+       "ratio": 2.0
+      }
+     ]
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A9): a weight_norms map with no held entry is not a weight check",
+    "rust_sdk": "AJ-2 (A9): the SDK fills weight_jumps in Python"
+   }
+  },
+  {
+   "name": "update_rms_mixed",
+   "about": "A3 on update_rms: true beside a held update size",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "ts": 15.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "ts": 16.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "ts": 17.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "ts": 18.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "ts": 19.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01,
+      "bad": true
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "ts": 15.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "ts": 16.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "ts": 17.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "ts": 18.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_rms_mixed",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "ts": 19.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0
+     },
+     "update_rms": {
+      "w": 0.01
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "update_rms": {
+      "w": 0.01
+     }
+    },
+    "extra": {
+     "update_rms": {
+      "bad": true
+     }
+    }
+   },
+   "expect": {
+    "incidents": [],
+    "run_state": "healthy",
+    "moe_routing_not_checked": null,
+    "update_trends": {
+     "parameters": 1,
+     "judged": 1,
+     "lowest": [
+      {
+       "name": "w",
+       "step": 10,
+       "ratio": 1.0
+      }
+     ]
+    },
+    "raises": false
+   }
+  },
+  {
+   "name": "moe_count_past_int64_beside_collapsed_router",
+   "about": "Arrow refuses one router's counts (past int64): that router is absent, the collapsed one is found, on every path (AJ-2)",
+   "paths": [
+    "row_sender",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ],
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_count_past_int64_beside_collapsed_router",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    "extra": {
+     "moe": {
+      "bad": [
+       9223372036854775808,
+       1
+      ]
+     }
+    },
+    "moved": [
+     "moe"
+    ]
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "moe_imbalance",
+      "step": 0,
+      "layer": 1,
+      "router": "good"
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers",
+    "rust_sdk": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers (the SDK's sample guard reads Python's router list)"
+   }
+  },
+  {
+   "name": "replica_spread_past_float_beside_drift",
+   "about": "A float overflow under one parameter's spread: refused alone, the drifting parameter beside it is found (AJ-2)",
+   "paths": [
+    "row_sender",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_past_float_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "w": [
+       10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,
+       0.0,
+       0.0
+      ],
+      "v": [
+       0.01,
+       0.0,
+       0.0
+      ]
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "replica_spread_past_float_beside_drift",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "replica_spread": {
+      "v": [
+       0.01,
+       0.0,
+       0.0
+      ]
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "replica_spread": {
+      "v": [
+       0.01,
+       0.0,
+       0.0
+      ]
+     }
+    },
+    "extra": {
+     "replica_spread": {
+      "w": [
+       10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,
+       0.0,
+       0.0
+      ]
+     }
+    },
+    "moved": [
+     "replica_spread"
+    ]
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "replica_drift",
+      "step": 0,
+      "parameters": [
+       "v"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2: a spread entry that is not a list of floats is not judged and raises nothing"
+   }
+  },
+  {
+   "name": "moe_string_then_valid_router_layer_order",
+   "about": "A5: a refused moe entry reserves no layer number; the router first registers at its first held entry (AJ-2)",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": "x"
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "ts": 15.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "ts": 16.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "ts": 17.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "ts": 18.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "ts": 19.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "ts": 12.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "ts": 13.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "ts": 14.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "ts": 15.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "ts": 16.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "ts": 17.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "ts": 18.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "moe_string_then_valid_router_layer_order",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "ts": 19.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ],
+      "bad": [
+       0,
+       0,
+       100,
+       0
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "bad": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe": {
+      "good": [
+       100,
+       0,
+       0,
+       0
+      ]
+     }
+    },
+    "extra": {
+     "moe": {
+      "bad": "x"
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "moe_imbalance",
+      "step": 5,
+      "layer": 2,
+      "router": "bad"
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (evidence.py): Python must skip the refused entry and count only held moe entries as routers; a router first registers (takes its layer number) at its first held entry"
+   }
+  },
+  {
+   "name": "update_spike_refused_on_the_later_side",
+   "about": "A refused gradient on the later side: whole totals, 13 against 13, no update_spike",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_later_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_later_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_later_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_later_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_later_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": true
+     },
+     "update_rms": {
+      "a": 2.0
+     }
+    }
+   ],
+   "clean_records": null,
+   "thresholds": {
+    "update_window": 3
+   },
+   "row": {
+    "step": 4,
+    "typed": {
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": null
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "c": true
+     }
+    }
+   },
+   "expect": {
+    "update_spike": [],
+    "raises": false
+   }
+  },
+  {
+   "name": "update_spike_refused_on_the_earlier_side",
+   "about": "A refused gradient on the earlier side: whole totals, sqrt(2644) against 13",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_earlier_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_earlier_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_earlier_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_earlier_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": "12"
+     },
+     "update_rms": {
+      "a": 1.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_refused_on_the_earlier_side",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 51.419840528729765,
+     "grad_norms": {
+      "a": 30.0,
+      "b": 40.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 2.0
+     }
+    }
+   ],
+   "clean_records": null,
+   "thresholds": {
+    "update_window": 3
+   },
+   "row": {
+    "step": 3,
+    "typed": {
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": null
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "c": "12"
+     }
+    }
+   },
+   "expect": {
+    "update_spike": [
+     [
+      4,
+      51.419840528729765,
+      13.0
+     ]
+    ],
+    "raises": false
+   }
+  },
+  {
+   "name": "update_spike_left_out_without_a_refusal",
+   "about": "Control: a parameter simply not listed is split as before (B3, unchanged), 13 against 5",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_left_out_without_a_refusal",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_left_out_without_a_refusal",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_left_out_without_a_refusal",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_left_out_without_a_refusal",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0,
+      "c": 12.0
+     },
+     "update_rms": {
+      "a": 1.01
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "update_spike_left_out_without_a_refusal",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 13.0,
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0
+     },
+     "update_rms": {
+      "a": 2.0
+     }
+    }
+   ],
+   "clean_records": null,
+   "thresholds": {
+    "update_window": 3
+   },
+   "row": {
+    "step": 4,
+    "typed": {
+     "grad_norms": {
+      "a": 3.0,
+      "b": 4.0
+     }
+    },
+    "extra": null
+   },
+   "expect": {
+    "update_spike": [
+     [
+      4,
+      13.0,
+      5.0
+     ]
+    ],
+    "raises": false
+   }
+  },
+  {
+   "name": "stalled_weight_streak_resets_on_a_refused_gradient",
+   "about": "A refused gradient resets a stalled weight's streak, as null does (step 4); an unlisted one would hold it (step 3)",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": true,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": null,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    }
+   ],
+   "row": {
+    "step": 1,
+    "typed": {
+     "grad_norms": {
+      "w": null,
+      "v": 1.0
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "w": true
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "stalled_weights",
+      "step": 4,
+      "parameters": [
+       "w"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
+    "raises": false
+   }
+  },
+  {
+   "name": "moe_top_k_past_int32_beside_good",
+   "about": "Arrow refuses one entry (sender's strict path): it alone travels in extra_json and moved names the key",
+   "paths": [
+    "row_sender"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_past_int32_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       3,
+       1
+      ]
+     },
+     "moe_top_k": {
+      "good": 1,
+      "big": 1099511627776
+     }
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "moe_top_k_past_int32_beside_good",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "moe": {
+      "good": [
+       3,
+       1
+      ]
+     },
+     "moe_top_k": {
+      "good": 1
+     }
+    }
+   ],
+   "row": {
+    "step": 0,
+    "typed": {
+     "moe_top_k": {
+      "good": 1
+     }
+    },
+    "extra": {
+     "moe_top_k": {
+      "big": 1099511627776
+     }
+    },
+    "moved": [
+     "moe_top_k"
+    ]
+   },
+   "expect": {
+    "raises": false
+   }
+  },
+  {
+   "name": "a7_caller_skip",
+   "about": "A7 (AJ-2's CALLER_SKIP, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "caller",
+     "update_rms": {
+      "w": 0.01
+     },
+     "ts": 12.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 1,
+      "judged": 1,
+      "lowest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_full_skip",
+   "about": "A7 (AJ-2's FULL_SKIP, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 0.01
+     },
+     "ts": 12.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 13.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 1,
+      "judged": 1,
+      "lowest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_partial_skip",
+   "about": "A7 (AJ-2's PARTIAL_SKIP, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "step_skipped_part": {
+      "skipped": 1,
+      "of": 2
+     },
+     "update_rms": {
+      "w": 0.01,
+      "u": 1.0
+     },
+     "ts": 12.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 2,
+      "judged": 2,
+      "lowest": [
+       {
+        "name": "u",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       },
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_skips_first",
+   "about": "A7 (AJ-2's SKIPS_FIRST, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 12.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 13.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 14.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 15.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 16.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 17.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 18.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 19.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 20.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 21,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 21.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 1,
+      "judged": 1,
+      "lowest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 20,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_only_skipped_updates",
+   "about": "A7: only skipped updates give no update_trends block",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": null
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a10_reload_then_jump",
+   "about": "A10 (AJ-2's, 876f627): weight_jumps exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 20.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 50.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 2,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 2,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 2,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 150.0
+     },
+     "ts": 50.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "weight_jumps": {
+      "checks": 6,
+      "parameters": 1,
+      "largest": [
+       {
+        "name": "w",
+        "ratio": 3.0,
+        "step": 50,
+        "previous_step": 40,
+        "before": 50.0,
+        "after": 150.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A10): weight_jumps resets when the attempt changes",
+    "rust_raw": "AJ-3 (A10): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A10): the SDK makes weight_jumps in Python (A9)"
+   }
+  },
+  {
+   "name": "a10_reload_only",
+   "about": "A10 (AJ-2's, 876f627): weight_jumps exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 20.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 50.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 2,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 2,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 2,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 50.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "weight_jumps": {
+      "checks": 6,
+      "parameters": 1,
+      "largest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "previous_step": 0,
+        "before": 1.0,
+        "after": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A10): weight_jumps resets when the attempt changes",
+    "rust_raw": "AJ-3 (A10): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A10): the SDK makes weight_jumps in Python (A9)"
+   }
+  }
+ ]
+}

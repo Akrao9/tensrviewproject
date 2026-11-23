@@ -129,7 +129,8 @@ def _ordered_json(value: Any) -> str:
 
 
 # JSONL key -> (Arrow column, converter). A value that does not fit its column's type, and
-# any key not listed here, travels in `extra_json`, so no field is ever dropped.
+# any key not listed here, travels in `extra_json`, so no field is ever dropped. For the maps of
+# `_SPLIT`, only the entries their column cannot hold do (wave AJ).
 _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "ts": ("ts", _float),
     "lr": ("lr", _list(_float)),
@@ -228,7 +229,14 @@ def _row(
     column's converter or Arrow cannot hold (lane AD4): an integer too large for a float
     (`float(10**400)` raises `OverflowError`), past int32 or int64, or a string with a lone
     surrogate; Arrow's check runs only when `schema` is given, which `rows_to_send` does for a row
-    Arrow refused. Before, any of these cost the whole step. Each such key is added to `moved`."""
+    Arrow refused. Before, any of these cost the whole step. Each such key is added to `moved`.
+
+    A map of `_SPLIT` is held entry by entry when it is not held whole (wave AJ, A3,
+    `WAVE_AJ_CONTRACT.md` section 1): the entries its column can hold stay in the column, and only
+    the others travel in `extra_json`, under the map's own key. Under `grad_norms` (`_NULL_REFUSED`)
+    a refused entry also stays in the column, as null. With no entry held the whole value travels
+    there and the column is null, as before. A map held whole is converted as before, so its row is
+    unchanged."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
     extra: dict[str, Any] = {}
     for key, value in record.items():
@@ -242,22 +250,34 @@ def _row(
             # A logged bool is not a number in either engine (lane W3, DET-16): that one value is left
             # out of the row, and the rest of the map stays in its column for the Rust detectors.
             value = {k: v for k, v in value.items() if not isinstance(v, bool)}
+        counted = False  # refused by an overflow or by Arrow, not by its type: `moved` names the key
         try:
             converted = spec[1](value)
         except (TypeError, ValueError):
-            extra[key] = value
-            continue
+            converted = _UNHELD
         except Exception:  # noqa: BLE001  OverflowError and the like: the value's, not the step's
+            converted, counted = _UNHELD, True
+        if converted is not _UNHELD:
+            if schema is None or _fits(converted, schema.field(spec[0]).type):
+                row[spec[0]] = converted
+                continue
+            counted = True
+        item = _SPLIT.get(key)
+        if item is not None and isinstance(value, dict):
+            # Wave AJ (A3, WAVE_AJ_CONTRACT.md section 1): an entry the column cannot hold leaves it
+            # alone; the rest of the map stays in the column, where the Rust detectors read it.
+            held, refused, counted = _split(value, item, None if schema is None else schema.field(spec[0]).type,
+                                            key in _NULL_REFUSED)
+            if held:
+                row[spec[0]] = held
+                if refused:
+                    extra[key] = refused
+            else:  # no entry held: the whole value, as before, and the column stays null
+                extra[key] = value
+        else:
             extra[key] = value
-            if moved is not None:
-                moved.append(key)
-            continue
-        if schema is not None and not _fits(converted, schema.field(spec[0]).type):
-            extra[key] = value
-            if moved is not None:
-                moved.append(key)
-            continue
-        row[spec[0]] = converted
+        if counted and moved is not None:
+            moved.append(key)
     row["schema_version"] = _int(record.get("schema_version", 0))
     row["run_id"] = _str(record["run_id"])
     row["rank"] = _int(record.get("rank", 0))
@@ -266,6 +286,56 @@ def _row(
     if extra:
         row["extra_json"] = _json(extra)
     return row
+
+
+# The maps held entry by entry (wave AJ, A3), each with its entries' converter. `scalars` keeps
+# lane W3's rule (a bool dropped, any other refusal moving the whole map) and is not among them.
+_SPLIT: dict[str, Callable[[Any], Any]] = {
+    "grad_norms": _float,
+    "weight_norms": _float,
+    "update_rms": _float,
+    "moe_top_k": _int,
+    "moe": _list(_int),
+    "replica_spread": _list(_float),
+}
+# The maps whose refused entry stays in the column as null, not absent (WAVE_AJ_CONTRACT.md, section 1):
+# a gradient that is listed with no value, as Python reads the raw `true` or string. So an update
+# comparison takes the whole-total fallback in both engines (a non-finite norm ends the split), and
+# a stalled weight's streak resets on it in both, where an unlisted gradient would leave both alone.
+_NULL_REFUSED = frozenset({"grad_norms"})
+_UNHELD = object()
+
+
+def _split(
+    value: Mapping[str, Any], item: Callable[[Any], Any], map_type: Any, null_refused: bool = False,
+) -> tuple[list[tuple[str, Any]], dict[str, Any], bool]:
+    """`value`'s entries as the column's pairs, those the column cannot hold, and whether any of
+    those was refused by an overflow or by Arrow (`map_type`, when given: the name is checked with
+    the value, as one entry of the map) and not by its type. With `null_refused`, a refused entry
+    whose name the column can hold is also kept in the pairs, as null."""
+    held: list[tuple[str, Any]] = []
+    refused: dict[str, Any] = {}
+    counted = False
+
+    def fits(pair: tuple[str, Any]) -> bool:
+        return map_type is None or _fits([pair], map_type)
+
+    for name, entry in value.items():
+        try:
+            pair = (_str(name), item(entry))
+        except (TypeError, ValueError):
+            pair = None
+        except Exception:  # noqa: BLE001  OverflowError and the like
+            pair, counted = None, True
+        if pair is not None and not fits(pair):
+            pair, counted = None, True
+        if pair is not None:
+            held.append(pair)
+            continue
+        refused[name] = entry
+        if null_refused and isinstance(name, str) and fits((name, None)):
+            held.append((name, None))
+    return held, refused, counted
 
 
 def _fits(value: Any, arrow_type: Any) -> bool:
@@ -280,9 +350,30 @@ def _fits(value: Any, arrow_type: Any) -> bool:
 
 
 def records_to_batch(records: Iterable[Mapping[str, Any]]) -> Any:
+    records = list(records)
+    return rows_batch(records, [record_to_row(r) for r in records], flight_schema())
+
+
+def rows_batch(records: list[Mapping[str, Any]], rows: list[dict[str, Any]], schema: Any) -> Any:
+    """`rows` (`_row`'s of `records`, made without Arrow's check) as one record batch of `schema`.
+    When Arrow refuses the batch, each row it refuses alone is made again with the check, so a
+    value only Arrow refuses (an integer past its column's type, a name with a lone surrogate)
+    travels in `extra_json` as on the sender's path (wave AJ), and the rest of its row is kept. A
+    key column Arrow refuses still raises, as before."""
     import pyarrow as pa
 
-    return pa.RecordBatch.from_pylist([record_to_row(r) for r in records], schema=flight_schema())
+    try:
+        return pa.RecordBatch.from_pylist(rows, schema=schema)
+    except Exception:  # noqa: BLE001  find the rows Arrow refuses, one at a time
+        pass
+    remade = []
+    for record, row in zip(records, rows):
+        try:
+            pa.RecordBatch.from_pylist([row], schema=schema)
+        except Exception:  # noqa: BLE001
+            row = _row(record, schema)
+        remade.append(row)
+    return pa.RecordBatch.from_pylist(remade, schema=schema)
 
 
 def _plain(value: Any) -> Any:
@@ -319,7 +410,12 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
         else:
             record[key] = _plain(value)
     if row.get("extra_json"):
-        record.update(json.loads(row["extra_json"]))
+        extra = json.loads(row["extra_json"])
+        for key in _SPLIT:
+            # The entries the column could not hold, beside those it did (wave AJ, A3).
+            if key in record and isinstance(extra.get(key), dict):
+                record[key] = {**record[key], **extra.pop(key)}
+        record.update(extra)
     return record
 
 
