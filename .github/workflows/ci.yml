@@ -108,8 +108,9 @@ jobs:
   server:
     name: Ingest server and end-to-end streaming
     runs-on: ubuntu-latest
-    # The whole SDK suite runs here (below): about 15 minutes of server tests and 8 of the rest on the last run, after the cargo steps.
-    timeout-minutes: 50
+    # The whole SDK suite runs here (below), after the cargo steps (about 10 minutes). On 2fba021 the suite, by then
+    # 5,978 tests, was at 87% after 37 minutes when the 50-minute limit ended the job: steady progress, no hang.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

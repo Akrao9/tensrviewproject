@@ -285,7 +285,9 @@ def test_fr_two_imports_at_once_leave_stdout_and_stderr_as_they_were(tmp_path):
         print("stdout kept" if sys.stdout is out else "stdout swapped", file=sys.__stdout__)
         print("stderr kept" if sys.stderr is err else "stderr swapped", file=sys.__stdout__)
     """)
-    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+    # Without NumPy, importing PyTorch prints its own warning on standard error: only that message is filtered.
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120,
+                          env={**__import__("os").environ, "PYTHONWARNINGS": "ignore:Failed to initialize NumPy"})
     assert done.stdout.split("\n")[:2] == ["stdout kept", "stderr kept"], done.stdout + done.stderr
 
 
@@ -347,8 +349,13 @@ print(json.dumps({{"failed": failed, "torn": torn, "read": [r["step"] for r in r
 """
 
 
+# Python's file buffer: 8 KiB up to Python 3.13, larger from 3.14 (where a 20,000-byte line still fitted and was
+# completed, so the "over it" case lost nothing). The long line is sized from the running interpreter's buffer.
+_BUFFER = __import__("io").DEFAULT_BUFFER_SIZE
+
+
 @pytest.mark.skipif(not hasattr(__import__("signal"), "SIGXFSZ"), reason="needs RLIMIT_FSIZE and SIGXFSZ")
-@pytest.mark.parametrize("pad", [150, 20000], ids=["a line under Python's buffer", "a line over it"])
+@pytest.mark.parametrize("pad", [150, 8 * _BUFFER], ids=["a line under Python's buffer", "a line over it"])
 def test_sink_the_next_write_after_one_that_failed_partway_is_read(tmp_path, pad):
     """A real partial write: a file-size limit lets the third step's line in part, then fails it.
     With the limit raised, the same sink's next write returns, and its two steps must be read by the
@@ -360,9 +367,9 @@ def test_sink_the_next_write_after_one_that_failed_partway_is_read(tmp_path, pad
     assert done.returncode == 0, done.stderr
     found = __import__("json").loads(done.stdout)
     assert found["failed"] and found["torn"]  # the write did fail partway, and left part of a line
-    expected = [0, 1, 2, 3, 4] if pad < 8192 else [0, 1, 3, 4]  # only the failed write's step can be lost
+    expected = [0, 1, 2, 3, 4] if pad < _BUFFER else [0, 1, 3, 4]  # only the failed write's step can be lost
     assert found["read"] == expected and found["sent"] == expected
-    assert found["left_out"] == found["skipped"] == (0 if pad < 8192 else 1)
+    assert found["left_out"] == found["skipped"] == (0 if pad < _BUFFER else 1)
 
 
 # --- Items 4 and 5: an in-process stand-in for the server, whose ending a test chooses -------

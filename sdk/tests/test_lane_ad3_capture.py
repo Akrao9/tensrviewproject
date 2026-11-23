@@ -331,7 +331,8 @@ def test_router_counts_under_inductor_match_eager_and_make_no_matrix(tmp_path, m
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
     import torch._inductor.config as inductor_config
 
-    monkeypatch.setattr(inductor_config, "cpp_cache_precompile_headers", False, raising=False)
+    if hasattr(inductor_config, "cpp_cache_precompile_headers"):  # absent before PyTorch 2.14: nothing shared to turn off
+        monkeypatch.setattr(inductor_config, "cpp_cache_precompile_headers", False)
     torch._dynamo.reset()
     eager, _, largest, _ = _count("integer ids", "cpu", None)
     records, _, _, _ = _count("integer ids", "cpu", "inductor")
@@ -521,6 +522,17 @@ def test_a_fullgraph_compiled_clip_no_longer_raises_into_training_at_the_recompi
     # Before, each step recompiled on the call count, and under fullgraph=True the eighth step raised
     # FailOnRecompileLimitHit out of the user's training step. Now it compiles once.
     from torch._dynamo.utils import counters
+
+    # PyTorch's own limit, checked with no TensorQuill session open: on PyTorch 2.6, Dynamo cannot trace
+    # `clip_grad_norm_` under fullgraph=True at all (`_group_tensors_by_device_and_dtype` returns a dict).
+    torch._dynamo.reset()
+    plain = nn.Linear(4, 1)
+    plain(torch.randn(2, 4)).sum().backward()
+    try:
+        torch.compile(lambda: torch.nn.utils.clip_grad_norm_(plain.parameters(), 1.0), backend="eager", fullgraph=True)()
+    except Exception as error:  # noqa: BLE001  whatever Dynamo raises there
+        torch._dynamo.reset()
+        pytest.skip(f"this PyTorch cannot compile clip_grad_norm_ under fullgraph=True without TensorQuill either: {type(error).__name__}")
 
     torch._dynamo.reset()
     torch.manual_seed(0)

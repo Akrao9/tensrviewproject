@@ -488,7 +488,9 @@ def test_a_watch_with_a_binary_of_protocol_3_is_refused_before_any_look(tmp_path
     done = _command(tmp_path, _speaks_3(tmp_path), *args)
     assert done.returncode == 2 and "Traceback" not in done.stderr
     last = done.stderr.strip().splitlines()[-1]
-    assert last.startswith("__main__.py: error: --watch needs the Rust detectors: ") and MISMATCH in last, last
+    # argparse names the program "__main__.py" up to Python 3.13 and "python -m tensorquill" from 3.14.
+    assert last.startswith(("__main__.py: error: --watch needs the Rust detectors: ",
+                            "python -m tensorquill: error: --watch needs the Rust detectors: ")) and MISMATCH in last, last
     assert last.endswith("To watch with the Python detectors, add --detectors python")
     assert "ran " not in done.stderr and not (tmp_path / "out.json").exists()
 

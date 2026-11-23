@@ -61,13 +61,19 @@ def test_the_hang_is_real_bounded_and_every_process_is_gone(tmp_path):
     assert result["hang_established"] is True, done.stdout
     assert result["left_running"] == [] and len(result["worker_pids"]) == 3
     assert not any(_alive(pid) for pid in result["worker_pids"])
-    assert result["dump_files"] == [f"fr_trace_rank_{r}" for r in range(3)]  # written by PyTorch's own writer
     assert result["plan"] == {"skip_rank": 1, "skip_step": 5, "collective": "all_reduce", "collective_seq_id": 6,
                               "waiting_ranks": [0, 2], "last_recorded_step": 3, "nproc": 3}
     # The capture of a waiting rank has steps 0..3 on disk: step 4 ran, and is held back until a next step ends.
     capture = next((out / result["run_id"] / "captures").glob("*.rank0.jsonl"))
     steps = [json.loads(line)["step"] for line in capture.read_text().splitlines() if line.strip()]
     assert steps == [0, 1, 2, 3]
+    if result["dump_files"] == []:
+        # A PyTorch that writes no Gloo dump on request (2.6 to 2.14 on Linux CI, Nov 23, 2026): the hang, the
+        # bound and the cleanup above still hold, and with no dump the harness says not proven, never passed.
+        assert done.returncode == frc.NOT_PROVEN, done.stdout
+        assert result["not_proven"] and result["failures"] == [] and "NOT PROVEN" in done.stdout
+        return
+    assert result["dump_files"] == [f"fr_trace_rank_{r}" for r in range(3)]  # written by PyTorch's own writer
     if done.returncode == frc.NOT_PROVEN:
         # torch 2.15: PyTorch's own analyzer cannot read Gloo's dumps (pg_config under an empty name).
         assert result["pytorch_analyzer"]["returncode"] != 0

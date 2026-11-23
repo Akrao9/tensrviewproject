@@ -52,7 +52,9 @@ def one_case(tmp_path: Path, body: dict) -> Path:
 
 
 def cli(*args: str, cwd: Path) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": str(SRC)}
+    # Without NumPy, importing PyTorch prints its own "Failed to initialize NumPy" warning on standard error.
+    # Only that message is filtered, so a stray line of TensorQuill's own still fails the one-line checks.
+    env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONWARNINGS": "ignore:Failed to initialize NumPy"}
     return subprocess.run([sys.executable, "-m", "tensorquill", *args], cwd=cwd, env=env, capture_output=True,
                           text=True, timeout=120)
 

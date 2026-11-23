@@ -93,7 +93,7 @@ def test_the_row_is_refused_before_moved_is_touched(name, body):
                          ids=[n for n, b in ONE if "detect" in b["expected"]])
 @pytest.mark.parametrize("run", [False, True])
 def test_the_offline_detect_refuses_the_row_by_name(name, body, run):
-    import pyarrow as pa
+    pa = pytest.importorskip("pyarrow")  # the plain CPU jobs have none: the raw `detect` stream needs it
 
     expected, field = body["expected"]["detect"], body["field"]
     schema = flight.flight_schema()

@@ -594,7 +594,10 @@ def test_the_ends_step_warning_under_python_w_error():
 
     src = os.path.join(os.path.dirname(tensorquill.__file__), os.pardir)
     env = {**os.environ, "PYTHONPATH": os.path.abspath(src)}
-    done = subprocess.run([sys.executable, "-W", "error", "-c", _W_ERROR_SCRIPT], capture_output=True, text=True,
+    # Without NumPy, importing PyTorch itself warns ("Failed to initialize NumPy"), which `-W error` would turn
+    # into a failed import before TensorQuill runs. Only that message is let through; every other warning is an error.
+    done = subprocess.run([sys.executable, "-W", "error", "-W", "ignore:Failed to initialize NumPy", "-c", _W_ERROR_SCRIPT],
+                          capture_output=True, text=True,
                           env=env, timeout=300)
     assert done.returncode == 0, done.stderr[-2000:]
     assert "trained 0" in done.stdout
