@@ -233,8 +233,10 @@ def _row(
 
     A map of `_SPLIT` is held entry by entry when it is not held whole (wave AJ, A3,
     `WAVE_AJ_CONTRACT.md` section 1): the entries its column can hold stay in the column, and only
-    the others travel in `extra_json`, under the map's own key. With no entry held the whole value
-    travels there, as before. A map held whole is converted as before, so its row is unchanged."""
+    the others travel in `extra_json`, under the map's own key. Under `grad_norms` (`_NULL_REFUSED`)
+    a refused entry also stays in the column, as null. With no entry held the whole value travels
+    there and the column is null, as before. A map held whole is converted as before, so its row is
+    unchanged."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
     extra: dict[str, Any] = {}
     for key, value in record.items():

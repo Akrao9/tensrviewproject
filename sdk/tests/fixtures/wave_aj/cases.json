@@ -3,7 +3,7 @@
  "how_to_read": [
   "Base trial/ai-wave 212205d. The rule is WAVE_AJ_CONTRACT.md.",
   "paths: row = record_to_row and row_to_record; row_sender = rows_to_send with flight_schema() (Arrow's check); python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_sdk = build_evidence(detectors='rust'); live_server = a release server fed by flight.send_file, the rank's incidents.json once its last_step is the last step sent.",
-  "Every engine path: for records it must give what it gives for clean_records (the same records with every refused entry removed, and a map left with none removed as a key), and nothing may raise.",
+  "Every engine path: for records it must give what it gives for clean_records, and nothing may raise. clean_records are the same records with every refused entry removed (a map left with none removed as a key), except under grad_norms, where a refused entry is replaced by null, as the column holds it. For grad_norms cases the Rust paths read the same typed row for both, so expect carries the check there.",
   "row: at row.step, the typed column holds exactly row.typed[key] (null: the column is null; non-finite numbers written as the sink's strings) and extra_json holds exactly row.extra (null: extra_json is null); row_to_record(record_to_row(r)) == r for every record; row.moved, when given, is what rows_to_send adds to moved.",
   "expect.incidents: the incidents in order, each matched on the fields given (parameters: the names of the incident's parameters). expect.run_state applies to python and rust_sdk only (rust_raw and incidents.json have none). expect.moe_routing_not_checked: the routers of not_checked's moe_routing entry, null for no entry. expect.weight_jumps and expect.update_trends: matched on the fields given (largest and lowest on their first entries' given fields).",
   "thresholds, when given, are passed to every engine path (build_evidence's keyword arguments, server_report's thresholds). clean_records null: no clean control; the case's expect is explicit (expect.update_spike: [step, grad_norm, grad_norm_before] of each update_spike incident, to 9 places).",
@@ -172,7 +172,10 @@
     "incidents": [
      {
       "kind": "non_finite",
-      "step": 4
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
      }
     ],
     "run_state": "unhealthy",
@@ -342,7 +345,10 @@
     "incidents": [
      {
       "kind": "non_finite",
-      "step": 4
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
      }
     ],
     "run_state": "unhealthy",
@@ -512,7 +518,10 @@
     "incidents": [
      {
       "kind": "non_finite",
-      "step": 4
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
      }
     ],
     "run_state": "unhealthy",
@@ -678,7 +687,10 @@
     "incidents": [
      {
       "kind": "non_finite",
-      "step": 4
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
      }
     ],
     "run_state": "unhealthy",
@@ -833,7 +845,10 @@
     "incidents": [
      {
       "kind": "non_finite",
-      "step": 4
+      "step": 4,
+      "gradients": [
+       "good"
+      ]
      }
     ],
     "run_state": "unhealthy",
@@ -6154,6 +6169,241 @@
       5.0
      ]
     ],
+    "raises": false
+   }
+  },
+  {
+   "name": "stalled_weight_streak_resets_on_a_refused_gradient",
+   "about": "A refused gradient resets a stalled weight's streak, as null does (step 4); an unlisted one would hold it (step 3)",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": true,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": null,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    },
+    {
+     "schema_version": 1,
+     "run_id": "stalled_weight_streak_resets_on_a_refused_gradient",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "grad_norm": 1.0,
+     "grad_norms": {
+      "w": 1.0,
+      "v": 1.0
+     },
+     "weights_unchanged": [
+      "w"
+     ]
+    }
+   ],
+   "row": {
+    "step": 1,
+    "typed": {
+     "grad_norms": {
+      "w": null,
+      "v": 1.0
+     }
+    },
+    "extra": {
+     "grad_norms": {
+      "w": true
+     }
+    }
+   },
+   "expect": {
+    "incidents": [
+     {
+      "kind": "stalled_weights",
+      "step": 4,
+      "parameters": [
+       "w"
+      ]
+     }
+    ],
+    "run_state": "unhealthy",
+    "moe_routing_not_checked": null,
     "raises": false
    }
   },

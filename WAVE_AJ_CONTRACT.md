@@ -112,4 +112,4 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 
 - **A held `replica_spread` entry `[]`.** Rust's replica reader counts it as covered, with no drift. AJ-2 proposes that it not count as gathered coverage. One side changes, and the shared case `replica_spread_empty_and_string_beside_drift` asks only for the drifting parameter.
 - **AJ-3's `update_spike` cases** are in `cases.json`, with explicit results and no clean control (deleting the refused entry also deletes the evidence that the map was incomplete).
-- **The stalled-weight streak** resets on a refused gradient in both engines: Rust reads the null, Python the raw value, whose `_finite` is None. AJ-3's test 68aeb7b says it holds, and is to be checked against this branch.
+- **The stalled-weight streak** resets on a refused gradient on every path. This was run, not only read: shared case `stalled_weight_streak_resets_on_a_refused_gradient` puts `stalled_weights` at step 4, as with a null, where an unlisted gradient puts it at step 3. Python, raw Rust, the SDK in Rust mode and the live server all agree. AJ-3's test 68aeb7b ("holds") was written for the earlier representation.
