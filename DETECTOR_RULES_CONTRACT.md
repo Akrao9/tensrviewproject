@@ -136,8 +136,8 @@ The first two are the robust local trend of the sibling repository LLM-Training-
 |---|---|---|---|
 | `gradient_trend` | B4 | The total gradient norm (the pre-clipping norm when the run clips), skipped steps left out | `series`, `points`, `first_step`, `last_step`, `first`, `last`, `growth` (last over first), `per_100_steps` (the slope as a share of `first`) |
 | `attention_trends` | Q1 | Each attention module's largest logit, probe by probe | `statistic`, `modules`, and `listed`: the ten with the largest `growth`, each with the fields above |
-| `update_trends` | Q2 | Each parameter's `update_rms` against the median of its own 50 records before, from 10 earlier values on | `parameters`, `judged`, and `lowest`: the ten parameters whose update fell furthest, each with `ratio`, `step`, `baseline`, `update_rms` |
-| `weight_jumps` | Q3 | Each tensor's norm at two consecutive weight checks | `checks`, `parameters`, and `largest`: the ten largest changes, each with `ratio`, `step`, `previous_step`, `before`, `after` |
+| `update_trends` | Q2 | Each parameter's `update_rms` against the median of its own 50 records before, from 10 earlier values on. A record whose `step_skipped` is true is left out (wave AJ, `WAVE_AJ_CONTRACT.md` section 6) | `parameters`, `judged`, and `lowest`: the ten parameters whose update fell furthest, each with `ratio`, `step`, `baseline`, `update_rms` |
+| `weight_jumps` | Q3 | Each tensor's norm at two consecutive weight checks of one attempt; the first check after a resume starts again (wave AJ, `WAVE_AJ_CONTRACT.md` section 7) | `checks`, `parameters`, and `largest`: the ten largest changes, each with `ratio`, `step`, `previous_step`, `before`, `after` |
 
 **What these measurements do not do, in the author's words of Nov 21, 2026:** B4's re-created fault is still missed, and Q1 has only synthetic coverage. Neither gap is closed by this wave.
 

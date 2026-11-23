@@ -291,10 +291,13 @@ def attention_trends(records):
 
 def update_trends(records):
     """Each parameter's lowest update against its own earlier ones: `update_rms` over the median of
-    the 50 records before, from 10 earlier finite values on."""
+    the 50 records before, from 10 earlier finite values on. A record whose `step_skipped` is true is
+    left out: it enters no baseline and gives no ratio (wave AJ, the author's decision of Nov 22, 2026)."""
     past: dict[str, list[float]] = {}
     lowest: dict[str, dict] = {}
     for r in sorted(records, key=lambda r: r["step"]):
+        if r.get("step_skipped"):
+            continue
         for name, value in (r.get("update_rms") or {}).items():
             now = finite(value)
             if now is None:
@@ -312,12 +315,16 @@ def update_trends(records):
 
 
 def weight_jumps(records):
-    """The largest change of one tensor's norm between two consecutive weight checks."""
+    """The largest change of one tensor's norm between two consecutive weight checks of one attempt:
+    the first check after a resume starts the comparison again, and `checks` still counts every check
+    (wave AJ, the author's decision of Nov 22, 2026)."""
     checks = [r for r in sorted(records, key=lambda r: r["step"]) if r.get("weight_norms")]
     if len(checks) < 2:
         return None
     best: dict[str, dict] = {}
     for before, after in zip(checks, checks[1:]):
+        if before.get("attempt", 0) != after.get("attempt", 0):
+            continue
         for name, value in after["weight_norms"].items():
             a, b = finite(before["weight_norms"].get(name)), finite(value)
             if a is None or b is None or a <= 0 or b <= 0:
