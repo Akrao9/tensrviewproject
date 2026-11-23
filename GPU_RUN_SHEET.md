@@ -1,6 +1,6 @@
 # GPU run sheet for step 5 of the v1 plan
 
-Written Nov 22, 2026 against the harness wave's code commit `195ed27` (wave AI; the bug list's section 14), with the author's terms of that day for the run: smoke the first-use branches first; measure the loader delay with capture off and on before any fix; the fault-injection pass rule; the DDP wrapper's graph breaks shown in a control run and an instrumented one; the Granite gate scored by its original criteria. **Nothing here has run on a GPU.** Every command was read from the scripts on that commit, and the three lanes that wrote the new harnesses gave their own lines (`lane-ai1.md`, `lane-ai2.md`, `lane-ai3.md` in the side-session notes).
+Written Nov 22, 2026 against the harness wave's code commit `5f6c11b` (wave AI; the bug list's section 14), with the author's terms of that day for the run: smoke the first-use branches first; measure the loader delay with capture off and on before any fix; the fault-injection pass rule; the DDP wrapper's graph breaks shown in a control run and an instrumented one; the Granite gate scored by its original criteria. **Nothing here has run on a GPU.** Every command was read from the scripts on that commit, and the three lanes that wrote the new harnesses gave their own lines (`lane-ai1.md`, `lane-ai2.md`, `lane-ai3.md` in the side-session notes).
 
 The "CPU" column says what was done on this Mac (macOS, CPU, PyTorch 2.15, offline): *dry-run* means the same script ran to its stated exit status with `--toy`, `--cpu` or a stand-in in place of the real model, router or NCCL; *refused* means the script stopped as it should without a GPU; *never run* means that branch of the script has executed nowhere. A CPU dry run shows that a harness starts, makes its checks and writes its files. Only the GPU run establishes the claim.
 
@@ -28,7 +28,111 @@ The GPU proofs run on the revision that passes Linux CI, not on this one if a fi
 
 Neither model is in this Mac's cache, so no real-model line was dry-run. Installing and downloading on the GPU machine is the author's step. A missing package, model or dataset makes each new script print one line saying what to install and exit 2.
 
-## Before anything
+## Where each part runs
+
+The author, Nov 22: "Run the single-GPU checks in Colab. Reserve the two- and eight-GPU NCCL proofs for a runtime with that many GPUs on one node."
+
+| Set | Lines | Runtime |
+|---|---|---|
+| **Single GPU** | Section 0: `smoke-wandb-toy`, `smoke-gate-granite`, `smoke-load-granite`, `smoke-load-smollm2`, the `nvidia-smi` and NVML lines, `smoke-megatron`, `smoke-loader-delay`. Section 1, all of it, with `loader-delay`. Section 2. Section 4: the two `megatron-*` lines only | Colab, one GPU |
+| **Two GPUs, one node** | Section 0: `smoke-nccl-2`, `smoke-fr-nccl`, `smoke-lightning-fsdp`, `smoke-trainer-ddp`, `smoke-trainer-ddp-control`. Section 3's `replica-2-files`. Section 4: Lightning and the `Trainer` under DDP, with the control lines. Section 5 | reserved: not Colab |
+| **Eight GPUs, one node** | Section 3's eight-rank lines, through files and a live server. Section 6, with its second environment and its smoke lines | reserved: not Colab |
+
+Nothing in the single-GPU set starts a process group or needs the server binary (only `replica_check.py` and the Flight Recorder check do), so the Colab run needs no Rust toolchain.
+
+## Colab, one GPU: the cells
+
+Nothing can run in Colab until the candidate is on the private remote, and that push is the author's. The order is: the author approves the exact SHA; it is pushed; Linux CI runs on it; **the smoke cells may run while CI runs, the scored cells only once CI is green on that SHA.** Cloning a private repository, installing packages and downloading the two models and WikiText-2 are the author's steps in the notebook.
+
+**The runtime is the author's choice of Nov 22: an RTX PRO 6000**, the GPU of the earlier Granite and SmolLM2 runs, which has the BF16 autocast the Granite lines need. On that GPU with PyTorch 2.14.1, Granite under `reduce-overhead` failed during CUDA-graph recording, so expect the four-arm gate to show CUDA-graph skips in every arm, capture off too; the commented `granite-gate-4arm-nocg` line is then the one that gives the other criteria. A shell function does not last from one cell to the next, so the `run` wrapper is a file, and each cell calls it.
+
+```python
+# cell 1: the revision. Clone with your own credentials, then:
+%cd /content/tensrviewproject
+!git checkout <the CI-green SHA> && git rev-parse HEAD
+```
+
+```python
+# cell 2: packages. --no-deps because the SDK names tensorquill-server, which is not on PyPI yet and is not needed here
+!pip install --no-deps -e sdk
+!pip install pyarrow transformers accelerate huggingface_hub nvidia-ml-py wandb neuraldbg megatron-core
+```
+
+```python
+# cell 3: where results go, the environment record, and the run wrapper as a file
+import os, subprocess
+sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+os.environ["OUT"] = f"/content/tensrviewproject/tensorquill-out/v1-gpu-{sha}"
+os.makedirs(os.environ["OUT"] + "/smoke", exist_ok=True)
+open("/content/run.sh", "w").write('''#!/bin/bash
+name=$1; shift
+echo "$ $*" > $OUT/$name.log
+"$@" >> $OUT/$name.log 2>&1
+code=$?
+echo "$name: exit $code" | tee -a $OUT/RESULTS.txt
+tail -n 15 $OUT/$name.log
+''')
+!(git rev-parse HEAD; python -c "import torch, sys; print(sys.version); print(torch.__version__, torch.version.cuda, torch.cuda.device_count(), torch.cuda.get_device_name(0))"; nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv; pip freeze | grep -i -E "^(torch|transformers|accelerate|wandb|neuraldbg|megatron|nvidia-ml-py|pyarrow)") | tee $OUT/ENVIRONMENT.txt
+%cd /content/tensrviewproject/sdk
+```
+
+```python
+# cell 4: smoke, never scored (may run while CI runs). Cheapest first.
+!nvidia-smi --query-gpu=temperature.gpu,clocks.sm,power.draw,enforced.power.limit,memory.total,memory.used,ecc.errors.uncorrected.volatile.total,ecc.errors.corrected.volatile.total --format=csv,noheader,nounits | tee $OUT/smoke/nvidia-smi-fields.txt
+!python -c "import pynvml; pynvml.nvmlInit(); print(pynvml.nvmlSystemGetDriverVersion())" | tee $OUT/smoke/nvml.txt
+!bash /content/run.sh smoke-loader-delay python examples/loader_delay_check.py --out $OUT/smoke/loader-delay --rounds 1
+!bash /content/run.sh smoke-megatron python examples/megatron_routing_check.py --out $OUT/smoke/megatron
+!bash /content/run.sh smoke-wandb-toy python examples/granite_compiler_gate.py --out $OUT/smoke/wandb-toy --toy --arms off,tensorquill,wandb --rounds 1 --warmup 50 --steps 50
+!bash /content/run.sh smoke-load-smollm2 python examples/gpu_probe_coverage.py --out $OUT/smoke/load-smollm2 --steps 50 --probe-every 50
+!bash /content/run.sh smoke-load-granite python examples/gpu_probe_coverage.py --out $OUT/smoke/load-granite --model ibm-granite/granite-3.0-1b-a400m-base --steps 50 --probe-every 50
+!bash /content/run.sh smoke-gate-granite python examples/granite_compiler_gate.py --out $OUT/smoke/gate-granite --arms off,tensorquill,wandb,neuraldbg --rounds 1 --warmup 50 --steps 50
+```
+
+```python
+# cell 5: scored, only on the CI-green SHA. The loader measurement first: it is short and it is the open question.
+!bash /content/run.sh loader-delay python examples/loader_delay_check.py --out $OUT/loader-delay
+!bash /content/run.sh system-check python examples/gpu_system_check.py --out $OUT/system-check
+!bash /content/run.sh seeded-both python examples/seeded_failures.py --case both --out $OUT/seeded
+!bash /content/run.sh seeded-fp32 python examples/seeded_failures.py --case stalled_weights --dtype float32 --out $OUT/seeded-fp32
+!bash /content/run.sh seeded-spike python examples/seeded_failures.py --case grad_spike --factor 100 --out $OUT/seeded-spike
+!bash /content/run.sh seeded-healthy python examples/seeded_failures.py --case healthy --out $OUT/seeded-healthy
+!bash /content/run.sh update-spike python examples/seeded_failures.py --case update_spike --out $OUT/update-spike
+!bash /content/run.sh paired-dtype python examples/seeded_failures.py --case paired_dtype --out $OUT/paired-dtype
+!TORCH_LOGS="graph_breaks,recompiles,cudagraphs" bash /content/run.sh compile-gate-toy python examples/gpu_check.py
+!bash /content/run.sh data-checkpoint python examples/data_checkpoint_check.py --out $OUT/data-check
+!bash /content/run.sh probe-coverage python examples/gpu_probe_coverage.py --out $OUT/probe-coverage
+!bash /content/run.sh probe-coverage-granite python examples/gpu_probe_coverage.py --out $OUT/probe-coverage-granite --model ibm-granite/granite-3.0-1b-a400m-base
+!bash /content/run.sh megatron-routing python examples/megatron_routing_check.py --out $OUT/megatron-routing
+!bash /content/run.sh megatron-position python examples/megatron_routing_check.py --out $OUT/megatron-routing-position --drop-policy position
+```
+
+```python
+# cell 6: scored, the longer ones
+!bash /content/run.sh dense-outlier python examples/dense_outlier_check.py --out $OUT/dense-outlier
+!bash /content/run.sh trainer-fp16 python examples/trainer_check.py --out $OUT/trainer-fp16 --precision fp16
+!bash /content/run.sh trainer-bf16 python examples/trainer_check.py --out $OUT/trainer-bf16 --precision bf16
+!bash /content/run.sh trainer-fp32 python examples/trainer_check.py --out $OUT/trainer-fp32 --precision fp32
+!bash /content/run.sh granite-collapse python examples/moe_dogfood.py --out $OUT/granite-collapse --collapse-layer 12
+!TORCH_LOGS="graph_breaks,recompiles,cudagraphs" bash /content/run.sh granite-gate-4arm python examples/granite_compiler_gate.py --out $OUT/granite-gate-4arm
+# every compile mode the harness handles (the author, Nov 22: "how about running in every mode of graph"); see the note below
+!TORCH_LOGS="graph_breaks,recompiles" bash /content/run.sh granite-gate-default python examples/granite_compiler_gate.py --out $OUT/granite-gate-default --mode default
+!TORCH_LOGS="graph_breaks,recompiles" bash /content/run.sh granite-gate-autotune-nocg python examples/granite_compiler_gate.py --out $OUT/granite-gate-autotune-nocg --mode max-autotune-no-cudagraphs
+!bash /content/run.sh granite-gate-eager python examples/granite_compiler_gate.py --out $OUT/granite-gate-eager --eager
+!bash /content/run.sh profile-routers python examples/profile_overhead.py --out $OUT/profile --capture routers --steps 200 --warmup 50 --rounds 3
+```
+
+```python
+# cell 7: after every cell that matters, pack the results; the session's disk goes with the session
+!cd /content/tensrviewproject && tar czf /content/v1-gpu-results.tgz tensorquill-out && ls -la /content/v1-gpu-results.tgz
+```
+
+- **Never run:** these cells themselves. They are the section 0 to 2 lines with the wrapper as a file; the option names are the scripts'. `--collapse-layer 12` is the layer of the earlier Colab runs.
+- **The compile modes.** `granite-gate-4arm` (`reduce-overhead`, CUDA graphs) is the preregistered gate: all four criteria. `granite-gate-default` and `granite-gate-autotune-nocg` (Inductor without CUDA graphs) are judged on overhead, graph breaks and recompiles, with the CUDA-graph line "not checked", so their status is `not_proven` at best, never `pass`. `granite-gate-eager` has no compiler: its overhead is measured and written, and its status is `dry_run`. Each mode's result names its mode; a figure from one mode is never quoted as another's. **Not run: `max-autotune` with CUDA graphs.** The harness counts CUDA-graph skips for `reduce-overhead` only, so that mode would need a change to the script and another gate. `max-autotune-no-cudagraphs` can take long to compile: raise `--arm-timeout` if an arm passes an hour.
+- **NeuralDBG:** the cells take it from pip; with a clone instead, add `--neuraldbg-path <clone>` to the two gate lines. If neither is there the arm reads `not_run`, which is recorded and never passed.
+- **`pip install` and the downloads are the author's steps.** A missing package makes each new script print one line and exit 2.
+- Download `/content/v1-gpu-results.tgz` (or copy it where the author keeps results) before the session ends.
+
+## Before anything (a machine with the server built: the two- and eight-GPU sets)
 
 ```bash
 git rev-parse HEAD                      # must be the CI-green revision
@@ -111,7 +215,8 @@ run loader-delay python examples/loader_delay_check.py --out $OUT/loader-delay
 - **What the line keeps:** three rounds, capture off and capture on in fresh processes, the same loop as `system-check`. For every step of every arm and round: the injected sleep, the time in `next()`, the step's whole time, and for the `on` arm TensorQuill's own `data_wait` and `step_time` (`loader_delay.json`, `arm-<arm>-r<round>.json`). The flush-boundary steps are reported by name, **step 100 among them**, for both arms; so are the worst delay per arm with its step and round, every step over 15 ms, the slowest rest of a step, and each garbage collection of 1 ms or more with the thread it ran on.
 - **Nothing is judged:** exit 0 means both arms were measured.
 - **What CPU showed (PyTorch 2.15, macOS; not a GPU result):** in 5 of 5 `on` rounds one generation-2 garbage collection of 78 to 92 ms ran on TensorQuill's writer thread at a flush boundary (step 150 in this loop), while the training thread was in `next()`, which was 60 to 74 ms over its sleep. The `off` arm had no collection at all. `system-check`'s own loop shows its delay at step 100 (36 and 62 ms in two runs); with a collection callback around it the delay moved to step 150, beside a 92.5 ms collection. Where the pause lands moves with what is watching, so read every step, not step 100 alone. That is evidence of a cause, on one machine. It is not a fix and not a GPU measurement.
-- **How it is reported:** the worst delay (this line, both arms) **beside** the preregistered median overhead (section 2). A passing median does not explain the spike, and the spike is reported whatever the median says. The toy loop's own step-time overhead in `loader_delay.json` is labelled as such and is not the preregistered figure.
+- **How it is reported (the author, Nov 22): the worst whole-step delay and the median overhead, separately.** The worst whole-step delay is a step's time less its injected sleep, against that round's median of the same (`worst_whole_step`, with its step and round, for each arm; `worst_whole_step_after_first` leaves out the first step, which is slow in both arms). The median overhead is section 2's primary criterion. A passing median does not explain the spike, and the spike is reported whatever the median says. The toy loop's own step-time overhead in `loader_delay.json` is labelled as such and is not the preregistered figure.
+- **The link between the original step-100 delay and garbage collection is an inference**, and stays labelled so: the collection was seen beside a delay at step 150, never beside the delay at step 100. The run records the interpreter's version, CPU count and collection thresholds, since Colab's interpreter is not this Mac's.
 - `system-check` still lists every step over its slack with both timers in `system.json`.
 
 ## 2. The Granite compiler gate, four arms
@@ -126,7 +231,8 @@ run profile-full python examples/profile_overhead.py --out $OUT/profile-full --c
 
 - **The arms:** capture off, TensorQuill router-only, NeuralDBG, `wandb.watch`. Each runs in a fresh process with the same model, the same batches, 50 warm-up and 200 timed steps, three paired rounds, the order rotating by round. `gate.json` holds every arm and round, the failing and absent ones too, with what each tool observes and how often it samples.
 - **Pass line, for the TensorQuill arm, the original criteria unchanged:** median overhead 1% or less against capture off (per round, on mean step time, so the flush steps count); **zero graph breaks**; zero recompiles after warm-up; zero CUDA-graph skips under `reduce-overhead`; every step recorded and every router's assignments summing to tokens × top-k. The three breaks of DDP's wrapper (section 4) are another run's observation and allow nothing here.
-- **Reported beside the pass line, never scored:** the slowest timed step of every arm and round with how far it is over that round's median step (`worst_step_by_round`; every step's time is `step_ms` in `arm-<arm>-r<round>.json`), for capture off and on alike; and the overhead as `moe_dogfood.py` printed it on earlier GPU runs (each arm's median round, then the ratio), said aloud if it falls on the other side of 1% from the scored figure. **Which of the two figures is "the preregistered median" is one line for the author to confirm:** the harness scores the paired-round one, as the plan's "three paired rounds" reads.
+- **The primary 1% criterion, recorded before any scored run (the author, Nov 22): the median of the three paired overheads** (`overhead_median`: each round's mean step time over capture off's in the same round, minus one; then the median of the three). **Reported alongside, never scored: the ratio of the arms' median rounds** (`overhead_of_median_rounds`), for comparison with earlier results. `gate.json` names which is which (`overhead_criterion`). The first Granite benchmark in `sdk/README.md` shows both forms for one run: +0.66%, +0.79% and +0.72% by paired round, so +0.72% by the primary criterion, and +0.78% by the ratio of medians.
+- **Also reported, never scored:** the slowest timed step of every arm and round with how far it is over that round's median step (`worst_step_by_round`; every step's time is `step_ms` in `arm-<arm>-r<round>.json`), for capture off and on alike.
 - **This loop has no data loader** (the batches are made before timing), so it cannot show a delay in `next()`. A pause of the training thread would show here as a slow step. The loader delay is section 1's `loader-delay`.
 - **Statuses to expect:** an arm whose package is absent is `not_run`, never passed. A run without CUDA graphs is `not_proven` (exit 3). Granite under `reduce-overhead` may skip CUDA graphs in every arm, capture off included (`moe_dogfood.py` notes it on an RTX PRO 6000 with PyTorch 2.14.1): then the cause is the model, and the second line gives the other criteria with skips "not checked".
 - **CPU:** dry-run with `--toy` (12 arm processes; off, TensorQuill and NeuralDBG measured; `wandb` `not_run`). **The `wandb` arm has never run:** it is written from wandb's documented calls. NeuralDBG has never run on Granite and will be slow (hooks with several host reads on every leaf module); raise `--arm-timeout` if an arm passes an hour.
@@ -224,14 +330,15 @@ After the runs, on the same revision: the audit's fifth pass over the captures i
 
 ## What the report of the run carries
 
-- For the overhead claim: the preregistered median overhead (section 2's scored figure, with each round) **and** the worst delay, for capture off and on: `loader-delay`'s worst step and its step-100 rows, and the gate's slowest step per arm and round. Neither replaces the other.
+- For the overhead claim, two things reported separately: the median overhead (section 2's primary criterion, the median of the three paired overheads, with each round, and the ratio of arm medians alongside), and the worst whole-step delay for capture off and on (`loader-delay`'s `worst_whole_step` and its step-100 rows; the gate's slowest step per arm and round). Neither replaces the other.
+- Which set each result came from: Colab on one GPU, or the reserved two- and eight-GPU runtime. A claim about NCCL or several ranks is not made from the Colab run.
 - For fault injection: found, partial, missed and false reports with their counts, the verdict, and the campaign environment's exact PyTorch version.
 - For the DDP `Trainer`: the wrapper's graph-break count in the control run and in the instrumented run, per rank.
 - Every smoke line's exit status, apart from the scored results.
 
 ## What is ready, and what is not
 
-- **Order:** section 0 (smoke, never scored), then sections 1 to 6.
+- **Order:** the single-GPU set in Colab first (its smoke cells, then its scored cells on the CI-green SHA); the two- and eight-GPU sets when that runtime exists.
 - **Ready to execute as written:** sections 0 to 6.
 - **Written and never executed anywhere, so the first GPU run is also the harness's first run (section 0 smokes each):** the `wandb` arm; NeuralDBG on Granite; Lightning FSDP; fp16 and Inductor under DDP, with and without TensorQuill (`--control`); Megatron's own router; NCCL's dump on timeout; the real fault-injection campaign and the entry script's `environment()` on CUDA; `loader_delay_check.py` on CUDA; every real-model load.
 - **Needs the author first:** the job of section 8; which of section 7's cases need a GPU.
