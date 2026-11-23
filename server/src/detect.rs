@@ -76,6 +76,7 @@ use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
 use measure::Measurements;
 mod system;
 use system::{System, SystemColumns};
+pub(crate) mod extra_json;
 #[cfg(test)]
 mod lane_ab2_tests;
 #[cfg(test)]

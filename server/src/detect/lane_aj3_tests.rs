@@ -528,3 +528,121 @@ fn a10_a_difference_across_a_reload_alone_is_not_a_jump() {
         {"name": "w", "ratio": 1.0, "step": 10, "previous_step": 0, "before": 1.0, "after": 1.0}]});
     assert_eq!(block(&reload([50.0, 50.0, 50.0]), "weight_jumps"), expected);
 }
+
+// --- a number too large for a float in `extra_json` (the author, Nov 22, 2026) ----------------
+//
+// "One `10**400` value can make Rust discard every `extra_json` field on that row. Preserve the
+// original integer for Python round-trip reading, treat it as unreadable where a float
+// measurement is required, and keep valid sibling fields available to Rust." The sender keeps
+// writing the integer in full; serde_json cannot hold it, and refused the whole text. Each note
+// below sits beside such numbers, and the report must be the one the same row gives with those
+// numbers replaced by text, which is just as unreadable as a float.
+
+/// Every `extra_json` key a detector reads, on one row of three, beside the placeholders `@BIG@`.
+fn noted() -> Vec<Value> {
+    vec![
+        json!({"run_id": "r", "rank": 0, "attempt": 1, "step": 0, "grad_norm": 1.0}),
+        json!({"run_id": "r", "rank": 0, "attempt": 1, "step": 1, "grad_norm": 1.0,
+               "step_skipped": true, "step_skipped_by": "scaler", "step_skipped_part": {"skipped": 1, "of": 2},
+               "clip_calls": 2,
+               "moe_source": {"router.0": {"form": "scores", "point": "dispatched"}},
+               "moe_refused": {"router.9": "not a router this capture reads"},
+               "grads_not_read": {"emb.weight": "a sparse gradient"},
+               "update_not_read": {"Adafactor": "factored second moments"},
+               "layers_not_read": {"lstm": "a tuple output"},
+               "update_rms": {"big": "@BIG@"},
+               "oversized": ["@BIG@", {"deep": "@NEG@"}, "@EXP@"]}),
+        json!({"run_id": "r", "rank": 0, "attempt": 1, "step": 2, "grad_norm": 1.0}),
+    ]
+}
+
+/// The batch of `records`, its `extra_json` text with each placeholder replaced by `with`.
+fn replaced(records: &[Value], with: [&str; 3]) -> RecordBatch {
+    let batch = super::lane_ad8_tests::stored(records);
+    let at = batch.schema().index_of("extra_json").unwrap();
+    let old = batch.column(at).as_any().downcast_ref::<StringArray>().unwrap();
+    let new: StringArray = old
+        .iter()
+        .map(|text| {
+            text.map(|text| {
+                text.replace("\"@BIG@\"", with[0])
+                    .replace("\"@NEG@\"", with[1])
+                    .replace("\"@EXP@\"", with[2])
+            })
+        })
+        .collect();
+    let mut columns = batch.columns().to_vec();
+    columns[at] = Arc::new(new);
+    RecordBatch::try_new(batch.schema(), columns).unwrap()
+}
+
+fn report_on(batch: RecordBatch) -> Value {
+    let detectors = judge(0, &[batch], &Arc::<Thresholds>::default()).unwrap();
+    report("r", 0, &detectors, 0)
+}
+
+#[test]
+fn every_extra_json_note_is_read_beside_a_number_too_large_for_a_float() {
+    let big = format!("1{}", "0".repeat(400));
+    let neg = format!("-{big}");
+    let oversized = report_on(replaced(&noted(), [big.as_str(), neg.as_str(), "1e400"]));
+    let control = report_on(replaced(&noted(), ["\"x\""; 3]));
+    assert_eq!(oversized, control);
+    // The control reads each note, so the equality says something of each.
+    assert_eq!(
+        control["moe_source"],
+        json!({"router.0": {"form": "scores", "point": "dispatched"}})
+    );
+    let checks: Vec<&str> = control["not_checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["check"].as_str())
+        .collect();
+    for check in ["layers", "update_size", "grads_not_read"] {
+        assert!(checks.contains(&check), "{check} not in {checks:?}");
+    }
+    let routing = control["not_checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["check"] == "moe_routing");
+    assert!(
+        routing.is_some_and(|entry| entry.to_string().contains("router.9")),
+        "{}",
+        control["not_checked"]
+    );
+    assert_eq!(
+        control["skipped_updates"]["scaler"], 1,
+        "{}",
+        control["skipped_updates"]
+    );
+    assert_eq!(
+        control["skipped_updates"]["partial"], 1,
+        "{}",
+        control["skipped_updates"]
+    );
+}
+
+#[test]
+fn the_shared_reader_keeps_every_other_value_and_reads_the_number_as_text() {
+    let big = format!("1{}", "0".repeat(400));
+    let text = format!(
+        r#"{{"a": [{big}, 1.5, "s", {{"b": -{big}}}], "c": 1e400, "d": {{"e": 2}}, "f": "1e400 in a string"}}"#
+    );
+    let read = super::extra_json::parse(&text).unwrap();
+    assert_eq!(read["a"][1], 1.5);
+    assert_eq!(read["a"][2], "s");
+    assert_eq!(read["d"], json!({"e": 2}));
+    assert_eq!(read["f"], "1e400 in a string");
+    for unreadable in [&read["a"][0], &read["a"][3]["b"], &read["c"]] {
+        assert!(unreadable.is_string() && unreadable.as_f64().is_none(), "{unreadable}");
+    }
+    // Text that is not JSON for any other reason is still not read.
+    assert!(super::extra_json::parse(r#"{"a": [1, }"#).is_none());
+    // An ordinary row is parsed as before.
+    assert_eq!(
+        super::extra_json::parse(r#"{"x": 1e300, "y": -0.0}"#).unwrap(),
+        json!({"x": 1e300, "y": -0.0})
+    );
+}
