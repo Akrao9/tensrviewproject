@@ -110,6 +110,14 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 
 ## 8. Open between AJ-2 and AJ-3
 
-- **A held `replica_spread` entry `[]`.** Rust's replica reader counts it as covered, with no drift. AJ-2 proposes that it not count as gathered coverage. One side changes, and the shared case `replica_spread_empty_and_string_beside_drift` asks only for the drifting parameter.
+- **Closed: a held `replica_spread` entry `[]`** covers nothing, in both engines.
+  - Rust, AJ-3 `1ab6a2a`: `replica.rs` matches AJ-2's rule. Its `extra_json` fallback reads entries as Python's `_spread_values` does.
+  - On a joined tree, the `a7_*`, `a10_*` and `replica_spread_empty*` paths pass with `--runxfail` (AJ-3: 25 of 25).
+- **Open, for the author: an integer too large for a float, carried into `extra_json`.** An example is `10**400`, written as a JSON integer.
+  - Rust's `serde_json` refuses the whole `extra_json` text. That row's replica observation, `step_skipped_by`, `moe_source` and every other `extra_json` key are then lost, not only the entry.
+  - This predates wave AJ. Lane AD4 already sent such values in `extra_json`, whole maps included. Wave AJ narrows what travels there, but does not change how it is written.
+  - One option is for the sender to write such a number as text, which Rust's readers skip as unreadable. That would break `row_to_record`'s round trip for that value, so it is not done here.
+  - Another option is for the Rust readers to parse `extra_json` with big numbers allowed.
+  - AJ-3's test is `#[ignore]`d with the reason, in `replica/lane_aj3_replica_tests.rs`.
 - **AJ-3's `update_spike` cases** are in `cases.json`, with explicit results and no clean control (deleting the refused entry also deletes the evidence that the map was incomplete).
 - **The stalled-weight streak** resets on a refused gradient on every path. This was run, not only read: shared case `stalled_weight_streak_resets_on_a_refused_gradient` puts `stalled_weights` at step 4, as with a null, where an unlisted gradient puts it at step 3. Python, raw Rust, the SDK in Rust mode and the live server all agree. AJ-3's test 68aeb7b ("holds") was written for the earlier representation.
