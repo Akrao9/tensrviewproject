@@ -336,7 +336,7 @@ class FollowedDetect:
         self._thresholds: str | None = None
         self._records: list[Mapping[str, Any]] = []
         self._newest: int | None = None  # the newest attempt read, as the binary orders attempts
-        self._top: int | None = None  # the highest step read
+        self._top: int | None = None  # the newest attempt's highest step read
         self._report: dict[str, Any] | None = None
         self.samples: list[dict[str, Any]] = []
         self._texts: list[str] = []
@@ -466,7 +466,7 @@ class FollowedDetect:
                     raise RuntimeError(f"{self._chosen} detect --follow gave samples from {follow.get('samples_from')}, "
                                        f"where {len(self.samples)} are kept")
                 self.samples.extend(answer.pop("samples"))
-                self._keep(records, answer)
+                self._keep(records, answer, _whole(records[-1].get("step")))  # each appended step is above the last
                 self._note("append", len(records) - known, follow.get("rows"), None)
                 return self._handed()
         self._start(sent)
@@ -474,8 +474,9 @@ class FollowedDetect:
         follow = answer.pop("follow", None) or {}
         self.samples = answer.pop("samples")
         self._texts = []
-        self._keep(records, answer)
-        self._newest = _whole(stream_order(records)[-1].get("attempt", 0))
+        last = stream_order(records)[-1]  # the binary's last row read: the newest attempt's highest step
+        self._keep(records, answer, _whole(last.get("step")))
+        self._newest = _whole(last.get("attempt", 0))
         self._note("full", len(records), follow.get("rows"), why)
         return self._handed()
 
@@ -491,9 +492,13 @@ class FollowedDetect:
             top = _whole(step)
         return None
 
-    def _keep(self, records: list[Mapping[str, Any]], answer: dict[str, Any]) -> None:
+    def _keep(self, records: list[Mapping[str, Any]], answer: dict[str, Any], top: int) -> None:
+        """Keep what was read. `top` is the step of the last row the binary read, in stream order:
+        the newest attempt's highest step, as `detect --follow` takes it (`last_step`). Before wave AJ
+        (A1) it was the highest step of every attempt, so after a resume below an earlier attempt's
+        last step each look restarted the child in full until the new attempt passed it."""
         self._records = records
-        self._top = max((_whole(r.get("step")) for r in records), default=None)
+        self._top = top
         self._report = answer
 
     def _handed(self) -> dict[str, Any]:

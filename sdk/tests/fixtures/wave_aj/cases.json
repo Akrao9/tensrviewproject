@@ -2972,8 +2972,7 @@
     "raises": false
    },
    "needs": {
-    "python": "AJ-2 (A4): [] has no spread and raises nothing",
-    "rust_sdk": "AJ-2 (A4): build_evidence recomputes replica_drift in Python"
+    "python": "AJ-2 (A4): [] has no spread and raises nothing"
    }
   },
   {

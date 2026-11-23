@@ -69,3 +69,26 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 - An append to the newest attempt after a resume below an earlier attempt's top is judged as an append, not a full restart.
 - A late row of a superseded attempt still restarts in full.
 - The report is unchanged.
+
+## 5. The four measurement blocks under `detectors="rust"` (A9, no code change)
+
+**`build_evidence(detectors="rust")` takes its four measurement blocks from Python**, computed from the records. The blocks are `gradient_trend`, `attention_trends`, `update_trends` and `weight_jumps`. The comment at `evidence.py`'s `measurement_blocks` call says so ("made here from the records under either detectors").
+
+**The raw Rust report must equal Python's for all four**, absence included: a block is absent in one exactly when it is absent in the other.
+
+**The audit's disagreement came from A3.** A `weight_norms` map whose only entry is a non-number gave 2 checks in raw Rust and 3 in Python. After section 1 the map is not a weight check in either engine, so both must give **2**. This is shared case `weight_norms_only_entry_refused`.
+
+## 6. Skipped updates in `update_trends` (A7, decided Nov 22; lanes AJ-2 and AJ-3)
+
+- An optimizer update that was skipped in full neither enters the `update_trends` baseline nor is reported as the lowest ratio.
+- In a partial skip across several optimizers, an update that did happen still counts, when the record identifies it.
+- A parameter whose optimizer the record cannot identify is left unjudged for that step.
+- Shared cases: added by AJ-2 and AJ-3.
+
+## 7. `weight_jumps` across a resume (A10, decided Nov 22; lanes AJ-2 and AJ-3)
+
+- `weight_jumps` resets when the attempt changes.
+- The first weight check after a resume is the new baseline.
+- Only a jump inside the new attempt is listed.
+- This applies to `weight_jumps` only.
+- Shared cases: added by AJ-2 and AJ-3.
