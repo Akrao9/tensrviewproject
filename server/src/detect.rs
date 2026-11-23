@@ -3640,7 +3640,7 @@ pub const LAYER_KINDS: [&str; 3] = ["activation_spike", "activation_drift", "dea
 struct CaptureNotes {
     /// Module -> (the step that first named it, why).
     layers_not_read: BTreeMap<String, (i64, String)>,
-    /// Router -> its `moe_source` entry as first recorded.
+    /// Router -> its first `moe_source` entry that is an object, with only `form` and `point`.
     moe_source: BTreeMap<String, Value>,
 }
 
@@ -3664,8 +3664,19 @@ impl CaptureNotes {
             let why = why.as_str().map_or_else(|| why.to_string(), str::to_owned);
             self.layers_not_read.entry(name.clone()).or_insert((step, why));
         }
+        // As Python's `moe_source` reads it (A8, lane AJ-3): of each router the first entry that is
+        // an object, holding only its `form` and `point` (an empty object kept as it is). An entry
+        // that is not an object is passed over, so a later record can still name the router.
         for (router, source) in extra.get("moe_source").and_then(Value::as_object).into_iter().flatten() {
-            self.moe_source.entry(router.clone()).or_insert_with(|| source.clone());
+            let Some(source) = source.as_object() else { continue };
+            if self.moe_source.contains_key(router) {
+                continue;
+            }
+            let kept: serde_json::Map<String, Value> = ["form", "point"]
+                .into_iter()
+                .filter_map(|key| source.get(key).map(|value| (key.to_owned(), value.clone())))
+                .collect();
+            self.moe_source.insert(router.clone(), Value::Object(kept));
         }
     }
 
@@ -4493,8 +4504,9 @@ impl RankDetectors {
         self.skipped_updates.report()
     }
 
-    /// The capture's `moe_source` as recorded (part 7), each router's first, or None when no
-    /// record said one: written in the report after `head_trends`.
+    /// The capture's `moe_source` (part 7) as Python's `moe_source` gives it: each router's first
+    /// object, with only `form` and `point`, or None when no record said one that is an object:
+    /// written in the report after `head_trends`.
     pub fn moe_source(&self) -> Option<Value> {
         (!self.notes.moe_source.is_empty()).then(|| json!(self.notes.moe_source))
     }
