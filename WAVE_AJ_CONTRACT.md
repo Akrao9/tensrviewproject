@@ -90,7 +90,11 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 - An optimizer update that was skipped in full neither enters the `update_trends` baseline nor is reported as the lowest ratio.
 - In a partial skip across several optimizers, an update that did happen still counts, when the record identifies it.
 - A parameter whose optimizer the record cannot identify is left unjudged for that step.
-- Shared cases: added by AJ-2 and AJ-3.
+- **As written for both engines (AJ-2):**
+  - A record whose `step_skipped` is true is left out. It enters no parameter's baseline and gives no ratio.
+  - That holds whoever reported the skip.
+  - It also holds on a partial skip (`step_skipped_part`), because no record names which optimizer applied its update to a parameter. Every parameter of such a step is unjudged there, as `update_spike` reads it.
+- Shared cases: AJ-2's `FULL_SKIP`, `SKIPS_FIRST`, `PARTIAL_SKIP` and `CALLER_SKIP`, copied into `cases.json` once committed.
 
 ## 7. `weight_jumps` across a resume (A10, decided Nov 22; lanes AJ-2 and AJ-3)
 
@@ -98,9 +102,14 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 - The first weight check after a resume is the new baseline.
 - Only a jump inside the new attempt is listed.
 - This applies to `weight_jumps` only.
-- Shared cases: added by AJ-2 and AJ-3.
+- **As written for both engines (AJ-2):**
+  - Two consecutive weight checks are compared only within one attempt.
+  - The first check after a reload starts the comparison again, and `checks` still counts every weight check.
+  - A weight check is a record whose `weight_norms` holds at least one value the float64 column carries (a null counts).
+- Shared cases: AJ-2's `RELOAD` and `RELOAD_ONLY`, copied into `cases.json` once committed.
 
 ## 8. Open between AJ-2 and AJ-3
 
 - **A held `replica_spread` entry `[]`.** Rust's replica reader counts it as covered, with no drift. AJ-2 proposes that it not count as gathered coverage. One side changes, and the shared case `replica_spread_empty_and_string_beside_drift` asks only for the drifting parameter.
-- **AJ-3's `update_spike` case** (whole totals kept when one side has a refused gradient) is added to `cases.json` when AJ-3 sends it.
+- **AJ-3's `update_spike` cases** are in `cases.json`, with explicit results and no clean control (deleting the refused entry also deletes the evidence that the map was incomplete).
+- **The stalled-weight streak** resets on a refused gradient in both engines: Rust reads the null, Python the raw value, whose `_finite` is None. AJ-3's test 68aeb7b says it holds, and is to be checked against this branch.
