@@ -95,6 +95,8 @@ mod lane_af_d_tests;
 #[cfg(test)]
 mod lane_af_w_tests;
 #[cfg(test)]
+mod lane_aj3_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
