@@ -29,7 +29,7 @@ jobs:
   cpu:
     name: CPU, Python ${{ matrix.python }}, PyTorch ${{ matrix.torch }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -77,7 +77,9 @@ jobs:
     # Lightning, Transformers and Rerun are optional, so their tests are skipped in the matrix above.
     name: CPU with Lightning, Hugging Face and Rerun
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 60, not 30: on a2e652d the suite passed here in 27 minutes 52 seconds (4,531 tests) and the job was cancelled
+    # at 30 minutes in the next step; the plain job on Python 3.11 with PyTorch 2.6 hit the same limit once on 981fe6c.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
