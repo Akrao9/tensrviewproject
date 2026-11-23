@@ -1,6 +1,6 @@
 # TensorQuill capture SDK
 
-The capture SDK, detectors and evidence exporter of the [v3 plan](../TensorQuill%20v3%20—%20Product%20and%20Build%20Plan.md). It records what happens inside a PyTorch model during training, cheaply enough to leave on, and in a way that survives `torch.compile`.
+The capture SDK, detectors and evidence exporter of the v3 plan. It records what happens inside a PyTorch model during training, cheaply enough to leave on, and in a way that survives `torch.compile`.
 
 ```python
 import tensorquill

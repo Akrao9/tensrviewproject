@@ -23,6 +23,10 @@ tensorlens-out/
 /*.jsonl
 /*.evidence.json
 
+# The planning records (plans, bug list, failure list, research review, archived reviews): a git repository
+# of their own in this folder since Nov 23, 2026. The contract pages and the GPU run sheet stay tracked here.
+/planning/
+
 # Working documents kept beside the repository, not in it: the task list and code reviews
 /PENDING_CODING_TASKS.md
 /CODEBASE_AUDIT.md
