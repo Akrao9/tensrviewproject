@@ -5,9 +5,9 @@ the three Rust paths among them. These are the raw report (`server_report`), the
 its `clean_records`.
 
 Fail-before: on 212205d the three Rust paths report nothing for a NaN beside `true`, a string, or
-"NaN". A path a case lists under `needs` waits for another lane (AJ-2, `evidence.py`) and is marked
-xfail here, not strict. The integrated gate runs this file with `--runxfail`, where every path must
-pass."""
+"NaN". A path a case lists under `needs` waited for another lane (AJ-2, `evidence.py`) and was marked
+xfail while the lanes were apart. On the joined tree every path passes, so no path is marked: each is an
+ordinary test (the author, Nov 22, 2026)."""
 
 from __future__ import annotations
 
@@ -40,10 +40,7 @@ def _params():
         for path in ENGINE_PATHS:
             if path not in case["paths"]:
                 continue
-            marks = []
-            if path in case.get("needs", {}):
-                marks.append(pytest.mark.xfail(reason=case["needs"][path], strict=False))
-            out.append(pytest.param(case, path, marks=marks, id=f"{case['name']}-{path}"))
+            out.append(pytest.param(case, path, id=f"{case['name']}-{path}"))
     return out
 
 

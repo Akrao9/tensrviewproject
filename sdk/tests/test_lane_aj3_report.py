@@ -208,7 +208,6 @@ def test_python_keeps_a_valid_sibling_of_a_refused_gradient_non_finite() -> None
     assert _non_finite(evidence.build_evidence(SIBLING, detectors="python")) == [["good"]]
 
 
-@pytest.mark.xfail(strict=False, reason="A3: until lane AJ-1's sender keeps the typed map, the whole map leaves the column")
 def test_the_raw_rust_report_keeps_a_valid_sibling_of_a_refused_gradient_non_finite() -> None:
     missing = _rust_missing()
     if missing:
@@ -256,8 +255,6 @@ def test_the_raw_rust_stall_streak_beside_a_refused_gradient(name: str) -> None:
 
     at_2, expected = STALL_CASES[name]
     found = _stall_step(server_report(stall_checks(at_2)))
-    if name.startswith("refused") and found != expected:
-        pytest.xfail("A3: until lane AJ-1's sender keeps the typed map, the whole map leaves the column")
     assert found == expected
 
 
