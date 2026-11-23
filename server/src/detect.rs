@@ -95,6 +95,8 @@ mod lane_af_d_tests;
 #[cfg(test)]
 mod lane_af_w_tests;
 #[cfg(test)]
+mod lane_aj3_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
@@ -862,6 +864,17 @@ fn non_finite_gradients<'a>(columns: &'a Columns, row: usize) -> Vec<&'a str> {
         bad.push("<total before clipping>");
     }
     bad
+}
+
+/// The `grad_norms` entries a row's column could not hold, as they travel in `extra_json` under
+/// `grad_norms` (`WAVE_AJ_CONTRACT.md` section 1), or None when it has none. `extra_json` is
+/// parsed only on a row that names the key.
+fn refused_gradients(columns: &Columns, row: usize) -> Option<Value> {
+    let extra = text(columns.extra, row).filter(|extra| extra.contains("\"grad_norms\""))?;
+    match serde_json::from_str::<Value>(extra).ok()? {
+        Value::Object(mut extra) => extra.remove("grad_norms"),
+        _ => None,
+    }
 }
 
 /// The columns the detectors read. A column that is missing or of another type reads as
@@ -2238,7 +2251,12 @@ impl Updates {
             .as_ref()
             .filter(|before| before.attempt == attempt)
             .and_then(|before| shared_largest(&own, largest, before).map(|sides| (before, sides)));
-        let grads: Option<Vec<(String, f64)>> = columns.grad_norms.as_ref().and_then(|norms| {
+        // A row whose `grad_norms` refused an entry has a typed map that is not the whole record's:
+        // its norms are not used to split, so a comparison with it on either side takes the whole
+        // totals (the author, Nov 22). A refused entry stored as null ends the split already (a
+        // norm that is not finite); one only in `extra_json` (a name Arrow cannot encode) ends it here.
+        let refused = refused_gradients(columns, row).is_some();
+        let grads: Option<Vec<(String, f64)>> = columns.grad_norms.as_ref().filter(|_| !refused).and_then(|norms| {
             let entries = norms.row(row);
             (!entries.is_empty()).then(|| {
                 entries
@@ -3315,6 +3333,16 @@ impl Stalled {
                 weight.changed |= !same;
             }
         }
+        // A refused gradient (`WAVE_AJ_CONTRACT.md` section 1) is a gradient listed with no value,
+        // as Python reads the raw `true`: its streak resets. One stored as null was reset above; a
+        // name Arrow cannot encode is only in `extra_json`, and is reset here.
+        if let Some(Value::Object(refused)) = refused_gradients(columns, row) {
+            for name in refused.keys() {
+                let weight = self.weights.slot(usize::MAX, name);
+                weight.streak = 0;
+                weight.changed |= !unchanged.contains(name.as_str());
+            }
+        }
         if !evidence {
             return;
         }
@@ -3638,7 +3666,7 @@ pub const LAYER_KINDS: [&str; 3] = ["activation_spike", "activation_drift", "dea
 struct CaptureNotes {
     /// Module -> (the step that first named it, why).
     layers_not_read: BTreeMap<String, (i64, String)>,
-    /// Router -> its `moe_source` entry as first recorded.
+    /// Router -> its first `moe_source` entry that is an object, with only `form` and `point`.
     moe_source: BTreeMap<String, Value>,
 }
 
@@ -3662,8 +3690,19 @@ impl CaptureNotes {
             let why = why.as_str().map_or_else(|| why.to_string(), str::to_owned);
             self.layers_not_read.entry(name.clone()).or_insert((step, why));
         }
+        // As Python's `moe_source` reads it (A8, lane AJ-3): of each router the first entry that is
+        // an object, holding only its `form` and `point` (an empty object kept as it is). An entry
+        // that is not an object is passed over, so a later record can still name the router.
         for (router, source) in extra.get("moe_source").and_then(Value::as_object).into_iter().flatten() {
-            self.moe_source.entry(router.clone()).or_insert_with(|| source.clone());
+            let Some(source) = source.as_object() else { continue };
+            if self.moe_source.contains_key(router) {
+                continue;
+            }
+            let kept: serde_json::Map<String, Value> = ["form", "point"]
+                .into_iter()
+                .filter_map(|key| source.get(key).map(|value| (key.to_owned(), value.clone())))
+                .collect();
+            self.moe_source.insert(router.clone(), Value::Object(kept));
         }
     }
 
@@ -4309,7 +4348,7 @@ impl RankDetectors {
             self.activations.row(step, layers);
             self.attention
                 .row(step, &columns, row, &mut self.scalars, &mut self.measurements);
-            self.measurements.row(step, &columns, row);
+            self.measurements.row(self.attempt, step, &columns, row);
             self.head.row(step, &columns, row);
             self.non_finite.row(step, &columns, row, layers);
             self.replica_drift
@@ -4491,8 +4530,9 @@ impl RankDetectors {
         self.skipped_updates.report()
     }
 
-    /// The capture's `moe_source` as recorded (part 7), each router's first, or None when no
-    /// record said one: written in the report after `head_trends`.
+    /// The capture's `moe_source` (part 7) as Python's `moe_source` gives it: each router's first
+    /// object, with only `form` and `point`, or None when no record said one that is an object:
+    /// written in the report after `head_trends`.
     pub fn moe_source(&self) -> Option<Value> {
         (!self.notes.moe_source.is_empty()).then(|| json!(self.notes.moe_source))
     }

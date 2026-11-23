@@ -247,18 +247,39 @@ async fn a_rebuild_from_the_store_gives_the_blocks_of_the_resolved_run() {
     let after_resume = report("ad8", 0, &rebuilt, 0);
     let every_attempt: Vec<Value> = attempt_1.iter().chain(&resumed).cloned().collect();
     assert_eq!(blocks(&after_resume), blocks(&judged(&every_attempt)));
-    // The resolved run: attempt 1 below step 80, then attempt 2, as one attempt.
-    let resolved: Vec<Value> = attempt_1
+    // The resolved run: attempt 1 below step 80, then attempt 2. With the attempts kept, all four
+    // blocks agree.
+    let kept: Vec<Value> = attempt_1
         .iter()
         .filter(|r| r["step"].as_i64().unwrap() < 80)
         .chain(&resumed)
+        .cloned()
+        .collect();
+    assert_eq!(blocks(&after_resume), blocks(&judged(&kept)));
+    // As one attempt, every block but `weight_jumps` agrees too: since A10 (the author's decision
+    // of Nov 22, lane AJ-3) `weight_jumps` compares two checks only within one attempt, so the
+    // reload at step 80 starts its comparison again, which one attempt does not.
+    let resolved: Vec<Value> = kept
+        .iter()
         .map(|r| {
             let mut r = r.clone();
             r["attempt"] = json!(0);
             r
         })
         .collect();
-    assert_eq!(blocks(&after_resume), blocks(&judged(&resolved)));
+    let but_jumps = |report: &Value| -> Vec<Option<Value>> {
+        BLOCKS
+            .iter()
+            .filter(|block| **block != "weight_jumps")
+            .map(|block| report.get(*block).cloned())
+            .collect()
+    };
+    assert_eq!(but_jumps(&after_resume), but_jumps(&judged(&resolved)));
+    assert_ne!(
+        after_resume["weight_jumps"],
+        judged(&resolved)["weight_jumps"],
+        "the reload at step 80 should start weight_jumps again"
+    );
     assert_ne!(
         blocks(&after_resume),
         blocks(&after_restart),
