@@ -76,6 +76,7 @@ use data::{DataProgress, DataRow, ResumeFound, ResumePass, ResumeRow};
 use measure::Measurements;
 mod system;
 use system::{System, SystemColumns};
+pub(crate) mod extra_json;
 #[cfg(test)]
 mod lane_ab2_tests;
 #[cfg(test)]
@@ -822,7 +823,7 @@ enum SkippedBy {
 fn skipped_by(columns: &Columns, row: usize) -> (Option<SkippedBy>, bool, bool) {
     let extra: Option<Value> = text(columns.extra, row)
         .filter(|extra| extra.contains("\"step_skipped_by\"") || extra.contains("\"step_skipped_part\""))
-        .and_then(|extra| serde_json::from_str::<Value>(extra).ok());
+        .and_then(extra_json::parse);
     let said = extra.as_ref().and_then(|extra| extra.get("step_skipped_by"));
     let carried = said.is_some();
     if !flag(columns.step_skipped, row) {
@@ -871,7 +872,7 @@ fn non_finite_gradients<'a>(columns: &'a Columns, row: usize) -> Vec<&'a str> {
 /// parsed only on a row that names the key.
 fn refused_gradients(columns: &Columns, row: usize) -> Option<Value> {
     let extra = text(columns.extra, row).filter(|extra| extra.contains("\"grad_norms\""))?;
-    match serde_json::from_str::<Value>(extra).ok()? {
+    match extra_json::parse(extra)? {
         Value::Object(mut extra) => extra.remove("grad_norms"),
         _ => None,
     }
@@ -1378,7 +1379,7 @@ impl Moe {
         }
         // `moe_refused` travels in `extra_json`, which is parsed only on a row that names it.
         if let Some(extra) = text(columns.extra, row).filter(|extra| extra.contains("\"moe_refused\"")) {
-            let extra: Option<Value> = serde_json::from_str(extra).ok();
+            let extra: Option<Value> = extra_json::parse(extra);
             if let Some(refused) = extra
                 .as_ref()
                 .and_then(|extra| extra.get("moe_refused"))
@@ -2152,7 +2153,7 @@ struct UpdateRow {
 fn clip_calls(columns: &Columns, row: usize) -> bool {
     text(columns.extra, row)
         .filter(|extra| extra.contains("\"clip_calls\""))
-        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(extra_json::parse)
         .and_then(|extra| extra.get("clip_calls").and_then(Value::as_u64))
         .is_some_and(|calls| calls > 1)
 }
@@ -2187,7 +2188,7 @@ impl Updates {
     fn row(&mut self, attempt: i64, step: i64, columns: &Columns, row: usize, window: usize) {
         // `update_not_read` travels in `extra_json`, which is parsed only on a row that names it.
         if let Some(extra) = text(columns.extra, row).filter(|extra| extra.contains("\"update_not_read\"")) {
-            let extra: Option<Value> = serde_json::from_str(extra).ok();
+            let extra: Option<Value> = extra_json::parse(extra);
             if let Some(said) = extra
                 .as_ref()
                 .and_then(|extra| extra.get("update_not_read"))
@@ -3359,7 +3360,7 @@ impl Stalled {
         self.stalled_steps += 1;
         // Parsed only on a row that reports something: `extra_json` is not small.
         let mut extra: Option<Option<Value>> = None;
-        let mut parsed = || text(columns.extra, row).and_then(|extra| serde_json::from_str::<Value>(extra).ok());
+        let mut parsed = || text(columns.extra, row).and_then(extra_json::parse);
         let first_onset = self.first.is_none();
         if first_onset {
             let extra = extra.get_or_insert_with(&mut parsed);
@@ -3624,7 +3625,7 @@ impl GradsNotRead {
         let Some(extra) = text(columns.extra, row).filter(|extra| extra.contains("\"grads_not_read\"")) else {
             return;
         };
-        let extra: Option<Value> = serde_json::from_str(extra).ok();
+        let extra: Option<Value> = extra_json::parse(extra);
         let said = extra
             .as_ref()
             .and_then(|extra| extra.get("grads_not_read"))
@@ -3678,7 +3679,7 @@ impl CaptureNotes {
         else {
             return;
         };
-        let Ok(Value::Object(extra)) = serde_json::from_str::<Value>(extra) else {
+        let Some(Value::Object(extra)) = extra_json::parse(extra) else {
             return;
         };
         for (name, why) in extra

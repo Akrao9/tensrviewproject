@@ -303,3 +303,89 @@ def test_an_unreadable_spread_entry_does_not_cover_drift_in_the_raw_run_report(b
     assert replica["steps"][0]["gathered"] == ["b"]
     assert replica["replica_drift"] == [{"step": 99, "parameters": ["w"], "source": "replica",
                                          "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1]}]
+
+
+# --- a number too large for a float in `extra_json` (the author, Nov 22, 2026) ----------------
+# "One `10**400` value can make Rust discard every `extra_json` field on that row. Preserve the
+# original integer for Python round-trip reading, treat it as unreadable where a float measurement
+# is required, and keep valid sibling fields available to Rust. Use the existing ignored regression
+# and add a live-server check: a valid replica observation beside the oversized integer must still
+# be judged. Verify that Python reads the integer back exactly."
+
+OVERSIZED = 10**400
+
+
+def test_the_row_round_trip_keeps_the_exact_integer() -> None:
+    from tensorquill.flight import record_to_row, row_to_record
+
+    record = row(7, ts=7.0, update_rms={"w": 0.5, "big": OVERSIZED}, replica_spread={"v": [0.0, 0.0, 0.0], "huge": [OVERSIZED]})
+    back = row_to_record(record_to_row(record))
+    assert back == record
+    for got in (back["update_rms"]["big"], back["replica_spread"]["huge"][0]):
+        assert got == OVERSIZED and type(got) is int
+
+
+# Lane AB2's live-server pattern: one file per rank through `send_file`, the run's `replica` read
+# from its `watchdog.json`. The records are `drift_between_two_ranks` of the replica fixtures; the
+# verdict is written out here, not read from the fixture.
+DRIFT_ON_B = {
+    "steps": [{"launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1], "step": 99, "coverage": "complete",
+               "fingerprints": "drift", "drift_parameters": ["b"], "signatures": "differ",
+               "signature_parameters": ["b"]}],
+    "replica_drift": [{"step": 99, "parameters": ["b"], "source": "replica",
+                       "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1]}],
+}
+LIVE = ("--flush-steps", "50", "--flush-seconds", "0.2", "--watchdog-seconds", "0.5")
+
+
+def _two_ranks(oversized: bool) -> list[dict[str, Any]]:
+    document = json.loads(REPLICA_CASES.read_text())
+    records = copy.deepcopy(document["cases"]["drift_between_two_ranks"]["records"])
+    if oversized:
+        for record in records:  # every entry refused, so the whole map travels in extra_json
+            record["update_rms"] = {"big": OVERSIZED}
+            record["oversized_note"] = OVERSIZED
+    return records
+
+
+@pytest.mark.parametrize("oversized", [True, False], ids=["beside_10_400", "control"])
+def test_a_live_server_judges_a_replica_observation_beside_an_oversized_integer(tmp_path: Path, oversized: bool) -> None:
+    missing = _rust_missing()
+    if missing:
+        pytest.skip(missing)
+    pytest.importorskip("pyarrow.flight")
+    import time
+
+    from tensorquill.flight import send_file
+    from test_flight_e2e import BINARY, Server, stored_records
+
+    if BINARY is None:
+        pytest.skip("tensorquill-server is not built")
+    records = _two_ranks(oversized)
+    run = records[0]["run_id"]
+    store = tmp_path / "store"
+    server = Server(store, 0, *LIVE)
+    try:
+        for rank in (0, 1):
+            file = tmp_path / f"{run}.rank{rank}.jsonl"
+            file.write_text("".join(json.dumps(r) + "\n" for r in records if r["rank"] == rank))
+            assert send_file(file, server.endpoint, run, rank, timeout=30.0)
+        status_path = store / "runs" / run / "watchdog.json"
+        deadline, replica = time.monotonic() + 30.0, None
+        while time.monotonic() < deadline:
+            try:
+                replica = json.loads(status_path.read_text(encoding="utf-8")).get("replica")
+            except (FileNotFoundError, ValueError):
+                replica = None
+            if replica and any(step.get("coverage") == "complete" for step in replica.get("steps", ())):
+                break
+            time.sleep(0.05)
+    finally:
+        assert server.terminate() == 0
+    assert replica is not None and replica["steps"] == DRIFT_ON_B["steps"], replica
+    assert replica["replica_drift"] == DRIFT_ON_B["replica_drift"]
+    if oversized:  # the store holds the integer itself, and reads it back exact
+        for rank in (0, 1):
+            (kept,) = stored_records(store, run, rank)
+            assert kept["update_rms"]["big"] == OVERSIZED and type(kept["update_rms"]["big"]) is int
+            assert kept["oversized_note"] == OVERSIZED

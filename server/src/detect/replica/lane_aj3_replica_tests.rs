@@ -116,11 +116,10 @@ fn the_extra_json_fallback_reads_entries_as_the_column_would() {
 }
 
 #[test]
-#[ignore = "open, not fixed in lane AJ-3: serde_json refuses the whole extra_json text over an integer \
-            too large for a float, so the row's observation is lost with the entry (reported to the coordinator)"]
 fn an_integer_too_large_for_a_float_leaves_only_its_entry_out() {
-    // Python writes 10**400 in full; it is no float, so its entry should say nothing and the rest
-    // of the row (here the observation beside it) still be read. Today no part of the row is read.
+    // Python writes 10**400 in full (the author, Nov 22: the sender keeps the integer). It is no
+    // float, so its entry says nothing, and the rest of the row (here the observation beside it)
+    // is still read. Until the shared `extra_json` reader, no part of the row was read.
     let big = format!("1{}", "0".repeat(400));
     let extra = format!(
         r#"{{"replica_spread": {{"big": [{big}, 0.0, 0.0], "v": [0.01, 0.0, 0.0]}}, "replica": {{"launch": "l", "group": [0, 1], "w": "00"}}}}"#
