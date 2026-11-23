@@ -155,6 +155,90 @@ def _is_non_finite(value: Any) -> bool:
     return False
 
 
+# What the typed columns of `flight.py` carry (wave AJ, lane AJ-2; OPEN_BUGS.md section 15, A4, A5,
+# A9). A map entry the column cannot hold is not read on its record by either engine: in Rust it
+# never reaches the column (lane AJ-1), and here it is skipped where it is read. The rest of the
+# map is judged as before. The records of `load_records` are JSON, so a tuple is never among them;
+# a tuple given to these readers directly is not a list, as `flight.py` refuses it, so the SDK in
+# either mode reads the same records alike. No reader here ever promised a tuple.
+_INT64 = (-(2**63), 2**63 - 1)
+_WIRE_NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}  # as JsonlSink writes them
+_UNCARRIED = object()
+
+
+def _router_counts(value: Any) -> list[int] | None:
+    """A router's counts as the `moe_counts` column carries them, a list of signed 64-bit integers
+    (a bool is not one), else None: that router is then absent from the record, as Rust sees it."""
+    if not isinstance(value, list):
+        return None
+    low, high = _INT64
+    if all(isinstance(c, int) and not isinstance(c, bool) and low <= c <= high for c in value):
+        return value
+    return None
+
+
+def _router_total(value: Any) -> int | None:
+    """The sum of a router's counts when the column carries them (`_router_counts`), else None, in one
+    pass over the counts (lane AF-W: the read rule reads a read router's counts once)."""
+    if not isinstance(value, list):
+        return None
+    low, high = _INT64
+    total = 0
+    for c in value:
+        if not isinstance(c, int) or isinstance(c, bool) or not low <= c <= high:
+            return None
+        total += c
+    return total
+
+
+def _wire_float(value: Any) -> Any:
+    """One value as a `float64` column carries it (`flight.py`'s `_float`): a number, None for a
+    null, a non-finite float for the sink's "nan", "inf" and "-inf"; `_UNCARRIED` for anything else,
+    a bool, other text and an integer too large for a float among them."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return _UNCARRIED
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except OverflowError:
+            return _UNCARRIED
+    if isinstance(value, str) and value in _WIRE_NON_FINITE:
+        return _WIRE_NON_FINITE[value]
+    return _UNCARRIED
+
+
+def _spread_values(value: Any) -> list[float] | None:
+    """One parameter's gathered spread as the `replica_spread` column carries it (WAVE_AJ_CONTRACT.md,
+    section 1), a list of floats, a null read as NaN as Rust reads it; else None, and the entry is
+    absent. A value that is not finite stays one (`non_finite`); a value that is not a number leaves
+    the entry out. `[]` is held and says nothing: it is judged as no drift and covers no parameter."""
+    if not isinstance(value, list):
+        return None
+    values = [_wire_float(v) for v in value]
+    if any(v is _UNCARRIED for v in values):
+        return None
+    return [math.nan if v is None else v for v in values]
+
+
+def _held_spread_table(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """A record's `replica_spread` when the column holds it: a map with at least one held entry, or
+    an empty map. A map whose every entry is refused reads as no `replica_spread` (WAVE_AJ_CONTRACT.md,
+    section 2: the column is null, and Rust reads no spread)."""
+    table = _spread_table(record)
+    if table is None or (table and all(_spread_values(v) is None for v in table.values())):
+        return None
+    return table
+
+
+def _weight_check(record: Mapping[str, Any]) -> bool:
+    """Whether a record is a weight check as both engines count one: `weight_norms` with at least
+    one norm the column carries (a null counts, as Rust counts the entry)."""
+    norms = record.get("weight_norms")
+    return isinstance(norms, Mapping) and any(_wire_float(v) is not _UNCARRIED for v in norms.values())
+
+
 def effective_overload_threshold(
     n_experts: int,
     routed_tokens: int,
@@ -280,10 +364,18 @@ class _StarvedFirsts:
 def _router_top_k(
     records: list[dict[str, Any]], routers: list[str], override: int | Mapping[str, int] | None
 ) -> dict[str, int]:
+    """Each router's experts per token: the last `moe_top_k` recorded for it, or `override`, else 1.
+    An entry the `moe_top_k` column cannot carry (anything but an integer that is not a bool and fits
+    int32, WAVE_AJ_CONTRACT.md, section 1) is absent on its record, as Rust never sees it (wave AJ:
+    before, `int(k)` raised on text and read 2.0 as 2)."""
     found: dict[str, int] = {}
     for record in records:
-        for name, k in record.get("moe_top_k", {}).items():
-            found[name] = int(k)
+        given = record.get("moe_top_k")
+        if not isinstance(given, Mapping):
+            continue
+        for name, k in given.items():
+            if isinstance(k, int) and not isinstance(k, bool) and -(2**31) <= k < 2**31:
+                found[name] = k
     if isinstance(override, int):
         found = {name: override for name in routers}
     elif override is not None:
@@ -1162,8 +1254,12 @@ def weight_jumps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The largest change of each tensor's norm between two consecutive weight checks (gap Q3),
     either way: `checks`, `parameters` compared, and `largest`, the MEASUREMENTS_LISTED largest,
     each with `name`, `ratio`, `step`, `previous_step`, `before` and `after`. None with fewer than
-    two weight checks, or no tensor with a positive finite norm at two of them."""
-    checks = [r for r in sorted(records, key=lambda r: r["step"]) if isinstance(r.get("weight_norms"), Mapping) and r["weight_norms"]]
+    two weight checks, or no tensor with a positive finite norm at two of them.
+
+    A weight check is a record whose `weight_norms` holds at least one norm the column carries
+    (`_weight_check`), as Rust counts the rows (wave AJ, A9: a map of text alone was a check here
+    and not in Rust)."""
+    checks = [r for r in sorted(records, key=lambda r: r["step"]) if _weight_check(r)]
     if len(checks) < 2:
         return None
     best: dict[str, dict[str, Any]] = {}
@@ -3222,7 +3318,8 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     for record in records:
         counts["steps"] += 1
         moe = record.get("moe")
-        if isinstance(moe, Mapping) and any(sum(int(c) for c in router) > 0 for router in moe.values()):
+        if isinstance(moe, Mapping) and any(
+                (total := _router_total(value)) is not None and total > 0 for value in moe.values()):
             counts["moe"] += 1
         total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
         norms, layers = bool(record.get("grad_norms")), bool(record.get("layers"))
@@ -3249,7 +3346,7 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
             and isinstance(probe.get("attention"), dict) and bool(probe["attention"])
         )
         counts["numbers"] += layers or total or norms
-        counts["replica_spread"] += bool(record.get("replica_spread"))
+        counts["replica_spread"] += bool(_held_spread_table(record))
         system = record.get("system")
         for part in ("cuda", "nvml"):
             counts[part] += isinstance(system, dict) and isinstance(system.get(part), dict)
@@ -6276,9 +6373,17 @@ def default_evidence_path(source: Path, records: list[dict[str, Any]]) -> Path:
 
 
 def _router_sizes(records: list[dict[str, Any]]) -> dict[str, int]:
+    """Each router's largest size, in the order routers first appear with counts the column carries:
+    a router whose entry is unreadable on a record (`_router_counts`) takes no layer number there."""
     sizes: dict[str, int] = {}
     for record in records:
-        for name, counts in record.get("moe", {}).items():
+        moe = record.get("moe")
+        if not isinstance(moe, Mapping):
+            continue
+        for name, value in moe.items():
+            counts = _router_counts(value)
+            if counts is None:
+                continue
             size = len(counts)
             if name not in sizes or size > sizes[name]:
                 sizes[name] = size
@@ -6334,21 +6439,27 @@ def routers_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[s
     when every router named has a count above 0 on some record. A router with counts on some records
     and zeros on others is read, as before. While some router of the records was read, the kinds
     are judged on it and the entry only names the others (`kind_checks`); with none read they are
-    `unavailable`. The server writes the same entry (lane D)."""
-    # Each router named, and whether a count above 0 was seen for it. A router once seen read is
-    # not looked at again: a whole run of a read router costs one dictionary lookup a record, not
-    # one step per count (the first form summed every count of every record at every look).
+    `unavailable`. The server writes the same entry (lane D).
+
+    A router is read on a record when the sum of its counts is above 0, as `_MoeSamples.feed`,
+    `input_counts` and Rust's `Moe::row` read it (wave AJ, A2: before, any one count above 0 was
+    enough, so `[5, -5]` read as read here and as not read in Rust). An entry the column cannot carry
+    (`_router_counts`) names no router on that record (A5)."""
+    # Each router named, and whether a sum above 0 was seen for it. A router once seen read is not
+    # looked at again: a whole run of a read router costs one dictionary lookup a record.
     read: dict[str, bool] = {}
     for record in records:
         moe = record.get("moe")
         if not isinstance(moe, Mapping):
             continue
-        for name, counts in moe.items():
+        for name, value in moe.items():
             name = str(name)
             if read.get(name):
                 continue
-            read[name] = isinstance(counts, (list, tuple)) and any(
-                isinstance(c, (int, float)) and c > 0 and int(c) > 0 for c in counts)
+            total = _router_total(value)
+            if total is None:
+                continue
+            read[name] = total > 0
     names = sorted(name for name, seen in read.items() if not seen)
     if not names:
         return None
@@ -6422,9 +6533,13 @@ def detect_non_finite(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     finite is raised with no gradient named. A gradient that is not finite on a skip the caller
     reported is kept in the evidence's `skipped_updates` instead (STEP_AND_EVIDENCE_CONTRACT.md,
     section 1); the scaler's skips are counted in `detect_loss_scale_trouble`.
+
+    The records are judged in step order, records of one step in the order given (wave AJ, A6:
+    before, a direct call judged them in list order). `build_evidence` feeds `_NonFinite` records
+    already in order and does not come through here.
     """
     state = _NonFinite()
-    state.feed(records)
+    state.feed(sorted(records, key=lambda r: r["step"]))
     return state.found
 
 
@@ -6471,14 +6586,28 @@ def detect_replica_drift(
     elements swapping places, but a change that keeps all three is still possible.
     Megatron's `check_param_hashes_across_dp_replicas` compares hashes for exact equality.
     Records written before the projection existed carry two values and are read as before.
+
+    The records are judged in step order, records of one step in the order given (wave AJ, A6).
+    A parameter's entry that the `replica_spread` column cannot carry (`_spread_values`: an empty
+    list, text other than "nan", "inf" and "-inf", a bool, a number too large for a float, anything
+    that is not a list) is not judged, and the other parameters of the record are (A4: before, it
+    raised `ValueError`). A null, "nan" and "inf" are values that are not finite, as before.
     """
+    return _replica_drift(sorted(records, key=lambda r: r["step"]), tolerance)
+
+
+def _replica_drift(records: Iterable[Mapping[str, Any]], tolerance: float) -> dict[str, Any] | None:
+    """`detect_replica_drift` over records in the order given: `build_evidence`'s, which are in
+    order already."""
     for record in records:
-        spreads = record.get("replica_spread")
+        spreads = _spread_table(record)
         if not spreads:
             continue
         diverged = {}
         for name, vals in spreads.items():
-            values = [float(v) for v in vals]
+            values = _spread_values(vals)
+            if not values:  # refused, or `[]`: nothing to judge (Rust finds no drift in it either)
+                continue
             detail = dict(zip(("norm_spread", "sum_spread", "projection_spread"), values))
             if not all(math.isfinite(v) for v in values):
                 # A NaN or Inf weight on any replica makes the spread non-finite, which
@@ -6546,7 +6675,7 @@ def _spread_scope(record: Mapping[str, Any]) -> tuple[str, tuple[int, ...]] | No
 def _over_tolerance(record: Mapping[str, Any], tolerance: float) -> list[str]:
     """The parameters a gathered spread shows drift on, by today's rule on its own record
     (`detect_replica_drift`, contract 6), sorted."""
-    found = detect_replica_drift([dict(record)], tolerance=tolerance)
+    found = _replica_drift([record], tolerance)
     return sorted(found["parameters"]) if found else []
 
 
@@ -6710,11 +6839,13 @@ def _replica_judged(
     aside: dict[tuple[str, tuple[int, ...], int], set[int]] = {}
     for record in listed:
         step, rank = int(record["step"]), int(record.get("rank", 0))
-        observation, table = _observation(record), _spread_table(record)
+        observation, table = _observation(record), _held_spread_table(record)
         if table is not None:
             over = _over_tolerance(record, tolerance)
             held = covers.setdefault((_spread_scope(record), step), {"covered": set(), "over": set()})
-            held["covered"].update(str(name) for name in table)
+            # Only a held entry with values says anything of its parameter: a refused one, or `[]`,
+            # covers nothing, so it cannot set aside the drift the observations show (wave AJ, A4).
+            held["covered"].update(str(name) for name, values in table.items() if _spread_values(values))
             held["over"].update(over)
             if observation is None:  # an old capture: judged as before, on its own (contract 6)
                 legacy.append({"rank": rank, "step": step, "drift": bool(over), **({"parameters": over} if over else {})})
@@ -7156,16 +7287,23 @@ class _MoeSamples:
         new: list[dict[str, Any]] = []
         for record in sorted(records, key=lambda r: r["step"]):
             step = int(record["step"])
-            moe = record.get("moe", {})
+            moe = record.get("moe")
+            if not isinstance(moe, Mapping):
+                moe = {}
             moe_stats = record.get("moe_stats", {})
             for layer_idx, router_name in enumerate(routers, 1):
                 expected_experts = router_sizes[router_name]
-                if router_name not in moe:
+                # An entry the column cannot carry is no entry (wave AJ, A5: before, `int(c)` raised
+                # over a string's characters), as Rust never sees it.
+                given = _router_counts(moe.get(router_name)) if router_name in moe else None
+                if given is None:
                     counts = [0] * expected_experts
                     missing = True
                 else:
-                    counts = [int(c) for c in moe[router_name]]
-                    missing = sum(counts) == 0
+                    counts = list(given)
+                    # A sum of 0 or less routed no token: a missing sample, as Rust's `Moe::row` reads
+                    # it (A2: a negative sum reached the judged branch's `rule` unset).
+                    missing = sum(counts) <= 0
                 n_experts = len(counts)
                 tokens = sum(counts)
                 if missing or tokens <= 0:
@@ -7668,7 +7806,7 @@ def _build_evidence(
     if from_rust is not None:
         drift_hit = next((i for i in from_rust if i.get("kind") == "replica_drift"), None)
     else:
-        drift_hit = detect_replica_drift(records, tolerance=drift_tolerance)
+        drift_hit = _replica_drift(records, drift_tolerance)
     if drift_hit is not None:
         incidents.append(drift_hit)
     # The ranks' replica observations (SDK-22). Every record as written, in attempt order: a rank's
@@ -7684,7 +7822,7 @@ def _build_evidence(
             incidents.append(observed_hit)
         rank_checks["replica_drift"] = replica_kind_check(
             rank_checks["replica_drift"], replica, all_ranks=False,
-            records=sum(_observation(r) is not None or _spread_table(r) is not None for r in records),
+            records=sum(_observation(r) is not None or _held_spread_table(r) is not None for r in records),
             held_ranks=held_ranks or ())
 
     if any(record.get("scalars") for record in records):

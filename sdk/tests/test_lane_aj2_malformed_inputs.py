@@ -119,7 +119,7 @@ def test_an_unreadable_router_alone_is_neither_read_nor_warned():
     assert evidence.input_counts(records)["moe"] == 0
     ev = evidence.build_evidence(records, detectors="python")
     assert checks_of(ev, "moe_routing") == [] and ev["incidents"] == []
-    assert ev["kind_checks"]["moe_imbalance"]["state"] != "checked"
+    assert ev["kind_checks"]["moe_imbalance"]["value"] == "not_configured"  # as with no `moe` at all
 
 
 def test_a_moe_that_is_not_a_map_is_not_read():
@@ -134,6 +134,13 @@ def test_capture_word_that_a_router_is_unreadable_is_kept():
     ev = evidence.build_evidence(records, detectors="python")
     assert [(n["routers"], n["step"]) for n in checks_of(ev, "router")] == [(["bad"], 0)]
     assert kinds(ev) == [("moe_imbalance", 0, "good", 1)]
+
+
+@pytest.mark.parametrize("bad", ["two", 2.0, True, None, 2**40], ids=_short)
+def test_an_unreadable_top_k_is_absent_and_the_recorded_one_stands(bad):
+    records = [rec(s, moe={"good": COLLAPSED}, moe_top_k={"good": 1} if s == 0 else {"good": bad}) for s in range(15)]
+    assert evidence._router_top_k(records, ["good"], None) == {"good": 1}
+    assert kinds(evidence.build_evidence(records, detectors="python")) == [("moe_imbalance", 0, "good", 1)]
 
 
 def _later_valid():
@@ -264,11 +271,31 @@ def test_an_unreadable_spread_entry_does_not_cover_drift_seen_by_the_observation
 @pytest.mark.parametrize("bad", ["invalid", []], ids=_short)
 def test_unreadable_spread_entry_coverage_raw_rust_awaits_aj3(bad):
     """The raw cross-rank report (`detect --run`) gives Python's result. On 212205d it counts the
-    unreadable entry as gathered and raises nothing: lane AJ-3 coordinates the fix."""
+    unreadable entry as gathered and raises nothing. After AJ-1's fix a refused "invalid" leaves the
+    column alone; `[]` is held there and still needs `replica.rs` to cover nothing by it (AJ-3)."""
     records, tolerance = _scoped_case(bad)
     replica = server_run_report(records)["replica"]
     assert replica["steps"][0]["gathered"] == EXPECTED_UNCOVERED["gathered"]
     assert replica["replica_drift"] == EXPECTED_UNCOVERED["replica_drift"]
+
+
+def test_a_spread_map_with_no_held_entry_reads_as_no_spread():
+    """WAVE_AJ_CONTRACT.md, section 2: the column is null, so neither engine reads a spread there."""
+    refused = [rec(0, replica_spread={"w": "invalid"})]
+    assert evidence.input_counts(refused)["replica_spread"] == 0
+    assert "legacy" not in evidence.compare_replicas(refused)
+    held = [rec(0, replica_spread={"w": []})]
+    assert evidence.input_counts(held)["replica_spread"] == 1
+    assert evidence.compare_replicas(held)["legacy"] == [{"rank": 0, "step": 0, "drift": False}]
+
+
+@needs_server
+def test_spread_input_counts_rust_awaits_aj1():
+    for table, count in (({"w": "invalid"}, 0), ({"w": []}, 1), ({"w": "invalid", "v": [0.0, 0.0, 0.0]}, 1)):
+        records = [rec(0, replica_spread=table)]
+        py = agree(records)
+        assert py["kind_checks"]["replica_drift"]["records"] == count, table
+        assert evidence.input_counts(records)["replica_spread"] == count
 
 
 # --- A6: the two public detectors judge in step order --------------------------------------------
