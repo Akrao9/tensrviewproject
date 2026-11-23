@@ -245,18 +245,44 @@ fn detect(
     Ok(())
 }
 
-async fn terminated() {
+/// The signals that stop the server, asked for when this is made and kept until the server ends.
+///
+/// Made before the listening line is printed: a script that reads that line may send SIGTERM at
+/// once. Before, the signals were asked for only when the serving `select!` was first polled, after
+/// the line and after the status writer had started; a SIGTERM in between met the default action
+/// and killed the process with nothing written, or was dropped while the handler was being
+/// registered and the server went on running.
+struct StopSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("cannot listen for SIGTERM");
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    fn register() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                terminate: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
         }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+
+    /// Returns at the first SIGTERM or Ctrl-C since `register`.
+    async fn received(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// The store location without anything a URL can carry besides the place (a password, a query).
@@ -324,6 +350,9 @@ async fn run(args: Args) -> Result<(), Error> {
         .await
         .map_err(|error| format!("cannot read or write the store ID of {}: {error}", store_name(&store)))?;
     eprintln!("tensorquill-server: store ID {store_id}");
+    // Before the listening line, so that a SIGTERM sent as soon as that line is read takes the
+    // ordinary stop below.
+    let mut stop = StopSignals::register().map_err(|error| format!("cannot listen for SIGTERM: {error}"))?;
     // Scripts and tests that ask for port 0 read the real address from this line.
     println!("tensorquill-server listening on {}", listener.local_addr()?);
     let flusher = ingest.spawn_flusher();
@@ -333,7 +362,7 @@ async fn run(args: Args) -> Result<(), Error> {
     // write each status to say the server stopped (not a stale verdict), and exit.
     tokio::select! {
         result = serve(listener, ingest.clone(), token, tls, std::future::pending()) => result?,
-        _ = terminated() => {}
+        _ = stop.received() => {}
     }
     ingest.stop([flusher, watchdog]).await?;
     Ok(())
