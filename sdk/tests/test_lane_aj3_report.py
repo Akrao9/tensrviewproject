@@ -8,7 +8,10 @@ Python's reading is taken twice: `moe_source` over the records as `build_evidenc
 
 from __future__ import annotations
 
+import copy
 import functools
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -256,3 +259,50 @@ def test_the_raw_rust_stall_streak_beside_a_refused_gradient(name: str) -> None:
     if name.startswith("refused") and found != expected:
         pytest.xfail("A3: until lane AJ-1's sender keeps the typed map, the whole map leaves the column")
     assert found == expected
+
+
+# --- A7, A10 and the replica `[]` coverage through the raw report ------------------------------
+# The cases are lane AJ-1's shared file itself, not a copy: `fixtures/wave_aj/cases.json` exists
+# on AJ-1's branch and on the joined tree, and these tests skip where it is not. The blocks are
+# compared whole against the case's `expect.blocks`.
+
+WAVE_AJ = Path(__file__).parent / "fixtures" / "wave_aj" / "cases.json"
+REPLICA_CASES = Path(__file__).parent / "fixtures" / "replica" / "incident_cases.json"
+
+
+def _shared(prefixes: tuple[str, ...]) -> list[Any]:
+    if not WAVE_AJ.exists():
+        return [pytest.param(None, marks=pytest.mark.skip(reason="no wave_aj/cases.json on this tree (lane AJ-1's)"))]
+    cases = json.loads(WAVE_AJ.read_text())["cases"]
+    return [pytest.param(case, id=case["name"]) for case in cases if case["name"].startswith(prefixes)]
+
+
+@pytest.mark.parametrize("case", _shared(("a7_", "a10_")))
+def test_the_raw_report_gives_the_shared_a7_and_a10_blocks(case: dict[str, Any]) -> None:
+    missing = _rust_missing()
+    if missing:
+        pytest.skip(missing)
+    from tensorquill.server_detect import server_report
+
+    report = server_report(copy.deepcopy(case["records"]), thresholds=case.get("thresholds"))
+    for name, expected in case["expect"]["blocks"].items():
+        assert report.get(name) == expected, name
+
+
+@pytest.mark.parametrize("bad", ["invalid", []], ids=["text", "empty"])
+def test_an_unreadable_spread_entry_does_not_cover_drift_in_the_raw_run_report(bad: Any) -> None:
+    """Lane AJ-2's case (`test_lane_aj2_malformed_inputs.py`): with each rank's gathered spread
+    saying nothing readable of `w`, the observations' drift on `w` is raised from `replica`."""
+    missing = _rust_missing()
+    if missing:
+        pytest.skip(missing)
+    from tensorquill.server_detect import server_run_report
+
+    document = json.loads(REPLICA_CASES.read_text())
+    records = copy.deepcopy(document["cases"]["explicit_spread_and_observations_on_one_step"]["records"])
+    for record in records:
+        record["replica_spread"]["w"] = bad
+    replica = server_run_report(records)["replica"]
+    assert replica["steps"][0]["gathered"] == ["b"]
+    assert replica["replica_drift"] == [{"step": 99, "parameters": ["w"], "source": "replica",
+                                         "launch": "2f6c1a9e4b7d4c1e9a3f6b8d0e1c2a47", "group": [0, 1]}]

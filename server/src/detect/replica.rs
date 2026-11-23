@@ -1391,3 +1391,6 @@ pub fn compare(records: &[Value], tolerance: f64) -> Value {
     }
     comparison.result()
 }
+
+#[cfg(test)]
+mod lane_aj3_replica_tests;

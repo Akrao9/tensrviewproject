@@ -413,3 +413,118 @@ fn an_absent_gradient_still_holds_the_streak() {
     assert_eq!(found[0]["step"], 3);
     assert_eq!(found[0]["parameters"], json!(["c"]));
 }
+
+// --- A7 and A10: update_trends and weight_jumps (the author's decisions of Nov 22) -----------
+//
+// `WAVE_AJ_CONTRACT.md` sections 6 and 7, as lane AJ-2 words them for both engines (876f627). The
+// records are AJ-2's constants (AJ-1's `cases.json`, `a7_*` and `a10_*`), and each block is
+// compared whole. A7: a row whose `step_skipped` is true, whoever reported it, enters no
+// baseline and gives no ratio; a partial skip is left out whole, since no record names which
+// optimizer's update was applied. A10: two weight checks are compared only within one attempt.
+
+fn rec(step: i64, attempt: i64, fields: Value) -> Value {
+    let mut record = json!({"run_id": "r", "rank": 0, "attempt": attempt, "step": step, "grad_norm": 1.0});
+    record
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    record
+}
+
+fn block(records: &[Value], name: &str) -> Value {
+    let detectors = judge(
+        0,
+        &[super::lane_ad8_tests::stored(records)],
+        &Arc::<Thresholds>::default(),
+    )
+    .unwrap();
+    report("r", 0, &detectors, 0).get(name).cloned().unwrap_or(Value::Null)
+}
+
+fn steady(steps: std::ops::Range<i64>, sizes: Value) -> Vec<Value> {
+    steps
+        .map(|step| rec(step, 1, json!({"update_rms": sizes.clone()})))
+        .collect()
+}
+
+fn lowest(name: &str, step: i64) -> Value {
+    json!({"name": name, "ratio": 1.0, "step": step, "baseline": 1.0, "update_rms": 1.0})
+}
+
+#[test]
+fn a7_a_fully_skipped_update_is_neither_baseline_nor_lowest() {
+    for by in ["scaler", "caller"] {
+        let mut records = steady(0..12, json!({"w": 1.0}));
+        records.push(rec(
+            12,
+            1,
+            json!({"step_skipped": true, "step_skipped_by": by, "update_rms": {"w": 0.01}}),
+        ));
+        records.push(rec(13, 1, json!({"update_rms": {"w": 1.0}})));
+        let expected = json!({"parameters": 1, "judged": 1, "lowest": [lowest("w", 10)]});
+        assert_eq!(block(&records, "update_trends"), expected, "skipped by {by}");
+    }
+}
+
+#[test]
+fn a7_skipped_updates_first_enter_no_baseline() {
+    let mut records: Vec<Value> = (0..10)
+        .map(|step| {
+            rec(
+                step,
+                1,
+                json!({"step_skipped": true, "step_skipped_by": "scaler", "update_rms": {"w": 5.0}}),
+            )
+        })
+        .collect();
+    records.extend(steady(10..22, json!({"w": 1.0})));
+    let expected = json!({"parameters": 1, "judged": 1, "lowest": [lowest("w", 20)]});
+    assert_eq!(block(&records, "update_trends"), expected);
+}
+
+#[test]
+fn a7_a_partial_skip_leaves_every_parameter_unjudged_that_step() {
+    let mut records = steady(0..12, json!({"w": 1.0, "u": 1.0}));
+    records.push(rec(
+        12,
+        1,
+        json!({"step_skipped": true, "step_skipped_by": "scaler", "step_skipped_part": {"skipped": 1, "of": 2},
+               "update_rms": {"w": 0.01, "u": 1.0}}),
+    ));
+    let expected = json!({"parameters": 2, "judged": 2, "lowest": [lowest("u", 10), lowest("w", 10)]});
+    assert_eq!(block(&records, "update_trends"), expected);
+}
+
+#[test]
+fn a7_only_skipped_updates_give_no_block() {
+    let records: Vec<Value> = (0..12)
+        .map(|step| rec(step, 1, json!({"step_skipped": true, "update_rms": {"w": 1.0}})))
+        .collect();
+    assert_eq!(block(&records, "update_trends"), Value::Null);
+}
+
+fn reload(after: [f64; 3]) -> Vec<Value> {
+    let mut records: Vec<Value> = (0..6)
+        .map(|at| rec(at * 10, 1, json!({"weight_norms": {"w": 1.0}})))
+        .collect();
+    for (at, norm) in after.iter().enumerate() {
+        records.push(rec(30 + 10 * at as i64, 2, json!({"weight_norms": {"w": norm}})));
+    }
+    records
+}
+
+#[test]
+fn a10_a_reload_resets_weight_jumps_and_a_real_jump_after_it_is_listed() {
+    // Attempt 2 resumes at 30, so attempt 1 counts at 0, 10 and 20: six checks. The 50x change
+    // across the reload is no jump; the threefold one from 40 to 50 inside attempt 2 is.
+    let expected = json!({"checks": 6, "parameters": 1, "largest": [
+        {"name": "w", "ratio": 3.0, "step": 50, "previous_step": 40, "before": 50.0, "after": 150.0}]});
+    assert_eq!(block(&reload([50.0, 50.0, 150.0]), "weight_jumps"), expected);
+}
+
+#[test]
+fn a10_a_difference_across_a_reload_alone_is_not_a_jump() {
+    let expected = json!({"checks": 6, "parameters": 1, "largest": [
+        {"name": "w", "ratio": 1.0, "step": 10, "previous_step": 0, "before": 1.0, "after": 1.0}]});
+    assert_eq!(block(&reload([50.0, 50.0, 50.0]), "weight_jumps"), expected);
+}
