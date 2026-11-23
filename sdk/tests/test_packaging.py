@@ -44,9 +44,11 @@ def _read(path: Path) -> bytes:
 
 
 @pytest.mark.parametrize("name", LICENSE_FILES)
-@pytest.mark.parametrize("where", ["root", "sdk", "server"])
+# The license files are kept with the two packages that ship them. The repository root has none since
+# Nov 23, 2026 (the author: this private repository is where the code is developed, not what is published).
+@pytest.mark.parametrize("where", ["sdk", "server"])
 def test_license_file_exists_and_is_not_empty(where, name):
-    directory = {"root": ROOT, "sdk": SDK, "server": SERVER}[where]
+    directory = {"sdk": SDK, "server": SERVER}[where]
     if where == "server" and not SERVER.exists():
         pytest.skip("server/ not in this checkout")
     path = directory / name
@@ -55,12 +57,12 @@ def test_license_file_exists_and_is_not_empty(where, name):
 
 
 def test_apache_text_is_the_unmodified_original():
-    text = _read(ROOT / "LICENSE-APACHE")
+    text = _read(SDK / "LICENSE-APACHE")
     assert hashlib.sha256(text).hexdigest() == APACHE_SHA256, "LICENSE-APACHE differs from the apache.org text"
 
 
 def test_mit_text_uses_the_project_copyright_line():
-    text = _read(ROOT / "LICENSE-MIT").decode()
+    text = _read(SDK / "LICENSE-MIT").decode()
     assert text.startswith("MIT License")
     assert MIT_COPYRIGHT in text
     assert "Permission is hereby granted, free of charge" in text
@@ -68,11 +70,15 @@ def test_mit_text_uses_the_project_copyright_line():
 
 
 @pytest.mark.parametrize("name", LICENSE_FILES)
-def test_package_license_copies_match_the_root_ones(name):
-    root = (ROOT / name).read_bytes()
-    assert (SDK / name).read_bytes() == root, f"sdk/{name} drifted from the root copy"
-    if SERVER.exists():
-        assert (SERVER / name).read_bytes() == root, f"server/{name} drifted from the root copy"
+def test_the_two_packages_license_copies_are_the_same(name):
+    if not SERVER.exists():
+        pytest.skip("server/ not in this checkout")
+    assert (SERVER / name).read_bytes() == (SDK / name).read_bytes(), f"server/{name} and sdk/{name} differ"
+
+
+@pytest.mark.parametrize("name", LICENSE_FILES)
+def test_the_repository_root_holds_no_license_file(name):
+    assert not (ROOT / name).exists(), f"{name} is back at the repository root; the packages carry their own"
 
 
 def test_sdk_license_is_the_dual_spdx_expression():
