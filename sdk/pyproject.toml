@@ -52,3 +52,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# A test stuck for ten minutes prints every thread's stack and goes on: a CI job once hit its 30-minute limit
+# with nothing to show where (Python 3.11 with PyTorch 2.6, on 981fe6c).
+faulthandler_timeout = 600
