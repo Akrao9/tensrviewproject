@@ -1221,14 +1221,20 @@ def update_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     median of the parameter's ACT_WINDOW records before, from SCORE_MIN_HISTORY earlier finite
     values on. `parameters` with an update size, `judged`, and `lowest`: the MEASUREMENTS_LISTED
     whose update fell furthest, each with `name`, `ratio`, `step`, `baseline` and `update_rms`.
-    None when no record carries `update_rms`."""
+    None when no record carries `update_rms` on an update that was applied.
+
+    A skipped update (`step_skipped` true, whoever reported it) is left out: it enters no baseline and
+    gives no ratio (wave AJ, A7, the author's decision of Nov 22). A partial skip (`step_skipped_part`)
+    is left out whole: the record counts the optimizers the scaler skipped and names none, so no
+    parameter's update can be told applied there, and an ambiguous parameter is not judged on that
+    step, as `update_spike` reads it (WAVE_AE_CONTRACT.md, section 4)."""
     # Each parameter's last ACT_WINDOW values, which is all the rule reads (lane AD11: the whole run
     # was kept), and never fewer than SCORE_MIN_HISTORY, so that its length still counts them.
     past: dict[str, deque[float]] = {}
     lowest: dict[str, dict[str, Any]] = {}
     for record in sorted(records, key=lambda r: r["step"]):
         sizes = record.get("update_rms")
-        if not isinstance(sizes, Mapping):
+        if not isinstance(sizes, Mapping) or record.get("step_skipped"):
             continue
         for name, value in sizes.items():
             now = _finite(value)
@@ -1258,12 +1264,18 @@ def weight_jumps(records: list[dict[str, Any]]) -> dict[str, Any] | None:
 
     A weight check is a record whose `weight_norms` holds at least one norm the column carries
     (`_weight_check`), as Rust counts the rows (wave AJ, A9: a map of text alone was a check here
-    and not in Rust)."""
+    and not in Rust).
+
+    Two checks are compared only within one attempt: the first check after a reload is the new
+    baseline, and the change across the reload is no jump (wave AJ, A10, the author's decision of
+    Nov 22). `checks` still counts every check. `weight_norm_trends` reads across reloads as before."""
     checks = [r for r in sorted(records, key=lambda r: r["step"]) if _weight_check(r)]
     if len(checks) < 2:
         return None
     best: dict[str, dict[str, Any]] = {}
     for before, after in zip(checks, checks[1:]):
+        if before.get("attempt") != after.get("attempt"):
+            continue
         for name, value in after["weight_norms"].items():
             a, b = _finite(before["weight_norms"].get(name)), _finite(value)
             if a is None or b is None or a <= 0 or b <= 0:
