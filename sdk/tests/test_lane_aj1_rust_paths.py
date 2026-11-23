@@ -62,6 +62,10 @@ def _check(doc: dict, expect: dict, path: str) -> None:
                for i in incidents if i.get("kind") == "update_spike"]
         assert got == [[step, round(now, 9), round(then, 9)] for step, now, then in expect["update_spike"]], incidents
         return
+    for block, value in expect.get("blocks", {}).items():  # exact, null for an absent block
+        assert doc.get(block) == value, (block, doc.get(block))
+    if "incidents" not in expect:
+        return
     assert [i["kind"] for i in incidents] == [w["kind"] for w in expect["incidents"]], incidents
     for got, want in zip(incidents, expect["incidents"]):
         for key, value in want.items():

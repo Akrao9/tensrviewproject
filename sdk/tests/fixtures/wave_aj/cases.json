@@ -7,7 +7,8 @@
   "row: at row.step, the typed column holds exactly row.typed[key] (null: the column is null; non-finite numbers written as the sink's strings) and extra_json holds exactly row.extra (null: extra_json is null); row_to_record(record_to_row(r)) == r for every record; row.moved, when given, is what rows_to_send adds to moved.",
   "expect.incidents: the incidents in order, each matched on the fields given (parameters: the names of the incident's parameters). expect.run_state applies to python and rust_sdk only (rust_raw and incidents.json have none). expect.moe_routing_not_checked: the routers of not_checked's moe_routing entry, null for no entry. expect.weight_jumps and expect.update_trends: matched on the fields given (largest and lowest on their first entries' given fields).",
   "thresholds, when given, are passed to every engine path (build_evidence's keyword arguments, server_report's thresholds). clean_records null: no clean control; the case's expect is explicit (expect.update_spike: [step, grad_norm, grad_norm_before] of each update_spike incident, to 9 places).",
-  "needs: the paths that cannot pass until that lane's change is in (measured on 212205d with the clean records). The integrated gate runs every path."
+  "needs: the paths that cannot pass until that lane's change is in (measured on 212205d with the clean records). The integrated gate runs every path.",
+  "expect.blocks: each named block must equal the value given exactly (null: the block is absent). The A7 and A10 cases are lane AJ-2's (876f627), with schema_version and ts added so the row round trip holds."
  ],
  "cases": [
   {
@@ -6472,6 +6473,1407 @@
    },
    "expect": {
     "raises": false
+   }
+  },
+  {
+   "name": "a7_caller_skip",
+   "about": "A7 (AJ-2's CALLER_SKIP, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_caller_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "caller",
+     "update_rms": {
+      "w": 0.01
+     },
+     "ts": 12.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 1,
+      "judged": 1,
+      "lowest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_full_skip",
+   "about": "A7 (AJ-2's FULL_SKIP, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 0.01
+     },
+     "ts": 12.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_full_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 13.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 1,
+      "judged": 1,
+      "lowest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_partial_skip",
+   "about": "A7 (AJ-2's PARTIAL_SKIP, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0,
+      "u": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_partial_skip",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "step_skipped_part": {
+      "skipped": 1,
+      "of": 2
+     },
+     "update_rms": {
+      "w": 0.01,
+      "u": 1.0
+     },
+     "ts": 12.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 2,
+      "judged": 2,
+      "lowest": [
+       {
+        "name": "u",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       },
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_skips_first",
+   "about": "A7 (AJ-2's SKIPS_FIRST, 876f627): update_trends exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "step_skipped_by": "scaler",
+     "update_rms": {
+      "w": 5.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 12,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 12.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 13,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 13.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 14,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 14.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 15,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 15.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 16,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 16.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 17,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 17.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 18,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 18.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 19,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 19.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 20.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_skips_first",
+     "rank": 0,
+     "attempt": 1,
+     "step": 21,
+     "grad_norm": 1.0,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 21.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": {
+      "parameters": 1,
+      "judged": 1,
+      "lowest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 20,
+        "baseline": 1.0,
+        "update_rms": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a7_only_skipped_updates",
+   "about": "A7: only skipped updates give no update_trends block",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 2.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 3.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 4.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 5.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 6.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 7.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 8.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 9.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a7_only_skipped_updates",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "grad_norm": 1.0,
+     "step_skipped": true,
+     "update_rms": {
+      "w": 1.0
+     },
+     "ts": 11.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "update_trends": null
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A7): a skipped update is neither baseline nor lowest",
+    "rust_raw": "AJ-3 (A7): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A7): the SDK makes update_trends in Python (A9)"
+   }
+  },
+  {
+   "name": "a10_reload_then_jump",
+   "about": "A10 (AJ-2's, 876f627): weight_jumps exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 20.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 1,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 50.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 2,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 2,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_then_jump",
+     "rank": 0,
+     "attempt": 2,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 150.0
+     },
+     "ts": 50.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "weight_jumps": {
+      "checks": 6,
+      "parameters": 1,
+      "largest": [
+       {
+        "name": "w",
+        "ratio": 3.0,
+        "step": 50,
+        "previous_step": 40,
+        "before": 50.0,
+        "after": 150.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A10): weight_jumps resets when the attempt changes",
+    "rust_raw": "AJ-3 (A10): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A10): the SDK makes weight_jumps in Python (A9)"
+   }
+  },
+  {
+   "name": "a10_reload_only",
+   "about": "A10 (AJ-2's, 876f627): weight_jumps exactly as given",
+   "paths": [
+    "python",
+    "rust_raw",
+    "rust_sdk"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 0.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 10.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 20,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 20.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 1,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 1.0
+     },
+     "ts": 50.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 2,
+     "step": 30,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 30.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 2,
+     "step": 40,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 40.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "a10_reload_only",
+     "rank": 0,
+     "attempt": 2,
+     "step": 50,
+     "grad_norm": 1.0,
+     "weight_norms": {
+      "w": 50.0
+     },
+     "ts": 50.0
+    }
+   ],
+   "clean_records": null,
+   "expect": {
+    "blocks": {
+     "weight_jumps": {
+      "checks": 6,
+      "parameters": 1,
+      "largest": [
+       {
+        "name": "w",
+        "ratio": 1.0,
+        "step": 10,
+        "previous_step": 0,
+        "before": 1.0,
+        "after": 1.0
+       }
+      ]
+     }
+    },
+    "raises": false
+   },
+   "needs": {
+    "python": "AJ-2 (A10): weight_jumps resets when the attempt changes",
+    "rust_raw": "AJ-3 (A10): the same in detect.rs",
+    "rust_sdk": "AJ-2 (A10): the SDK makes weight_jumps in Python (A9)"
    }
   }
  ]
