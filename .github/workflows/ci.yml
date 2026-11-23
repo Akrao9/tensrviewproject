@@ -67,7 +67,7 @@ jobs:
           pip install --no-deps -e .
           python -c "import torch; print(torch.__version__)"
       - name: Tests
-        run: pytest -ra
+        run: pytest -ra -o faulthandler_timeout=600
       - name: Compiler gate script, CPU fallback
         # Without CUDA this runs on aot_eager: it checks graph breaks, recompiles, router
         # counts and the detector, but not Inductor or CUDA graphs. The gpu job does those.
@@ -93,11 +93,11 @@ jobs:
           pip install -r <(python packaging/requirements.py dev lightning huggingface rerun flight nvml)
           pip install --no-deps -e .
       - name: Tests
-        run: pytest -ra
+        run: pytest -ra -o faulthandler_timeout=600
       - name: Gate 1 fixtures through the SDK pipeline
-        run: pytest -ra ../experiments/moe-bakeoff/test_fixtures.py ../experiments/gate1/test_gate1.py
+        run: pytest -ra -o faulthandler_timeout=600 ../experiments/moe-bakeoff/test_fixtures.py ../experiments/gate1/test_gate1.py
       - name: TrainCheck's silent errors against TensorQuill, the catalog and one short run
-        run: pytest -ra ../experiments/traincheck-bugs/test_traincheck_bugs.py
+        run: pytest -ra -o faulthandler_timeout=600 ../experiments/traincheck-bugs/test_traincheck_bugs.py
       - name: Trainer callback acceptance script, toy model
         run: python examples/trainer_check.py --toy --backend aot_eager --steps 150 --seed-step 100 --probe-every 50 --out "$RUNNER_TEMP/trainer-check"
       - name: Seeded gradient-spike and stalled-weight cases, toy model
@@ -143,7 +143,7 @@ jobs:
         run: |
           set -o pipefail
           test -x "$TENSORQUILL_SERVER_BIN"
-          pytest -ra 2>&1 | tee "$RUNNER_TEMP/server-pytest.log"
+          pytest -ra -o faulthandler_timeout=600 2>&1 | tee "$RUNNER_TEMP/server-pytest.log"
           if grep -E '^SKIPPED.*(tensorquill-server|TENSORQUILL_SERVER_BIN|server binary|pyarrow)' "$RUNNER_TEMP/server-pytest.log"; then
             echo "::error::the tests above were skipped for want of the server binary or pyarrow, which this job provides"
             exit 1
@@ -188,7 +188,7 @@ jobs:
           pip install -r <(python packaging/requirements.py dev)
           pip install --no-deps -e .
       - name: Tests
-        run: pytest -ra
+        run: pytest -ra -o faulthandler_timeout=600
       - name: Compiler gate, Inductor with CUDA graphs
         env:
           TORCH_LOGS: graph_breaks,recompiles,cudagraphs

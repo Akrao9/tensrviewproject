@@ -955,18 +955,28 @@ def test_the_watch_command_s_follow_child_ends_when_the_watcher_is_killed(tmp_pa
     env = {**child_env(), sd.BINARY_ENV: str(BINARY)}
     watcher = subprocess.Popen([sys.executable, "-m", "tensorquill", str(path), "--watch", "--interval", "0.05",
                                 "-o", str(tmp_path / "out.json")], cwd=tmp_path, env=env,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.DEVNULL, stderr=(tmp_path / "watcher.stderr").open("wb"))
+
+    def table() -> list[str]:
+        # -ww: whole lines. On Linux CI (981fe6c) no child was found here; the cause is not known (see
+        # test_lane_af_w_watch), so a failure below says what the table held.
+        return subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,command="], capture_output=True,
+                              text=True).stdout.splitlines()
 
     def followers() -> list[int]:
-        # -ww: the whole line, not cut at the screen width (see test_lane_af_w_watch)
-        table = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
-        return [int(line.split()[0]) for line in table.splitlines()
+        return [int(line.split()[0]) for line in table()
                 if line.split()[1:2] == [str(watcher.pid)] and "detect --samples --follow" in line]
+
+    def seen() -> str:
+        return (f"no evidence or no follow child: watcher pid {watcher.pid}, ended with {watcher.poll()}, evidence "
+                f"written {(tmp_path / 'out.json').exists()}; lines naming the server: "
+                f"{[line for line in table() if 'tensorquill-server' in line]}; the watcher's standard error: "
+                f"{(tmp_path / 'watcher.stderr').read_text(errors='replace')[-600:]!r}")
 
     try:
         deadline = time.monotonic() + 60
         while not (tmp_path / "out.json").exists() or not followers():
-            assert time.monotonic() < deadline and watcher.poll() is None, "no evidence or no follow child"
+            assert time.monotonic() < deadline and watcher.poll() is None, seen()
             time.sleep(0.05)
         child = followers()[0]
         watcher.send_signal(signal.SIGKILL)

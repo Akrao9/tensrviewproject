@@ -256,12 +256,24 @@ class Watching:
         assert code == 0, self.process.stderr.read()
 
 
-# `-ww` in each listing of the process table: without it procps may cut a line at the screen width (80 columns
-# where there is no terminal, as on Linux CI), and the server's path there is longer than that, so no line
-# showed `--follow` and no child was found.
+# Every listing of the process table asks for all processes (`-A`, which means the same to macOS's ps and
+# to procps) and for whole lines (`-ww`). On Linux CI (981fe6c) no listing showed the watcher's child and the
+# cause is not known. One hypothesis, not verified on Linux: procps cut each line at a screen width shorter
+# than the server's path there. So a failed search also says what the table held (`_seen`).
+_PS = ["ps", "-A", "-ww", "-o"]
+
+
+def _seen(binary: str) -> str:
+    """For a failure's message: the process table's lines that name the server, as ps printed them."""
+    done = subprocess.run([*_PS, "pid=,ppid=,command="], capture_output=True, text=True)
+    lines = [line for line in done.stdout.splitlines() if "tensorquill-server" in line]
+    return (f"binary {binary!r}; this process {os.getpid()}; ps exit {done.returncode}, {len(done.stdout.splitlines())} "
+            f"lines, standard error {done.stderr.strip()[:200]!r}; lines naming the server: {lines}")
+
+
 def _children_left(binary: str) -> list[str]:
-    listed = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout.splitlines()
-    return [line for line in listed if line.startswith(binary) and "--follow" in line]
+    listed = subprocess.run([*_PS, "command="], capture_output=True, text=True).stdout.splitlines()
+    return [line.strip() for line in listed if line.strip().startswith(binary) and "--follow" in line]
 
 
 def fresh(tmp: Path, source: Path, **thresholds) -> dict:
@@ -520,7 +532,7 @@ def test_one_read_with_auto_and_a_binary_of_protocol_3_uses_the_python_detectors
 
 def _followers(binary: str) -> list[tuple[int, int]]:
     """(pid, parent pid) of each `detect --follow` process of `binary`, from the process table."""
-    listed = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    listed = subprocess.run([*_PS, "pid=,ppid=,command="], capture_output=True, text=True).stdout
     found = []
     for line in listed.splitlines():
         pid, ppid, command = line.split(None, 2)
@@ -553,7 +565,9 @@ def _watching_with_child(tmp: Path, binary: str) -> tuple["Watching", int, Path]
         os.environ.pop("TMPDIR") if before is None else os.environ.__setitem__("TMPDIR", before)
     watching.wait(1)
     children = [pid for pid, ppid in _followers(binary) if ppid == watching.process.pid]
-    assert len(children) == 1, "the watcher has no detect --follow child"
+    assert len(children) == 1, (f"the watcher has no detect --follow child: watcher pid {watching.process.pid}, "
+                                f"ended with {watching.process.poll()}, {watching.updates} updates, "
+                                f"evidence written {watching.out.exists()}; {_seen(binary)}")
     return watching, children[0], scratch
 
 
@@ -569,7 +583,7 @@ def test_the_child_ends_with_a_watch_that_ends_by_itself(binary, tmp_path):
             write_jsonl(path, records(range(40, 45)), "a")
 
     ev.watch(path, tmp_path / "out.json", interval=0.0, polls=3, on_update=grow, detectors="rust")
-    assert len(seen) == 2 and len(set(seen)) == 1, "one child, the same at both looks"
+    assert len(seen) == 2 and len(set(seen)) == 1, f"one child, the same at both looks: saw {seen}; {_seen(binary)}"
     assert _gone(seen[0]) and not [pid for pid, _ in _followers(binary) if pid == seen[0]]
 
 
