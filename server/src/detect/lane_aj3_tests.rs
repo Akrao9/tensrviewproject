@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    ArrayRef, Float64Array, Float64Builder, Int32Array, Int64Array, ListBuilder, MapBuilder, StringArray, StringBuilder,
+};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Value};
@@ -129,4 +131,228 @@ fn a8_a_well_formed_source_is_kept_as_written() {
         json!({"router.0": {"form": "other", "point": "requested"}}),
     ]);
     assert_eq!(found["moe_source"], source, "{found}");
+}
+
+// --- an incomplete `grad_norms` (the author, Nov 22, 2026) -----------------------------------
+//
+// `WAVE_AJ_CONTRACT.md` section 1: an entry the column cannot hold is left out of the typed map
+// and travels alone in `extra_json` under the record's own key. The rows here are built as the
+// contract writes them, so raw Rust is checked without the sender. The author's terms: valid
+// sibling gradients stay visible to `non_finite`; when either side of an `update_spike`
+// comparison had a refused gradient entry, the whole totals are compared (the existing
+// fallback), so the typed map's missing entry cannot make a rise; the stalled-weight streak
+// reads a refused gradient as absent (contract 2 of lane W3: listed without a gradient holds).
+// The expected results are written out: the same records with the bad entry deleted are not a
+// control here, since deleting it also deletes the evidence that the map was incomplete.
+
+/// One row as the sender stores it: the typed `grad_norms` (None: the column is null), the
+/// refused entries in `extra_json` (None: no `extra_json`), `grad_norm`, `update_rms` of `a`,
+/// and `weights_unchanged` (None: no weight check).
+struct Row<'a> {
+    grads: Option<Vec<(&'a str, Option<f64>)>>,
+    refused: Option<Value>,
+    grad_norm: Option<f64>,
+    update: Option<f64>,
+    unchanged: Option<Vec<&'a str>>,
+}
+
+fn row<'a>(grads: &[(&'a str, f64)], grad_norm: f64, update: f64) -> Row<'a> {
+    Row {
+        grads: Some(grads.iter().map(|(name, norm)| (*name, Some(*norm))).collect()),
+        refused: None,
+        grad_norm: Some(grad_norm),
+        update: Some(update),
+        unchanged: None,
+    }
+}
+
+fn stored(given: &[Row]) -> RecordBatch {
+    let n = given.len();
+    let mut grads = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
+    let mut updates = MapBuilder::new(None, StringBuilder::new(), Float64Builder::new());
+    let mut lists = ListBuilder::new(StringBuilder::new());
+    for row in given {
+        match &row.grads {
+            Some(entries) => {
+                for (name, norm) in entries {
+                    grads.keys().append_value(name);
+                    grads.values().append_option(*norm);
+                }
+                grads.append(true).unwrap();
+            }
+            None => grads.append(false).unwrap(),
+        }
+        match row.update {
+            Some(size) => {
+                updates.keys().append_value("a");
+                updates.values().append_value(size);
+                updates.append(true).unwrap();
+            }
+            None => updates.append(false).unwrap(),
+        }
+        match &row.unchanged {
+            Some(names) => {
+                for name in names {
+                    lists.values().append_value(name);
+                }
+                lists.append(true);
+            }
+            None => lists.append(false),
+        }
+    }
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        ("run_id", Arc::new(StringArray::from_iter_values((0..n).map(|_| "run")))),
+        ("rank", Arc::new(Int32Array::from_iter_values((0..n).map(|_| 0)))),
+        ("attempt", Arc::new(Int64Array::from_iter_values((0..n).map(|_| 1)))),
+        ("step", Arc::new(Int64Array::from_iter_values(0..n as i64))),
+        (
+            "grad_norm",
+            Arc::new(Float64Array::from(
+                given.iter().map(|row| row.grad_norm).collect::<Vec<_>>(),
+            )),
+        ),
+        ("grad_norms", Arc::new(grads.finish())),
+        ("update_rms", Arc::new(updates.finish())),
+        ("weights_unchanged", Arc::new(lists.finish())),
+        (
+            "extra_json",
+            Arc::new(StringArray::from(
+                given
+                    .iter()
+                    .map(|row| {
+                        row.refused
+                            .as_ref()
+                            .map(|refused| json!({"grad_norms": refused}).to_string())
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+    ];
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, array)| Field::new(*name, array.data_type().clone(), true))
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns.into_iter().map(|(_, array)| array).collect(),
+    )
+    .unwrap()
+}
+
+fn kind(given: &[Row], kind: &str) -> Vec<Value> {
+    let thresholds = Arc::new(Thresholds::parse(r#"{"update_window": 3}"#).unwrap());
+    let detectors = judge(0, &[stored(given)], &thresholds).unwrap();
+    detectors
+        .incidents()
+        .into_iter()
+        .filter(|incident| incident["kind"] == kind)
+        .collect()
+}
+
+const ALL: [(&str, f64); 3] = [("a", 3.0), ("b", 4.0), ("c", 12.0)];
+const SHARED: [(&str, f64); 2] = [("a", 3.0), ("b", 4.0)];
+
+/// Steps 0 to 3 name a, b and c (whole norm 13) with updates that change by 0.01, which fills a
+/// window of 3; `last` is step 4, where the update jumps to 2.0.
+fn steady_then(last: Row<'static>) -> Vec<Row<'static>> {
+    let mut rows: Vec<Row> = [1.0, 1.01, 1.0, 1.01]
+        .iter()
+        .map(|size| row(&ALL, 13.0, *size))
+        .collect();
+    rows.push(last);
+    rows
+}
+
+#[test]
+fn incomplete_grads_on_the_later_side_compare_the_whole_totals() {
+    // Step 4's whole norm is still 13 (c is 12 there too, refused as `true`). Whole totals: 13
+    // against 13, no rise, so no threshold and no incident. Split over the typed map alone it
+    // would be 13 against 5 (a and b's share of step 3), a rise of 8 that flags the jump.
+    let mut last = row(&SHARED, 13.0, 2.0);
+    last.refused = Some(json!({"c": true}));
+    let found = kind(&steady_then(last), "update_spike");
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_parameter_left_out_without_a_refusal_is_still_split() {
+    // The rule as it stands (B3, unchanged): with c simply not recorded at step 4 the totals are
+    // split, 13 against 5, and the jump is flagged. This is the row above without its
+    // `extra_json`, and it reads differently on purpose.
+    let found = kind(&steady_then(row(&SHARED, 13.0, 2.0)), "update_spike");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["step"], 4);
+    assert_eq!(found[0]["grad_norm"], 13.0);
+    assert!(
+        (found[0]["grad_norm_before"].as_f64().unwrap() - 5.0).abs() < 1e-12,
+        "{}",
+        found[0]
+    );
+}
+
+#[test]
+fn incomplete_grads_on_the_earlier_side_compare_the_whole_totals() {
+    // Step 3 refused c; step 4 names all three with a whole norm of sqrt(2644). Whole totals:
+    // sqrt(2644) against 13. Split, step 4 would read 50 (a and b alone) against 13.
+    let mut third = row(&SHARED, 13.0, 1.01);
+    third.refused = Some(json!({"c": "12"}));
+    let mut rows: Vec<Row> = [1.0, 1.01, 1.0].iter().map(|size| row(&ALL, 13.0, *size)).collect();
+    rows.push(third);
+    let whole = 2644f64.sqrt();
+    rows.push(row(&[("a", 30.0), ("b", 40.0), ("c", 12.0)], whole, 2.0));
+    let found = kind(&rows, "update_spike");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["step"], 4);
+    assert_eq!(found[0]["grad_norm"], whole);
+    assert_eq!(found[0]["grad_norm_before"], 13.0);
+}
+
+#[test]
+fn a_valid_sibling_of_a_refused_gradient_is_still_non_finite() {
+    let given = [Row {
+        grads: Some(vec![("good", Some(f64::NAN))]),
+        refused: Some(json!({"bad": true})),
+        grad_norm: Some(1.0),
+        update: None,
+        unchanged: None,
+    }];
+    let found = kind(&given, "non_finite");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["step"], 0);
+    assert_eq!(found[0]["gradients"], json!(["good"]), "{}", found[0]);
+}
+
+/// `c` listed unchanged at every check, `d` always changing; at step 2 `c`'s gradient is `at_2`.
+fn checks(at_2: Option<Option<f64>>, refused: bool) -> Vec<Row<'static>> {
+    (0..4)
+        .map(|step| {
+            let mut grads = vec![("d", Some(0.5))];
+            match (step, at_2) {
+                (2, Some(norm)) => grads.push(("c", norm)),
+                (2, None) => {}
+                _ => grads.push(("c", Some(0.5))),
+            }
+            Row {
+                grads: Some(grads),
+                refused: (step == 2 && refused).then(|| json!({"c": true})),
+                grad_norm: None,
+                update: None,
+                unchanged: Some(vec!["c"]),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_refused_gradient_holds_the_streak_as_an_absent_one_does() {
+    // Lane W3's contract 2: listed without a gradient holds the streak, so c reaches three
+    // checks at step 3, whether its gradient at step 2 was refused or not recorded.
+    for refused in [true, false] {
+        let found = kind(&checks(None, refused), "stalled_weights");
+        assert_eq!(found.len(), 1, "refused={refused}: {found:?}");
+        assert_eq!(found[0]["step"], 3);
+        assert_eq!(found[0]["parameters"], json!(["c"]));
+    }
+    // A null (stored) gradient is not finite, and resets it: no stall by step 3.
+    assert!(kind(&checks(Some(None), false), "stalled_weights").is_empty());
 }
