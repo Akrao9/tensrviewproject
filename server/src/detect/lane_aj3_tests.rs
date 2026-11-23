@@ -599,28 +599,24 @@ fn every_extra_json_note_is_read_beside_a_number_too_large_for_a_float() {
         .iter()
         .filter_map(|entry| entry["check"].as_str())
         .collect();
-    for check in ["layers", "update_size", "grads_not_read"] {
+    // `layers_not_read`, `update_not_read`, `grads_not_read` and `moe_refused`, as `not_checked` names them.
+    for check in ["layers", "update_size", "gradients", "router"] {
         assert!(checks.contains(&check), "{check} not in {checks:?}");
     }
     let routing = control["not_checked"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["check"] == "moe_routing");
+        .find(|entry| entry["check"] == "router");
     assert!(
         routing.is_some_and(|entry| entry.to_string().contains("router.9")),
         "{}",
         control["not_checked"]
     );
+    // `step_skipped_by` "scaler" with `step_skipped_part` 1 of 2: a partial skip, which needs both.
     assert_eq!(
-        control["skipped_updates"]["scaler"], 1,
-        "{}",
-        control["skipped_updates"]
-    );
-    assert_eq!(
-        control["skipped_updates"]["partial"], 1,
-        "{}",
-        control["skipped_updates"]
+        control["skipped_updates"],
+        json!({"both": 0, "caller": 0, "partial": 1, "scaler": 0})
     );
 }
 

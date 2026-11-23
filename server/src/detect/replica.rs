@@ -306,7 +306,7 @@ pub fn records_from_batch(batch: &RecordBatch, rank: i64, tolerance: f64) -> Vec
         }
         let parsed: Option<Value> = extra
             .filter(|extra| !extra.is_null(row) && extra.value(row).contains("\"replica"))
-            .and_then(|extra| serde_json::from_str(extra.value(row)).ok());
+            .and_then(|extra| super::extra_json::parse(extra.value(row)));
         let column_table = match (&spreads, numbers) {
             (Some(spreads), Some(numbers)) if !spreads.map.is_null(row) => {
                 let offsets = spreads.values.value_offsets();
