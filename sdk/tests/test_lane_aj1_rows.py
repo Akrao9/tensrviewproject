@@ -44,7 +44,7 @@ def test_the_typed_column_keeps_every_held_entry(case):
 
 @pytest.mark.parametrize("case", CASES, ids=[c["name"] for c in CASES])
 def test_every_record_reads_back_as_it_was_sent(case):
-    for record in case["records"] + case["clean_records"]:
+    for record in case["records"] + (case["clean_records"] or []):
         if "row" in case["paths"]:
             assert row_to_record(record_to_row(record)) == record
         batch, steps, skipped = rows_to_send([record], flight_schema())
@@ -65,7 +65,7 @@ def test_an_entry_arrow_refuses_travels_alone_and_moved_names_its_key(case):
 def test_a_clean_records_row_has_nothing_in_extra_json():
     """The control of every case: with the refused entries removed, nothing travels in `extra_json`."""
     for case in CASES:
-        for record in case["clean_records"]:
+        for record in case["clean_records"] or []:
             assert record_to_row(record)["extra_json"] is None, (case["name"], record["step"])
 
 

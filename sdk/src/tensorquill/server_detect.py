@@ -204,18 +204,19 @@ def _stream(records: Iterable[Mapping[str, Any]]) -> bytes:
         import pyarrow as pa
     except ImportError as error:
         raise RuntimeError("the Rust detectors read Arrow: pip install 'tensorquill[flight]'") from error
-    from .flight import _row, flight_schema
+    from .flight import _row, flight_schema, rows_batch
 
-    rows = [
-        # Records written without a run ID still have to travel in the column.
-        _row(record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""})
-        for record in stream_order(listed)
-    ]
+    # Records written without a run ID still have to travel in the column.
+    ordered = [record if isinstance(record.get("run_id"), str) else {**record, "run_id": ""}
+               for record in stream_order(listed)]
+    rows = [_row(record) for record in ordered]
     schema = flight_schema()
     out = io.BytesIO()
     with pa.ipc.new_stream(out, schema) as writer:
         for start in range(0, len(rows), _BATCH_ROWS):
-            writer.write_batch(pa.RecordBatch.from_pylist(rows[start:start + _BATCH_ROWS], schema=schema))
+            # A value only Arrow refuses travels in `extra_json`, as on the sender's path (wave AJ).
+            end = start + _BATCH_ROWS
+            writer.write_batch(rows_batch(ordered[start:end], rows[start:end], schema))
     return out.getvalue()
 
 

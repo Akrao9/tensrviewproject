@@ -57,6 +57,11 @@ def _part(doc: dict) -> dict:
 
 def _check(doc: dict, expect: dict, path: str) -> None:
     incidents = doc.get("incidents") or []
+    if "update_spike" in expect:  # an explicit case (no clean control): the update_spike incidents alone
+        got = [[i["step"], round(i["grad_norm"], 9), round(i["grad_norm_before"], 9)]
+               for i in incidents if i.get("kind") == "update_spike"]
+        assert got == [[step, round(now, 9), round(then, 9)] for step, now, then in expect["update_spike"]], incidents
+        return
     assert [i["kind"] for i in incidents] == [w["kind"] for w in expect["incidents"]], incidents
     for got, want in zip(incidents, expect["incidents"]):
         for key, value in want.items():
@@ -129,20 +134,24 @@ def live(tmp_path_factory):
     server.close()
 
 
-def _run(path: str, records: list[dict], live, tmp_path: Path, run_id: str) -> dict:
+def _run(path: str, records: list[dict], live, tmp_path: Path, run_id: str, thresholds: dict | None = None) -> dict:
+    thresholds = thresholds or {}
     if path == "python":
-        return evidence.build_evidence(records, detectors="python")
+        return evidence.build_evidence(records, detectors="python", **thresholds)
     if path == "rust_raw":
-        return server_report(records)
+        return server_report(records, thresholds=thresholds or None)
     if path == "rust_sdk":
-        return evidence.build_evidence(records, detectors="rust")
+        return evidence.build_evidence(records, detectors="rust", **thresholds)
+    assert not thresholds, "the live server judges with its own thresholds"
     return live.report(records, run_id, tmp_path)
 
 
 @pytest.mark.parametrize(("case", "path"), _params())
 def test_every_path_reports_what_the_case_expects_and_what_its_clean_records_give(case, path, request, tmp_path):
     server = request.getfixturevalue("live") if path == "live_server" else None
-    got = _run(path, case["records"], server, tmp_path, case["name"])
+    thresholds = case.get("thresholds")
+    got = _run(path, case["records"], server, tmp_path, case["name"], thresholds)
     _check(got, case["expect"], path)
-    clean = _run(path, case["clean_records"], server, tmp_path, case["name"] + "-clean")
-    assert _text(_part(got)) == _text(_part(clean))
+    if case["clean_records"] is not None:
+        clean = _run(path, case["clean_records"], server, tmp_path, case["name"] + "-clean", thresholds)
+        assert _text(_part(got)) == _text(_part(clean))

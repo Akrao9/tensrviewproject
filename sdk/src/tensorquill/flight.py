@@ -264,7 +264,8 @@ def _row(
         if item is not None and isinstance(value, dict):
             # Wave AJ (A3, WAVE_AJ_CONTRACT.md section 1): an entry the column cannot hold leaves it
             # alone; the rest of the map stays in the column, where the Rust detectors read it.
-            held, refused, counted = _split(value, item, None if schema is None else schema.field(spec[0]).type)
+            held, refused, counted = _split(value, item, None if schema is None else schema.field(spec[0]).type,
+                                            key in _NULL_REFUSED)
             if held:
                 row[spec[0]] = held
                 if refused:
@@ -295,31 +296,43 @@ _SPLIT: dict[str, Callable[[Any], Any]] = {
     "moe": _list(_int),
     "replica_spread": _list(_float),
 }
+# The maps whose refused entry stays in the column as null, not absent (WAVE_AJ_CONTRACT.md, section 1):
+# a gradient that is listed with no value, as Python reads the raw `true` or string. So an update
+# comparison takes the whole-total fallback in both engines (a non-finite norm ends the split), and
+# a stalled weight's streak resets on it in both, where an unlisted gradient would leave both alone.
+_NULL_REFUSED = frozenset({"grad_norms"})
 _UNHELD = object()
 
 
 def _split(
-    value: Mapping[str, Any], item: Callable[[Any], Any], map_type: Any,
+    value: Mapping[str, Any], item: Callable[[Any], Any], map_type: Any, null_refused: bool = False,
 ) -> tuple[list[tuple[str, Any]], dict[str, Any], bool]:
     """`value`'s entries as the column's pairs, those the column cannot hold, and whether any of
     those was refused by an overflow or by Arrow (`map_type`, when given: the name is checked with
-    the value, as one entry of the map) and not by its type."""
+    the value, as one entry of the map) and not by its type. With `null_refused`, a refused entry
+    whose name the column can hold is also kept in the pairs, as null."""
     held: list[tuple[str, Any]] = []
     refused: dict[str, Any] = {}
     counted = False
+
+    def fits(pair: tuple[str, Any]) -> bool:
+        return map_type is None or _fits([pair], map_type)
+
     for name, entry in value.items():
         try:
             pair = (_str(name), item(entry))
         except (TypeError, ValueError):
-            refused[name] = entry
-            continue
+            pair = None
         except Exception:  # noqa: BLE001  OverflowError and the like
-            refused[name], counted = entry, True
+            pair, counted = None, True
+        if pair is not None and not fits(pair):
+            pair, counted = None, True
+        if pair is not None:
+            held.append(pair)
             continue
-        if map_type is not None and not _fits([pair], map_type):
-            refused[name], counted = entry, True
-            continue
-        held.append(pair)
+        refused[name] = entry
+        if null_refused and isinstance(name, str) and fits((name, None)):
+            held.append((name, None))
     return held, refused, counted
 
 
@@ -335,9 +348,30 @@ def _fits(value: Any, arrow_type: Any) -> bool:
 
 
 def records_to_batch(records: Iterable[Mapping[str, Any]]) -> Any:
+    records = list(records)
+    return rows_batch(records, [record_to_row(r) for r in records], flight_schema())
+
+
+def rows_batch(records: list[Mapping[str, Any]], rows: list[dict[str, Any]], schema: Any) -> Any:
+    """`rows` (`_row`'s of `records`, made without Arrow's check) as one record batch of `schema`.
+    When Arrow refuses the batch, each row it refuses alone is made again with the check, so a
+    value only Arrow refuses (an integer past its column's type, a name with a lone surrogate)
+    travels in `extra_json` as on the sender's path (wave AJ), and the rest of its row is kept. A
+    key column Arrow refuses still raises, as before."""
     import pyarrow as pa
 
-    return pa.RecordBatch.from_pylist([record_to_row(r) for r in records], schema=flight_schema())
+    try:
+        return pa.RecordBatch.from_pylist(rows, schema=schema)
+    except Exception:  # noqa: BLE001  find the rows Arrow refuses, one at a time
+        pass
+    remade = []
+    for record, row in zip(records, rows):
+        try:
+            pa.RecordBatch.from_pylist([row], schema=schema)
+        except Exception:  # noqa: BLE001
+            row = _row(record, schema)
+        remade.append(row)
+    return pa.RecordBatch.from_pylist(remade, schema=schema)
 
 
 def _plain(value: Any) -> Any:
