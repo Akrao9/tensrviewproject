@@ -2240,7 +2240,15 @@ impl Updates {
             .as_ref()
             .filter(|before| before.attempt == attempt)
             .and_then(|before| shared_largest(&own, largest, before).map(|sides| (before, sides)));
-        let grads: Option<Vec<(String, f64)>> = columns.grad_norms.as_ref().and_then(|norms| {
+        // A row whose `grad_norms` lost an entry the column cannot hold (it travels in `extra_json`,
+        // `WAVE_AJ_CONTRACT.md` section 1) has a typed map that is not the whole record's: its
+        // norms are not used to split, so a comparison with it on either side takes the whole
+        // totals, as Python's `_split_totals` does with the record's own value (the author, Nov 22).
+        let refused = text(columns.extra, row)
+            .filter(|extra| extra.contains("\"grad_norms\""))
+            .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+            .is_some_and(|extra| extra.get("grad_norms").is_some());
+        let grads: Option<Vec<(String, f64)>> = columns.grad_norms.as_ref().filter(|_| !refused).and_then(|norms| {
             let entries = norms.row(row);
             (!entries.is_empty()).then(|| {
                 entries
