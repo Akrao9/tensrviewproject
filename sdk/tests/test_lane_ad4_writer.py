@@ -343,7 +343,7 @@ resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
 sink.write([rec(3), rec(4)])  # the same sink again, the limit gone: this write returns
 sink.close()
 records, left_out = read_jsonl(path)
-lines, _ = read_lines(path, 0, 1000, 1 << 22)
+lines, _ = read_lines(path, 0, 1000, path.stat().st_size + 1)  # one look takes the whole file, however long the lines
 sent, skipped = parse_lines(lines, "r")
 print(json.dumps({{"failed": failed, "torn": torn, "read": [r["step"] for r in records], "left_out": left_out,
                   "sent": [r["step"] for r in sent], "skipped": skipped}}))

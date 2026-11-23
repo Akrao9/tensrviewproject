@@ -256,8 +256,11 @@ class Watching:
         assert code == 0, self.process.stderr.read()
 
 
+# `-ww` in each listing of the process table: without it procps may cut a line at the screen width (80 columns
+# where there is no terminal, as on Linux CI), and the server's path there is longer than that, so no line
+# showed `--follow` and no child was found.
 def _children_left(binary: str) -> list[str]:
-    listed = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True).stdout.splitlines()
+    listed = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout.splitlines()
     return [line for line in listed if line.startswith(binary) and "--follow" in line]
 
 
@@ -517,7 +520,7 @@ def test_one_read_with_auto_and_a_binary_of_protocol_3_uses_the_python_detectors
 
 def _followers(binary: str) -> list[tuple[int, int]]:
     """(pid, parent pid) of each `detect --follow` process of `binary`, from the process table."""
-    listed = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    listed = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
     found = []
     for line in listed.splitlines():
         pid, ppid, command = line.split(None, 2)

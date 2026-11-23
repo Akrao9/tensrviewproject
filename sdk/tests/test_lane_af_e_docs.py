@@ -58,7 +58,9 @@ def section(text: str, title: str) -> str:
 
 
 def child_env() -> dict[str, str]:
-    return {**os.environ, "PYTHONPATH": str(SDK / "src")}
+    # Without NumPy (CI's streaming job), importing PyTorch warns on standard error, ahead of the one line a
+    # command prints there; the filter names only that warning.
+    return {**os.environ, "PYTHONPATH": str(SDK / "src"), "PYTHONWARNINGS": "ignore:Failed to initialize NumPy"}
 
 
 # --- 1. The agent instructions and what the tools answer -------------------------------------------
@@ -956,7 +958,8 @@ def test_the_watch_command_s_follow_child_ends_when_the_watcher_is_killed(tmp_pa
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def followers() -> list[int]:
-        table = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+        # -ww: the whole line, not cut at the screen width (see test_lane_af_w_watch)
+        table = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
         return [int(line.split()[0]) for line in table.splitlines()
                 if line.split()[1:2] == [str(watcher.pid)] and "detect --samples --follow" in line]
 

@@ -331,11 +331,20 @@ def test_router_counts_under_inductor_match_eager_and_make_no_matrix(tmp_path, m
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
     import torch._inductor.config as inductor_config
 
-    if hasattr(inductor_config, "cpp_cache_precompile_headers"):  # absent before PyTorch 2.14: nothing shared to turn off
-        monkeypatch.setattr(inductor_config, "cpp_cache_precompile_headers", False)
-    torch._dynamo.reset()
-    eager, _, largest, _ = _count("integer ids", "cpu", None)
-    records, _, _, _ = _count("integer ids", "cpu", "inductor")
+    # Set and put back by hand, not with monkeypatch: PyTorch keeps this setting outside the module's
+    # `__dict__`, so pytest's undo deletes the attribute, and deleting hides the setting from PyTorch
+    # itself. On CI with PyTorch 2.9 and 2.10 every later `torch.compile(backend="inductor")` in the
+    # process then failed ("cpp_cache_precompile_headers does not exist"). PyTorch 2.6 has no such setting.
+    precompile = getattr(inductor_config, "cpp_cache_precompile_headers", None)
+    if precompile is not None:
+        inductor_config.cpp_cache_precompile_headers = False
+    try:
+        torch._dynamo.reset()
+        eager, _, largest, _ = _count("integer ids", "cpu", None)
+        records, _, _, _ = _count("integer ids", "cpu", "inductor")
+    finally:
+        if precompile is not None:
+            inductor_config.cpp_cache_precompile_headers = precompile
     _same_counts(records, eager)
     assert _cost_holds("integer ids", largest)
 
