@@ -633,3 +633,17 @@ The first batch is test and workflow changes only (`trial/ai-wave`), run here on
 - **Second run, 08:34 to 09:15, alone, that server stopped first: every stage exit 0.** 375 Rust tests, 285 without default features, both clippy lines and `cargo fmt --check` clean; the full SDK suite 5,978 passed, 6 skipped; the compact fixture; 13 driver runs at code 0; Gate 1's shown files unchanged; Gate 1, bake-off and TrainCheck tests 71, 37 and 18. No server left. Logs: `ci-fix-gate-on-6884eca-second-run/`.
 - Also run on the PyTorch 2.6 scratch environment (no NumPy, no `pyarrow`, as the floor CI job): the whole plain suite, 3,912 passed, 44 failed. 13 are Apple MPS cases; 31 are tests that found this checkout's built server while that environment has no `pyarrow`, which CI's plain jobs never see (no binary there). None of the 44 failed on Linux CI.
 
+
+**The author's two corrections to the clip test and its wording (Nov 23), commit `0d8f7c8b641a9c87aa4cd48d10d4cfdd9c9fd58a`.** This corrects the table row above where it reads as a rule by version.
+- **The first step against the control:** where this PyTorch compiles `clip_grad_norm_` on its own, the watched step must compile exactly as many graphs as the control; where it compiles nothing for the clip, the same count or one more is accepted, never more. Kept as they were: no step after the first compiles a graph, with or without TensorQuill, and the recorded pre-clipping norm is the true one.
+- **The wording:** the test comment and `sdk/README.md` state what was observed on PyTorch 2.6.0 and 2.15.0, on CPU with the `eager` backend, and name no other version. The clip compiled on its own was measured on those two only. (CI on `2fba021` saw 2 graphs against 1 at the first step on its PyTorch 2.9 and 2.10 jobs too, on Linux; whether the clip compiles alone there was not measured.)
+- **Measured on the corrected test's own loop** (`clip_counts.py`, output `ci-fix-clip-counts-corrected.txt` in the notes):
+
+| PyTorch | Clip compiled alone | First step, control | First step, watched | Later steps, both | Recorded norm against the true one | The test |
+|---|---|---|---|---|---|---|
+| 2.15.0 | 1 graph | 2 | 2 | 0 | relative error 5.3e-8 | passes, on the exact-parity branch |
+| 2.6.0 | 0 graphs | 1 | 2 | 0 | relative error 4.9e-8 | passes, on the zero-or-one branch |
+
+- The whole file on 2.15.0: 58 passed. On the 2.6.0 scratch environment: 45 passed, 1 skipped (the full-graph clip, PyTorch's own `Unsupported`), 12 failed, all of them the Apple MPS router cases recorded above.
+- **The local gate on `0d8f7c8`, alone, 09:42 to 10:23: every stage exit 0.** 375 Rust tests, 285 without default features, both clippy lines and `cargo fmt --check` clean; the full SDK suite 5,978 passed, 6 skipped; the compact fixture; 13 driver runs at code 0; Gate 1's shown files unchanged against `f5ee53e`; Gate 1, bake-off and TrainCheck tests 71, 37 and 18. No server running before or left after. Logs: `ci-fix-gate-on-0d8f7c8/`. Both gate logs on `6884eca` are kept.
+- Not pushed. The five Linux watcher tests are to be read from the private CI run once the SHA is approved; scored Colab runs wait for green CI.
