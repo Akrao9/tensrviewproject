@@ -4348,7 +4348,7 @@ impl RankDetectors {
             self.activations.row(step, layers);
             self.attention
                 .row(step, &columns, row, &mut self.scalars, &mut self.measurements);
-            self.measurements.row(step, &columns, row);
+            self.measurements.row(self.attempt, step, &columns, row);
             self.head.row(step, &columns, row);
             self.non_finite.row(step, &columns, row, layers);
             self.replica_drift

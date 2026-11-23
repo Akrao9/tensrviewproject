@@ -165,10 +165,10 @@ pub(super) struct Measurements {
     /// Each attention module's largest logit, probe by probe.
     attention: HashMap<String, Series>,
     updates: HashMap<String, UpdateHistory>,
-    /// Rows with a non-empty `weight_norms`, the last one's step and norms (a norm that is not
-    /// finite is None), and each tensor's largest change.
+    /// Rows with a non-empty `weight_norms`, the last one's attempt, step and norms (a norm that is
+    /// not finite is None), and each tensor's largest change.
     checks: u64,
-    previous: Option<(i64, HashMap<String, Option<f64>>)>,
+    previous: Option<(i64, i64, HashMap<String, Option<f64>>)>,
     jumps: HashMap<String, Jump>,
     scratch: Vec<f64>,
     /// How many times a report found a series' trend (each call of [`trend`] at report time), for
@@ -179,10 +179,10 @@ pub(super) struct Measurements {
 impl Measurements {
     /// Reads one row that counts (after the attempt's cutoff), every row of it but the probe,
     /// which [`probe`](Self::probe) is given.
-    pub(super) fn row(&mut self, step: i64, columns: &Columns, row: usize) {
+    pub(super) fn row(&mut self, attempt: i64, step: i64, columns: &Columns, row: usize) {
         self.gradient_row(step, columns, row);
         self.update_row(step, columns, row);
-        self.weight_row(step, columns, row);
+        self.weight_row(attempt, step, columns, row);
     }
 
     /// `gradient_trend`'s series: `clip_grad_norm` once any row has it, as Python reads it for every
@@ -237,8 +237,15 @@ impl Measurements {
     }
 
     /// `update_trends`: each finite `update_rms` against the median of the parameter's last
-    /// [`WINDOW`] finite values, from [`SCORE_MIN`] of them on, on every row (skipped steps too).
+    /// [`WINDOW`] finite values, from [`SCORE_MIN`] of them on. A row whose `step_skipped` is true,
+    /// whoever reported it, is left out: it enters no baseline and gives no ratio (A7, the author's
+    /// decision of Nov 22; `WAVE_AJ_CONTRACT.md` section 6). A partial skip is left out whole, since
+    /// `step_skipped_part` counts the optimizers skipped and names none, so no parameter's update
+    /// can be told applied there, as `update_spike` reads it.
     fn update_row(&mut self, step: i64, columns: &Columns, row: usize) {
+        if flag(columns.step_skipped, row) {
+            return;
+        }
         let Some(sizes) = &columns.update_rms else { return };
         for entry in sizes.row(row) {
             if sizes.values.is_null(entry) {
@@ -269,8 +276,10 @@ impl Measurements {
     }
 
     /// `weight_jumps`: a row with a non-empty `weight_norms` is a weight check, and each tensor's
-    /// positive finite norm is compared with its norm at the check before, either way.
-    fn weight_row(&mut self, step: i64, columns: &Columns, row: usize) {
+    /// positive finite norm is compared with its norm at the check before, either way, when both
+    /// checks are of one attempt: the first check after a reload is the new baseline, and `checks`
+    /// counts every check (A10, the author's decision of Nov 22; `WAVE_AJ_CONTRACT.md` section 7).
+    fn weight_row(&mut self, attempt: i64, step: i64, columns: &Columns, row: usize) {
         let Some(norms) = &columns.weight_norms else { return };
         let entries = norms.row(row);
         if entries.is_empty() {
@@ -282,7 +291,7 @@ impl Measurements {
             let norm = Some(norms.values.value(entry)).filter(|norm| !norms.values.is_null(entry) && norm.is_finite());
             current.insert(norms.keys.value(entry).to_owned(), norm);
         }
-        if let Some((previous_step, before)) = &self.previous {
+        if let Some((_, previous_step, before)) = self.previous.as_ref().filter(|(was, ..)| *was == attempt) {
             for (name, after) in &current {
                 let (Some(a), Some(b)) = (before.get(name).copied().flatten(), *after) else {
                     continue;
@@ -300,7 +309,7 @@ impl Measurements {
                 }
             }
         }
-        self.previous = Some((step, current));
+        self.previous = Some((attempt, step, current));
     }
 
     /// The block `gradient_trend`, or None under [`TREND_MIN`] points.
