@@ -162,6 +162,29 @@ fn number(value: &Value) -> f64 {
     }
 }
 
+/// One parameter's gathered spread as the `replica_spread` column carries it, as Python's
+/// `_spread_values` reads it (`WAVE_AJ_CONTRACT.md` sections 1 and 8, lane AJ-2's f9a7dff): a list
+/// of numbers (not bools), nulls (read as NaN) and exactly the sink's `"nan"`, `"inf"` and
+/// `"-inf"`; None for anything else, and the entry says nothing of its parameter. Before wave AJ any
+/// text was parsed and anything unreadable read as NaN, which counted as drift.
+fn spread_values(values: &Value) -> Option<Vec<f64>> {
+    values
+        .as_array()?
+        .iter()
+        .map(|value| match value {
+            Value::Number(number) => number.as_f64(),
+            Value::Null => Some(f64::NAN),
+            Value::String(text) => match text.as_str() {
+                "nan" => Some(f64::NAN),
+                "inf" => Some(f64::INFINITY),
+                "-inf" => Some(f64::NEG_INFINITY),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 fn ranks(value: &Value) -> Option<Vec<i64>> {
     value.as_array()?.iter().map(Value::as_i64).collect()
 }
@@ -221,6 +244,11 @@ fn spread(
     let mut covered = BTreeSet::new();
     let mut over = BTreeSet::new();
     for (name, values) in table {
+        // A held `[]` says nothing of its parameter: it covers nothing, so it cannot set aside a
+        // drift the observations show (wave AJ, contract section 8, as Python's `_replica_judged`).
+        if values.is_empty() {
+            continue;
+        }
         // Section 6, as `ReplicaDrift::row` reads a spread on its own record.
         if values.iter().any(|value| !value.is_finite() || *value > tolerance) {
             over.insert(name.clone());
@@ -230,19 +258,21 @@ fn spread(
     Spread { scope, covered, over }
 }
 
-/// A record given as JSON (a fixture's, or a line of a rank's file); None without a rank or step.
+/// A record given as JSON (a fixture's, a line of a rank's file, or the `extra_json` fallback);
+/// None without a rank or step. Its `replica_spread` is read as Python's `_held_spread_table`
+/// reads it: a map, each entry through [`spread_values`] with an unreadable one left out, and a
+/// non-empty map whose every entry is left out is no spread (an empty map is one, covering nothing).
 pub fn record_from_json(record: &Value, tolerance: f64) -> Option<Record> {
-    let table = record.get("replica_spread").map(|table| {
-        table
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(name, values)| {
-                let values = values.as_array().map(|values| values.iter().map(number).collect());
-                (name.clone(), values.unwrap_or_default())
-            })
-            .collect::<Vec<_>>()
-    });
+    let table = record
+        .get("replica_spread")
+        .and_then(Value::as_object)
+        .and_then(|table| {
+            let read: Vec<(String, Vec<f64>)> = table
+                .iter()
+                .filter_map(|(name, values)| Some((name.clone(), spread_values(values)?)))
+                .collect();
+            (table.is_empty() || !read.is_empty()).then_some(read)
+        });
     Some(Record {
         rank: record["rank"].as_i64()?,
         attempt: record["attempt"].as_i64().unwrap_or(0),
