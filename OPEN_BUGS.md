@@ -537,3 +537,32 @@ Also corrected, as stale text: section 12's head (it said `main` was at `76a3b5d
 - **A3:** Python, raw Rust, the SDK in Rust mode and the live server must each name the valid parameter's NaN beside a malformed sibling, with the `None` control kept.
 - B1 to B3 stay recorded for calibration. One integrated gate with the candidate's own server; scored GPU runs wait for the gate and the parity results; the push needs the author's approval of the exact SHA.
 
+### Wave AJ: the fixes, merged and gated (Nov 22)
+
+**Not in `main`** (`931dfb6`). Nothing is pushed. On `trial/ai-wave`. Each lane was cut from `main`, fast-forwarded to `212205d` before its first edit (checked by the coordinator on each branch), and touched only its own files. Their notes are `lane-aj1.md`, `lane-aj2.md` and `lane-aj3.md`; the contract is `WAVE_AJ_CONTRACT.md` and the shared cases `sdk/tests/fixtures/wave_aj/cases.json`.
+
+| Lane | Final tip | What |
+|---|---|---|
+| AJ-1 | `8d5cb13` | A3: an entry a map column cannot hold leaves alone, the rest stays typed, the refused entry travels in `extra_json`, and `row_to_record` gives the record back. A refused `grad_norms` entry stays in the column as null (the author, in the lane). A1: the watcher's last step read is the newest attempt's. The contract and the shared cases |
+| AJ-2 | `f9a7dff` | A2 (a router is read when its counts sum above 0), A4 and A5 (no traceback; the valid sibling is still judged), A6 (the two direct calls sort by step), and the Python side of A7 and A10 |
+| AJ-3 | `1ab6a2a` | A8 (the raw report's `moe_source` as Python's), the Rust side of the refused-gradient case, A7 and A10 in `measure.rs`, and a held `replica_spread` `[]` covering nothing, as in Python |
+
+Merged `--no-ff` one at a time, to `76e2e5d`.
+
+**The gates.**
+- **First integrated gate, on `76e2e5d`, failed one test** (20:53 to 21:36; logs `wave-aj-exit-gate-first-run-76e2e5d/`). Every stage exit 0 but the SDK suite: 5,940 passed, 1 failed. The failure was not timing: `test_lane_ad10_server`'s resume case holds a live server's blocks to the rules contract's reference functions (`sdk/tests/fixtures/rules/make_cases.py`), which still paired `weight_jumps` across a reload; in that test the server's blocks equalled raw Rust's. Lane AJ-2's build overlapped the gate's first 14 seconds at most (`cargo build` and the compile phase of `cargo test`; AJ-2's last activity 20:53:29, `cargo test` ended 20:54:12, the SDK suite began 20:54:30). `cargo test` was run again alone afterwards: 372 passed, 0 failed, as in the gate (`cargo-test-alone.log`).
+- **`00efae9`: the reference functions and the rules contract's part 6 brought to the author's A7 and A10 decisions** (approved by the author). No product code.
+- **The passing isolated gate is on `00efae9209c435604fc8e4eb1a5aa82fb277f8ad`** (21:39 to 22:22, tree unchanged, no server left; logs `wave-aj-exit-gate-on-00efae9/`). Every stage exit 0: 372 Rust tests passed, 7 ignored; 282 without default features; both clippy lines and `cargo fmt --check` clean; the full SDK suite alone, 5,941 passed, 6 skipped, 34 passing under stale marks; the compact fixture; 13 driver runs at code 0; Gate 1's build against `f5ee53e` with no file differing and 14 recordings the same by content; Gate 1, bake-off and TrainCheck tests 71, 37 and 18.
+- **`16012db`: the stale expected-failure marks removed.** The 34 tests they covered run as ordinary tests; the 278 lane tests pass. Tests only.
+
+**Checked by the coordinator on the joined tree, not taken from a lane** (scripts and outputs in `detector-audit/`): A3 on Python, raw Rust, the SDK in Rust mode and a live server, with both controls; the audit's own script, every A case; the four measurement blocks equal between raw Rust and Python on the seven captures, absence included; the Python evidence of the seven captures byte-identical to `5f6c11b`; and each engine held to the shared cases' written values for A9, A7 and A10 (`final_checks.py`).
+
+**A7's limit, accepted for v1 by the author:** "the SDK records that one of two updates was skipped, but cannot identify which parameters were updated." On a partial multi-optimizer skip (`step_skipped` with `step_skipped_part`), both engines leave every parameter of that step unjudged, the one whose update did happen included. No wire field is added in this wave.
+
+**Still open after wave AJ.**
+- The oversized integer in `extra_json` (contract section 8): being fixed in lane AJ-3 on the author's terms before the v1 fast-forward.
+- `[5, -3]` under `moe` (a negative count with a positive sum) is judged by both engines as it stands: a detector-policy question, not decided.
+- `scalars` keeps lane W3's rule: a refused entry other than a Boolean still sends the whole `scalars` map to `extra_json`.
+- The rules fixture's generator (`make_cases.py` run as a script) fails an internal assertion, on `5f6c11b` too, so before this wave; its `cases.json` is unchanged.
+- B1 to B3, recorded above for calibration.
+
