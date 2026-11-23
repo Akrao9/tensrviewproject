@@ -135,19 +135,20 @@ fn a8_a_well_formed_source_is_kept_as_written() {
 
 // --- an incomplete `grad_norms` (the author, Nov 22, 2026) -----------------------------------
 //
-// `WAVE_AJ_CONTRACT.md` section 1: an entry the column cannot hold is left out of the typed map
-// and travels alone in `extra_json` under the record's own key. The rows here are built as the
-// contract writes them, so raw Rust is checked without the sender. The author's terms: valid
+// `WAVE_AJ_CONTRACT.md` section 1 (lane AJ-1, 9cf73e7): `grad_norms` keeps a refused entry in the
+// column as null, its raw value in `extra_json` under `grad_norms`; a name Arrow cannot encode
+// cannot sit in the column even as null, and travels in `extra_json` alone. The rows here are
+// built in both forms, so raw Rust is checked without the sender. The author's terms: valid
 // sibling gradients stay visible to `non_finite`; when either side of an `update_spike`
 // comparison had a refused gradient entry, the whole totals are compared (the existing
-// fallback), so the typed map's missing entry cannot make a rise; the stalled-weight streak
-// reads a refused gradient as absent (contract 2 of lane W3: listed without a gradient holds).
-// The expected results are written out: the same records with the bad entry deleted are not a
-// control here, since deleting it also deletes the evidence that the map was incomplete.
+// fallback), so a missing entry cannot make a rise; a stalled weight's streak resets on a
+// refused gradient, as Python's reading of the raw `true` does. The expected results are written
+// out: the same records with the bad entry deleted are not a control here, since deleting it
+// also deletes the evidence that the map was incomplete.
 
-/// One row as the sender stores it: the typed `grad_norms` (None: the column is null), the
-/// refused entries in `extra_json` (None: no `extra_json`), `grad_norm`, `update_rms` of `a`,
-/// and `weights_unchanged` (None: no weight check).
+/// One row as the sender stores it: the typed `grad_norms` (None: the column is null; a None
+/// norm: null), the refused entries in `extra_json` (None: no `extra_json`), `grad_norm`,
+/// `update_rms` of `a`, and `weights_unchanged` (None: no weight check).
 struct Row<'a> {
     grads: Option<Vec<(&'a str, Option<f64>)>>,
     refused: Option<Value>,
@@ -252,6 +253,32 @@ fn kind(given: &[Row], kind: &str) -> Vec<Value> {
 const ALL: [(&str, f64); 3] = [("a", 3.0), ("b", 4.0), ("c", 12.0)];
 const SHARED: [(&str, f64); 2] = [("a", 3.0), ("b", 4.0)];
 
+/// How `c`'s refused gradient is stored: as null in the column beside its raw value in
+/// `extra_json`, or (a name Arrow cannot encode) in `extra_json` alone.
+#[derive(Clone, Copy, Debug)]
+enum Form {
+    Null,
+    ExtraOnly,
+}
+
+const FORMS: [Form; 2] = [Form::Null, Form::ExtraOnly];
+
+/// A row naming a and b, with `c`'s gradient refused (raw `refused_as`) in `form`.
+fn refused_c(
+    form: Form,
+    shared: &[(&'static str, f64)],
+    refused_as: Value,
+    grad_norm: f64,
+    update: f64,
+) -> Row<'static> {
+    let mut row = row(shared, grad_norm, update);
+    if let (Form::Null, Some(grads)) = (form, row.grads.as_mut()) {
+        grads.push(("c", None));
+    }
+    row.refused = Some(json!({"c": refused_as}));
+    row
+}
+
 /// Steps 0 to 3 name a, b and c (whole norm 13) with updates that change by 0.01, which fills a
 /// window of 3; `last` is step 4, where the update jumps to 2.0.
 fn steady_then(last: Row<'static>) -> Vec<Row<'static>> {
@@ -266,19 +293,22 @@ fn steady_then(last: Row<'static>) -> Vec<Row<'static>> {
 #[test]
 fn incomplete_grads_on_the_later_side_compare_the_whole_totals() {
     // Step 4's whole norm is still 13 (c is 12 there too, refused as `true`). Whole totals: 13
-    // against 13, no rise, so no threshold and no incident. Split over the typed map alone it
-    // would be 13 against 5 (a and b's share of step 3), a rise of 8 that flags the jump.
-    let mut last = row(&SHARED, 13.0, 2.0);
-    last.refused = Some(json!({"c": true}));
-    let found = kind(&steady_then(last), "update_spike");
-    assert!(found.is_empty(), "{found:?}");
+    // against 13, no rise, so no threshold and no incident. Split over a and b alone it would be
+    // 13 against 5 (a and b's share of step 3), a rise of 8 that flags the jump.
+    for form in FORMS {
+        let found = kind(
+            &steady_then(refused_c(form, &SHARED, json!(true), 13.0, 2.0)),
+            "update_spike",
+        );
+        assert!(found.is_empty(), "{form:?}: {found:?}");
+    }
 }
 
 #[test]
 fn a_parameter_left_out_without_a_refusal_is_still_split() {
     // The rule as it stands (B3, unchanged): with c simply not recorded at step 4 the totals are
-    // split, 13 against 5, and the jump is flagged. This is the row above without its
-    // `extra_json`, and it reads differently on purpose.
+    // split, 13 against 5, and the jump is flagged. This is the row above without its refusal,
+    // and it reads differently on purpose.
     let found = kind(&steady_then(row(&SHARED, 13.0, 2.0)), "update_spike");
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0]["step"], 4);
@@ -294,47 +324,68 @@ fn a_parameter_left_out_without_a_refusal_is_still_split() {
 fn incomplete_grads_on_the_earlier_side_compare_the_whole_totals() {
     // Step 3 refused c; step 4 names all three with a whole norm of sqrt(2644). Whole totals:
     // sqrt(2644) against 13. Split, step 4 would read 50 (a and b alone) against 13.
-    let mut third = row(&SHARED, 13.0, 1.01);
-    third.refused = Some(json!({"c": "12"}));
-    let mut rows: Vec<Row> = [1.0, 1.01, 1.0].iter().map(|size| row(&ALL, 13.0, *size)).collect();
-    rows.push(third);
     let whole = 2644f64.sqrt();
-    rows.push(row(&[("a", 30.0), ("b", 40.0), ("c", 12.0)], whole, 2.0));
-    let found = kind(&rows, "update_spike");
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0]["step"], 4);
-    assert_eq!(found[0]["grad_norm"], whole);
-    assert_eq!(found[0]["grad_norm_before"], 13.0);
+    for form in FORMS {
+        let mut rows: Vec<Row> = [1.0, 1.01, 1.0].iter().map(|size| row(&ALL, 13.0, *size)).collect();
+        rows.push(refused_c(form, &SHARED, json!("12"), 13.0, 1.01));
+        rows.push(row(&[("a", 30.0), ("b", 40.0), ("c", 12.0)], whole, 2.0));
+        let found = kind(&rows, "update_spike");
+        assert_eq!(found.len(), 1, "{form:?}: {found:?}");
+        assert_eq!(found[0]["step"], 4);
+        assert_eq!(found[0]["grad_norm"], whole, "{form:?}");
+        assert_eq!(found[0]["grad_norm_before"], 13.0, "{form:?}");
+    }
 }
 
 #[test]
 fn a_valid_sibling_of_a_refused_gradient_is_still_non_finite() {
-    let given = [Row {
-        grads: Some(vec![("good", Some(f64::NAN))]),
-        refused: Some(json!({"bad": true})),
-        grad_norm: Some(1.0),
-        update: None,
-        unchanged: None,
-    }];
-    let found = kind(&given, "non_finite");
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0]["step"], 0);
-    assert_eq!(found[0]["gradients"], json!(["good"]), "{}", found[0]);
+    for form in FORMS {
+        let mut grads = vec![("good", Some(f64::NAN))];
+        if let Form::Null = form {
+            grads.push(("bad", None));
+        }
+        let given = [Row {
+            grads: Some(grads),
+            refused: Some(json!({"bad": true})),
+            grad_norm: Some(1.0),
+            update: None,
+            unchanged: None,
+        }];
+        let found = kind(&given, "non_finite");
+        assert_eq!(found.len(), 1, "{form:?}: {found:?}");
+        assert_eq!(found[0]["step"], 0);
+        assert_eq!(found[0]["gradients"], json!(["good"]), "{form:?}: {}", found[0]);
+    }
 }
 
-/// `c` listed unchanged at every check, `d` always changing; at step 2 `c`'s gradient is `at_2`.
-fn checks(at_2: Option<Option<f64>>, refused: bool) -> Vec<Row<'static>> {
+/// How `c`'s gradient is given at step 2 of four weight checks.
+#[derive(Clone, Copy, Debug)]
+enum AtTwo {
+    Refused(Form),
+    Absent,
+    Null,
+}
+
+/// `c` listed unchanged at every check with a gradient of 0.5, `d` always changing; step 2 as `at_2`.
+fn checks(at_2: AtTwo) -> Vec<Row<'static>> {
     (0..4)
         .map(|step| {
             let mut grads = vec![("d", Some(0.5))];
+            let mut refused = None;
             match (step, at_2) {
-                (2, Some(norm)) => grads.push(("c", norm)),
-                (2, None) => {}
+                (2, AtTwo::Refused(form)) => {
+                    if let Form::Null = form {
+                        grads.push(("c", None));
+                    }
+                    refused = Some(json!({"c": true}));
+                }
+                (2, AtTwo::Absent) => {}
+                (2, AtTwo::Null) => grads.push(("c", None)),
                 _ => grads.push(("c", Some(0.5))),
             }
             Row {
                 grads: Some(grads),
-                refused: (step == 2 && refused).then(|| json!({"c": true})),
+                refused,
                 grad_norm: None,
                 update: None,
                 unchanged: Some(vec!["c"]),
@@ -344,15 +395,21 @@ fn checks(at_2: Option<Option<f64>>, refused: bool) -> Vec<Row<'static>> {
 }
 
 #[test]
-fn a_refused_gradient_holds_the_streak_as_an_absent_one_does() {
-    // Lane W3's contract 2: listed without a gradient holds the streak, so c reaches three
-    // checks at step 3, whether its gradient at step 2 was refused or not recorded.
-    for refused in [true, false] {
-        let found = kind(&checks(None, refused), "stalled_weights");
-        assert_eq!(found.len(), 1, "refused={refused}: {found:?}");
-        assert_eq!(found[0]["step"], 3);
-        assert_eq!(found[0]["parameters"], json!(["c"]));
+fn a_refused_gradient_resets_the_streak() {
+    // The contract (section 1): a stalled weight's streak resets on a refused gradient, in either
+    // form, as on a null one: c has only one check in a row at step 3, and no stall.
+    for at_2 in [AtTwo::Refused(Form::Null), AtTwo::Refused(Form::ExtraOnly), AtTwo::Null] {
+        let found = kind(&checks(at_2), "stalled_weights");
+        assert!(found.is_empty(), "{at_2:?}: {found:?}");
     }
-    // A null (stored) gradient is not finite, and resets it: no stall by step 3.
-    assert!(kind(&checks(Some(None), false), "stalled_weights").is_empty());
+}
+
+#[test]
+fn an_absent_gradient_still_holds_the_streak() {
+    // Lane W3's contract 2, unchanged: listed without a gradient (and nothing refused) holds the
+    // streak, so c reaches three checks at step 3.
+    let found = kind(&checks(AtTwo::Absent), "stalled_weights");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["step"], 3);
+    assert_eq!(found[0]["parameters"], json!(["c"]));
 }

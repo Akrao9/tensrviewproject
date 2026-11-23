@@ -213,3 +213,46 @@ def test_the_raw_rust_report_keeps_a_valid_sibling_of_a_refused_gradient_non_fin
     from tensorquill.server_detect import server_report
 
     assert _non_finite(server_report(SIBLING)) == [["good"]]
+
+
+def stall_checks(at_2: Any) -> list[dict[str, Any]]:
+    """`c` listed unchanged at four weight checks with a gradient of 0.5, `d` always changing;
+    `c`'s gradient at step 2 is `at_2` (`ABSENT`: not recorded)."""
+    out = []
+    for step in range(4):
+        grads: dict[str, Any] = {"d": 0.5}
+        value = at_2 if step == 2 else 0.5
+        if value is not _ABSENT:
+            grads["c"] = value
+        out.append(row(step, grad_norm=None, grad_norms=grads, weights_unchanged=["c"]))
+    return out
+
+
+# A refused gradient resets the streak (WAVE_AJ_CONTRACT.md section 1), as a null one does; an
+# absent one holds it (lane W3's contract 2). Step of the stall, or None.
+STALL_CASES = {"refused_true": (True, None), "refused_string": ("0.5", None), "null": (None, None), "absent": (_ABSENT, 3)}
+
+
+def _stall_step(found: dict[str, Any]) -> int | None:
+    steps = [i["step"] for i in found["incidents"] if i.get("kind") == "stalled_weights"]
+    return steps[0] if steps else None
+
+
+@pytest.mark.parametrize("name", sorted(STALL_CASES))
+def test_python_stall_streak_beside_a_refused_gradient(name: str) -> None:
+    at_2, expected = STALL_CASES[name]
+    assert _stall_step(evidence.build_evidence(stall_checks(at_2), detectors="python")) == expected
+
+
+@pytest.mark.parametrize("name", sorted(STALL_CASES))
+def test_the_raw_rust_stall_streak_beside_a_refused_gradient(name: str) -> None:
+    missing = _rust_missing()
+    if missing:
+        pytest.skip(missing)
+    from tensorquill.server_detect import server_report
+
+    at_2, expected = STALL_CASES[name]
+    found = _stall_step(server_report(stall_checks(at_2)))
+    if name.startswith("refused") and found != expected:
+        pytest.xfail("A3: until lane AJ-1's sender keeps the typed map, the whole map leaves the column")
+    assert found == expected
