@@ -595,3 +595,30 @@ Merged `--no-ff` one at a time, to `76e2e5d`.
 
 **Open after this**, with the list above (the negative `moe` count with a positive sum; `scalars`' whole-map rule; the rules generator's old assertion; B1 to B3 for calibration; A7's accepted limit): the loader pause, to be measured in Colab first; the push, held for the author's review of this candidate; then Linux CI on the pushed SHA before any scored GPU run; the two- and eight-GPU proofs; the live-agent sign-in and D10, the author's.
 
+## 16. The push of `2fba021` and Linux CI on it (Nov 23)
+
+**Pushed on the author's word** ("Push 2fba021628c3e75fe8b55c12d1b4bc724db99818 to the existing private remote"): the private remote's `main` went from `e531c36` to `2fba021`, a fast-forward of 296 commits. **CI on it is not green, so no scored GPU run has started.**
+
+| Workflow | Result on `2fba021` |
+|---|---|
+| Server wheels | Passed: three builds, the fallback wheel, five installs |
+| CI: Lightning, Hugging Face and Rerun (PyTorch 2.15); build, twine check, clean-venv smoke | Passed |
+| CI: the 12 plain CPU jobs (Python 3.10 to 3.14, PyTorch 2.6 to 2.15) | Failed: 47 to 52 tests each, about 3,800 passing |
+| CI: ingest server and end-to-end streaming | Cancelled at its 50-minute limit, at 87% of the suite after 37 minutes of steady progress; `test_lane_ae5_capture` had one failure and `test_lane_af_w_watch` five by then, their detail not printed |
+
+None of the failing tests is wave AJ's. They are tests of waves AD to AI, which had never run on Linux CI.
+
+| What failed | Jobs | Kind | Disposition |
+|---|---|---|---|
+| `test_wave_af_seams`, 18 tests: no `pyarrow` in the plain jobs | 12 | The test's assumption | Skipped without `pyarrow` (first batch) |
+| `test_lane_af_c_identity` (28), `test_lane_ad4_writer`'s two-imports test, `test_lane_ae5_capture`'s `-W error` test: PyTorch prints "Failed to initialize NumPy" on standard error where there is no NumPy | 12, and the streaming job | The test's assumption | Only that one message filtered (first batch) |
+| `cpp_cache_precompile_headers does not exist` in two tests | PyTorch 2.9, 2.10 | The test's assumption | The setting is touched only where PyTorch has it (first batch) |
+| A full-graph compiled `clip_grad_norm_` raises `Unsupported` | PyTorch 2.6 | PyTorch's own limit: the failing line is `clip_grad_norm_` itself | Skipped where a clip with no TensorQuill session cannot compile either (first batch) |
+| The hang test: no Flight Recorder dump written | Every PyTorch below 2.15 | PyTorch's own limit | The test asserts the harness's not-proven outcome there; the bound and the cleanup are still asserted (first batch) |
+| The program name in two watcher refusal messages; the torn-write test's 20,000-byte line no longer over the buffer | Python 3.14 | Python's wording and buffer size | Both forms accepted; the line sized from the interpreter's buffer (first batch) |
+| The streaming job's limit | | The workflow | 50 to 100 minutes (first batch) |
+| **`test_clipping_inside_a_compiled_step_does_not_recompile_at_every_step`: 2 graphs at the first step with TensorQuill, 1 without; none after** | PyTorch 2.6, 2.9, 2.10 | **TensorQuill differing from the control on the supported floor. Open: not relaxed.** No later step recompiles, which is what the test's name asks; the equality with the control is what fails. No interpreter with an older PyTorch is on this Mac | The author's decision, or a PyTorch 2.6 environment to find the cause |
+| **Five `test_lane_af_w_watch` tests on the follow child's end** (a watch that ends by itself; the command stopped by SIGINT, SIGTERM, SIGKILL; a look that raises) | The streaming job (Linux, with the binary) | **Not known.** The cancelled job printed no detail and there is no Linux machine here. They pass on macOS | The next CI run prints them |
+
+The first batch is test and workflow changes only (`trial/ai-wave`), run here on the affected files: 501 passed, 1 skipped. The NumPy and `pyarrow` cases were reproduced with import shims; the older PyTorch, Python 3.14 and Linux cases could not be run here and rest on the CI logs.
+
