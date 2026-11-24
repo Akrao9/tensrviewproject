@@ -1,0 +1,405 @@
+{
+ "dense-layer8/dense.jsonl": {
+  "empty_layers": 0,
+  "keys": {
+   "layers": {
+    "abs_max": 12800,
+    "mean": 12800,
+    "std": 12800,
+    "zero_frac": 12800
+   },
+   "moe_stats": {},
+   "probe": {
+    "attention": 4,
+    "histograms": 4
+   },
+   "probe.attention.entry": {
+    "entropy": 128,
+    "entropy_share": 128,
+    "invalid_rows": 128,
+    "key_len": 128,
+    "map": 128,
+    "masked_rows": 128,
+    "max_logit": 128,
+    "query_len": 128,
+    "rows": 128
+   },
+   "probe.head": {},
+   "probe.histograms.entry": {
+    "counts": 128,
+    "hi": 128,
+    "lo": 128,
+    "nonfinite": 128
+   }
+  },
+  "map_shapes": {
+   "64x64 (query_len 512, key_len 512)": 128
+  },
+  "maps": {
+   "not_finite": 0,
+   "not_float32": 0,
+   "values": 524288
+  },
+  "round_trip": {
+   "not_equal": [],
+   "not_equal_count": 0,
+   "order_differs": [],
+   "order_differs_count": 0,
+   "records": 400,
+   "rows_with_extra_json": 8
+  },
+  "sizes": {
+   "bytes": 15720071,
+   "lines": 400,
+   "probe_histograms_json_bytes": 25415,
+   "probe_json_bytes": 6761022,
+   "probe_maps_json_bytes": 6606788,
+   "probe_records": 4
+  },
+  "types": {
+   "layers/abs_max/float": 12800,
+   "layers/mean/float": 12800,
+   "layers/std/float": 12800,
+   "layers/zero_frac/float": 12800
+  }
+ },
+ "moe-rtx/granite-full.jsonl": {
+  "empty_layers": 0,
+  "keys": {
+   "layers": {
+    "abs_max": 15600,
+    "mean": 15600,
+    "std": 15600,
+    "zero_frac": 15600
+   },
+   "moe_stats": {
+    "dead_experts": 15600,
+    "dead_frac": 15600,
+    "diversity": 15600,
+    "entropy": 15600,
+    "routed_tokens": 15600
+   },
+   "probe": {},
+   "probe.attention.entry": {},
+   "probe.head": {},
+   "probe.histograms.entry": {}
+  },
+  "map_shapes": {},
+  "maps": {
+   "not_finite": 0,
+   "not_float32": 0,
+   "values": 0
+  },
+  "round_trip": {
+   "not_equal": [],
+   "not_equal_count": 0,
+   "order_differs": [],
+   "order_differs_count": 0,
+   "records": 650,
+   "rows_with_extra_json": 13
+  },
+  "sizes": {
+   "bytes": 17122663,
+   "lines": 650,
+   "probe_histograms_json_bytes": 0,
+   "probe_json_bytes": 0,
+   "probe_maps_json_bytes": 0,
+   "probe_records": 0
+  },
+  "types": {
+   "layers/abs_max/float": 15600,
+   "layers/mean/float": 15600,
+   "layers/std/float": 15600,
+   "layers/zero_frac/float": 15600,
+   "moe_stats/dead_experts/int": 15600,
+   "moe_stats/dead_frac/float": 15600,
+   "moe_stats/diversity/float": 15600,
+   "moe_stats/entropy/float": 15600,
+   "moe_stats/routed_tokens/int": 15600
+  }
+ },
+ "moe-rtx/granite-no-grads.jsonl": {
+  "empty_layers": 0,
+  "keys": {
+   "layers": {
+    "abs_max": 15600,
+    "mean": 15600,
+    "std": 15600,
+    "zero_frac": 15600
+   },
+   "moe_stats": {
+    "dead_experts": 15600,
+    "dead_frac": 15600,
+    "diversity": 15600,
+    "entropy": 15600,
+    "routed_tokens": 15600
+   },
+   "probe": {},
+   "probe.attention.entry": {},
+   "probe.head": {},
+   "probe.histograms.entry": {}
+  },
+  "map_shapes": {},
+  "maps": {
+   "not_finite": 0,
+   "not_float32": 0,
+   "values": 0
+  },
+  "round_trip": {
+   "not_equal": [],
+   "not_equal_count": 0,
+   "order_differs": [],
+   "order_differs_count": 0,
+   "records": 650,
+   "rows_with_extra_json": 0
+  },
+  "sizes": {
+   "bytes": 7691473,
+   "lines": 650,
+   "probe_histograms_json_bytes": 0,
+   "probe_json_bytes": 0,
+   "probe_maps_json_bytes": 0,
+   "probe_records": 0
+  },
+  "types": {
+   "layers/abs_max/float": 15600,
+   "layers/mean/float": 15600,
+   "layers/std/float": 15600,
+   "layers/zero_frac/float": 15600,
+   "moe_stats/dead_experts/int": 15600,
+   "moe_stats/dead_frac/float": 15600,
+   "moe_stats/diversity/float": 15600,
+   "moe_stats/entropy/float": 15600,
+   "moe_stats/routed_tokens/int": 15600
+  }
+ },
+ "moe-rtx/granite-router-only.jsonl": {
+  "empty_layers": 650,
+  "keys": {
+   "layers": {},
+   "moe_stats": {
+    "dead_experts": 15600,
+    "dead_frac": 15600,
+    "diversity": 15600,
+    "entropy": 15600,
+    "routed_tokens": 15600
+   },
+   "probe": {},
+   "probe.attention.entry": {},
+   "probe.head": {},
+   "probe.histograms.entry": {}
+  },
+  "map_shapes": {},
+  "maps": {
+   "not_finite": 0,
+   "not_float32": 0,
+   "values": 0
+  },
+  "round_trip": {
+   "not_equal": [],
+   "not_equal_count": 0,
+   "order_differs": [],
+   "order_differs_count": 0,
+   "records": 650,
+   "rows_with_extra_json": 0
+  },
+  "sizes": {
+   "bytes": 5869001,
+   "lines": 650,
+   "probe_histograms_json_bytes": 0,
+   "probe_json_bytes": 0,
+   "probe_maps_json_bytes": 0,
+   "probe_records": 0
+  },
+  "types": {
+   "moe_stats/dead_experts/int": 15600,
+   "moe_stats/dead_frac/float": 15600,
+   "moe_stats/diversity/float": 15600,
+   "moe_stats/entropy/float": 15600,
+   "moe_stats/routed_tokens/int": 15600
+  }
+ },
+ "moe-rtx/granite.jsonl": {
+  "empty_layers": 0,
+  "keys": {
+   "layers": {
+    "abs_max": 15600,
+    "mean": 15600,
+    "std": 15600,
+    "zero_frac": 15600
+   },
+   "moe_stats": {
+    "dead_experts": 15600,
+    "dead_frac": 15600,
+    "diversity": 15600,
+    "entropy": 15600,
+    "routed_tokens": 15600
+   },
+   "probe": {},
+   "probe.attention.entry": {},
+   "probe.head": {},
+   "probe.histograms.entry": {}
+  },
+  "map_shapes": {},
+  "maps": {
+   "not_finite": 0,
+   "not_float32": 0,
+   "values": 0
+  },
+  "round_trip": {
+   "not_equal": [],
+   "not_equal_count": 0,
+   "order_differs": [],
+   "order_differs_count": 0,
+   "records": 650,
+   "rows_with_extra_json": 13
+  },
+  "sizes": {
+   "bytes": 17119698,
+   "lines": 650,
+   "probe_histograms_json_bytes": 0,
+   "probe_json_bytes": 0,
+   "probe_maps_json_bytes": 0,
+   "probe_records": 0
+  },
+  "types": {
+   "layers/abs_max/float": 15600,
+   "layers/mean/float": 15600,
+   "layers/std/float": 15600,
+   "layers/zero_frac/float": 15600,
+   "moe_stats/dead_experts/int": 15600,
+   "moe_stats/dead_frac/float": 15600,
+   "moe_stats/diversity/float": 15600,
+   "moe_stats/entropy/float": 15600,
+   "moe_stats/routed_tokens/int": 15600
+  }
+ },
+ "trainer-check-block/trainer.jsonl": {
+  "empty_layers": 0,
+  "keys": {
+   "layers": {
+    "abs_max": 12800,
+    "mean": 12800,
+    "std": 12800,
+    "zero_frac": 12800
+   },
+   "moe_stats": {},
+   "probe": {
+    "attention": 4,
+    "histograms": 4
+   },
+   "probe.attention.entry": {
+    "entropy": 128,
+    "entropy_share": 128,
+    "invalid_rows": 128,
+    "key_len": 128,
+    "map": 128,
+    "masked_rows": 128,
+    "max_logit": 128,
+    "query_len": 128,
+    "rows": 128
+   },
+   "probe.head": {},
+   "probe.histograms.entry": {
+    "counts": 128,
+    "hi": 128,
+    "lo": 128,
+    "nonfinite": 128
+   }
+  },
+  "map_shapes": {
+   "64x64 (query_len 512, key_len 512)": 128
+  },
+  "maps": {
+   "not_finite": 0,
+   "not_float32": 0,
+   "values": 524288
+  },
+  "round_trip": {
+   "not_equal": [],
+   "not_equal_count": 0,
+   "order_differs": [],
+   "order_differs_count": 0,
+   "records": 400,
+   "rows_with_extra_json": 8
+  },
+  "sizes": {
+   "bytes": 15706666,
+   "lines": 400,
+   "probe_histograms_json_bytes": 26997,
+   "probe_json_bytes": 6842685,
+   "probe_maps_json_bytes": 6702471,
+   "probe_records": 4
+  },
+  "types": {
+   "layers/abs_max/float": 12800,
+   "layers/mean/float": 12800,
+   "layers/std/float": 12800,
+   "layers/zero_frac/float": 12800
+  }
+ },
+ "trainer-check/trainer.jsonl": {
+  "empty_layers": 0,
+  "keys": {
+   "layers": {
+    "abs_max": 12800,
+    "mean": 12800,
+    "std": 12800,
+    "zero_frac": 12800
+   },
+   "moe_stats": {},
+   "probe": {
+    "attention": 4,
+    "histograms": 4
+   },
+   "probe.attention.entry": {
+    "entropy": 128,
+    "entropy_share": 128,
+    "invalid_rows": 128,
+    "key_len": 128,
+    "map": 128,
+    "masked_rows": 128,
+    "max_logit": 128,
+    "query_len": 128,
+    "rows": 128
+   },
+   "probe.head": {},
+   "probe.histograms.entry": {
+    "counts": 128,
+    "hi": 128,
+    "lo": 128,
+    "nonfinite": 128
+   }
+  },
+  "map_shapes": {
+   "64x64 (query_len 512, key_len 512)": 128
+  },
+  "maps": {
+   "not_finite": 0,
+   "not_float32": 0,
+   "values": 524288
+  },
+  "round_trip": {
+   "not_equal": [],
+   "not_equal_count": 0,
+   "order_differs": [],
+   "order_differs_count": 0,
+   "records": 400,
+   "rows_with_extra_json": 8
+  },
+  "sizes": {
+   "bytes": 15693511,
+   "lines": 400,
+   "probe_histograms_json_bytes": 26950,
+   "probe_json_bytes": 6778480,
+   "probe_maps_json_bytes": 6637961,
+   "probe_records": 4
+  },
+  "types": {
+   "layers/abs_max/float": 12800,
+   "layers/mean/float": 12800,
+   "layers/std/float": 12800,
+   "layers/zero_frac/float": 12800
+  }
+ }
+}

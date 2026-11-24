@@ -1,0 +1,102 @@
+{
+ "behaviour/cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 336,
+  "same_as_today": 336
+ },
+ "checkpoint/cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 264,
+  "same_as_today": 264
+ },
+ "replica/attribution_cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 87,
+  "same_as_today": 87
+ },
+ "replica/incident_cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 28,
+  "same_as_today": 28
+ },
+ "replica/no_incident_cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 63,
+  "same_as_today": 63
+ },
+ "rules/cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 6229,
+  "same_as_today": 6229
+ },
+ "wave_ae/cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 844,
+  "same_as_today": 844
+ },
+ "wave_af/cases.json": {
+  "both_raise": 17,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 30,
+  "same_as_today": 13
+ },
+ "wave_af/cases_ag.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 180,
+  "same_as_today": 180
+ },
+ "wave_aj/cases.json": {
+  "both_raise": 0,
+  "differs_count": 0,
+  "differs_from_today": [],
+  "order_differs_count": 0,
+  "raised": [],
+  "raised_count": 0,
+  "records": 402,
+  "same_as_today": 402
+ }
+}
