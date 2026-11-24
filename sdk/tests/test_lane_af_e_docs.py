@@ -519,7 +519,8 @@ def test_an_mcp_tool_answers_the_error_and_the_next_call_and_the_listing_does_no
 @pytest.mark.parametrize(("column", "value", "said"), [
     ("step", -3, "row 3: step is -3, not an integer of 0 or more; the input is refused"),
     ("rank", -3, "row 3: rank is -3, not an integer of 0 or more; the input is refused"),
-    ("schema_version", 2, "row 3: schema_version is 2; this server reads versions 0 and 1; the input is refused"),
+    # Version 2 is protocol 5's row (wave AL, section 3), so 3 is the version refused since then.
+    ("schema_version", 3, "row 3: schema_version is 3; this server reads versions 0, 1 and 2; the input is refused"),
     (None, None, None),
 ])
 def test_offline_detect_refuses_a_negative_key_and_carries_attempt_order(tmp_path, column, value, said):
