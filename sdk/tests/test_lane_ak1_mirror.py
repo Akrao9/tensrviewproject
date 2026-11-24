@@ -82,7 +82,16 @@ class _StandInWandb:
                 stand_in.calls.append((data, step, commit))
                 return stand_in.returned
 
+        class NoopRun(Run):
+            """`wandb/sdk/lib/noop_run.py`: what `wandb.init(mode="disabled")` makes, a subclass of
+            `Run` whose own `log` does not call `Run.log`."""
+
+            def log(self, data, *args, **kwargs):
+                stand_in.calls.append((data, "disabled", None))
+                return None
+
         self.Run = run_class if run_class is not None else Run
+        self.NoopRun = NoopRun
         self.module = module
         self.module_log_delegates = module_log_delegates
         module.Run = self.Run
@@ -109,8 +118,8 @@ class _StandInWandb:
         preinit_wrapper.__name__ = "wandb.log"
         return preinit_wrapper
 
-    def init(self, run_id: str = "w-ak1"):
-        run = self.Run(run_id)
+    def init(self, run_id: str = "w-ak1", mode: str = "online"):
+        run = (self.NoopRun if mode == "disabled" else self.Run)(run_id)
         self.module.run = run
         if self.module_log_delegates:
             # An older wandb shape: a module function that calls the current run's `log`.
@@ -198,6 +207,10 @@ def no_trackers(monkeypatch):
     monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
     monkeypatch.delenv("TENSORQUILL_ENDPOINT", raising=False)
     yield
+    # A test that failed before closing its session leaves no wrapper for the next one.
+    mirror = sys.modules.get("tensorquill.mirror")
+    for session in list(getattr(mirror, "_sessions", [])):
+        session.close()
 
 
 @pytest.fixture
@@ -261,6 +274,24 @@ def test_wandb_log_when_tensorquill_init_comes_before_wandb_init(wandb_):
     session.close()
     assert _scalars(sink) == [{"loss": 1.5, "eval/acc": 0.75}]
     assert len(wandb_.calls) == 2
+
+
+@pytest.mark.parametrize("tensorquill_first", [True, False])
+def test_a_disabled_wandb_run_is_mirrored_in_either_order(wandb_, tensorquill_first):
+    model = _model()
+    if tensorquill_first:
+        session, sink, opt = _open(model)
+        run = wandb_.module.init(mode="disabled")  # a `Run` subclass with its own `log`
+    else:
+        run = wandb_.module.init(mode="disabled")
+        session, sink, opt = _open(model)
+    wandb_.module.log({"loss": 1.0})
+    run.log({"acc": 0.5})
+    _step(model, opt)
+    session.close()
+    assert _scalars(sink) == [{"loss": 1.0, "acc": 0.5}]
+    assert [c[1] for c in wandb_.calls] == ["disabled", "disabled"]
+    assert "log" in vars(wandb_.NoopRun) and vars(wandb_.NoopRun)["log"].__qualname__.endswith("NoopRun.log")
 
 
 def test_a_module_log_that_delegates_to_run_log_records_once(monkeypatch):
@@ -734,6 +765,7 @@ def test_no_tracker_imported_in_a_fresh_interpreter():
 def _originals(wandb_: _StandInWandb, mlflow_: _StandInMlflow) -> dict:
     return {
         "Run.log": wandb_.Run.__dict__["log"],
+        "NoopRun.log": wandb_.NoopRun.__dict__["log"],
         "wandb.log": wandb_.module.log,
         "mlflow.log_metric": mlflow_.module.log_metric,
         "mlflow.log_metrics": mlflow_.module.log_metrics,
