@@ -16186,7 +16186,7 @@
   {
    "name": "scalar_log_refusals",
    "section": 4,
-   "about": "session.log(..., step=s) refuses, before anything is recorded: a bool, a float, a negative integer or text as s (TypeError or ValueError, as log refuses a bad value); with no step= the rules of wave AK hold (owner's question Q5 for a value with no step in memory)",
+   "about": "session.log(..., step=s) refuses, before anything is recorded: a bool, a float, a negative integer or text as s (TypeError or ValueError, as log refuses a bad value); with no step= the rules of wave AK hold (a value with no step in memory: the scalar_no_step_* cases, Q5)",
    "paths": [
     "capture"
    ],
@@ -16199,6 +16199,160 @@
      "3"
     ],
     "written": 0
+   }
+  },
+  {
+   "name": "scalar_no_step_baseline_warning",
+   "section": 4,
+   "about": "under session.phase(\"eval\") before the first step, session.log({\"eval/loss\": 2.5}) with no step=: nothing is written, and the one warning names a baseline evaluation and the call that records it at start_step (0)",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "start_step": 0,
+     "steps_before": 0,
+     "flush": false,
+     "phase": "eval",
+     "mirrored": false,
+     "at": "log"
+    },
+    "records_written": 0,
+    "warnings": 1,
+    "warning_contains": [
+     "it was logged before the first training step (a baseline evaluation)",
+     "session.log({'eval/loss': value}, step=0), the step training starts at",
+     "Said once per session."
+    ]
+   }
+  },
+  {
+   "name": "scalar_no_step_baseline_on_a_resume_warning",
+   "section": 4,
+   "about": "the same on a resumed session (start_step=500): the text suggests step=500, the step training starts at",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "start_step": 500,
+     "steps_before": 0,
+     "flush": false,
+     "phase": "eval",
+     "mirrored": false,
+     "at": "log"
+    },
+    "records_written": 0,
+    "warnings": 1,
+    "warning_contains": [
+     "(a baseline evaluation)",
+     "session.log({'eval/loss': value}, step=500), the step training starts at"
+    ]
+   }
+  },
+  {
+   "name": "scalar_no_step_after_flush_warning",
+   "section": 4,
+   "about": "steps 0 to 4, flush(), then session.log({\"eval/loss\": 1.9}) under \"eval\": nothing is written, and the warning names an evaluation after flush() and the last step training finished, 4",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "start_step": 0,
+     "steps_before": 5,
+     "flush": true,
+     "phase": "eval",
+     "mirrored": false,
+     "at": "log"
+    },
+    "records_written": 0,
+    "warnings": 1,
+    "warning_contains": [
+     "it was logged after flush() with no training step since (an evaluation after flush())",
+     "session.log({'eval/loss': value}, step=4), the last step training finished"
+    ]
+   }
+  },
+  {
+   "name": "scalar_no_step_pending_at_close_after_flush_warning",
+   "section": 4,
+   "about": "steps 0 to 4, flush(), session.log({\"eval/loss\": 1.9}) outside \"eval\", then close(): the pending value is left out, and the warning says so and suggests step 4",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "start_step": 0,
+     "steps_before": 5,
+     "flush": true,
+     "phase": "train",
+     "mirrored": false,
+     "at": "close"
+    },
+    "records_written": 0,
+    "warnings": 1,
+    "warning_contains": [
+     "it was still pending at close() after flush() with no training step since",
+     "step=4), the last step training finished"
+    ]
+   }
+  },
+  {
+   "name": "scalar_no_step_mirrored_warning",
+   "section": 4,
+   "about": "a value wandb.log brings through mirror_scalars under \"eval\" before the first step: the warning adds that the mirror cannot pass a step and the user must call session.log(..., step=...) for it (a documented limit, Q7)",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "start_step": 0,
+     "steps_before": 0,
+     "flush": false,
+     "phase": "eval",
+     "mirrored": true,
+     "at": "log"
+    },
+    "records_written": 0,
+    "warnings": 1,
+    "warning_contains": [
+     "(a baseline evaluation)",
+     "It came from your tracker's log call through mirror_scalars, which cannot pass a step (the tracker's own step is ignored): call session.log(..., step=...) yourself for it."
+    ]
+   }
+  },
+  {
+   "name": "scalar_no_step_said_once",
+   "section": 4,
+   "about": "a baseline evaluation left out, then steps 0 to 4, flush() and an evaluation left out: one warning in the session, the baseline's; the second value is left out silently",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "start_step": 0,
+     "steps_before": 5,
+     "flush": true,
+     "phase": "eval",
+     "mirrored": false,
+     "at": "log",
+     "baseline_first": true
+    },
+    "records_written": 0,
+    "warnings": 1,
+    "warning_contains": [
+     "(a baseline evaluation)"
+    ],
+    "warning_lacks": [
+     "after flush()"
+    ]
    }
   }
  ]

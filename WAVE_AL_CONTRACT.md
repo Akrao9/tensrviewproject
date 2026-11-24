@@ -8,7 +8,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 
 ## Where each decision stands
 
-**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided eight of the nine on Nov 24 (the next section). Q5 is open, and the contract is written for its recommended option (e) until the owner answers.
+**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided all nine on Nov 24 (the next section).
 
 | # | Decision | Stands | Evidence |
 |---|---|---|---|
@@ -30,15 +30,15 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 | Q2 | The heavy probe arrays: columns in the same row (Q2 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q3 | The scalar-only record travels in the same `.jsonl` and stream, with `seq` (Q3 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q4 | Scalar-only records are series only, never incident context (Q4 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
-| Q5 | A value logged with no step in memory and no `step=`: options (a) to (e), (e) recommended. | **Owner, open** | section Q5 |
+| Q5 | With no step in memory and no `step=`, the value is left out with one warning per session, and the warning shows the explicit `session.log({...}, step=N)` for a baseline evaluation and for an evaluation after `flush()`; the mirror's case is a documented limit (section Q5). | **Owner, decided Nov 24** | "keep the one-time warning and show how to record the value explicitly. Cover both a baseline evaluation before training and an evaluation after flush()" |
 | Q6 | At one series point, the scalar-only record with the highest `seq` wins (Q6 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q7 | The mirror ignores a tracker's own `step=` (Q7 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q8 | `compare` reads scalar-only records as series points (Q8 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q9 | A downgrade is documented as unsupported (Q9 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 
-## The owner's decisions, and Q5
+## The owner's decisions
 
-**The owner answered on Nov 24: "Yes, all but Q5".** Q1 to Q4 and Q6 to Q9 are decided as the recommended option (a) of each. The alternatives are kept as one line each, for the record. Q5 is open: section Q5 below gives five options with their costs.
+**The owner answered on Nov 24: "Yes, all but Q5".** Q1 to Q4 and Q6 to Q9 are decided as the recommended option (a) of each. The alternatives are kept as one line each, for the record. Q5 was decided later the same day (section Q5).
 
 - **Q1 (a), decided: only what changed is version 2.**
   - Rows of protocol 5's layout carry row version 2, and a `record_version` column (Int32, null for a record with no `schema_version` key) holds the record's own version.
@@ -60,72 +60,45 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 - **Q9 (a), decided: the README says a downgrade is not supported, and how it shows.** A protocol 4 server on a store with protocol 5 parts reads them silently, with no layers, no MoE statistics, no maps, and no `scalars-*`.
   - Not taken: (b) a `part5-*` prefix.
 
-### Q5, open: a value logged with no step in memory and no `step=`
+### Q5, decided Nov 24: a value with no step in memory and no `step=`
 
-**What reaches `Session._no_step_for` today**, the one switch (wave AK). A value is left out there with one warning when:
-- it is logged under `phase("eval")`, by the user or by the mirror, before any step was committed, or after `flush()` with no step since;
-- or it is pending at `close()` with no step in memory.
+**The owner's words:** "For Q5, when there is no training step in memory and the caller supplies no step=, keep the one-time warning and show how to record the value explicitly. Cover both a baseline evaluation before training and an evaluation after flush()". This is option (a), with the warning's text changed.
 
-A plain `log()` outside "eval" before the first step is not one of these. It is pending, and lands on step 0's training record, as today.
+**What reaches `Session._no_step_for`**, which stays the one switch:
+- a value logged under `phase("eval")`, by the user or by the mirror, before any step was committed, or after `flush()` with no step since;
+- a value pending at `close()` with no step in memory.
 
-**What every option shares.** The mirror calls `session.log()` with no `step=` (Q7), so its values reach the switch the same way the user's do. The switch stays the one place under every option. What changes is what it does.
+A plain `log()` outside "eval" before the first step is not one of these. It is pending and lands on step 0's training record, as today.
 
-**(a) Unchanged: leave the value out, with one warning; only an explicit `step=` writes a record.**
-- Cost: wave AK's warning promises the value a place in protocol 5, and it gets none.
-- A baseline evaluation is recorded only if the user writes `step=0` by hand. A mirrored one is never recorded.
-- Cases: none change.
+**What happens to it:** it is left out, with one warning per session, as in wave AK. No record is written. The warning now shows the explicit call that records it: `session.log({...}, step=N)`, which writes a scalar-only record (section 4.2).
 
-**(b) A scalar-only record at the step about to run** (`_next_step`).
-- Cost: after `flush()`, the value lands on a step it was not logged in. That is the move wave AK took away.
+**Which step the warning suggests.** Both numbers are host integers the session already keeps, the ones `_record_manifest` uses for `after_step`, so no device is read.
 
-**(c) A scalar-only record at the last committed step** (`_next_step - 1`).
-- Right after a `flush()`. No step exists for a baseline evaluation.
+| Case | When `_no_step_for` sees it | `N` in the text | From |
+|---|---|---|---|
+| A baseline evaluation before training | no step committed yet (`_steps_committed == 0`) | the step training starts at: `start_step`, 0 unless resumed | `self._next_step` |
+| An evaluation after `flush()`; a value pending at `close()` after a flush | a step committed, none in memory since | the last step training finished | `self._next_step - 1` |
 
-**(d), the coordinator's: (c) after a committed step, and a record with a null `step` before the first one,** marked as before the first step, as a save before the first step has `after_step: null` (`_record_manifest`).
-- **Code that changes, because `step` is a key everywhere today:**
-  - `identity.check` refuses a record with no step.
-  - The sender skips such a line (`SENDER_FIELDS`).
-  - The Arrow `step` field is non-nullable (`flight_schema`).
-  - The server's `drop_unstorable_rows` drops and counts a row whose `step` is null, before anything else is looked at.
-- **What (d) needs for that:** a version-2 record may have a null step; the field becomes nullable in protocol 5's layout; the server routes rows with a non-null `seq` before its null-key check.
-- **What it can keep:** the `scalars-<seq>-<seq>.parquet` objects and their `seq` watermark never read `step`, so they hold the row unchanged, and `keep_new_rows` is never touched.
-- **Every series reader needs a rule for a point with no step.** `get_series` and `first_divergence` key points by `int(step)`, the Rerun export sets its timeline from `step`, and `runs` reads steps.
-  - The rule: place it before the attempt's first training step, which is `start_step` on a resume, read from the records.
-  - For an attempt with no training record at all, there is no place: the point is listed apart.
-  - `compact` and the Rust report never see it.
-- **Old readers:** they refuse the file, as for any version-2 record.
+A value pending at `close()` with no step at all (a session that never trained) is the first case.
 
-**(e) Recommended: (c) after a committed step, and before the first one, a record at the step about to run, marked `"before_step": true`.**
-- **The step before the first one is `start_step`:** 0 on a fresh run, the resumed step on a resume. That is the step a trainer's baseline evaluation is usually plotted at.
-- **No key column is ever null.** `identity`, the sender, the Arrow field and the server's key checks are unchanged from section 4. The record is section 4.2's nine keys plus `before_step` on this one form.
-- **Readers order points at a step `(step, before_step first, seq)`.** So a baseline at step 0 and an evaluation after step 0 are two points, not one that Q6 would resolve to the later.
-  - `get_series` shows `before_step: true` on the point.
-  - The Rerun export logs both at step 0, the earlier first.
-  - `compare` pairs (step, before) positions.
-  - `runs` never counts it as a step.
-  - `compact` and the Rust report never see it.
-- **Old readers:** they refuse the file, as for any version-2 record.
+**Why the text names a number in both cases.**
+- After `flush()`, the last finished step is what the value followed, and it is the step wave AK puts such a value on while that step is in memory.
+- For a baseline, `start_step` is where a trainer plots one. The number is given as the step about to start, so the user can choose another knowingly.
 
-**The rest is the same under (d) and (e):**
-- **The warning goes away.**
-  - A value is lost only after a stop of capture. Nothing is written then, and `_stop`'s own warning already says so.
-  - Values given to a closed session are not recorded, as today (`_closed_call`).
-- **AK-5's call 11 is closed too.** A value logged late inside a compiled function, then written before the newly-trainable-parameter flush, becomes a record at the last committed step.
-- **One rule needs a choice.** A value pending at `close()` after a flush would become a scalar-only record at the last committed step. Under Q6 it would win on the series over the step's own value of that name. Wave AK's rule is that such a value does not replace a name the step holds, but that step's record is already written, so the capture cannot tell. Either the record carries `"pending": true`, and readers let the training record's value win for it, or the series shows the later value.
-  - Recommended: the key, so wave AK's rule holds on the series.
-- **Cases that change:**
-  - `scalar_record_keys`: its key list gains the optional `before_step` under (e), or a nullable `step` under (d).
-  - Wave AK's own tests of "left out with one warning" change in lane AL-5: `test_lane_ak5_late_scalars.py`'s rows for the baseline, the flush, close after a flush, and call 11.
-- **Cases that are new:**
-  - `scalar_after_flush_at_last_step`.
-  - `scalar_baseline_before_first_step`.
-  - `scalar_baseline_on_a_resume` (`start_step` 500).
-  - `scalar_pending_at_close_after_flush`.
-  - `scalar_mirrored_baseline`.
-  - `scalar_late_in_compiled_before_unfrozen_flush`.
-  - They are written into `cases.json` once Q5 is decided.
+**The text, step 2 (lane AL-5).** `<names>` is as today: the first five names quoted, then "and K more". `<first>` is the first name.
+- **Before the first step:** `TensorQuill left out the scalar <names>: it was logged before the first training step (a baseline evaluation), when no step is in memory. To record it, log it with an explicit step, which writes a scalar-only record: session.log({<first>: value}, step=<start_step>), the step training starts at. Said once per session.`
+- **After `flush()`:** `TensorQuill left out the scalar <names>: it was logged after flush() with no training step since (an evaluation after flush()), when no step is in memory. To record it, log it with an explicit step, which writes a scalar-only record: session.log({<first>: value}, step=<last step>), the last step training finished. Said once per session.`
+- **Pending at `close()` after a flush:** the same, with "it was still pending at close() after flush() with no training step since" in place of the first clause.
+- **A value the mirror brought** gets this sentence before "Said once per session.": `It came from your tracker's log call through mirror_scalars, which cannot pass a step (the tracker's own step is ignored): call session.log(..., step=...) yourself for it.` This is a documented limit (Q7).
+  - The mirror tells the session that the value is its own. Today its call with nowhere to go is a plain `session.log(dict(values))` (`mirror._log_into`), so `mirror.py` passes a mark that `_no_step_for` reads. That is lane AL-5's.
 
-**Why (e) over (d).** Both give every value a place. (d) costs a nullable key column through `identity`, the sender, the schema, the server's key checks and every series reader, all for one record form. (e) adds one optional key and one ordering rule, and plots a baseline where trainers do.
+**Said once per session, as today.** The text is the case of the first value left out. Later ones are left out silently.
+
+**Step 1 leaves the text as wave AK wrote it.** That text names protocol 5's record and no argument, and `step=` still raises `TypeError` until step 2. The push follows step 2, so no build tells a user to pass an argument that raises.
+
+**Weighed and not taken:**
+- (d) a record with a null step before the first step: `step` is a key in `identity.check`, the sender, the Arrow schema and the server's null-key check, so all four and every series reader would change.
+- (e) a record at `start_step` marked `before_step` was the simpler way to record a baseline with no null. (b) and (c), the next or the last step, without a mark.
 
 ## 1. `layers` and `moe_stats` as typed columns (lanes AL-1, AL-3)
 
@@ -319,10 +292,7 @@ There are four, not three.
   - `ts` is when `log` was called, in Unix seconds.
   - `scalars` holds numbers only, as `Session._scalar_values` gives them. A non-finite value is written as the sink's string.
 - **The capture writes one for an explicit `step=`.** It never writes one for a value logged without it that a step in memory takes, even one naming the step in progress.
-- **Under Q5 (e), recommended and open, it also writes one where `_no_step_for` leaves the value out today:**
-  - at the last committed step;
-  - before the first step, at `start_step`, with `"before_step": true`.
-  - A value pending at `close()` also carries `"pending": true`.
+- **It writes none for a value with no step in memory and no `step=`** (Q5). That value is left out with one warning, which shows the explicit call.
 - **`step=` refuses, before anything is recorded:** a bool, a float, a negative integer and anything not an integer (case `scalar_log_refusals`). The refusals are `TypeError`, or `ValueError` for a negative.
 - **A tensor value is copied on its device** and read with the next flush, with that flush's records, so no sync is added.
 - **The writer writes it with the next block of step records, or at `close()`.** A stop of capture loses a pending one, as it loses pending steps.
@@ -380,7 +350,7 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
 
 ### 4.7 The cases
 
-`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`.
+`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`, `scalar_no_step_baseline_warning`, `scalar_no_step_baseline_on_a_resume_warning`, `scalar_no_step_after_flush_warning`, `scalar_no_step_pending_at_close_after_flush_warning`, `scalar_no_step_mirrored_warning`, `scalar_no_step_said_once`.
 
 ## 5. The matrix
 
@@ -466,7 +436,14 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 - **`PROTOCOL` stays 4 in every lane's own tree.** The coordinator raises it to 5 in both `server_detect.py` and `main.rs` in step 1's seam commit. So each lane's tree keeps its `rust_raw` pins passing with a binary built from it.
 - **Targets that need two lanes are judged on the joined tree,** with `--runxfail`, as wave AJ did. A `rust_raw` target needs AL-1's layout and AL-3's reader.
 - A lane's tests are its cases' paths. Its targets in `test_wave_al_contract.py` lose their `xfail` mark when they pass on its branch, or at the merge for a joined target. The live-server, `runs` and MCP paths are tests each lane writes for its cases, failing first.
-- **No lane owns `sdk/README.md`.** Each lane writes its passage in its report, and the coordinator puts them in at the seam, with the README's version table and the test that reads it.
+- **No lane owns `sdk/README.md`.** Each lane writes its passage in its report, and the coordinator puts them in at the seam, with the README's version table and the test that reads it. The passages owed:
+  - **The `scalars` bullet (AL-5, step 2):**
+    - `step=` writes a scalar-only record (section 4.2).
+    - A value with no step in memory and no `step=` is left out with one warning per session, which shows `session.log({...}, step=N)`: `start_step` for a baseline evaluation, the last finished step after `flush()`.
+    - The mirror's values cannot carry a step, so the user logs such a value with `step=` themself.
+    - This replaces wave AK's "comes with protocol 5's scalar-only record".
+  - **The versions (AL-1, AL-2):** section 3's table; the older-server message; "a downgrade is not supported", with how it shows (Q9).
+  - **The probe (AL-1):** the maps and histograms are in their own columns; the `.jsonl` is unchanged.
 
 **Step 1: typed columns, the probe split, the versions.**
 
@@ -488,7 +465,7 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 
 | Lane | Owns | Does | Cases |
 |---|---|---|---|
-| AL-5 | `capture.py` (`Session.log`, `_no_step_for` as Q5 decides, the writer's block), `sink.py` if needed | Writes the record of section 4.2 | `scalar_record_keys` (capture), `scalar_log_refusals` |
+| AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases; wave AK's tests of the old warning text change with it |
 | AL-1′ | `flight.py`, `server_detect.py` | The record's row (`seq`, `record_version`). Scalar-only records set apart before `_stream`, `FollowedDetect` and `stream_order` | `scalar_record_keys` (row) |
 | AL-2′ | `ingest.rs`, `storage.rs`, `watchdog.rs` (`scalars_not_newer`) | Section 4.5 | `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart` |
 | AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6, and section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step`; the `python` targets of `layers_entry_not_object` and `layers_value_not_object`; the samples comparison of `moe_stats_diversity_refused` |
