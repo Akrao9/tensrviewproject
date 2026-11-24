@@ -203,6 +203,8 @@ def test_a_coverage_case_is_what_the_session_records(tmp_path, name, body):
         ShapeRaises.armed = False
     assert model_component(manifest) == expected["model_component"]
     if "tensors" in expected:
+        if "folder" in given:  # lane AK-2: the header is read now, and an empty stand-in file is refused as short
+            assert (manifest["tensors"].pop("refused"), manifest["tensors"].pop("file")) == ("short_file", "model.safetensors")
         assert manifest["tensors"] == expected["tensors"]
     else:
         assert expected["tensors_key"] is False and "tensors" not in manifest
@@ -424,7 +426,8 @@ def test_a_folder_is_marked_at_a_load_and_not_at_a_save(tmp_path):
     marked = [r["checkpoint"] for r in read(path) if "checkpoint" in r]
     [load] = [m["load"] for m in marked if "load" in m]
     [save] = [m["save"] for m in marked if "save" in m]
-    assert load["tensors"] == {"state": "unavailable", "why": "folder"}
+    # Lane AK-2: the empty stand-in is opened at a load now, and its header refused as short.
+    assert load["tensors"] == {"state": "unavailable", "why": "folder", "refused": "short_file", "file": "model.safetensors"}
     assert {k: v for k, v in save.items() if k != "after_step"} == files_manifest(["model.safetensors"])
 
 

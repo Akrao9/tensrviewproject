@@ -13,6 +13,8 @@ identities of each (counts, an optimizer's step, a scheduler's `last_epoch`, a l
   that was saved or loaded. At a load the checkpoint's tensors are also compared with the
   model's by name and shape (`load_manifest`, CHECKPOINT_TENSOR_CONTRACT.md): names and shapes
   only, read from each module's own tables, never through `state_dict()`.
+  `session.checkpoint_files(folder, event="load")` compares a folder's `.safetensors` weights
+  the same way, listed from their headers alone (`safetensors_listing`): no tensor byte is read.
 
 The hash is BLAKE2b (8 bytes, unkeyed) over each batch's length and bytes, in order, so
 every process, rank and attempt that draws the same samples in the same order gets the same
@@ -45,8 +47,11 @@ from __future__ import annotations
 import collections
 import copyreg
 import hashlib
+import json
 import numbers
+import os
 import re
+import stat
 import sys
 import threading
 import warnings
@@ -676,7 +681,9 @@ def files_manifest(names: Iterable[str]) -> dict[str, Any]:
 # on a device. The checkpoint's side is the names and shapes of the mapping already in memory.
 
 NAMES_LISTED = 50  # a list's names in the manifest, sorted; `count` is the whole number
-FOLDER_TENSORS = {"state": "unavailable", "why": "folder"}  # `checkpoint_files` at a load: no file is opened
+# A folder load whose tensors are not listed: no `.safetensors` weights, or (with `refused`) their
+# headers refused (`safetensors_listing`).
+FOLDER_TENSORS = {"state": "unavailable", "why": "folder"}
 _WRAPPERS = ("module.", "_orig_mod.")  # DDP's and `torch.compile`'s, removed from every name on both sides
 # A key is conventional when its last word (a trailing `state`, `states` or `dict` set aside) is one
 # of these, or it is `state_dict`, and none of its words names an averaged copy.
@@ -957,50 +964,51 @@ def _unavailable(why: str, **more: Any) -> dict[str, Any]:
     return {"state": "unavailable", "why": why, **more}
 
 
-def tensor_coverage(
-    state: Mapping[Any, Any], model: Any, *, model_state: Any = None
-) -> tuple[dict[str, Any], _Match | None]:
-    """The load manifest's `tensors` object (CHECKPOINT_TENSOR_CONTRACT.md, sections 1 to 3), and
-    the entry it names as the model's (compared, or the loader's entry whose names differ). May
-    raise; `load_manifest` turns a raise into `error`."""
+def _model_table(model: Any) -> tuple[dict[str, tuple[list[int], str, int | None]], dict[str, Any] | None]:
+    """The model's tensors by comparable name (wrappers removed), `{name: (shape, kind, identity)}`,
+    and None; or nothing and the `unavailable` object, when the model cannot be read
+    (`model_not_readable`) or two of its names become one once a wrapper is removed (`ambiguous`,
+    `collides: "model"`)."""
     try:
         rows = _read_model(model)
     except _NotReadable:
-        return _unavailable("model_not_readable"), None
+        return {}, _unavailable("model_not_readable")
     names: dict[str, tuple[list[int], str, int | None]] = {}
     for name, shape, kind, identity in rows:
         names.setdefault(_strip_wrappers(name), (shape, kind, identity))
     if len(names) < len(rows):  # two of the model's names are one once a wrapper is removed
-        return _unavailable("ambiguous", collides="model"), None
+        return {}, _unavailable("ambiguous", collides="model")
+    return names, None
 
-    def compared(match: _Match, by: str) -> tuple[dict[str, Any], _Match | None]:
-        """A comparison, unless two names became one on either side: then which name a tensor
-        stands for cannot be told, and nothing is said of the model's entry."""
-        if match.collides is not None:
-            return _unavailable("ambiguous", collides=match.collides, closest=match.closest()), None
-        return _compared(match, by, names), match
 
-    # Rule 1: the loader named the entry (`model_state=`, the Lightning adapter): the very mapping
-    # given to `load_state_dict`, found among the entries by identity.
-    if isinstance(model_state, Mapping):
-        match = _Match(_key_of(state, model_state), model_state, _entry_shapes(model_state, loose=True) or {}, names)
-        if match.passes():
-            return compared(match, "loader")
-        return _unavailable("names_differ", closest=match.closest()), match
-    matches = [_Match(key, mapping, shapes, names) for key, mapping, shapes in _entries(state)]
+def _compared_or_collides(match: _Match, by: str, names: dict[str, tuple[list[int], str, int | None]]
+                          ) -> tuple[dict[str, Any], _Match | None]:
+    """A comparison, unless two names became one on either side: then which name a tensor stands
+    for cannot be told, and nothing is said of the model's entry."""
+    if match.collides is not None:
+        return _unavailable("ambiguous", collides=match.collides, closest=match.closest()), None
+    return _compared(match, by, names), match
+
+
+def _by_rules(matches: list[_Match], names: dict[str, tuple[list[int], str, int | None]],
+              conventional: Callable[[str | None], bool] | None = None) -> tuple[dict[str, Any], _Match | None]:
+    """Rules 2 to 6 of the contract's section 2 over the entries looked at. `conventional` says
+    whether an entry's key names a model (`_conventional` by default; a folder's file names are
+    read by their stem)."""
+    conventional = conventional or _conventional
     passing = [m for m in matches if m.passes()]
-    conventional = [m for m in passing if _conventional(m.key)]
-    if len(conventional) == 1:  # rule 2: the key says which entry is looked at, its names whether it is compared
-        match = conventional[0]
+    named = [m for m in passing if conventional(m.key)]
+    if len(named) == 1:  # rule 2: the key says which entry is looked at, its names whether it is compared
+        match = named[0]
         if _holds_half(match, names):
-            return compared(match, "name")
+            return _compared_or_collides(match, "name", names)
         return _unavailable("weak_match", closest=match.closest()), None
-    if len(conventional) > 1:  # rule 3
-        return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in conventional)), None
+    if len(named) > 1:  # rule 3
+        return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in named)), None
     if len(passing) == 1:  # rule 4
         match = passing[0]
         if _holds_half(match, names):
-            return compared(match, "names")
+            return _compared_or_collides(match, "names", names)
         return _unavailable("weak_match", closest=match.closest()), None
     if len(passing) > 1:  # rule 5
         return _unavailable("ambiguous", candidates=sorted(str(m.key) for m in passing)), None
@@ -1008,6 +1016,25 @@ def tensor_coverage(
     sharing = sorted((m for m in matches if m.matched > 0), key=lambda m: (-m.matched, str(m.key)))
     return (_unavailable("not_identified", closest=sharing[0].closest()) if sharing
             else _unavailable("not_identified")), None
+
+
+def tensor_coverage(
+    state: Mapping[Any, Any], model: Any, *, model_state: Any = None
+) -> tuple[dict[str, Any], _Match | None]:
+    """The load manifest's `tensors` object (CHECKPOINT_TENSOR_CONTRACT.md, sections 1 to 3), and
+    the entry it names as the model's (compared, or the loader's entry whose names differ). May
+    raise; `load_manifest` turns a raise into `error`."""
+    names, unavailable = _model_table(model)
+    if unavailable is not None:
+        return unavailable, None
+    # Rule 1: the loader named the entry (`model_state=`, the Lightning adapter): the very mapping
+    # given to `load_state_dict`, found among the entries by identity.
+    if isinstance(model_state, Mapping):
+        match = _Match(_key_of(state, model_state), model_state, _entry_shapes(model_state, loose=True) or {}, names)
+        if match.passes():
+            return _compared_or_collides(match, "loader", names)
+        return _unavailable("names_differ", closest=match.closest()), match
+    return _by_rules([_Match(key, mapping, shapes, names) for key, mapping, shapes in _entries(state)], names)
 
 
 def _with_model_entry(manifest: dict[str, Any], tensors: Mapping[str, Any], match: _Match | None) -> dict[str, Any]:
@@ -1048,6 +1075,223 @@ def load_manifest(state: Mapping[str, Any], model: Any, *, model_state: Any = No
         return {**manifest, "tensors": _unavailable("error")}
     out["tensors"] = tensors
     return out
+
+
+# --- a checkpoint folder's tensors, from its `.safetensors` headers ------------------------------
+#
+# A folder load (`checkpoint_files`, as the Hugging Face `Trainer` and Accelerate's `save_state`
+# write) holds the model's weights in `.safetensors` files: `model.safetensors`, Accelerate's
+# `model_1.safetensors` for a second prepared model, or `save_pretrained`'s shards
+# `model-0000k-of-0000n.safetensors` listed by `model.safetensors.index.json` (its `weight_map`,
+# tensor name -> shard file). A `.safetensors` file starts with N, an unsigned little-endian 64-bit
+# integer, then N bytes of UTF-8 JSON: `{name: {"dtype", "shape", "data_offsets"}}`, with
+# `__metadata__`, which is not a tensor; the tensors' bytes follow. Only those 8 + N bytes are read,
+# with plain reads, the `safetensors` package not imported: no tensor byte, so no tensor's data is
+# needed or checked (`data_offsets` are not read). Pickled weights (`.bin`, `.pt`) are never opened.
+# Anything that cannot be trusted is refused, never raised: the load then reads as a folder always
+# has (`why: "folder"`), with `refused`, the reason, and `file`.
+
+SAFETENSORS_HEADER_CAP = 100_000_000  # the format's own cap on N: `safetensors` refuses a larger one
+FOLDER_FILES_READ = 1024  # index and weight files read at one load; a folder with more is refused
+# Header bytes read at one load, every file's N and each index's size together. The format allows
+# 100 MB per file; read on the training thread at a load, a folder's JSON is bounded much lower.
+# The largest real headers are a few MB (a model of ~100k tensors).
+FOLDER_HEADER_BYTES = 32 * 1024 * 1024
+_INDEX_SUFFIX = ".safetensors.index.json"
+_WEIGHTS_SUFFIX = ".safetensors"
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+
+
+class _Refused(Exception):
+    """A folder whose tensors cannot be listed: `reason`, the file it was found in, and more."""
+
+    def __init__(self, reason: str, file: str | None = None, **more: Any) -> None:
+        super().__init__(reason)
+        self.reason, self.file, self.more = reason, file, more
+
+    def record(self) -> dict[str, Any]:
+        return {**FOLDER_TENSORS, "refused": self.reason, **({"file": self.file} if self.file else {}), **self.more}
+
+
+def _read_file_start(folder: str, name: str, budget: list[int], *, header: bool) -> bytes:
+    """A regular file's header (`header`: N, then N bytes) or its whole content (an index), charged
+    to `budget`. Checked with `stat` before it is opened, so a named pipe or a device is never
+    opened: opening a pipe waits for a writer."""
+    path = os.path.join(folder, name)
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise _Refused("unreadable", name)
+        fd = os.open(path, _READ_FLAGS)
+    except OSError:
+        raise _Refused("unreadable", name) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _Refused("unreadable", name)
+        if header:
+            start = _read_exactly(fd, 8, name)
+            if len(start) < 8:
+                raise _Refused("short_file", name)
+            length = int.from_bytes(start, "little")
+            if length > SAFETENSORS_HEADER_CAP:
+                raise _Refused("header_too_large", name)
+            if length > info.st_size - 8:
+                raise _Refused("header_past_end", name)
+        else:
+            length = info.st_size
+        if length > budget[0]:
+            raise _Refused("too_many_header_bytes", name)
+        budget[0] -= length
+        raw = _read_exactly(fd, length, name)
+        if len(raw) < length:  # the file shrank while it was read
+            raise _Refused("header_past_end" if header else "unreadable", name)
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _read_exactly(fd: int, n: int, name: str) -> bytes:
+    chunks: list[bytes] = []
+    left = n
+    try:
+        while left > 0:
+            chunk = os.read(fd, min(left, 1 << 24))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+    except OSError:
+        raise _Refused("unreadable", name) from None
+    return b"".join(chunks)
+
+
+def _json_object(raw: bytes, name: str) -> dict[str, Any]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _Refused("not_utf8", name) from None
+    try:
+        found = json.loads(text)
+    except (ValueError, RecursionError):
+        raise _Refused("not_json", name) from None
+    if not isinstance(found, dict):
+        raise _Refused("not_an_object", name)
+    return found
+
+
+def _header_shapes(header: Mapping[str, Any], name: str) -> dict[str, list[int]]:
+    """`{tensor: shape}` of a header: every entry but `__metadata__` must have a non-empty string
+    `dtype` and a `shape` of whole numbers from 0 up."""
+    shapes: dict[str, list[int]] = {}
+    for tensor, entry in header.items():
+        if tensor == "__metadata__":
+            continue
+        dtype = entry.get("dtype") if isinstance(entry, dict) else None
+        shape = entry.get("shape") if isinstance(entry, dict) else None
+        if (not isinstance(dtype, str) or not dtype or not isinstance(shape, list)
+                or not all(type(n) is int and n >= 0 for n in shape)):
+            raise _Refused("bad_entry", name, tensor=tensor)
+        shapes[tensor] = list(shape)
+    return shapes
+
+
+def _index_shards(folder: str, name: str, budget: list[int]) -> list[str]:
+    """The shard files an index's `weight_map` names: plain `.safetensors` file names in the folder
+    itself (a path, or a pickled shard, is refused: neither is opened)."""
+    weight_map = _json_object(_read_file_start(folder, name, budget, header=False), name).get("weight_map")
+    if not isinstance(weight_map, dict) or not all(isinstance(v, str) for v in weight_map.values()):
+        raise _Refused("bad_index", name)
+    shards = sorted(set(weight_map.values()))
+    for shard in shards:
+        if not shard.endswith(_WEIGHTS_SUFFIX) or "/" in shard or "\\" in shard or os.sep in shard:
+            raise _Refused("bad_index", name)
+    return shards
+
+
+def _weights_stem(file: str | None) -> str | None:
+    """`model` for `model.safetensors` and `model.safetensors.index.json`: the name a folder's
+    entry is read by, as an entry of a state dict is read by its key."""
+    if file is None:
+        return None
+    for suffix in (_INDEX_SUFFIX, _WEIGHTS_SUFFIX):
+        if file.endswith(suffix):
+            return file[:-len(suffix)]
+    return file
+
+
+def safetensors_listing(folder: str | os.PathLike[str], names: Iterable[str] | None = None) -> dict[str, Any]:
+    """The tensors a checkpoint folder's `.safetensors` files hold, by name and shape, read from
+    their headers only: `{"state": "listed", "entries": {file: {tensor: shape}}}`.
+
+    Each `*.safetensors.index.json` is one entry, the shards its `weight_map` names read together;
+    each other `.safetensors` file is an entry of its own (Accelerate's `model.safetensors` and
+    `model_1.safetensors` are two models). `names` is the folder's listing when the caller has it.
+    A folder with no `.safetensors` file is `{"state": "unavailable", "why": "folder"}`, nothing
+    opened. Never raises: what cannot be read gives that object with `refused` (`unreadable`,
+    `short_file`, `header_too_large`, `header_past_end`, `not_utf8`, `not_json`, `not_an_object`,
+    `bad_entry`, `bad_index`, `shard_absent`, `duplicate_tensor`, `too_many_files`,
+    `too_many_header_bytes`, `no_tensors`), `file` where one file is at fault and `tensor` where one
+    tensor is."""
+    try:
+        where = os.fspath(folder)
+        present = set(os.listdir(where) if names is None else names)
+        indexes = sorted(n for n in present if n.endswith(_INDEX_SUFFIX))
+        weights = sorted(n for n in present if n.endswith(_WEIGHTS_SUFFIX))
+        if not indexes and not weights:
+            return dict(FOLDER_TENSORS)
+        if len(indexes) + len(weights) > FOLDER_FILES_READ:  # every one of them is read
+            raise _Refused("too_many_files")
+        budget = [FOLDER_HEADER_BYTES]
+        groups: list[tuple[str, list[str]]] = []
+        claimed: set[str] = set()
+        for index in indexes:
+            shards = _index_shards(where, index, budget)
+            for shard in shards:
+                if shard not in present:
+                    raise _Refused("shard_absent", shard)
+            groups.append((index, shards))
+            claimed.update(shards)
+        groups += [(name, [name]) for name in weights if name not in claimed]
+        entries: dict[str, dict[str, list[int]]] = {}
+        for entry, files in groups:
+            shapes: dict[str, list[int]] = {}
+            for file in files:
+                for tensor, shape in _header_shapes(
+                        _json_object(_read_file_start(where, file, budget, header=True), file), file).items():
+                    if tensor in shapes:
+                        raise _Refused("duplicate_tensor", file, tensor=tensor)
+                    shapes[tensor] = shape
+            if shapes:
+                entries[entry] = shapes
+    except _Refused as refusal:
+        return refusal.record()
+    except (OSError, TypeError, ValueError):
+        return _Refused("unreadable").record()
+    if not entries:
+        return _Refused("no_tensors").record()
+    return {"state": "listed", "entries": entries}
+
+
+def folder_tensor_coverage(folder: str | os.PathLike[str], model: Any, names: Iterable[str] | None = None
+                           ) -> dict[str, Any]:
+    """The `tensors` object of a folder load: the folder's entries (`safetensors_listing`) set
+    against `model` by the contract's rules 2 to 6, each entry read by its file's stem (`model` is
+    conventional, `model_1` is not), with the same wrappers, prefix and tied weights as a state
+    dict's. `entry` is the file compared: `model.safetensors` or `model.safetensors.index.json`.
+    A folder that cannot be listed gives the listing's `unavailable` object. Never raises: a
+    comparison that raises is `{"state": "unavailable", "why": "error"}`."""
+    listed = safetensors_listing(folder, names)
+    if listed.get("state") != "listed":
+        return listed
+    try:
+        table, unavailable = _model_table(model)
+        if unavailable is not None:
+            return unavailable
+        matches = [_Match(file, shapes, shapes, table) for file, shapes in listed["entries"].items()]
+        tensors, _ = _by_rules(matches, table, lambda key: _conventional(_weights_stem(key)))
+        return tensors
+    except Exception:  # noqa: BLE001  nothing here may stop the training
+        return _unavailable("error")
 
 
 def optimizer_entries(optimizer: Any) -> int:
