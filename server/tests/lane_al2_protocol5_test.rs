@@ -134,19 +134,29 @@ fn schema_v4() -> Arc<Schema> {
     ]))
 }
 
-fn layers_object(step: i64) -> serde_json::Value {
-    let mut layers = serde_json::Map::new();
-    for (i, name) in MODEL_ORDER.iter().enumerate() {
-        layers.insert(
-            name.to_string(),
-            serde_json::json!({"mean": 0.0, "std": 1.0 + i as f64 / 100.0, "abs_max": 3.0 + step as f64 / 100.0, "zero_frac": 0.0}),
-        );
-    }
-    serde_json::Value::Object(layers)
+/// The `layers` object of a record at `step`, as JSON text with its entries in `MODEL_ORDER`
+/// (`serde_json::Map` would sort them).
+fn layers_text(step: i64) -> String {
+    let entries: Vec<String> = MODEL_ORDER
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            format!(
+                "\"{name}\":{{\"mean\":0.0,\"std\":{},\"abs_max\":{},\"zero_frac\":0.0}}",
+                1.0 + i as f64 / 100.0,
+                3.0 + step as f64 / 100.0
+            )
+        })
+        .collect();
+    format!("{{{}}}", entries.join(","))
 }
+
+/// Where a row's `layers` text goes, put in after the rest of the row is written.
+const LAYERS: &str = "\"<layers>\"";
 
 fn decode(schema: Arc<Schema>, rows: &[serde_json::Value]) -> RecordBatch {
     let text: String = rows.iter().map(|row| format!("{row}\n")).collect();
+    let text = text.replace(LAYERS, &layers_text(0));
     let mut reader = arrow::json::ReaderBuilder::new(schema.clone())
         .with_batch_size(rows.len().max(1))
         .build(Cursor::new(text))
@@ -165,7 +175,7 @@ fn batch_v5(steps: std::ops::Range<i64>, version: i32) -> RecordBatch {
             serde_json::json!({
                 "schema_version": version, "run_id": RUN, "rank": 0, "attempt": ATTEMPT, "step": step,
                 "ts": step as f64, "grad_norm": 1.0,
-                "layers": layers_object(step),
+                "layers": "<layers>",
                 "moe_stats": {"model.layers.0.mlp.router": {"routed_tokens": 512, "entropy": 2.1, "diversity": 0.9, "dead_experts": 0, "dead_frac": 0.0}},
                 "probe_json": "{\"attention\":{\"model.layers.0.self_attn\":{\"max_logit\":[3.5],\"rows\":2}}}",
                 "probe_maps": {"model.layers.0.self_attn": [[0.25, 0.75], [0.5, 0.5]]},
@@ -184,7 +194,7 @@ fn batch_v4(steps: std::ops::Range<i64>, version: i32) -> RecordBatch {
             serde_json::json!({
                 "schema_version": version, "run_id": RUN, "rank": 0, "attempt": ATTEMPT, "step": step,
                 "ts": step as f64, "grad_norm": 1.0,
-                "layers_json": layers_object(step).to_string(),
+                "layers_json": layers_text(step),
                 "moe_stats_json": null, "probe_json": null, "extra_json": null,
             })
         })
