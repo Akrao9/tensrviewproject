@@ -251,7 +251,7 @@ SERVER_SKIPS = (
     "needs the server binary and pyarrow",
     "needs the server binary: set TENSORQUILL_SERVER_BIN",
     "the Rust detectors need the tensorquill-server binary and none was found: pip install tensorquill-server",
-    "/x/tensorquill-server speaks protocol 3 and this tensorquill needs protocol 4: install a tensorquill and a "
+    "/x/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a "
     "tensorquill-server that match",
     "pyarrow is not installed",
     "could not import 'pyarrow': No module named 'pyarrow'",
