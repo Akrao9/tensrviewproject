@@ -27,16 +27,20 @@ from pathlib import Path
 
 import pytest
 
-pa = pytest.importorskip("pyarrow")
-flight = pytest.importorskip("pyarrow.flight")
-pq = pytest.importorskip("pyarrow.parquet")
+from tensorquill.server_detect import find_binary
 
-from tensorquill.server_detect import find_binary  # noqa: E402
+try:  # each test is collected and skipped without pyarrow (a module skipped whole collects nothing)
+    import pyarrow as pa
+    import pyarrow.flight as flight
+    import pyarrow.parquet as pq
+except ImportError:
+    pa = flight = pq = None
 
 BINARY = find_binary()
-pytestmark = pytest.mark.skipif(
-    not BINARY or not os.path.isfile(BINARY), reason="tensorquill-server is not built"
-)
+pytestmark = [
+    pytest.mark.skipif(pa is None, reason="pyarrow is not installed"),
+    pytest.mark.skipif(not BINARY or not os.path.isfile(BINARY), reason="tensorquill-server is not built"),
+]
 
 CASES = json.loads((Path(__file__).parent / "fixtures" / "wave_al" / "cases.json").read_text())["cases"]
 ORDER_CASE = next(case for case in CASES if case["name"] == "layers_model_order")
