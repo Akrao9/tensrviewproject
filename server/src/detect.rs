@@ -4970,7 +4970,7 @@ pub async fn replay(
             Some(first) => Some(first),
             // A part this server did not name: read its steps.
             None => storage
-                .read_part(&part.location)
+                .read_part_for_detect(&part.location)
                 .await?
                 .iter()
                 .filter_map(|batch| column::<Int64Array>(batch, "step"))
@@ -4989,7 +4989,7 @@ pub async fn replay(
             continue;
         };
         detectors.attempt = part.attempt;
-        for batch in storage.read_part(&part.location).await? {
+        for batch in storage.read_part_for_detect(&part.location).await? {
             detectors.read(&batch, cutoff, Some(&mut pass));
         }
     }

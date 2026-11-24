@@ -22,7 +22,7 @@
 //! `WAVE_AL_CONTRACT.md` section 3), and 1 otherwise, as the Python sender does; `--metadata-version`
 //! names one for every batch instead (1 sends a typed source to a protocol 4 server, as the
 //! contract's prototype arm was measured). The parts are sent whole, probe arrays included
-//! (`Storage::read_part_whole`).
+//! (`Storage::read_part`).
 //!
 //! Timed per batch: from sending it to its acknowledgement (the server stores the part first;
 //! a rank's first batch is shown apart, since later ones can wait behind the detectors),
@@ -149,7 +149,7 @@ impl Source {
         if let Some((_, batch)) = recent.iter().find(|(held, _)| *held == index) {
             return Ok(batch.clone());
         }
-        let batches = self.storage.read_part_whole(&self.parts[index].location).await?;
+        let batches = self.storage.read_part(&self.parts[index].location).await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
         recent.push_back((index, batch.clone()));
         if recent.len() > 2 {

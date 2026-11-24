@@ -130,7 +130,7 @@ async fn main() -> Result<(), Error> {
         let started = Instant::now();
         let mut batches: Vec<Vec<RecordBatch>> = Vec::new();
         for rank_parts in &parts {
-            batches.push(storage.read_part(&rank_parts[flush].location).await?);
+            batches.push(storage.read_part_for_detect(&rank_parts[flush].location).await?);
         }
         read.push(ms(started.elapsed()));
         steps_per_flush = batches[0].iter().map(RecordBatch::num_rows).sum();
