@@ -106,7 +106,8 @@ def arm_batch(records: list[dict], arm: str) -> pa.RecordBatch:
 
 
 def check_layouts() -> None:
-    """Refuse to measure a tree whose `flight` is not protocol 5's, or a binary that is not this tree's."""
+    """Refuse to measure with an SDK whose `flight` is not protocol 5's (the binary is
+    `TENSORQUILL_SERVER_BIN`'s, not checked here: build it in the tree being measured)."""
     if "layers" not in flight.flight_schema().names or "layers_json" not in v4.flight_schema().names:
         raise SystemExit(f"{flight.__file__} does not write protocol 5's layout: run this on the joined tree")
 
@@ -364,7 +365,9 @@ def main() -> None:
     capture_steps = None
     if args.smoke:
         args.rounds, args.write_rounds, args.flushes = 1, 1, 2
-        args.ranks, args.steps, capture_steps = 8, 100, 200  # 200 of the capture's steps hold two probes
+        # 16 ranks: live64 replays 8 source ranks, so half go through live_streams' simulated ranks, as
+        # 56 of the full run's 64 do; 200 of the capture's steps hold two probes.
+        args.ranks, args.steps, capture_steps = 16, 100, 200
     elif args.rounds < 5:
         raise SystemExit("--rounds must be 5 or more")
     check_layouts()

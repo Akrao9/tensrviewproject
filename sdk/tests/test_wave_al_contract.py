@@ -13,8 +13,8 @@ What runs here, on the base and on every lane's tree:
   case's `rust_raw` expectation: ordinary tests since the joined tree (92e471a).
 - Pins: where the base already reports on `records` what the contract asks (`expect`), the engine
   paths are ordinary tests, so no lane can move them.
-- Targets: where the base does not (a refused entry today, the row layout, the scalar-only record),
-  the test is a strict expected failure (`xfail(strict=True)`, as the repository marks work a lane
+- Targets: where the base does not (a refused entry today, the scalar-only record; the row layout
+  until lane AL-1 landed), the test is a strict expected failure (`xfail(strict=True)`, as the repository marks work a lane
   has not landed). The lane named in its reason turns it into an ordinary test by removing the mark
   when its change makes it pass; a target that passes before that fails the run (strict).
 - Section 4.8, on `tensorquill.init` and `Session.log` themselves: a value logged late inside a compiled
@@ -169,17 +169,17 @@ def test_flight_gives_the_row(case):
 def test_flight_gives_the_prototype_s_row_on_every_record(case):
     """`flight.record_to_row` gives the measured prototype's row, every column, on every record of the
     case (`records` and `clean_records`), so section 6's prototype figures are the product's layout.
-    The prototype's `seq` is step 2's (section 4.4) and not in step 1's schema."""
+    The prototype's `seq` is step 2's (section 4.4): not in step 1's schema, compared once it is."""
     pytest.importorskip("pyarrow")
     from tensorquill import flight
 
     p5 = _prototype()
-    assert set(p5.flight_schema_v5().names) - set(flight.flight_schema().names) == {"seq"}
+    assert set(p5.flight_schema_v5().names) ^ set(flight.flight_schema().names) <= {"seq"}
     for record in [*case["records"], *(case.get("clean_records") or [])]:
         row = flight.record_to_row(copy.deepcopy(record))
         prototype = p5.record_to_row_v5(copy.deepcopy(record))
-        assert set(prototype) - set(row) == {"seq"} and set(row) <= set(prototype), record["step"]
-        for column in row:
+        assert set(prototype) ^ set(row) <= {"seq"}, record["step"]
+        for column in set(row) & set(prototype):
             assert _jsonable(row[column]) == _jsonable(prototype[column]), (record["step"], column)
 
 

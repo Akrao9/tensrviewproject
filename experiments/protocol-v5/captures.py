@@ -10,7 +10,7 @@ own `flight` (protocol 5's layout since lane AL-1, `92e471a`): `record_to_row`, 
 (`rows_batch`, 50 records each) and `row_to_record` on the batch's rows, checked with `==` and with
 the order of every map whose order the readers use (layers, moe_stats, probe.attention,
 probe.histograms). Each row is also compared, every column, with the measured prototype's
-(`prototype.py`; its `seq` is step 2's). Nothing is timed here.
+(`prototype.py`; its `seq` is step 2's, compared once `flight` has it). Nothing is timed here.
 
 `--fixtures`: every record of the repository's shared case files, alone, through `flight` and back,
 against protocol 4's round trip (`flight_v4.py`, frozen at `5c286ed`) as today's.
@@ -30,8 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # This tree's SDK first, with -I or without: an interpreter whose tensorquill is installed from another
 # checkout (an editable install) would otherwise give that checkout's flight.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "src"))
-
-import pyarrow as pa  # noqa: E402
 
 import prototype as p5  # noqa: E402
 from tensorquill import flight  # noqa: E402
@@ -131,7 +129,7 @@ def round_trip(records: list[dict]) -> dict:
         extra_rows += sum(1 for r in rows if r.get("extra_json"))
         for record, row in zip(chunk, rows):
             prototype = p5.record_to_row_v5(record)
-            if set(row) != set(prototype) - {"seq"} or any(_jsonable(row[k]) != _jsonable(prototype[k]) for k in row):
+            if (set(row) ^ set(prototype)) - {"seq"} or any(_jsonable(row[k]) != _jsonable(prototype[k]) for k in set(row) & set(prototype)):
                 prototype_differs.append(record["step"])
         batch = flight.rows_batch(chunk, rows, schema)
         versions.update(batch.column("schema_version").to_pylist())
