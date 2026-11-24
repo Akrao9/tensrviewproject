@@ -98,6 +98,13 @@ def test_on_cpu_every_step_of_both_arms_is_written_from_fresh_processes(tmp_path
             assert all(s >= n for s, n in zip(r["step_ms"], r["next_ms"]))
             assert json.loads((out / f"arm-{name}-r{r['round']}.json").read_text())["step_ms"] == r["step_ms"]
             assert isinstance(r["gc_collections"], list)
+            # Lane AK-4: the collector's own counters around training, in every arm and round.
+            assert len(r["gc_count_before"]) == len(r["gc_count_after"]) == 3
+            assert [set(g) for g in r["gc_stats_before"]] == [{"collections", "collected", "uncollectable"}] * 3
+            assert len(r["gc_stats_after"]) == 3 and r["gc_hold"] is None
+            assert all(c["generation"] in (0, 1, 2) and isinstance(c["thread"], str) for c in r["gc_collections"])
+        by_generation = result["arms"][name]["gc_by_generation"]
+        assert set(by_generation) == {"0", "1", "2"} and all(isinstance(v, int) for v in by_generation.values())
     on, off = result["per_step"]["on"][0], result["per_step"]["off"][0]
     assert "tq_data_wait_ms" not in off and "tensorquill_file" not in off  # no session in the off arm
     assert Path(on["tensorquill_file"]).resolve().is_relative_to(SRC)
@@ -106,3 +113,51 @@ def test_on_cpu_every_step_of_both_arms_is_written_from_fresh_processes(tmp_path
     assert all(isinstance(v, float) for v in on["tq_step_time_ms"][1:])
     assert set(result["on_minus_off"]["excess_ms_at_named_steps"]) == {"20", "40"}
     assert result["arms"]["on"]["worst_excess"]["step"] in range(60)
+
+
+def test_lane_ak4_a_held_collector_is_set_by_the_script_after_warm_up_in_both_arms(tmp_path):
+    """Lane AK-4's controlled arm: the script, never the SDK, changes the collector at `--hold-at`,
+    before that step's timer starts, in both arms; each arm says what it did and the counts after."""
+    env = {**os.environ, "PYTHONPATH": str(SRC)}
+    out = tmp_path / "held"
+    done = subprocess.run([sys.executable, str(EXAMPLES / "loader_delay_check.py"), "--out", str(out), "--rounds", "1",
+                           "--steps", "30", "--every", "10", "--wait-ms", "1", "--hold-gc", "freeze", "--hold-at", "5"],
+                          env=env, capture_output=True, text=True, timeout=300)
+    assert done.returncode == 0, done.stdout + done.stderr
+    result = json.loads((out / "loader_delay.json").read_text())
+    assert result["hold_gc"] == {"kind": "freeze", "at_step": 5}
+    for name in ("off", "on"):
+        r = result["per_step"][name][0]
+        hold = r["gc_hold"]
+        assert hold["kind"] == "freeze" and hold["step"] == 5 and len(hold["count_after"]) == 3
+        assert hold["frozen"] > 1000  # the heap the process built before warm-up ended is frozen
+        assert len(r["step_ms"]) == 30
+    assert "collector held by the script: freeze at step 5" in done.stdout
+
+
+def test_lane_ak4_the_scripts_own_collection_is_kept_apart_from_trainings():
+    """A `--hold-gc collect` collection is the script's, run between two steps: it is tagged `hold`
+    and left out of the per-arm sums and of the collections of 1 ms or more."""
+    held = {"step": 10, "in_next": False, "generation": 2, "collected": 40, "thread": "MainThread", "ms": 50.0, "hold": True}
+    real = {"step": 150, "in_next": True, "generation": 2, "collected": 15, "thread": "tensorquill-writer", "ms": 60.0}
+    small = {"step": 49, "in_next": False, "generation": 0, "collected": 0, "thread": "MainThread", "ms": 0.1}
+    summary = ld.summarize({"on": [arm("on", 0, [1.0] * 200, gc=[held, small, real])]}, [150], 15.0)["arms"]["on"]
+    assert summary["gc_by_generation"] == {"0": 1, "1": 0, "2": 1}
+    assert summary["gc_over_1ms"] == [{"round": 0, **real}] and summary["gc_collections"] == 2
+    assert summary["gc_held_by_script"] == [{"round": 0, **held}]
+
+
+def test_lane_ak4_a_collect_hold_tags_its_own_full_collection(tmp_path):
+    env = {**os.environ, "PYTHONPATH": str(SRC)}
+    out = tmp_path / "collect"
+    done = subprocess.run([sys.executable, str(EXAMPLES / "loader_delay_check.py"), "--out", str(out), "--rounds", "1",
+                           "--steps", "30", "--every", "10", "--wait-ms", "1", "--hold-gc", "collect", "--hold-at", "5"],
+                          env=env, capture_output=True, text=True, timeout=300)
+    assert done.returncode == 0, done.stdout + done.stderr
+    result = json.loads((out / "loader_delay.json").read_text())
+    for name in ("off", "on"):
+        r = result["per_step"][name][0]
+        mine = [c for c in r["gc_collections"] if c.get("hold")]
+        assert [c["generation"] for c in mine] == [2] and mine[0]["step"] == 5
+        assert all(not c.get("hold") for c in r["gc_collections"] if c is not mine[0])
+        assert result["arms"][name]["gc_held_by_script"][0]["generation"] == 2

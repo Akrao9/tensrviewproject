@@ -26,7 +26,9 @@ gives, per arm: the worst whole-step delay (below) with its step and round; the 
 (its time outside `next()`) against that round's median; every garbage collection of the interpreter
 that took 1 ms or more, with its step, the thread it ran on and whether the training thread was in
 `next()` at the time (a collection on any thread holds the interpreter lock, so the training thread
-waits for it wherever it is); the excess at the named steps
+waits for it wherever it is), and the collector's counts (`gc.get_count()`) and per-generation
+totals (`gc.get_stats()`) from just before training and just after, with the collections by
+generation summed per arm; the excess at the named steps
 (`--name-steps`, by default every flush boundary, so step 100 at `--every 50`) in each round; the
 steps over `--slack-ms`; and the median step time. `on_minus_off` sets the two arms side by side at
 each named step.
@@ -42,6 +44,15 @@ The median step-time overhead printed here is this toy loop's, with a sleeping l
 preregistered figure: that one is the Granite compiler gate's (`granite_compiler_gate.py`), whose
 loop has no loader and so cannot show a delay in `next()`. The gate reports its own slowest step per
 arm and round.
+
+The controlled arm (lane AK-4): `--hold-gc freeze|collect|threshold` makes the script, never
+TensorQuill, change the interpreter's collector once in each arm, between steps `--hold-at` - 1 and
+`--hold-at` (so in neither step's time): `freeze` moves every object made so far out of the
+collector's reach (`gc.freeze()`), `collect` runs the full collection the process owes now
+(`gc.collect()`), `threshold` raises generation 2's threshold so no full collection runs after it.
+Each arm keeps what it did as `gc_hold`, with the counts right after; a collection the hold itself
+runs is tagged `hold` and listed as `gc_held_by_script`, apart from training's collections. The default, `none`, changes
+nothing. The load average of the machine is kept with each arm and with the summary.
 
 Exit status: 0 when both arms were measured in every round, 1 when an arm process failed or wrote no
 result (what was measured is still written), 2 bad arguments. There is no pass line.
@@ -88,15 +99,42 @@ def run_arm(args) -> dict[str, Any]:
         if phase == "start":
             began_gc[0] = time.perf_counter()
         else:
-            collections.append({"step": len(step_ms), "in_next": len(next_ms) == len(step_ms) and in_next[0],
-                                "generation": info.get("generation"), "collected": info.get("collected"),
-                                "thread": threading.current_thread().name, "ms": (time.perf_counter() - began_gc[0]) * 1e3})
+            row = {"step": len(step_ms), "in_next": len(next_ms) == len(step_ms) and in_next[0],
+                   "generation": info.get("generation"), "collected": info.get("collected"),
+                   "thread": threading.current_thread().name, "ms": (time.perf_counter() - began_gc[0]) * 1e3}
+            if holding[0]:
+                row["hold"] = True  # the script's own `--hold-gc` collection, between two steps
+            collections.append(row)
 
     in_next = [False]
+    holding = [False]
+    hold: list[dict[str, Any] | None] = [None]
+
+    def hold_collector() -> None:
+        """The controlled arm (lane AK-4): the script, never the SDK, changes the collector once,
+        between two steps, so the change is in neither step's time."""
+        holding[0] = True
+        try:
+            _hold(args.hold_gc)
+        finally:
+            holding[0] = False
+        hold[0] = {"kind": args.hold_gc, "step": len(step_ms), "count_after": list(gc.get_count()),
+                   "frozen": gc.get_freeze_count(), "threshold_after": list(gc.get_threshold())}
+
+    def _hold(kind: str) -> None:
+        if kind == "freeze":
+            gc.freeze()  # the heap built so far is never scanned again
+        elif kind == "collect":
+            gc.collect()  # pay what the collector owes now, before the timed steps
+        elif kind == "threshold":
+            low, middle, _ = gc.get_threshold()
+            gc.set_threshold(low, middle, 10**9)  # no full collection for the rest of the arm
 
     def train() -> None:
         batches = iter(loader)
-        for _ in range(args.steps):
+        for step in range(args.steps):
+            if args.hold_gc != "none" and step == args.hold_at:
+                hold_collector()
             began = time.perf_counter()
             in_next[0] = True
             x = next(batches)  # with capture on, TensorQuill times this call too
@@ -113,16 +151,20 @@ def run_arm(args) -> dict[str, Any]:
             next_ms.append((got - began) * 1e3)
             step_ms.append((ended - began) * 1e3)
 
+    counters: dict[str, Any] = {}
+
     def timed_train() -> None:
+        counters.update(gc_count_before=list(gc.get_count()), gc_stats_before=gc.get_stats())
         gc.callbacks.append(on_gc)
         try:
             train()
         finally:
             gc.callbacks.remove(on_gc)
+            counters.update(gc_count_after=list(gc.get_count()), gc_stats_after=gc.get_stats())
 
     result: dict[str, Any] = {"arm": args.arm, "round": args.round, "torch": torch.__version__,
                               "python": platform.python_version(), "cpu_count": os.cpu_count(),
-                              "gc_threshold": list(gc.get_threshold()),
+                              "gc_threshold": list(gc.get_threshold()), "loadavg": _loadavg(),
                               "device": torch.cuda.get_device_name() if cuda else "CPU",
                               "steps": args.steps, "every": args.every, "wait_ms": args.wait_ms}
     if args.arm == "on":
@@ -145,7 +187,8 @@ def run_arm(args) -> dict[str, Any]:
     injected = [data.delay(s) * 1e3 for s in range(args.steps)]
     result.update(state="measured", injected_ms=injected, next_ms=next_ms,
                   excess_ms=[n - i for n, i in zip(next_ms, injected)], step_ms=step_ms,
-                  rest_ms=[t - n for t, n in zip(step_ms, next_ms)], gc_collections=collections)
+                  rest_ms=[t - n for t, n in zip(step_ms, next_ms)], gc_collections=collections,
+                  gc_hold=hold[0], **counters)
     return result
 
 
@@ -156,6 +199,14 @@ def arm_main(args) -> int:
         result = {"arm": args.arm, "round": args.round, "state": "error", "error": f"{type(error).__name__}: {error}"}
     Path(args.result).write_text(json.dumps(result))
     return 0 if result["state"] == "measured" else 1
+
+
+def _loadavg() -> list[float] | None:
+    """The machine's load average: other work on it makes the wall-clock numbers noisy."""
+    try:
+        return list(os.getloadavg())
+    except OSError:
+        return None
 
 
 def named_steps(args) -> list[int]:
@@ -208,8 +259,15 @@ def summarize(results: dict[str, list[dict]], names: list[int], slack_ms: float)
                 # The step's time outside next(): the forward, backward, optimizer step and TensorQuill's own work.
                 worst_rest_by_round=[{"round": r["round"], "ms": max(r["rest_ms"]), "step": r["rest_ms"].index(max(r["rest_ms"])),
                                       "over_median_ms": max(r["rest_ms"]) - statistics.median(r["rest_ms"])} for r in measured],
-                gc_over_1ms=[{"round": r["round"], **c} for r in measured for c in r.get("gc_collections", []) if c["ms"] >= 1.0],
-                gc_collections=sum(len(r.get("gc_collections", [])) for r in measured),
+                # Training's collections; the script's own `--hold-gc` one, between steps, kept apart.
+                gc_over_1ms=[{"round": r["round"], **c} for r in measured for c in r.get("gc_collections", [])
+                             if c["ms"] >= 1.0 and not c.get("hold")],
+                gc_collections=sum(not c.get("hold") for r in measured for c in r.get("gc_collections", [])),
+                gc_by_generation={str(g): sum(c.get("generation") == g and not c.get("hold")
+                                              for r in measured for c in r.get("gc_collections", []))
+                                  for g in range(3)},
+                gc_held_by_script=[{"round": r["round"], **c} for r in measured for c in r.get("gc_collections", [])
+                                   if c.get("hold")],
                 step_ms_median_by_round=[statistics.median(r["step_ms"]) for r in measured],
                 step_ms_mean_by_round=[statistics.fmean(r["step_ms"]) for r in measured],
             )
@@ -251,6 +309,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slack-ms", type=float, default=15.0, help="steps whose next() is this far over the sleep are listed")
     parser.add_argument("--name-steps", type=int, nargs="*", help="steps to report by name (default: every flush boundary)")
     parser.add_argument("--arm-timeout", type=float, default=1800)
+    parser.add_argument("--hold-gc", choices=("none", "freeze", "collect", "threshold"), default="none",
+                        help="a controlled arm: at --hold-at the script (never the SDK) freezes the heap, runs a full "
+                             "collection, or raises the generation-2 threshold, in both arms")
+    parser.add_argument("--hold-at", type=int, default=10, help="the step before which --hold-gc is applied")
     parser.add_argument("--arm", choices=ARMS, help=argparse.SUPPRESS)
     parser.add_argument("--round", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--result", help=argparse.SUPPRESS)
@@ -263,6 +325,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--rounds must be at least 1 and --steps more than --every")
     args.out.mkdir(parents=True)
     names = named_steps(args)
+    if args.hold_gc != "none":
+        print(f"collector held by the script: {args.hold_gc} at step {args.hold_at}, in both arms", flush=True)
     results: dict[str, list[dict]] = {arm: [] for arm in ARMS}
     for round_index in range(args.rounds):
         for arm in (ARMS if round_index % 2 == 0 else ARMS[::-1]):
@@ -270,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
             command = [sys.executable, str(Path(__file__).resolve()), "--arm", arm, "--round", str(round_index),
                        "--result", str(path), "--dim", str(args.dim), "--blocks", str(args.blocks),
                        "--batch", str(args.batch), "--steps", str(args.steps), "--every", str(args.every),
-                       "--wait-ms", str(args.wait_ms)]
+                       "--wait-ms", str(args.wait_ms), "--hold-gc", args.hold_gc, "--hold-at", str(args.hold_at)]
             with (args.out / f"arm-{arm}-r{round_index}.log").open("w") as log:
                 try:
                     code: Any = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=args.arm_timeout).returncode
@@ -282,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = {"arm": arm, "round": round_index, "state": "error",
                           "error": f"the arm process wrote no result (exit {code})"}
             results[arm].append(result)
+            result.setdefault("loadavg_after", _loadavg())
             if result.get("state") == "measured":
                 worst = max(result["excess_ms"])
                 print(f"Round {round_index + 1} {arm:<3} worst next() {worst:+.2f} ms over its sleep at step "
@@ -293,7 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     document = {"measurement": "loader_delay", "judged": False, "torch": first.get("torch"), "device": first.get("device"),
                 "python": first.get("python"), "cpu_count": first.get("cpu_count"), "gc_threshold": first.get("gc_threshold"),
                 "rounds": args.rounds, "steps": args.steps, "every": args.every, "wait_ms": args.wait_ms,
-                **summary, "per_step": results}
+                "hold_gc": None if args.hold_gc == "none" else {"kind": args.hold_gc, "at_step": args.hold_at},
+                "loadavg": _loadavg(), **summary, "per_step": results}
     (args.out / "loader_delay.json").write_text(json.dumps(document, indent=1))
     for step in map(str, names):
         row = summary.get("on_minus_off", {}).get("excess_ms_at_named_steps", {}).get(step)
@@ -309,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
             whole, later = entry["worst_whole_step"], entry["worst_whole_step_after_first"]
             print(f"{arm}: worst whole-step delay {whole['ms']:+.2f} ms at step {whole['step']} (round {whole['round'] + 1})"
                   + (f"; after the first step {later['ms']:+.2f} ms at step {later['step']} (round {later['round'] + 1})" if later else ""))
+            print(f"{arm}: collections while training, by generation {entry['gc_by_generation']}")
             print(f"{arm}: worst delay in next() {w['ms']:+.2f} ms at step {w['step']} (round {w['round'] + 1}); "
                   f"{len(entry['over_slack'])} steps over {args.slack_ms:g} ms; worst rest of a step "
                   f"{rest['over_median_ms']:+.2f} ms over its median at step {rest['step']} (round {rest['round'] + 1}); "
