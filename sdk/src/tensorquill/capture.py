@@ -1307,6 +1307,7 @@ class _Plan:
     probe_blocks: list[tuple[str, nn.Module]]
     head: tuple[str | None, str | None, str | None]
     scaler: Any
+    mirror_scalars: bool = False  # wrap the trackers' logging calls (`mirror.py`)
 
 
 def _plan_session(
@@ -1325,6 +1326,7 @@ def _plan_session(
     scaler: Any,
     ends_step: Any = None,
     auto_step: bool = True,
+    mirror_scalars: bool = False,
 ) -> _Plan:
     """Every check `init` and `Session` make of the model and the options, and what they work
     out from them, with nothing changed: no hook, thread, file or global. `init` runs it before
@@ -1350,6 +1352,8 @@ def _plan_session(
         raise ValueError("replica_every must be a positive integer")
     if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
         raise ValueError("probe_every must be a positive integer")
+    if not isinstance(mirror_scalars, bool):
+        raise ValueError(f"mirror_scalars must be True or False, not {type(mirror_scalars).__name__}")
     probe_fn = probe_callable(probe) if probe is not None else None
     probe_off = None
     if probe_fn is not None:
@@ -1398,6 +1402,7 @@ def _plan_session(
         replicas=replicas,
         selected=selected, routers=planned_routers, probe_blocks=probe_blocks, head=head,
         scaler=scaler if scaler is not None and scaler.is_enabled() else None,
+        mirror_scalars=mirror_scalars,
     )
 
 
@@ -1479,6 +1484,7 @@ class Session:
         updates: bool = False,
         probe_head: str | bool | None = None,
         ends_step: Any = None,
+        mirror_scalars: bool = False,
         _plan: _Plan | None = None,
     ) -> None:
         # Every check first, with nothing changed (`_plan_session`); `init` has made them already.
@@ -1486,6 +1492,7 @@ class Session:
             model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
             replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
             replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
+            mirror_scalars=mirror_scalars,
         )
         # The optimizer whose step ends each step (`init(ends_step=...)`, wave AE section 3), weakly
         # held, or None for the default lead; and the steps of this model's other optimizers before it
@@ -1825,9 +1832,10 @@ class Session:
         auto_step: bool, data_wait: bool,
     ) -> None:
         """What the session changes outside itself, each registered in `undo` as it is made: the
-        forward hooks, the heartbeat's step counter, the writer thread, the clipping, scaler and
-        optimizer hooks and the data-loader timer; last, the end marker of an earlier run is
-        removed, the one effect that is not undone, so it happens only once all else has."""
+        forward hooks, the heartbeat's step counter, the writer thread, the clipping and scaler
+        hooks, the scalar mirror, the optimizer hooks and the data-loader timer; last, the end
+        marker of an earlier run is removed, the one effect that is not undone, so it happens only
+        once all else has."""
         undo.append(lambda: [handle.remove() for handle in self._handles])
         self._handles += [
             module.register_forward_hook(
@@ -1891,6 +1899,11 @@ class Session:
         if self._scaler is not None:
             self._watch_scaler(self._scaler)
             undo.append(self._unwatch_scaler)
+        if plan.mirror_scalars:
+            from . import mirror  # the trackers' `log` wrappers, shared by every session that mirrors
+
+            mirror.watch(self)
+            undo.append(lambda: mirror.unwatch(self))
         if auto_step:
             # Run eagerly where `optimizer.step()` is called inside a function `torch.compile` traces
             # (`init` there too, say): traced, these hooks would make Dynamo warn on what it cannot
@@ -3886,7 +3899,7 @@ class Session:
             self._queue.put_nowait(None)
         except queue.Full:
             pass
-        for undo in (lambda: _unwatch_clipping(self), lambda: datawait.unwatch(self)):
+        for undo in (lambda: _unwatch_clipping(self), lambda: datawait.unwatch(self), self._unwatch_mirror):
             try:
                 undo()
             except Exception:  # noqa: BLE001
@@ -4019,6 +4032,14 @@ class Session:
         state for these calls: its one warning was given when it stopped."""
         return self._closed or self._stopped
 
+    def _unwatch_mirror(self) -> None:
+        """Stop mirroring tracker scalars into this session (`mirror.py`), taking the wrappers out
+        when it was the last session to mirror. Nothing when it never mirrored or the module was
+        never loaded."""
+        mirror = sys.modules.get(__package__ + ".mirror")
+        if mirror is not None:
+            mirror.unwatch(self)
+
     def close(self, *, _exception: BaseException | None = None) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
         removing a hook from a compiled module triggers a recompile. Once the records file is
@@ -4050,6 +4071,7 @@ class Session:
             lambda: [handle.remove() for handle in self._optimizer_handles],
             lambda: _unwatch_clipping(self),
             self._unwatch_scaler,
+            self._unwatch_mirror,
         ):
             try:
                 undo()
@@ -4619,6 +4641,7 @@ def init(
     data_wait: bool = False,
     updates: bool = False,
     ends_step: Any = None,
+    mirror_scalars: bool = True,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -4795,6 +4818,20 @@ def init(
             on a GPU. It also records the total gradient norm on every step, which the rule
             needs (per-parameter gradient norms, unless clipping was seen that step). Any
             other optimizer is not read, and the evidence says so (`not_checked`).
+        mirror_scalars: also record, as `session.log` would, the plain numbers this process logs
+            through `wandb.log` / `wandb.Run.log` and `mlflow.log_metric` / `mlflow.log_metrics`,
+            on TensorQuill's step in progress (W&B's `step` and `commit` and MLflow's `step` are
+            ignored), so incidents and `compare` have the loss and evaluation numbers beside them.
+            Python `int` and `float` (not `bool`), NumPy scalars and 0-D tensors already on the CPU
+            are taken; a tensor on a GPU is skipped unread (no sync), and images, tables, strings
+            and lists are ignored. A key this session got from `session.log` in the same step
+            (yours, or an adapter's) is kept. The tracker's call, arguments, return value and
+            errors are unchanged; the mirror never raises, reads no API key, calls no server and
+            never reads `wandb.run.step`. Only a tracker already imported when `init` runs is
+            wrapped (none is imported here): import `wandb` or `mlflow` first. `wandb.init()` may
+            come before or after. A function bound before `init` (`from mlflow import log_metric`)
+            and `MlflowClient` calls are not seen. The wrappers come off when the last session that
+            mirrors closes or stops. See `mirror.py` and the README. `False` installs nothing.
     """
     mode = capture if capture is not None else ("routers" if routers else "full")
     if mode not in CAPTURE_MODES:
@@ -4818,6 +4855,7 @@ def init(
         model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
         replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
         replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
+        mirror_scalars=mirror_scalars,
     )
     # What `init` opens is undone if a later step fails (`_undo`): the default sink and its file,
     # the run manifest, the stream to a server. A sink the caller passed in is never closed here.
@@ -4877,6 +4915,7 @@ def init(
             data_wait=data_wait,
             updates=updates,
             ends_step=ends_step,
+            mirror_scalars=mirror_scalars,
             _plan=plan,
         )
     except BaseException:
