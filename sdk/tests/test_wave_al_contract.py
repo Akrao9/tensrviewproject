@@ -5,7 +5,10 @@ What runs here, on the base and on every lane's tree:
 - The document: every case is named on the page, in its section, with the fields its paths need.
 - The cases against the prototype (`experiments/protocol-v5/prototype.py`): each case's `row` is
   what the prototype gives, its round trip holds and keeps each map's order. This keeps the cases and
-  the page's layout one thing; the prototype is not product code.
+  the page's layout one thing; the prototype is not product code. It is built on protocol 4's row
+  functions, frozen beside it in `flight_v4.py` (`flight.py` at `5c286ed`), as it was measured.
+- `flight` itself (lane AL-1, merged at `92e471a`): each case's `row` and round trip, and the
+  prototype's row on every record of every section 1 and 2 case, `clean_records` included.
 - Pins: where the base already reports on `records` what the contract asks (`expect`), the engine
   paths are ordinary tests, so no lane can move them.
 - Targets: where the base does not (a refused entry today, the row layout, the scalar-only record),
@@ -39,10 +42,15 @@ PAGE = (ROOT / DOCUMENT["contract"]).read_text()
 EXPERIMENTS = ROOT / "experiments" / "protocol-v5"
 ROWS = [c for c in CASES if c["section"] in (1, 2)]
 SCALAR = [c for c in CASES if c["section"] == 4]
-LANE_ROW = "lane AL-1 (flight.py, server_detect.py): protocol 5's row layout, contract sections 1 and 2"
 LANE_RUST = "lanes AL-1 and AL-3 joined (flight.py's layout, detect.rs' reader): contract sections 1 and 2"
 LANE_PY = "lane AL-4' (evidence.py, step 2): an entry the column cannot hold is absent to every detector, contract section 1.5"
 LANE_SCALAR = "step 2 of the wave (contract section 4): the scalar-only record"
+# Targets whose lanes have landed: they pass on the joined tree and are ordinary tests now. A case's
+# `today` stays the base's (f71d8e0), so the mark is decided here, not by `today == expect`.
+LANDED = {
+    ("layers_entry_not_object", "rust_raw"),  # lanes AL-1 and AL-3, merged at 92e471a
+    ("layers_name_arrow_cannot_encode", "rust_raw"),  # lanes AL-1 and AL-3, merged at 92e471a
+}
 
 
 def _prototype():
@@ -135,11 +143,11 @@ def _jsonable(value):
     return value
 
 
-@pytest.mark.xfail(strict=True, reason=LANE_ROW)
 @pytest.mark.parametrize("case", ROWS, ids=[c["name"] for c in ROWS])
 def test_flight_gives_the_row(case):
-    """Lane AL-1's target: `flight.record_to_row` gives the case's row in protocol 5's layout, and
-    `row_to_record` gives the record back."""
+    """Lane AL-1's (landed at 92e471a): `flight.record_to_row` gives the case's row in protocol 5's
+    layout, and `row_to_record` gives the record back."""
+    pytest.importorskip("pyarrow")  # flight_schema() imports it; CI's plain jobs have none
     from tensorquill import flight
 
     record = next(r for r in case["records"] if r["step"] == case["row_step"])
@@ -153,6 +161,24 @@ def test_flight_gives_the_row(case):
             assert got == want[column], column
     assert (json.loads(row["extra_json"]) if row.get("extra_json") else None) == want["extra"]
     assert flight.row_to_record(row) == record
+
+
+@pytest.mark.parametrize("case", ROWS, ids=[c["name"] for c in ROWS])
+def test_flight_gives_the_prototype_s_row_on_every_record(case):
+    """`flight.record_to_row` gives the measured prototype's row, every column, on every record of the
+    case (`records` and `clean_records`), so section 6's prototype figures are the product's layout.
+    The prototype's `seq` is step 2's (section 4.4) and not in step 1's schema."""
+    pytest.importorskip("pyarrow")
+    from tensorquill import flight
+
+    p5 = _prototype()
+    assert set(p5.flight_schema_v5().names) - set(flight.flight_schema().names) == {"seq"}
+    for record in [*case["records"], *(case.get("clean_records") or [])]:
+        row = flight.record_to_row(copy.deepcopy(record))
+        prototype = p5.record_to_row_v5(copy.deepcopy(record))
+        assert set(prototype) - set(row) == {"seq"} and set(row) <= set(prototype), record["step"]
+        for column in row:
+            assert _jsonable(row[column]) == _jsonable(prototype[column]), (record["step"], column)
 
 
 def _brief(incident: dict) -> dict:
@@ -184,15 +210,17 @@ def _engine_params():
             if path not in case["paths"] or path not in case["expect"]:
                 continue
             pinned = case["today"].get(path) == case["expect"][path]
+            landed = (case["name"], path) in LANDED
             marks = []
             if path == "rust_raw":
                 from tensorquill.server_detect import find_binary
 
                 marks.append(pytest.mark.skipif(find_binary() is None or importlib.util.find_spec("pyarrow") is None,
                                                 reason="tensorquill-server is not built, or pyarrow is not installed"))
-            if not pinned:
+            if not pinned and not landed:
                 marks.append(pytest.mark.xfail(strict=True, reason=LANE_PY if path == "python" else LANE_RUST))
-            out.append(pytest.param(case, path, marks=marks, id=f"{case['name']}-{path}-{'pin' if pinned else 'target'}"))
+            kind = "pin" if pinned else "landed" if landed else "target"
+            out.append(pytest.param(case, path, marks=marks, id=f"{case['name']}-{path}-{kind}"))
     return out
 
 
