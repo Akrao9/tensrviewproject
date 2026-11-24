@@ -129,3 +129,62 @@ def test_the_sender_of_this_package_says_an_older_server_reads_its_versions():
     plural = REFUSAL["this_server"]["text"].replace("schema_version 3 ", "schema_version 2 ").replace("1 and 2", "1 and 3")
     said = str(flight.FlightSender._older(stand_in, ConnectionError(plural)))
     assert "It reads batch schema_versions 1 and 3 and this tensorquill sends version 2" in said
+
+
+# --- 4. Known differences on a name Arrow cannot encode, pinned on each side (not fixed) --------------
+# The owner, Nov 24, 2026, on lane AL-3's decisions 3 and 4. The Rust sides are
+# `a_protocol_4_row_with_a_name_arrow_cannot_encode_reads_no_layer_in_rust` and
+# `a_name_arrow_cannot_encode_is_not_read_by_non_finite` (`server/src/detect/lane_al3_tests.rs`).
+
+CASES = json.loads((Path(__file__).parent / "fixtures" / "wave_al" / "cases.json").read_text(encoding="utf-8"))
+SURROGATE_CASE = next(case for case in CASES["cases"] if case["name"] == "layers_name_arrow_cannot_encode")
+ACTIVATION_KINDS = ("activation_spike", "activation_drift", "dead_activations")
+
+
+def _protocol_4_row(record: dict) -> dict:
+    """`record` as a protocol 4 sender's row: the layers as JSON text in `layers_json`, row version 1."""
+    row = {key: record[key] for key in ("run_id", "rank", "attempt", "step", "schema_version", "ts", "grad_norm")}
+    row.update(layers_json=json.dumps(record["layers"]), moe_stats_json=None, extra_json=None)
+    return row
+
+
+def _activation_checks(records) -> dict:
+    from tensorquill import evidence
+
+    checks = evidence.build_evidence(records)["kind_checks"]
+    return {kind: checks[kind]["value"] for kind in ACTIVATION_KINDS}
+
+
+def test_python_reads_every_layer_of_a_protocol_4_row_with_a_name_arrow_cannot_encode():
+    """Rust reads no layer of such a row (its activation kinds `not_configured`, the case's `today`
+    `rust_raw`); Python reads the row back to the record, every layer and the name included."""
+    records = SURROGATE_CASE["records"]
+    assert any("bad\ud800" in record["layers"] for record in records)
+    rows = [_protocol_4_row(record) for record in records]
+    assert "bad\\ud800" in rows[1]["layers_json"]  # the escape serde_json refuses
+    back = [flight.row_to_record(row) for row in rows]
+    assert back == records
+    assert _activation_checks(back) == dict.fromkeys(ACTIVATION_KINDS, "checked")
+    today = SURROGATE_CASE["today"]
+    assert {kind: today["python"]["kind_checks"][kind] for kind in ACTIVATION_KINDS} == _activation_checks(back)
+    assert {kind: today["rust_raw"]["kind_checks"][kind] for kind in ACTIVATION_KINDS} == dict.fromkeys(
+        ACTIVATION_KINDS, "not_configured")
+
+
+def test_python_names_a_non_finite_field_of_a_name_arrow_cannot_encode_where_rust_does_not():
+    """In protocol 5's layout the entry travels in `extra_json`, whose whole text Rust cannot parse (the
+    lone surrogate's escape), so Rust's `non_finite` names no layer there; Python reads the row back to
+    the record and names the layer."""
+    records = [{"schema_version": 1, "run_id": "s", "rank": 0, "attempt": 1, "step": step, "ts": float(step),
+                "grad_norm": 1.0, "layers": {"model.layers.0": {"mean": 0.0, "std": 1.0, "abs_max": 3.0,
+                                                                "zero_frac": 0.0}}} for step in range(3)]
+    records[1]["layers"]["bad\ud800"] = {"p99": "nan"}
+    rows = [flight.record_to_row(record) for record in records]
+    assert json.loads(rows[1]["extra_json"]) == {"layers": {"bad\ud800": {"p99": "nan"}}}
+    assert "bad\\ud800" in rows[1]["extra_json"]
+    back = [flight.row_to_record(row) for row in rows]
+    assert back == records
+    from tensorquill import evidence
+
+    found = [incident for incident in evidence.build_evidence(back)["incidents"] if incident["kind"] == "non_finite"]
+    assert found and found[0]["step"] == 1 and "bad\ud800" in json.dumps(found[0], ensure_ascii=False), found
