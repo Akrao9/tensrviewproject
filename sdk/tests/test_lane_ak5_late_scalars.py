@@ -459,6 +459,44 @@ def test_a_compiled_step_that_logs_is_not_recompiled_by_an_evaluation():
     assert scalars[1]["eval/x"] == 1.0 and scalars[2]["eval/x"] == 2.0
 
 
+@pytest.mark.parametrize("every", [3, 1])
+def test_a_compiled_evaluation_that_logs_compiles_once_and_lands_on_each_step(every):
+    """`session.log` traced inside a compiled evaluation: the late path must not read the ring (its
+    length, its step numbers, the held step), each a guard that changes at every step."""
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    model = nn.Linear(4, 1)
+    session, sink, opt = _open(model, every=every)
+    train_counter, eval_counter = CompileCounter(), CompileCounter()
+
+    @torch.compile(backend=train_counter, fullgraph=True)
+    def forward(x):
+        loss = model(x).pow(2).mean()
+        session.log({"train/loss": loss})
+        return loss
+
+    @torch.compile(backend=eval_counter, fullgraph=True)
+    def evaluate(x):
+        with torch.no_grad():
+            loss = model(x).pow(2).mean()
+        session.log({"eval/loss": loss, "eval/i": 1.0})
+        return loss
+
+    expected = {}
+    for i in range(7):
+        forward(torch.randn(8, 4)).backward()
+        opt.step()
+        opt.zero_grad()
+        with session.phase("eval"):
+            expected[i] = evaluate(torch.full((8, 4), float(i))).item()
+    session.close()
+    torch._dynamo.reset()
+    assert train_counter.frame_count == 1 and eval_counter.frame_count == 1
+    scalars = _by_step(sink.records)
+    assert [scalars[i]["eval/loss"] for i in range(7)] == pytest.approx([expected[i] for i in range(7)])
+
+
 def test_a_phase_left_behind_sends_the_next_steps_values_to_the_step_before():
     """Pinned as it is, for the owner: `set_phase("eval")` never set back. The next step's values,
     logged before its `optimizer.step()` ends the phase, are taken as late values of the newest step.
