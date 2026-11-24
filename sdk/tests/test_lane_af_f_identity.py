@@ -72,10 +72,15 @@ def test_no_upper_bound_and_run_id_is_not_looked_at():
     assert check({"step": 0, "schema_version": 0}) is None
 
 
-def test_the_newest_schema_version_written_is_read():
+def test_the_version_numbers_are_kept_apart():
+    """`WAVE_AL_CONTRACT.md` section 3: the batch metadata's version and a row's are protocol 5's, 2 each,
+    and neither is a record's version. The record versions every reader takes are their own list. (Until
+    wave AL this asserted that the metadata version was one of the record versions.)"""
     from tensorquill import flight
 
-    assert flight.SCHEMA_VERSION in identity.SCHEMA_VERSIONS
+    assert (flight.SCHEMA_VERSION, flight.ROW_VERSION) == (2, 2)
+    assert identity.SCHEMA_VERSIONS == (0, 1)
+    assert flight.SCHEMA_VERSIONS is identity.SCHEMA_VERSIONS  # what the sender checks a record against
 
 
 def test_importing_it_loads_neither_torch_nor_pyarrow():
@@ -129,7 +134,9 @@ def test_a_pinned_case_still_makes_a_stream(name, body, stream):
 def test_record_to_row_reads_a_pinned_case_as_on_the_base(name, body):
     """An absent `schema_version`, `rank` or `attempt` makes a row. `run_id` is left as it is: the
     base's `record_to_row` raises a KeyError or TypeError on a missing or non-text run ID (its
-    callers fill one in), and it still does, never the new error."""
+    callers fill one in), and it still does, never the new error. Since protocol 5 (wave AL, section 3,
+    Q1 a) the row's `schema_version` is 2 and the record's own version is in `record_version`, null for
+    a record with no key; until then the row's version was the record's, 0 when absent."""
     record = body["given"]["record"]
     if body["field"] == "run_id":
         with pytest.raises((KeyError, TypeError)) as raised:
@@ -137,8 +144,9 @@ def test_record_to_row_reads_a_pinned_case_as_on_the_base(name, body):
         assert not isinstance(raised.value, MalformedRecordError)
     else:
         row = flight.record_to_row(record)
-        assert (row["schema_version"], row["rank"], row["attempt"], row["step"]) == (
-            record.get("schema_version", 0), record.get("rank", 0), record.get("attempt", 0), record["step"])
+        assert (row["schema_version"], row["record_version"], row["rank"], row["attempt"], row["step"]) == (
+            flight.ROW_VERSION, record.get("schema_version"), record.get("rank", 0), record.get("attempt", 0),
+            record["step"])
 
 
 def test_sdk06_a_refusal_leaves_moved_as_it_was_passed():
@@ -171,9 +179,15 @@ VALID = [
      "moe": {"r": [1, 2]}, "moe_top_k": {"r": 2**40}, "unknown": [1, None]},
     {"schema_version": 1, "run_id": "v", "rank": 0, "attempt": 1, "step": 4, "step_skipped": True, "data": {"h": "x"}},
 ]
-# sha256 of the rows `record_to_row` made of VALID on the base (1ca26d4), with and without the schema.
-BASE_ROWS = "cb6c98b556d0d49ef742ec9f8e9ee605ac9393b8934c76194139108554c8d954"
-BASE_ROWS_SCHEMA = "631f74a7c8c31069a728894f5c85e054b217247b9bf550a45515643960728ee1"
+# sha256 of the rows `record_to_row` makes of VALID in protocol 5's layout (wave AL, Nov 24, 2026), with
+# and without the schema. Until then they were the base's (1ca26d4), in protocol 4's layout:
+# cb6c98b5...c8d954 and 631f74a7...728ee1. The rows differ from those in what `WAVE_AL_CONTRACT.md`
+# sections 1.2 to 1.4 and 3 change, and in nothing else: the row's `schema_version` is 2 and the record's
+# own is in `record_version` (null with no key); `layers`, `moe_stats`, `probe_maps` and `probe_histograms`
+# replace `layers_json` and `moe_stats_json`; and the fourth record's layer field `x`, which no struct
+# field names, is refused into `extra_json` with the map's entries kept in its order. `moved` is the same.
+PROTOCOL_5_ROWS = "381b15a4bf060020f9500153b7c80a889ab4bd1619f2c4f816439b6114b0b4f7"
+PROTOCOL_5_ROWS_SCHEMA = "15d845e6196a9e8cddcffe1c7d9f8e0d9652064cca55a6e9b1a65d9d19b25259"
 
 
 def _rows_digest(schema) -> str:
@@ -184,9 +198,10 @@ def _rows_digest(schema) -> str:
     return hashlib.sha256(json.dumps(out, sort_keys=True, default=repr).encode()).hexdigest()
 
 
-def test_a_valid_record_s_row_is_what_it_is_on_the_base():
-    assert _rows_digest(None) == BASE_ROWS
-    assert _rows_digest(flight.flight_schema()) == BASE_ROWS_SCHEMA
+def test_a_valid_record_s_row_is_protocol_5_s():
+    """The rows of VALID are pinned in protocol 5's layout, as they were in protocol 4's on the base."""
+    assert _rows_digest(None) == PROTOCOL_5_ROWS
+    assert _rows_digest(flight.flight_schema()) == PROTOCOL_5_ROWS_SCHEMA
 
 
 

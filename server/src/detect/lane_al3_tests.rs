@@ -538,6 +538,45 @@ fn a_name_arrow_cannot_encode_is_not_read_by_non_finite() {
     assert!(!kinds(&typed).iter().any(|(kind, _)| kind == "non_finite"), "{typed}");
 }
 
+/// A known difference on a protocol 4 row, pinned and not fixed (the owner, Nov 24, 2026, on lane
+/// AL-3's decision 3): a `layers_json` text holding a name Arrow cannot encode (a lone surrogate's
+/// escape, which serde_json refuses) reads as no layer at all in Rust, so the activation kinds are
+/// `not_configured` and step 35's spike is not seen. Python reads every layer of such a row, the
+/// spike included (`test_wave_al_step1_seams.py`). Protocol 5's layout keeps the other entries in
+/// the column, so both engines read them there (`a_name_only_in_extra_json_leaves_the_column_s_entries_read` above, case
+/// `layers_name_arrow_cannot_encode`).
+#[test]
+fn a_protocol_4_row_with_a_name_arrow_cannot_encode_reads_no_layer_in_rust() {
+    let plain = batch(&run(), Layout::Json);
+    let at = plain.schema().index_of("layers_json").unwrap();
+    let texts = plain.column(at).as_any().downcast_ref::<StringArray>().unwrap();
+    let with_name: StringArray = texts
+        .iter()
+        .map(|text| {
+            text.map(|text| {
+                let open = &text[..text.len() - 1];
+                format!(r#"{open},"bad\ud800":{{"mean":0.0,"std":1.0,"abs_max":3.0,"zero_frac":0.0}}}}"#)
+            })
+        })
+        .collect();
+    assert!(with_name
+        .value(0)
+        .ends_with(r#""bad\ud800":{"mean":0.0,"std":1.0,"abs_max":3.0,"zero_frac":0.0}}"#));
+    let mut columns = plain.columns().to_vec();
+    columns[at] = Arc::new(with_name);
+    let surrogate = RecordBatch::try_new(plain.schema(), columns).unwrap();
+    let (clean, report) = (judged(&[plain]), judged(&[surrogate]));
+    assert_eq!(check(&clean, "activation_spike"), "checked");
+    assert!(
+        kinds(&clean).iter().any(|(kind, _)| kind == "activation_spike"),
+        "{clean}"
+    );
+    for kind in ["activation_spike", "activation_drift", "dead_activations"] {
+        assert_eq!(check(&report, kind), "not_configured", "{kind}");
+    }
+    assert!(kinds(&report).is_empty(), "{report}");
+}
+
 /// Section 1.5's second target, `layers_value_not_object`: the column is null, the value in
 /// `extra_json`; nothing is read, as on the JSON row.
 #[test]
@@ -780,13 +819,14 @@ fn detect_takes_row_version_2_and_names_the_three_it_reads() {
     );
 }
 
-/// A row version this server stores is one `detect` reads: the live server's list (lane AL-2's,
-/// `ingest::SUPPORTED_ROW_VERSIONS`) and `detect`'s may differ only until the seam joins them.
+/// A row version this server stores is one `detect` reads: both read the one list,
+/// `ingest::SUPPORTED_ROW_VERSIONS`, which holds protocol 4's 0 and 1 and protocol 5's 2 (section 3).
 #[test]
 fn every_version_the_server_stores_is_one_detect_reads() {
+    assert_eq!(crate::ingest::SUPPORTED_ROW_VERSIONS.to_vec(), vec![0, 1, 2]);
     let typed = batch(&run(), TYPED);
     let at = typed.schema().index_of("schema_version").unwrap();
-    for version in crate::ingest::SUPPORTED_ROW_VERSIONS.into_iter().chain([2]) {
+    for version in crate::ingest::SUPPORTED_ROW_VERSIONS {
         let mut columns = typed.columns().to_vec();
         columns[at] = Arc::new(Int32Array::from_iter_values((0..40).map(|_| version)));
         let rows = RecordBatch::try_new(typed.schema(), columns).unwrap();

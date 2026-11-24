@@ -23,7 +23,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-# The schema versions the server stores and this package reads (`flight.SCHEMA_VERSION` is the newest).
+# The record versions (a record's own `schema_version`, as in the `.jsonl` file) this package reads.
+# They are neither the batch metadata's version (`flight.SCHEMA_VERSION`) nor a stored row's
+# (`flight.ROW_VERSION`, with the record's own in `record_version`): `WAVE_AL_CONTRACT.md` section 3
+# keeps the four numbers apart.
 SCHEMA_VERSIONS = (0, 1)
 # Checked in this order; the first field that is not valid is the one named.
 FIELDS = ("schema_version", "rank", "attempt", "step")

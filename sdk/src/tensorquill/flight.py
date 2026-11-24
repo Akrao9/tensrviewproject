@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import re
 import struct
 import sys
 import threading
@@ -969,22 +970,23 @@ class OlderServer(ConnectionError):
     goes once the server is upgraded; the sender keeps trying."""
 
 
-_REFUSED_VERSION = f"schema_version {SCHEMA_VERSION} is not supported; this server reads version "
+# A server's refusal of a batch metadata version it does not read, in either wording: a protocol 4
+# server's singular "this server reads version 1", or a protocol 5 server's plural "this server reads
+# versions 1 and 2" (both pinned in `tests/fixtures/wave_al/refusal.json`, which the server's own test
+# reads too).
+_REFUSED_VERSION = re.compile(r"schema_version (-?\d+) is not supported; this server reads versions? "
+                              r"(\d+(?:(?:, | and )\d+)*)")
 
 
-def _older_server_reads(text: str) -> str | None:
-    """The batch metadata version a server reads, when `text` is its refusal of this package's
-    (`ingest.rs`: "schema_version N is not supported; this server reads version M", sent as
+def _older_server_reads(text: str, sent: int = SCHEMA_VERSION) -> str | None:
+    """The batch metadata versions a server reads, as its refusal lists them ("1", "1 and 2"), when
+    `text` holds its refusal of version `sent` (`ingest.rs`: "schema_version N is not supported; this
+    server reads versions 1 and 2", or a protocol 4 server's "... reads version 1", sent as
     INVALID_ARGUMENT); else None."""
-    at = text.find(_REFUSED_VERSION)
-    if at < 0:
-        return None
-    digits = ""
-    for c in text[at + len(_REFUSED_VERSION):]:
-        if not c.isdigit():
-            break
-        digits += c
-    return digits or None
+    for found in _REFUSED_VERSION.finditer(text):
+        if int(found.group(1)) == sent:
+            return found.group(2)
+    return None
 
 
 class LocalFileUnreadable(OSError):
@@ -1390,7 +1392,8 @@ class FlightSender:
                 return None
             return OlderServer(
                 f"the server at {self.endpoint} speaks an older protocol: upgrade tensorquill-server "
-                f"(pip install -U tensorquill-server). It reads batch schema_version {reads} and this tensorquill "
+                f"(pip install -U tensorquill-server). It reads batch schema_version{'s' if ' ' in reads else ''} "
+                f"{reads} and this tensorquill "
                 f"sends version {SCHEMA_VERSION}, so it acknowledges nothing; {self.path} keeps every line, and "
                 "they are sent once the server is upgraded")
         except Exception:  # noqa: BLE001  explaining a failure must never be one

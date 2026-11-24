@@ -1,0 +1,13 @@
+{
+  "about": "The server's refusal of a batch metadata schema_version it does not read (INVALID_ARGUMENT, nothing acknowledged), in both wordings, read by both sides: server/tests/lane_al2_protocol5_test.rs asserts this server's real refusal is this_server's text, and sdk/tests/test_wave_al_step1_seams.py asserts the sender's _older_server_reads recognises both and reads the versions out of each. protocol_4_server is what a protocol 4 server prints for a protocol 5 sender's version 2 (WAVE_AL_CONTRACT.md D6, recorded against the protocol 4 binary); this_server is what a protocol 5 server prints for a version it does not read, as a later sender's 3. Wave AL step 1 seam, Nov 24, 2026.",
+  "protocol_4_server": {
+    "sent": 2,
+    "text": "schema_version 2 is not supported; this server reads version 1",
+    "reads": "1"
+  },
+  "this_server": {
+    "sent": 3,
+    "text": "schema_version 3 is not supported; this server reads versions 1 and 2",
+    "reads": "1 and 2"
+  }
+}

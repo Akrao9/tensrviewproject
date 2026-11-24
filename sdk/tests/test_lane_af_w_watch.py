@@ -467,12 +467,13 @@ def test_a_threshold_change_while_one_watcher_runs_is_judged_again_in_full(binar
         watching.stop()
 
 
-# ---- Protocol 4: the pair and a mismatch, through the command (the author's follow-up 2) ------------
+# ---- The protocol: the pair and a mismatch, through the command (the author's follow-up 2) ---------
+# Protocol 4 when this was written; 5 since wave AL (Nov 24, 2026), and a binary of 3 is still refused.
 
 
-def test_this_trees_binary_and_sdk_are_a_pair_of_protocol_4(binary):
+def test_this_trees_binary_and_sdk_are_a_pair_of_protocol_5(binary):
     done = subprocess.run([binary, "protocol"], capture_output=True, text=True, timeout=30)
-    assert (done.returncode, done.stdout, done.stderr) == (0, "4\n", "") and sd.PROTOCOL == 4
+    assert (done.returncode, done.stdout, done.stderr) == (0, "5\n", "") and sd.PROTOCOL == 5
     assert sd.rust_ready(binary) == binary
 
 
@@ -495,7 +496,7 @@ def _command(tmp: Path, binary: Path, *args: str) -> subprocess.CompletedProcess
                            "-o", str(tmp / "out.json")], cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
 
 
-MISMATCH = "speaks protocol 3 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match"
+MISMATCH = "speaks protocol 3 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match"
 
 
 @pytest.mark.parametrize("args", [("--watch",), ("--watch", "--detectors", "rust")], ids=["watch", "watch_rust"])

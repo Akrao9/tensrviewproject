@@ -26,7 +26,14 @@ use tokio::net::TcpListener;
 /// 4 (Nov 21, 2026, wave AF-W): `detect --follow`, the detectors kept between looks for the SDK's
 /// `--watch` with the Rust detectors. What `detect` and `detect --samples` print is unchanged; an
 /// SDK built for 4 runs a `--watch` through `--follow`, which a binary of 3 does not have.
-const PROTOCOL: u32 = 4;
+///
+/// 5 (Nov 24, 2026, wave AL, `WAVE_AL_CONTRACT.md`): protocol 5's row layout, which `detect` reads.
+/// `layers` and `moe_stats` are typed map columns in the model's order (`layers_json` and
+/// `moe_stats_json` are still read where a batch has them), the probe is split into `probe_json`,
+/// `probe_maps` and `probe_histograms` (no detector reads the last two), and a row carries
+/// row version 2 with the record's own version in `record_version`. An SDK built for 5 sends
+/// row version 2, which a binary of 4 refuses.
+const PROTOCOL: u32 = 5;
 
 /// Self-hosted TensorQuill ingest: Arrow Flight DoPut in, partitioned Parquet out.
 #[derive(Parser)]

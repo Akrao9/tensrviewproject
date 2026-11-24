@@ -36,7 +36,12 @@ BINARY_NAME = "tensorquill-server"
 # a larger one is a newer binary whose reports this module was not written for.
 # 3 (lanes W2 and W3, Nov 19, 2026): attempts ordered by first appearance (contract 1), the
 # capture-stopped state (contract 3), and the detector rules of lane W3.
-PROTOCOL = 4  # 4: `detect --follow` (wave AF-W), for `--watch` with the Rust detectors
+# 4 (wave AF-W, Nov 21, 2026): `detect --follow`, for `--watch` with the Rust detectors.
+# 5 (wave AL, Nov 24, 2026): protocol 5's row layout (`WAVE_AL_CONTRACT.md`), which `detect` reads:
+# `layers` and `moe_stats` as typed map columns in the model's order, the probe split into
+# `probe_json`, `probe_maps` and `probe_histograms`, and row version 2 with the record's own
+# version in `record_version`.
+PROTOCOL = 5
 INSTALL_HINT = "pip install tensorquill-server"
 DETECTOR_CHOICES = ("auto", "python", "rust")
 _BATCH_ROWS = 500

@@ -519,7 +519,8 @@ def test_an_mcp_tool_answers_the_error_and_the_next_call_and_the_listing_does_no
 @pytest.mark.parametrize(("column", "value", "said"), [
     ("step", -3, "row 3: step is -3, not an integer of 0 or more; the input is refused"),
     ("rank", -3, "row 3: rank is -3, not an integer of 0 or more; the input is refused"),
-    ("schema_version", 2, "row 3: schema_version is 2; this server reads versions 0 and 1; the input is refused"),
+    # Version 2 is protocol 5's row (wave AL, section 3), so 3 is the version refused since then.
+    ("schema_version", 3, "row 3: schema_version is 3; this server reads versions 0, 1 and 2; the input is refused"),
     (None, None, None),
 ])
 def test_offline_detect_refuses_a_negative_key_and_carries_attempt_order(tmp_path, column, value, said):
@@ -832,7 +833,7 @@ from tensorquill import server_detect as sd  # noqa: E402
 WATCH_RUST = flat(README[README.index("**Watching through Rust.**"):README.index("**All ranks.** `--rank all --detectors rust`")])
 WATCH_GUIDE = flat(GUIDE[GUIDE.index("**Watching while the job trains.**"):GUIDE.index("**All ranks at once.**")])
 COMPACT = flat(section(README, "Compact evidence and the trigger"))
-needs_protocol_4 = pytest.mark.skipif(BINARY is None or sd.binary_protocol(BINARY) != sd.PROTOCOL,
+needs_protocol_5 = pytest.mark.skipif(BINARY is None or sd.binary_protocol(BINARY) != sd.PROTOCOL,
                                       reason="no tensorquill-server of this SDK's protocol (TENSORQUILL_SERVER_BIN)")
 
 
@@ -842,11 +843,12 @@ def watched_records(steps, *, attempt: int = 0, router: str = "r0") -> list[dict
              "moe": {router: [5 + s % 3, 4, 6, 5]}, "moe_top_k": {router: 1}} for s in steps]
 
 
-def protocol_3(tmp: Path) -> Path:
-    """A stand-in binary of protocol 3: it answers `protocol` and fails anything else."""
+def protocol_4(tmp: Path) -> Path:
+    """A stand-in binary of protocol 4, the one before protocol 5's row layout: it answers `protocol`
+    and fails anything else."""
     path = tmp / "old" / "tensorquill-server"
     path.parent.mkdir(parents=True)
-    path.write_text('#!/bin/sh\nif [ "$1" = protocol ]; then echo 3; exit 0; fi\necho "ran $*" >&2; exit 3\n')
+    path.write_text('#!/bin/sh\nif [ "$1" = protocol ]; then echo 4; exit 0; fi\necho "ran $*" >&2; exit 3\n')
     path.chmod(0o755)
     return path
 
@@ -866,21 +868,22 @@ def quoted(text: str, start: str) -> str:
 
 
 def test_the_protocol_the_pages_give_is_the_sdks():
-    assert sd.PROTOCOL == 4
-    assert "both speak protocol 4 since Nov 21, 2026 (3 before), when `detect --follow` was added" in flat(README)
-    assert "The SDK and `tensorquill-server` must be built from the same version (protocol 4)." in WATCH_GUIDE
+    assert sd.PROTOCOL == 5
+    assert ("both speak protocol 5 since Nov 24, 2026 (4 before), when protocol 5's row layout was added; "
+            "protocol 4 came on Nov 21, 2026 with `detect --follow`") in flat(README)
+    assert "The SDK and `tensorquill-server` must be built from the same version (protocol 5)." in WATCH_GUIDE
     assert "must be built again after you upgrade the SDK" in flat(README) and "must be built again after you upgrade the SDK" in WATCH_GUIDE
 
 
-@needs_protocol_4
+@needs_protocol_5
 def test_this_trees_binary_prints_the_protocol_the_pages_give():
     done = subprocess.run([str(BINARY), "protocol"], capture_output=True, text=True, timeout=30)
     assert (done.returncode, done.stdout) == (0, f"{sd.PROTOCOL}\n")
 
 
 def test_a_watch_with_a_binary_of_another_protocol_prints_the_message_the_readme_quotes(tmp_path):
-    old = protocol_3(tmp_path)
-    said = quoted(flat(README), "--watch needs the Rust detectors: <binary> speaks protocol 3").replace("<binary>", str(old))
+    old = protocol_4(tmp_path)
+    said = quoted(flat(README), "--watch needs the Rust detectors: <binary> speaks protocol 4").replace("<binary>", str(old))
     for args in (("--watch",), ("--watch", "--detectors", "rust")):
         done = run_command(tmp_path, old, *args)
         assert done.returncode == 2 and not (tmp_path / "out.json").exists()
@@ -889,7 +892,7 @@ def test_a_watch_with_a_binary_of_another_protocol_prints_the_message_the_readme
 
 
 def test_one_read_with_a_binary_of_another_protocol_refuses_rust_and_falls_back_with_auto(tmp_path):
-    old = protocol_3(tmp_path)
+    old = protocol_4(tmp_path)
     mismatch = quoted(flat(README), "--watch needs the Rust detectors: ").split(": ", 1)[1].split(". To watch")[0]
     mismatch = mismatch.replace("<binary>", str(old))
     done = run_command(tmp_path, old, "--detectors", "rust")
@@ -907,7 +910,7 @@ def test_one_read_with_a_binary_of_another_protocol_refuses_rust_and_falls_back_
         assert len(warned) == 1 and warned[0].startswith(head) and warned[0].endswith(tail), warned
 
 
-@needs_protocol_4
+@needs_protocol_5
 def test_the_follower_judges_an_append_alone_and_every_change_the_pages_name_in_full(monkeypatch):
     monkeypatch.setenv(sd.BINARY_ENV, str(BINARY))
     pytest.importorskip("pyarrow")
@@ -944,7 +947,7 @@ def test_the_follower_judges_an_append_alone_and_every_change_the_pages_name_in_
     assert "keeps one `tensorquill-server detect --follow` process for the whole watch" in WATCH_GUIDE
 
 
-@needs_protocol_4
+@needs_protocol_5
 def test_the_watch_command_s_follow_child_ends_when_the_watcher_is_killed(tmp_path):
     import signal
     import time

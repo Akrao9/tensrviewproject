@@ -28,7 +28,8 @@ const FOOTER_PREFETCH_BYTES: usize = 64 * 1024;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// The columns of protocol 5's layout that the detectors never read: an attention module's map and
-/// a probe's histograms (`WAVE_AL_CONTRACT.md` section 2.4, D11). `read_part` leaves them out.
+/// a probe's histograms (`WAVE_AL_CONTRACT.md` section 2.4, D11). `read_part_for_detect` leaves them
+/// out; `read_part` keeps them.
 pub const NOT_REPLAYED: [&str; 2] = ["probe_maps", "probe_histograms"];
 
 /// Why a store with no `store.json` whose backend cannot create one atomically gets none, and the
@@ -640,15 +641,26 @@ impl Storage {
         Ok(parts)
     }
 
+    /// The rows of one part, in order, with every column: what was sent, probe arrays included.
+    /// Every reader but the detectors' takes this one, so a read loses nothing by default (the
+    /// owner's choice, Nov 24, 2026, for Phase 4's read API); `examples/live_streams.rs` sends parts
+    /// read this way again.
+    pub async fn read_part(&self, location: &Path) -> Result<Vec<RecordBatch>, Error> {
+        let bytes = self.store.get(location).await?.bytes().await?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+        Ok(reader.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// The rows of one part, in order, as the detectors read them: every column but the probe's
     /// heavy arrays (`NOT_REPLAYED`), which are never decoded. This is the read `detect::replay`
-    /// makes after a restart and on a rebuild. A part without those columns (protocol 4's layout)
-    /// is read whole. The live path is unchanged: a batch is already decoded from Flight there.
+    /// makes after a restart and on a rebuild, and what `examples/detect_store.rs` times. A part
+    /// without those columns (protocol 4's layout) is read whole. The live path is unchanged: a
+    /// batch is already decoded from Flight there.
     ///
     /// `ProjectionMask::roots` (arrow-rs `parquet/src/arrow/mod.rs`) selects the part's top-level
     /// columns by position, here looked up by name in the part's own Arrow schema, so the columns
     /// kept stay in the part's order, each with every leaf under it (WAVE_AL_CONTRACT.md section 2.4).
-    pub async fn read_part(&self, location: &Path) -> Result<Vec<RecordBatch>, Error> {
+    pub async fn read_part_for_detect(&self, location: &Path) -> Result<Vec<RecordBatch>, Error> {
         let bytes = self.store.get(location).await?.bytes().await?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
         let fields = builder.schema().fields();
@@ -664,15 +676,6 @@ impl Storage {
             builder
         };
         Ok(builder.build()?.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// The rows of one part, in order, with every column: what was sent, probe arrays included.
-    /// For a tool that sends stored parts again (`examples/live_streams.rs`); the detectors read
-    /// [`read_part`](Self::read_part).
-    pub async fn read_part_whole(&self, location: &Path) -> Result<Vec<RecordBatch>, Error> {
-        let bytes = self.store.get(location).await?.bytes().await?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
-        Ok(reader.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn attempt_dir(&self, run_id: &str, rank: i32, attempt: i64) -> Path {
