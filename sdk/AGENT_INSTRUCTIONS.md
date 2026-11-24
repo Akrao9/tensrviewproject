@@ -163,22 +163,22 @@ Work in this order.
 
 **Where it came from.** Only the run manifest says: `run_id_source` in `<run_id>.run.json`, the file beside the capture and its evidence files, or in `runs/<run_id>/run.json` in a server's store. No tool answers with it and no evidence file holds it, so read that file (and do not change it). The `source` in a tool's answer is something else: where the evidence was read. So is a run's `source` in `list_runs`: where the run is kept, `local` or `store`. Neither says where the run ID came from. `run_id_source` is one of these words:
 
-- `wandb`: the ID of the W&B run the job's process had open (`wandb.run.id`). Query the W&B MCP server by it.
+- `wandb`: the ID of the W&B run the job's process had open (`wandb.run.id`). Query the W&B MCP server by it. W&B finds a run by its entity, project and ID, and an ID is unique only within one project. TensorQuill records no entity, and the run's `project` is the W&B project only when the job gave `tensorquill.init` none. Take the entity and project from a person or from the W&B server's own setup; if you cannot tell which project, or the ID is in more than one, say so.
 - `mlflow`: the ID of the MLflow run active in the job's process. Query the MLflow MCP server by it.
 - `env`: the MLflow run ID in the job's `MLFLOW_RUN_ID` environment variable. Query the MLflow MCP server by it.
-- `explicit`: the job's code gave the run ID to `tensorquill.init`. It is a tracker's ID only if that code gave one (as with `run_id=wandb.run.id`). You may look it up by that exact run ID; if the tracker has no run with it, the run has no tracker run you can name.
+- `explicit`: the job's code gave the run ID to `tensorquill.init`. It is a tracker's ID only if that code gave one (as with `run_id=wandb.run.id`). You may look it up by that exact run ID, scoped as above; if the tracker has no run with it, the run has no tracker run you can name, and a run found with it is that run only as far as the job's code says so.
 - `launcher`: torchrun's rendezvous ID (`run-<TORCHELASTIC_RUN_ID>`) or SLURM's job ID (`run-slurm<job>`, with `.<step>` when the job has a step ID). It will not match a tracker run.
 - `generated`: made by TensorQuill when nothing else named the run, `run-<UTC time>-<6 hex digits>`. It will not match a tracker run.
 
-A job of several ranks under `torch.distributed` writes every rank under rank 0's run ID and source.
+A job of several ranks under `torch.distributed` writes every rank under rank 0's run ID and source, unless a rank could not get them from rank 0; that rank warned and wrote under an ID of its own.
 
-When the source is `launcher` or `generated`, when there is no manifest, or when the tracker has no run with the exact run ID, say so in the diagnosis: which tracker run this job was is not known from the evidence. Say so instead, and do not guess: do not search the tracker by the run's `name` or `project`, by its start time or by an ID that looks close, and do not work out the source from the ID's shape. The `name` and `project` are TensorQuill's labels; they may be the tracker's or what the job gave `tensorquill.init`, and a name may repeat. Only the run ID is matched.
+When the source is `launcher` or `generated`, when there is no manifest or you cannot read it, or when the tracker has no run with the exact run ID, say so in the diagnosis: which tracker run this job was is not known from the evidence. Say so instead, and do not guess: do not pick a tracker run by the run's `name`, its start time or an ID that looks close, and do not work out the source from the ID's shape. The `name` and `project` are TensorQuill's labels; they may be the tracker's or what the job gave `tensorquill.init`, and a name may repeat. A project only narrows where to look; only the exact run ID is matched.
 
 When you read the tracker:
 
 - Only read from the tracker. Do not log to it, tag, note or change its runs, or make a report or anything else in it.
 - Send it the run ID alone. TensorQuill's numbers, layer and parameter names and evidence stay with you.
-- A TensorQuill `step` is TensorQuill's count of the job's optimizer steps, not the tracker's step. Do not assume the two axes agree; say which axis each number you cite is on.
+- A TensorQuill `step` is TensorQuill's own step number, not the tracker's step. Do not assume the two axes agree; say which axis each number you cite is on.
 - In the diagnosis, mark each number from the tracker as the tracker's, with the call that gave it.
 
 ## The three classes
