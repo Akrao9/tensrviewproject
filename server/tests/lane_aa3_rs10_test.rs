@@ -52,18 +52,19 @@ fn rank_entry(server: &lane_aa3_support::TestServer) -> serde_json::Value {
 
 /// The rows of versions 0 and 1 are stored and the batch is acknowledged; the rows of any other
 /// version are dropped and counted in `dropped_rows` and `dropped_row_keys`, under their own key.
-/// Until Nov 20, 2026 the value was not looked at: every row was stored, whatever it named.
+/// Until Nov 20, 2026 the value was not looked at: every row was stored, whatever it named. Version 2
+/// is protocol 5's row (wave AL, stored from then on), so the dropped rows here are of version 3.
 #[tokio::test]
 async fn rows_of_an_unsupported_schema_version_are_dropped_and_the_rest_of_the_batch_is_stored() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path()).await;
     let mut put = open(&server.address, RUN, 0, schema()).await;
-    put.send(rows(&[(1, 0), (0, 1), (2, 2), (1, 3), (-1, 4), (99, 5), (0, 6)]), 100)
+    put.send(rows(&[(1, 0), (0, 1), (3, 2), (1, 3), (-1, 4), (99, 5), (0, 6)]), 100)
         .await;
     assert_eq!(put.ack().await, 100, "the batch's valid rows are acknowledged");
     // A batch whose every row is of another version is acknowledged too: nothing of it can be
     // stored, and its sender must not send it forever.
-    put.send(rows(&[(2, 7)]), 200).await;
+    put.send(rows(&[(3, 7)]), 200).await;
     assert_eq!(put.ack().await, 200);
     // The stream goes on.
     put.send(rows(&[(1, 8)]), 300).await;

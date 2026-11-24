@@ -3,7 +3,12 @@
 //! A sender opens one stream per `(run_id, rank)` with the descriptor path
 //! `["runs", "<run_id>", "rank=<rank>"]`. Every record batch carries `app_metadata` JSON:
 //! `{"schema_version": 1, "run_id", "rank", "min_step", "max_step", "end_byte_offset"}`,
-//! where `end_byte_offset` is the position in the sender's local file just after the batch.
+//! where `end_byte_offset` is the position in the sender's local file just after the batch. The
+//! metadata's `schema_version` is 1 from a protocol 4 sender and 2 from one of protocol 5's layout
+//! (`WAVE_AL_CONTRACT.md` section 3, from Nov 24, 2026); the server takes both, and refuses any other
+//! with `INVALID_ARGUMENT`, acknowledging nothing. A layout is told by its columns (`layers` against
+//! `layers_json`), never by a version: each batch is stored as received, with no conversion, and a
+//! part has one schema, so a rank whose protocol 4 backlog meets protocol 5 rows has parts of both.
 //!
 //! Every row names its `attempt`: the session that wrote it, as that session's start time in
 //! Unix milliseconds. Rows whose step is not above the last step kept for that
@@ -19,8 +24,9 @@
 //! `end_byte_offset` alone, as before). Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
-//! 0 or 1, cannot be stored: it is dropped and counted, with a line on stderr and in the rank's
-//! entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`), and the rest of its
+//! 0, 1 or 2 (`STORED_ROW_VERSIONS`), cannot be stored: it is dropped and counted, with a line on
+//! stderr and in the rank's entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`),
+//! and the rest of its
 //! batch is kept and acknowledged (RS10). A batch whose key column is missing or of another type
 //! has no row that can be read: it is refused with `INVALID_ARGUMENT` naming the column, which ends
 //! its stream, and counted in the same entry (`refused_batches`, `refused_batch_keys`). The stream
@@ -67,7 +73,9 @@ type DataWindow = BTreeMap<i64, (Option<i64>, String)>;
 use crate::storage::{AttemptOrder, Storage};
 use crate::watchdog::{RankReport, Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INTERVAL};
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// The batch metadata versions this server takes: 1, a protocol 4 sender's, and 2, protocol 5's
+/// layout (`WAVE_AL_CONTRACT.md` section 3, D6). Any other refuses the stream.
+pub const SCHEMA_VERSIONS: [i64; 2] = [1, 2];
 pub const DEFAULT_QUOTA_BYTES: usize = 128 * 1024 * 1024;
 pub const DEFAULT_FLUSH_STEPS: usize = 500;
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
@@ -1547,9 +1555,9 @@ impl Ingest {
                 .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
             let metadata: BatchMetadata = serde_json::from_slice(&message.inner.app_metadata)
                 .map_err(|error| Status::invalid_argument(format!("bad app_metadata: {error}")))?;
-            if metadata.schema_version != SCHEMA_VERSION {
+            if !SCHEMA_VERSIONS.contains(&metadata.schema_version) {
                 return Err(Status::invalid_argument(format!(
-                    "schema_version {} is not supported; this server reads version {SCHEMA_VERSION}",
+                    "schema_version {} is not supported; this server reads versions 1 and 2",
                     metadata.schema_version
                 )));
             }
@@ -2136,10 +2144,16 @@ const KEY_COLUMNS: [(&str, DataType); 5] = [
     ("schema_version", DataType::Int32),
 ];
 
-/// The row versions (`schema_version`) this server stores: 1, the current one, and 0, which
-/// `flight.py` writes for a record that names none. A row of any other version is dropped and
-/// counted under `unsupported_schema_version` (RS10, decided by the author on Nov 20, 2026).
+/// The row versions (`schema_version`) the offline modes read (`detect::check_keys`): 1 and 0, which
+/// `flight.py` writes for a record that names none. Protocol 5's row version 2 is taken there by
+/// `detect.rs` itself (lane AL-3 of wave AL); what ingest stores is `STORED_ROW_VERSIONS`.
 pub const SUPPORTED_ROW_VERSIONS: [i32; 2] = [0, 1];
+
+/// The row versions (`schema_version`) this server stores: 0 and 1, a protocol 4 sender's, and 2, a
+/// row of protocol 5's layout (`WAVE_AL_CONTRACT.md` section 3, D7, from Nov 24, 2026). A row of any
+/// other version is dropped and counted under `unsupported_schema_version` (RS10, decided by the
+/// author on Nov 20, 2026).
+pub const STORED_ROW_VERSIONS: [i32; 3] = [0, 1, 2];
 
 /// The key under which rows of a version this server does not read are counted.
 pub const UNSUPPORTED_SCHEMA_VERSION: &str = "unsupported_schema_version";
@@ -2153,7 +2167,7 @@ struct Refused {
 
 /// Drops the rows that cannot be stored and says how many, by key (RS10): first the rows whose run,
 /// rank, step, attempt or schema version is null, by the first null key of each row in that order;
-/// then, of the rest, the rows whose `schema_version` is not one of `SUPPORTED_ROW_VERSIONS`. The
+/// then, of the rest, the rows whose `schema_version` is not one of `STORED_ROW_VERSIONS`. The
 /// rest of the batch is kept: until Nov 19, 2026 one null key refused the whole batch, which ended
 /// the stream, and its sender, which sends from its offset again, stored nothing more for the rank;
 /// until Nov 20, 2026 a row's version was not looked at. The batch is checked whole before any of
@@ -2204,7 +2218,7 @@ fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Re
         .expect("checked above");
     let mut rows = 0;
     for (row, kept) in keep.iter_mut().enumerate() {
-        if *kept && !SUPPORTED_ROW_VERSIONS.contains(&versions.value(row)) {
+        if *kept && !STORED_ROW_VERSIONS.contains(&versions.value(row)) {
             *kept = false;
             rows += 1;
         }
