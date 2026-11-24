@@ -12,7 +12,7 @@ use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::async_reader::{MetadataFetch, MetadataSuffixFetch};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaDataReader;
@@ -26,6 +26,10 @@ use parquet::file::statistics::Statistics;
 const FOOTER_PREFETCH_BYTES: usize = 64 * 1024;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// The columns of protocol 5's layout that the detectors never read: an attention module's map and
+/// a probe's histograms (`WAVE_AL_CONTRACT.md` section 2.4, D11). `read_part` leaves them out.
+pub const NOT_REPLAYED: [&str; 2] = ["probe_maps", "probe_histograms"];
 
 /// Why a store with no `store.json` whose backend cannot create one atomically gets none, and the
 /// two ways out.
@@ -636,8 +640,36 @@ impl Storage {
         Ok(parts)
     }
 
-    /// The rows of one part, in order.
+    /// The rows of one part, in order, as the detectors read them: every column but the probe's
+    /// heavy arrays (`NOT_REPLAYED`), which are never decoded. This is the read `detect::replay`
+    /// makes after a restart and on a rebuild. A part without those columns (protocol 4's layout)
+    /// is read whole. The live path is unchanged: a batch is already decoded from Flight there.
+    ///
+    /// `ProjectionMask::roots` (arrow-rs `parquet/src/arrow/mod.rs`) selects the part's top-level
+    /// columns by position, here looked up by name in the part's own Arrow schema, so the columns
+    /// kept stay in the part's order, each with every leaf under it (WAVE_AL_CONTRACT.md section 2.4).
     pub async fn read_part(&self, location: &Path) -> Result<Vec<RecordBatch>, Error> {
+        let bytes = self.store.get(location).await?.bytes().await?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+        let fields = builder.schema().fields();
+        let builder = if fields.iter().any(|field| NOT_REPLAYED.contains(&field.name().as_str())) {
+            let kept = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| !NOT_REPLAYED.contains(&field.name().as_str()))
+                .map(|(index, _)| index);
+            let mask = ProjectionMask::roots(builder.parquet_schema(), kept);
+            builder.with_projection(mask)
+        } else {
+            builder
+        };
+        Ok(builder.build()?.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The rows of one part, in order, with every column: what was sent, probe arrays included.
+    /// For a tool that sends stored parts again (`examples/live_streams.rs`); the detectors read
+    /// [`read_part`](Self::read_part).
+    pub async fn read_part_whole(&self, location: &Path) -> Result<Vec<RecordBatch>, Error> {
         let bytes = self.store.get(location).await?.bytes().await?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
         Ok(reader.collect::<Result<Vec<_>, _>>()?)
@@ -738,7 +770,6 @@ impl Storage {
     /// The highest step in a part, read from its step column (leaf `column`) alone.
     async fn highest_step(&self, path: &Path, column: usize) -> Result<Option<i64>, Error> {
         use arrow::array::{Array, Int64Array};
-        use parquet::arrow::ProjectionMask;
         let bytes = self.store.get(path).await?.bytes().await?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
         let mask = ProjectionMask::leaves(builder.parquet_schema(), [column]);

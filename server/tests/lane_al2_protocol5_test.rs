@@ -489,7 +489,7 @@ async fn the_replay_read_of_a_part_leaves_out_the_probe_maps_and_histograms() {
     let storage = storage(dir.path());
     let sent = batch_v5(0..5, 2);
     let written = storage
-        .write_part(RUN, 0, ATTEMPT, &[sent.clone()], 0, 4)
+        .write_part(RUN, 0, ATTEMPT, std::slice::from_ref(&sent), 0, 4)
         .await
         .unwrap();
     let read = storage.read_part(&written).await.unwrap();
@@ -506,8 +506,13 @@ async fn the_replay_read_of_a_part_leaves_out_the_probe_maps_and_histograms() {
             "{name}"
         );
     }
+    // What a tool that sends stored parts again reads (`examples/live_streams.rs`): every column.
+    assert_eq!(storage.read_part_whole(&written).await.unwrap(), vec![sent]);
     let old = batch_v4(5..10, 1);
-    let written = storage.write_part(RUN, 0, ATTEMPT, &[old.clone()], 5, 9).await.unwrap();
+    let written = storage
+        .write_part(RUN, 0, ATTEMPT, std::slice::from_ref(&old), 5, 9)
+        .await
+        .unwrap();
     assert_eq!(storage.read_part(&written).await.unwrap(), vec![old]);
 }
 

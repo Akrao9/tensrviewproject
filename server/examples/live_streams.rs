@@ -17,6 +17,13 @@
 //! sends as fast as the acknowledgements return). `--first-step`, `--batches` and `--attempt`
 //! send a few batches from a given step or as a new attempt, to time what a restart costs.
 //!
+//! Each batch's metadata names `schema_version` 2 when the source part is in protocol 5's layout,
+//! told by its columns (`layers`, `moe_stats`, `probe_maps`, `probe_histograms` or `record_version`,
+//! `WAVE_AL_CONTRACT.md` section 3), and 1 otherwise, as the Python sender does; `--metadata-version`
+//! names one for every batch instead (1 sends a typed source to a protocol 4 server, as the
+//! contract's prototype arm was measured). The parts are sent whole, probe arrays included
+//! (`Storage::read_part_whole`).
+//!
 //! Timed per batch: from sending it to its acknowledgement (the server stores the part first;
 //! a rank's first batch is shown apart, since later ones can wait behind the detectors),
 //! and, with `--store`, from the acknowledgement until the rank's `incidents.json` covers the
@@ -86,6 +93,32 @@ struct Args {
     /// Milliseconds of training per step; 0 sends as fast as acknowledgements return.
     #[arg(long, default_value_t = 0.0)]
     step_ms: f64,
+    /// The batch metadata's `schema_version` for every batch (default: 2 for a part in protocol 5's
+    /// layout, told by its columns, and 1 for any other).
+    #[arg(long)]
+    metadata_version: Option<i64>,
+}
+
+/// The columns only protocol 5's layout has (`WAVE_AL_CONTRACT.md` sections 1.2, 2.4 and 3).
+const PROTOCOL_5_COLUMNS: [&str; 5] = [
+    "layers",
+    "moe_stats",
+    "probe_maps",
+    "probe_histograms",
+    "record_version",
+];
+
+/// The batch metadata version a sender gives `batch`: 2 for protocol 5's layout, 1 for protocol 4's.
+fn metadata_version(batch: &RecordBatch) -> i64 {
+    let schema = batch.schema();
+    if PROTOCOL_5_COLUMNS
+        .iter()
+        .any(|name| schema.column_with_name(name).is_some())
+    {
+        2
+    } else {
+        1
+    }
 }
 
 /// One source rank's parts, read once for all the simulated ranks that replay it: they ask
@@ -116,7 +149,7 @@ impl Source {
         if let Some((_, batch)) = recent.iter().find(|(held, _)| *held == index) {
             return Ok(batch.clone());
         }
-        let batches = self.storage.read_part(&self.parts[index].location).await?;
+        let batches = self.storage.read_part_whole(&self.parts[index].location).await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
         recent.push_back((index, batch.clone()));
         if recent.len() > 2 {
@@ -246,6 +279,7 @@ async fn send(args: &Args, rank: i32, source: &Source, stream: Stream, timings: 
             tokio::time::sleep_until(early.into()).await;
         }
         let batch = renumber(&next, step, rank, args.attempt)?;
+        let version = args.metadata_version.unwrap_or_else(|| metadata_version(&batch));
         let rows = batch.num_rows();
         step += rows as i64;
         let encoded: Vec<FlightData> = FlightDataEncoderBuilder::new()
@@ -261,7 +295,7 @@ async fn send(args: &Args, rank: i32, source: &Source, stream: Stream, timings: 
             .max(Instant::now().saturating_duration_since(due).as_secs_f64());
         tokio::time::sleep_until(due.into()).await;
         let metadata = format!(
-            "{{\"schema_version\":1,\"run_id\":\"{}\",\"rank\":{rank},\"min_step\":null,\"max_step\":null,\"end_byte_offset\":{}}}",
+            "{{\"schema_version\":{version},\"run_id\":\"{}\",\"rank\":{rank},\"min_step\":null,\"max_step\":null,\"end_byte_offset\":{}}}",
             args.run_id,
             index + 1
         );
