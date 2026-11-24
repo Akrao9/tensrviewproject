@@ -48,7 +48,9 @@
 //!
 //! - A value that does not fit its column's type travels in `extra_json` and reads as
 //!   absent here (only `optimizer_ownership` and `weight_dtypes`, which have no column,
-//!   are read from there, on the rows where parameters first stall).
+//!   are read from there, on the rows where parameters first stall). One exception: in
+//!   protocol 5's layout, `non_finite` also reads a layer's refused fields there
+//!   (`WAVE_AL_CONTRACT.md` section 1.5), as Python reads every value of a layer.
 //! - The server never stores a step twice within one attempt, so that case of
 //!   `repeated_steps` cannot arise from its own store. Rows given to `tensorquill-server
 //!   detect` can hold one, and the pass over every attempt reports it as Python does.
@@ -60,7 +62,9 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray};
+use arrow::array::{
+    Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
+};
 use arrow::record_batch::RecordBatch;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
@@ -903,8 +907,10 @@ struct Columns<'a> {
     moe_top_k: Option<MapColumn<'a, Int32Array>>,
     moe_counts: Option<MapColumn<'a, ListArray>>,
     moe_count_values: Option<&'a Int64Array>,
-    moe_stats: Option<&'a StringArray>,
-    layers: Option<&'a StringArray>,
+    /// The routers' statistics: protocol 5's typed map, or protocol 4's `moe_stats_json`.
+    moe_stats: Option<StructMap<'a, RouterStatsColumn<'a>>>,
+    /// The layers' statistics: protocol 5's typed map, or protocol 4's `layers_json`.
+    layers: Option<StructMap<'a, LayersColumn<'a>>>,
     data: Option<&'a StringArray>,
     checkpoint: Option<&'a StringArray>,
     probe: Option<&'a StringArray>,
@@ -938,12 +944,44 @@ impl<'a> Columns<'a> {
             moe_top_k: MapColumn::new(batch, "moe_top_k"),
             moe_counts: moe_counts.filter(|_| moe_count_values.is_some()),
             moe_count_values,
-            moe_stats: column(batch, "moe_stats_json"),
-            layers: column(batch, "layers_json"),
+            moe_stats: StructMap::new(batch, "moe_stats", "moe_stats_json", RouterStatsColumn::new),
+            layers: StructMap::new(batch, "layers", "layers_json", LayersColumn::new),
             data: column(batch, "data_json"),
             checkpoint: column(batch, "checkpoint_json"),
             probe: column(batch, "probe_json"),
         })
+    }
+}
+
+impl<'a> Columns<'a> {
+    /// A row's layers in stored order, each with the statistics the detectors read, from whichever
+    /// layout the batch has. An entry that is not an object is absent: protocol 4's reader then
+    /// reads no layer of the row, as it always has; protocol 5's reads the rest (contract 1.5).
+    fn layers(&self, row: usize) -> Vec<(Cow<'a, str>, LayerStats)> {
+        match &self.layers {
+            None => Vec::new(),
+            Some(StructMap::Json(layers)) => text(Some(*layers), row)
+                .and_then(|layers| serde_json::from_str::<Members<LayerStats>>(layers).ok())
+                .map_or_else(Vec::new, |Members(layers)| layers),
+            Some(StructMap::Typed(layers)) => layers.row(row, text(self.extra, row)),
+        }
+    }
+
+    /// A row's routers in stored order, each with its recorded diversity when that is a finite
+    /// number, or None when the row records no statistics (or protocol 4's text does not parse).
+    fn router_diversities(&self, row: usize) -> Option<Vec<(Cow<'a, str>, Option<f64>)>> {
+        match self.moe_stats.as_ref()? {
+            StructMap::Json(stats) => {
+                let Members(stats) = serde_json::from_str::<Members<RouterStats>>(text(Some(*stats), row)?).ok()?;
+                Some(
+                    stats
+                        .into_iter()
+                        .map(|(name, stats)| (name, stats.diversity.0))
+                        .collect(),
+                )
+            }
+            StructMap::Typed(stats) => stats.row(row),
+        }
     }
 }
 
@@ -1069,6 +1107,12 @@ impl Stat {
         number: None,
         non_finite: false,
     };
+
+    /// Whether a value, as `extra_json` holds a refused field, is one of the capture's strings for
+    /// NaN and Inf: what the visitor below reads as not finite.
+    fn is_non_finite_text(value: &Value) -> bool {
+        matches!(value, Value::String(text) if matches!(text.as_str(), "nan" | "inf" | "-inf"))
+    }
 }
 
 impl<'de> Deserialize<'de> for Stat {
@@ -1157,6 +1201,189 @@ struct RouterStats {
     diversity: Number,
 }
 
+// --- the typed columns (protocol 5) -------------------------------------------------------------
+
+/// A column of struct maps in whichever layout its batch has (`WAVE_AL_CONTRACT.md` section 3): the
+/// typed map of protocol 5 where the batch has it, else protocol 4's JSON text. The layout is told
+/// per batch by the column's name, never per row: a null typed row is a row without the key.
+enum StructMap<'a, T> {
+    Typed(T),
+    Json(&'a StringArray),
+}
+
+impl<'a, T> StructMap<'a, T> {
+    fn new(
+        batch: &'a RecordBatch,
+        typed: &str,
+        json: &str,
+        read: impl FnOnce(TypedMap<'a>) -> Option<T>,
+    ) -> Option<Self> {
+        match batch.column_by_name(typed) {
+            // A typed column of another shape reads as absent, as any column of another type does.
+            Some(_) => TypedMap::new(batch, typed).and_then(read).map(StructMap::Typed),
+            None => column(batch, json).map(StructMap::Json),
+        }
+    }
+}
+
+/// A `Map<Utf8, Struct<...>>` column (sections 1.2 and 1.3): its entries in stored order, each a
+/// struct whose fields are looked up by name (D3), a null struct for an entry that was not an object.
+struct TypedMap<'a> {
+    map: &'a MapArray,
+    keys: &'a StringArray,
+    structs: &'a StructArray,
+}
+
+impl<'a> TypedMap<'a> {
+    fn new(batch: &'a RecordBatch, name: &str) -> Option<Self> {
+        let map = batch.column_by_name(name)?.as_any().downcast_ref::<MapArray>()?;
+        Some(Self {
+            map,
+            keys: map.keys().as_any().downcast_ref()?,
+            structs: map.values().as_any().downcast_ref()?,
+        })
+    }
+
+    /// The entries of one row, as indexes into `keys` and `structs`; none for a null row.
+    fn row(&self, row: usize) -> std::ops::Range<usize> {
+        if self.map.is_null(row) {
+            return 0..0;
+        }
+        let offsets = self.map.value_offsets();
+        offsets[row] as usize..offsets[row + 1] as usize
+    }
+
+    /// The struct field `name`, when the part has it as Float64; a part without it reads as absent.
+    fn float(&self, name: &str) -> Option<&'a Float64Array> {
+        self.structs.column_by_name(name)?.as_any().downcast_ref()
+    }
+
+    /// A Float64 field's value at an entry whose struct is not null.
+    fn value(field: Option<&Float64Array>, at: usize) -> Option<f64> {
+        field.filter(|field| !field.is_null(at)).map(|field| field.value(at))
+    }
+}
+
+/// Protocol 5's `layers`, with the struct fields the detectors read found once per batch.
+struct LayersColumn<'a> {
+    map: TypedMap<'a>,
+    std: Option<&'a Float64Array>,
+    abs_max: Option<&'a Float64Array>,
+    zero_frac: Option<&'a Float64Array>,
+    /// Every Float64 field, whatever its name: `non_finite` reads them all (contract 1.5).
+    floats: Vec<&'a Float64Array>,
+}
+
+impl<'a> LayersColumn<'a> {
+    fn new(map: TypedMap<'a>) -> Option<Self> {
+        let floats = map
+            .structs
+            .columns()
+            .iter()
+            .filter_map(|field| field.as_any().downcast_ref::<Float64Array>())
+            .collect();
+        Some(Self {
+            std: map.float("std"),
+            abs_max: map.float("abs_max"),
+            zero_frac: map.float("zero_frac"),
+            floats,
+            map,
+        })
+    }
+
+    /// A row's layers as the JSON visitor gives them (`LayerStats`), read from the struct fields with
+    /// no JSON. A null struct (an entry that was not an object) is absent to every detector, so the
+    /// rest of the map is read (contract 1.5). A refused field is null in the struct and absent too,
+    /// except to `non_finite`, which also reads the refused fields kept in `extra_json` under
+    /// `layers`: parsed only on a row whose text names the key, as `refused_gradients` does. A layer
+    /// whose name only `extra_json` holds (one Arrow cannot encode) is read after the column's
+    /// entries, as `row_to_record` puts it back, and by `non_finite` alone.
+    fn row(&self, row: usize, extra: Option<&str>) -> Vec<(Cow<'a, str>, LayerStats)> {
+        let entries = self.map.row(row);
+        let mut layers = Vec::with_capacity(entries.len());
+        for at in entries {
+            if self.map.structs.is_null(at) {
+                continue;
+            }
+            let finite = |field| TypedMap::value(field, at).filter(|value| value.is_finite());
+            layers.push((
+                Cow::Borrowed(self.map.keys.value(at)),
+                LayerStats {
+                    std: finite(self.std),
+                    abs_max: finite(self.abs_max),
+                    zero_frac: finite(self.zero_frac),
+                    non_finite: self
+                        .floats
+                        .iter()
+                        .any(|field| TypedMap::value(Some(field), at).is_some_and(|value| !value.is_finite())),
+                },
+            ));
+        }
+        if let Some(Value::Object(mut extra)) = extra
+            .filter(|extra| extra.contains("\"layers\""))
+            .and_then(extra_json::parse)
+        {
+            if let Some(Value::Object(refused)) = extra.remove("layers") {
+                for (name, fields) in refused {
+                    // An entry that is not an object, refused whole, is absent (section 1.5).
+                    let Value::Object(fields) = fields else { continue };
+                    if !fields.values().any(Stat::is_non_finite_text) {
+                        continue;
+                    }
+                    match layers.iter_mut().find(|(known, _)| *known == name) {
+                        Some((_, stats)) => stats.non_finite = true,
+                        None => layers.push((
+                            Cow::Owned(name),
+                            LayerStats {
+                                non_finite: true,
+                                ..LayerStats::default()
+                            },
+                        )),
+                    }
+                }
+            }
+        }
+        layers
+    }
+}
+
+/// Protocol 5's `moe_stats`, with its `diversity` field found once per batch: the only field a
+/// detector reads (contract 1.1).
+struct RouterStatsColumn<'a> {
+    map: TypedMap<'a>,
+    diversity: Option<&'a Float64Array>,
+}
+
+impl<'a> RouterStatsColumn<'a> {
+    fn new(map: TypedMap<'a>) -> Option<Self> {
+        Some(Self {
+            diversity: map.float("diversity"),
+            map,
+        })
+    }
+
+    /// A row's routers with their recorded diversity: absent for a null struct, a null (refused or
+    /// missing) field, a part without the field, and a value that is not finite, as `Number` reads
+    /// protocol 4's text. None for a null row.
+    fn row(&self, row: usize) -> Option<Vec<(Cow<'a, str>, Option<f64>)>> {
+        if self.map.map.is_null(row) {
+            return None;
+        }
+        Some(
+            self.map
+                .row(row)
+                .map(|at| {
+                    let diversity = Some(at)
+                        .filter(|at| !self.map.structs.is_null(*at))
+                        .and_then(|at| TypedMap::value(self.diversity, at))
+                        .filter(|value| value.is_finite());
+                    (Cow::Borrowed(self.map.keys.value(at)), diversity)
+                })
+                .collect(),
+        )
+    }
+}
+
 // --- MoE load: moe_imbalance and starved_experts -----------------------------------------
 
 /// The `check` of the `not_checked` entry that names the routers recorded with no tokens on any row.
@@ -1175,7 +1402,7 @@ struct Router {
     recent: VecDeque<(Arc<[i64]>, i64)>,
     recent_sums: Vec<i64>,
     recent_tokens: i64,
-    /// Where this router was last found in `moe_stats_json`.
+    /// Where this router was last found in a row's `moe_stats`.
     stats_at: usize,
     /// The most experts any of its recorded counts had: the size of the sample it is given
     /// on a step that recorded nothing for it (Python's `_router_sizes`).
@@ -1447,8 +1674,7 @@ impl Moe {
         if self.present.iter().all(Option::is_none) {
             return;
         }
-        let stats: Option<Members<RouterStats>> =
-            text(columns.moe_stats, row).and_then(|text| serde_json::from_str(text).ok());
+        let stats = columns.router_diversities(row);
         let offsets = counts.values.value_offsets();
         for (router, entry) in self.routers.iter_mut().zip(&self.present) {
             if let Some(entry) = entry {
@@ -1486,14 +1712,10 @@ impl Moe {
             let experts = router_counts.len();
             let recorded = stats.as_ref().and_then(|stats| {
                 // The statistics list the routers in the same order on every step.
-                if stats
-                    .0
-                    .get(router.stats_at)
-                    .is_none_or(|(name, _)| name != &router.name)
-                {
-                    router.stats_at = stats.0.iter().position(|(name, _)| name == &router.name)?;
+                if stats.get(router.stats_at).is_none_or(|(name, _)| name != &router.name) {
+                    router.stats_at = stats.iter().position(|(name, _)| name == &router.name)?;
                 }
-                stats.0[router.stats_at].1.diversity.0
+                stats[router.stats_at].1
             });
             let diversity = recorded.unwrap_or_else(|| diversity_from_counts(&router_counts));
             let share = |count: &i64| *count as f64 / tokens as f64;
@@ -4354,9 +4576,8 @@ impl RankDetectors {
                 continue;
             }
             let before = self.reported();
-            let layers: Option<Members<LayerStats>> =
-                text(columns.layers, row).and_then(|layers| serde_json::from_str(layers).ok());
-            let layers = layers.as_ref().map_or(&[][..], |layers| &layers.0);
+            let layers = columns.layers(row);
+            let layers = &layers[..];
             self.inputs.row(&columns, row, !layers.is_empty(), data.is_some());
             self.moe.row(step, &columns, row, &self.thresholds, &mut self.scalars);
             self.gradients.row(step, &columns, row, &mut self.scalars);
@@ -5189,6 +5410,12 @@ fn follow_append(
     Ok((from_rows, before as u64))
 }
 
+/// The row versions (`schema_version`) the offline modes read: 0 and 1, protocol 4's, and 2, the
+/// version of a row in protocol 5's layout (`WAVE_AL_CONTRACT.md` section 3, D7). Kept here, not
+/// read from `ingest::SUPPORTED_ROW_VERSIONS`, while wave AL's lanes are apart; the live server's
+/// list is to name the same three once its lane is joined to this one.
+pub(crate) const ROW_VERSIONS: [i32; 3] = [0, 1, 2];
+
 /// The key columns of rows given to the offline modes (`detect` and `detect --run`), checked
 /// before anything is judged: a `run_id` string, a `rank` int32 and a `step` int64, none of
 /// them null, and an `attempt` int64 without nulls when the column is there. A batch with no
@@ -5197,8 +5424,8 @@ fn follow_append(
 /// attempt 0. Live ingest checks its own (`ingest.rs`).
 ///
 /// The values, too (wave AF, section 1 of `WAVE_AF_CONTRACT.md`): a `rank`, `attempt` or `step`
-/// below 0, and a `schema_version` (when the column is there) that is not one this server stores
-/// (`ingest::SUPPORTED_ROW_VERSIONS`), refuse the input with one line that names the column, the
+/// below 0, and a `schema_version` (when the column is there) that is not one of [`ROW_VERSIONS`],
+/// refuse the input with one line that names the column, the
 /// value and the row. Until then they were judged: a report of rank -3, or of a row of version 99.
 /// `before` is the number of rows of the input before this batch, so the row named is the row's
 /// place in the whole input, 1-based, in the order the batches were given. A null names its row
@@ -5259,15 +5486,14 @@ pub(crate) fn check_keys(batch: &RecordBatch, before: usize) -> Result<(), Strin
         if steps.value(at) < 0 {
             return Err(negative("step", at, steps.value(at)));
         }
-        if let Some(versions) =
-            versions.filter(|versions| !crate::ingest::SUPPORTED_ROW_VERSIONS.contains(&versions.value(at)))
-        {
-            let supported = crate::ingest::SUPPORTED_ROW_VERSIONS.map(|version| version.to_string());
+        if let Some(versions) = versions.filter(|versions| !ROW_VERSIONS.contains(&versions.value(at))) {
+            let (last, rest) = ROW_VERSIONS.split_last().expect("versions");
+            let rest: Vec<String> = rest.iter().map(i32::to_string).collect();
             return Err(format!(
-                "row {}: schema_version is {}; this server reads versions {}; the input is refused",
+                "row {}: schema_version is {}; this server reads versions {} and {last}; the input is refused",
                 row_of(at),
                 versions.value(at),
-                supported.join(" and ")
+                rest.join(", ")
             ));
         }
     }
