@@ -688,8 +688,9 @@ async fn bad_requests_are_invalid_argument() {
     assert_eq!(put.ack().await, Err(Code::InvalidArgument));
 
     let mut put = open(&server, 0).await;
-    let version_2 = format!("{{\"schema_version\":2,\"run_id\":\"{RUN}\",\"rank\":0,\"end_byte_offset\":5}}");
-    put.send_with_metadata(batch(0, 0..5), version_2).await;
+    // Version 2 is protocol 5's (wave AL); 3 is read by no server.
+    let version_3 = format!("{{\"schema_version\":3,\"run_id\":\"{RUN}\",\"rank\":0,\"end_byte_offset\":5}}");
+    put.send_with_metadata(batch(0, 0..5), version_3).await;
     assert_eq!(put.ack().await, Err(Code::InvalidArgument));
 
     let mut put = open(&server, 0).await;
