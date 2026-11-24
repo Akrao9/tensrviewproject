@@ -124,7 +124,7 @@ Not compared, `{"state": "unavailable", "why": ...}`:
 | `weak_match` | The entry was inferred, by its key or by its names, and holds under half of the model's names. `closest` names it and its counts | `one_matching_name_under_a_key_named_model`, `a_cache_sharing_one_name` |
 | `names_differ` | The loader named an entry that fails the filter | `the_loader_names_an_entry_of_another_model` |
 | `model_not_readable` | The model cannot be read by the local path (section 1) | `a_model_that_replaces_its_parameter_walk` |
-| `folder` | `session.checkpoint_files`: file names only, no file opened. Hugging Face's `Trainer` and Accelerate record their checkpoints this way | `a_checkpoint_folder` |
+| `folder` | `session.checkpoint_files`: no `.safetensors` weights in the folder, or their headers refused (`refused` says why). Hugging Face's `Trainer` and Accelerate record their checkpoints through this call (amended Nov 24, 2026, section 8) | `a_checkpoint_folder` |
 | `error` | The comparison raised | `the_comparison_raises` |
 
 No `tensors` key at all: a capture written before this page, or a save (`a_resume_recorded_before_this_check`).
@@ -158,7 +158,7 @@ No `tensors` key at all: a capture written before this page, or a save (`a_resum
 |---|---|---|---|
 | Compared, a trainable tensor missing | `missing_tensors`, naming each | `compared`, with the lists | `a_resume_with_two_tensors_verified_missing` |
 | No entry identified as the model's | `not_identified`, as today, once | `unavailable`, `not_identified` | `a_resume_whose_model_was_not_identified` |
-| A folder | Nothing from tensors; the folder's own findings as today | `unavailable`, `folder` | `a_resume_from_a_folder`, `a_resume_from_a_folder_with_no_optimizer_file` |
+| A folder with no `.safetensors` weights, or whose headers are refused; one with them is read as any compared load (section 8) | Nothing from tensors; the folder's own findings as today | `unavailable`, `folder` | `a_resume_from_a_folder`, `a_resume_from_a_folder_with_no_optimizer_file` |
 | An ambiguous source | Nothing from tensors | `unavailable`, `ambiguous` | `a_resume_from_an_ambiguous_checkpoint` |
 | Compared, every trainable tensor there | Nothing | `compared`, with what was counted | `a_resume_with_every_tensor_verified` |
 | No `tensors` | Nothing from tensors | No entry | `a_resume_recorded_before_this_check` |
@@ -184,7 +184,7 @@ A capture written after it is different, and that is expected, not a regression.
 ## 5. What this does not see
 
 - **A tensor that is in the checkpoint and was never loaded into the model.** Names are compared, not values.
-- **A checkpoint folder.** Hugging Face's `Trainer` and Accelerate resume from one, and its tensors are not read. Reading the names from a `safetensors` header would open a file, which `checkpoint_files` promises not to do; not proposed here.
+- **A checkpoint folder of pickled weights.** FSDP's and DeepSpeed's folders, and any `.bin` or `.pt`: nothing is unpickled, so its tensors are not read. A folder's `.safetensors` weights are read from their headers at a load (section 8, signed Nov 24, 2026, which replaced this bullet's first form), with what that does not see listed there.
 - **A load that is not recorded,** and a first load at the run's first step, which is not a resume and is not judged today either.
 - **A parameter frozen after the call.** It is counted as trainable, so it is raised if missing.
 - **A source that is ambiguous or a weak match.** Nothing is named as missing, and the evidence says coverage is unavailable. Naming the entry with `model_state=` resolves it. A checkpoint that holds under half of the model, such as a head saved alone under `model`, is a weak match until the loader names it.
@@ -194,7 +194,7 @@ A capture written after it is different, and that is expected, not a regression.
 
 | Part | Lane AC1, Python | Lane AC2, Rust |
 |---|---|---|
-| Sections 1 to 3 | `data.py`: reading the model, the entry rules and the comparison. `capture.py`: `checkpoint()` takes `model_state=`, passes the model on a load, and `checkpoint_files()` marks a folder load. `lightning.py`: passes the module and its `state_dict` entry | Nothing |
+| Sections 1 to 3 | `data.py`: reading the model, the entry rules and the comparison. `capture.py`: `checkpoint()` takes `model_state=`, passes the model on a load, and `checkpoint_files()` compares a folder load from its `.safetensors` headers (section 8); as first built it marked one. `lightning.py`: passes the module and its `state_dict` entry | Nothing |
 | Section 4, findings | `data_checks.py` | `detect/data.rs` |
 | Section 4, the block and the words | `evidence.py`, with the all-ranks view | The block in its report, from `detect.rs` or `detect/data.rs` |
 
@@ -218,9 +218,9 @@ At the trial merge both engines are run on every `records` case and held to the 
 | Reading the model | `a_model_whose_state_export_gathers`, `a_model_that_replaces_its_parameter_walk`, `the_comparison_raises` |
 | Not compared | `a_checkpoint_folder`, `a_save_is_not_compared` |
 
-## 8. Proposed, awaiting the author's sign-off: a checkpoint folder's tensors (lane AK-2, Nov 24, 2026)
+## 8. A checkpoint folder's tensors (lane AK-2; signed by the author on Nov 24, 2026)
 
-**Not signed.** This section is lane AK-2's proposal, built and tested on CPU in wave AK (the plan's Phase 1, item 3). Nothing above it is rewritten. Where it would change a signed statement, the statement is named at the end, and stays as written until the author signs.
+**Signed by the author on Nov 24, 2026.** This section was lane AK-2's proposal, built and tested on CPU in wave AK (the plan's Phase 1, item 3), and is signed as built. The four signed statements it changes are amended in place above, each naming this section, and are listed at the end. Not run on a GPU.
 
 **What is read.** At `session.checkpoint_files(folder, event="load")` the model's weights in the folder are listed by name and shape from `.safetensors` headers only (`safetensors_listing` in `data.py`). A `.safetensors` file starts with N, an unsigned little-endian 64-bit integer, then N bytes of UTF-8 JSON naming each tensor's `dtype`, `shape` and `data_offsets`, with `__metadata__`, which is not a tensor. From each file those 8 + N bytes are read with plain reads, and nothing after them: no tensor byte, so a file whose data region is cut off or overwritten lists the same. `data_offsets` are not read. The `safetensors` package is not imported. A file is checked with `stat` before it is opened, so a named pipe or a device is never opened. Pickled weights (`.bin`, `.pt`, `.pth`, `.pkl`) are never opened.
 
@@ -234,7 +234,7 @@ At the trial merge both engines are run on every `records` case and held to the 
 
 **Which entry is compared.** The entries go through section 2's rules 2 to 6, unchanged: names made comparable (wrappers, one prefix), the half filter, and tied weights. An entry is read by its file's stem as a state dict's entry is read by its key: `model.safetensors` and `model.safetensors.index.json` are conventional (`model`), `model_1.safetensors` and an unindexed shard are not. Rule 1 does not apply: the loader names a folder, not a file, so `by` is `name` or `names`, never `loader`. `entry` is the file compared. So one Accelerate folder of two different models compares the session's model with the file whose names are its own, and two shards whose index is gone read `ambiguous`. Two models of the same architecture in one Accelerate folder both pass the filter, and rule 2 compares `model.safetensors`, the first prepared model's, whichever the session watches.
 
-**A model whose saved names are not its own: the first thing to confirm.** Transformers 5 holds some models' weights in another form than it writes them: a Mixtral's or a Qwen2-MoE's experts are one fused tensor in the model (`mlp.experts.gate_up_proj`), and `save_pretrained` writes them back in the original per-expert format (`block_sparse_moe.experts.0.w1.weight`; `revert_weight_conversion` in `modeling_utils.py`). Such a folder reads `compared`, with the fused tensors `missing` and the per-expert ones `unexpected`, and the resume raises `missing_tensors`. For the `Trainer`, which is where the adapter records a folder load, that is true: its `_load_from_checkpoint` loads `model.safetensors` with `model.load_state_dict(state_dict, False)`, which does not convert, and a real resume of a tiny Mixtral (transformers 5.23, the installed one) starts with fresh experts and a fresh router (`test_a_trainer_resume_of_a_moe_model_names_the_experts_it_did_not_restore`). A folder loaded with `from_pretrained`, which converts the names back, and recorded by hand with `checkpoint_files`, would read the same, wrongly. No matching rule is added for it here; the author decides whether a folder whose names follow another scheme in part (both `missing` and `unexpected`) should be compared.
+**A model whose saved names are not its own: signed as a stated limit.** Transformers 5 holds some models' weights in another form than it writes them: a Mixtral's or a Qwen2-MoE's experts are one fused tensor in the model (`mlp.experts.gate_up_proj`), and `save_pretrained` writes them back in the original per-expert format (`block_sparse_moe.experts.0.w1.weight`; `revert_weight_conversion` in `modeling_utils.py`). Such a folder reads `compared`, with the fused tensors `missing` and the per-expert ones `unexpected`, and the resume raises `missing_tensors`. For the `Trainer`, which is where the adapter records a folder load, that is true: its `_load_from_checkpoint` loads `model.safetensors` with `model.load_state_dict(state_dict, False)`, which does not convert, and a real resume of a tiny Mixtral (transformers 5.23, the installed one) starts with fresh experts and a fresh router (`test_a_trainer_resume_of_a_moe_model_names_the_experts_it_did_not_restore`). A folder loaded with `from_pretrained`, which converts the names back, and recorded by hand with `checkpoint_files`, would read the same, wrongly. No matching rule is added: a folder whose names follow another scheme in part (both `missing` and `unexpected`) is compared as it stands, and the reading for a folder loaded with `from_pretrained` and recorded by hand is a limit the README states.
 
 **What `components` says.** The folder's components are read from its file names as before (`files_manifest`), whatever the comparison finds. Section 2's table, which takes `components.model` away at `not_identified`, is not applied to a folder: a file named `model.safetensors` is the model's by the framework that wrote it.
 
@@ -259,16 +259,16 @@ One file refused refuses the folder: the other entries are not compared, since t
 
 **A save** opens no file and carries no `tensors`, as decision 4 says.
 
-**The bounds, for the author to confirm.** 1,024 files and 32 MiB of headers at one load, chosen, not derived: the largest published models are sharded into fewer than 200 files (not measured here), and at the 110 bytes a tensor's entry took in the measured headers, 32 MiB is about 300,000 tensors. Read at the cap, the JSON would take about half a second, once, at the load (extrapolated from the 1 MB measurement below, not measured). Measured on an 8-core Apple M1 Pro shared with three other lanes' tests, warm page cache, median of 50: listing the headers takes 0.07 ms (one file, 12 tensors), 0.4 ms (one file, 291 tensors, a 32-layer Llama), 0.55 ms (the same in 3 shards), 1.4 ms (14 shards, 723 tensors, an 80-layer Llama) and 17 ms (11 shards, 9,555 tensors, 1 MB of headers); the whole `checkpoint_files` call, with the model read and compared, 0.18, 2.4, 2.8, 6.9 and 23 ms. The plan's "under 1 ms" holds for reading the headers of a model of a few hundred tensors, not for the whole call.
+**The bounds, signed as chosen.** 1,024 files and 32 MiB of headers at one load, chosen, not derived: the largest published models are sharded into fewer than 200 files (not measured here), and at the 110 bytes a tensor's entry took in the measured headers, 32 MiB is about 300,000 tensors. Read at the cap, the JSON would take about half a second, once, at the load (extrapolated from the 1 MB measurement below, not measured). Measured on an 8-core Apple M1 Pro shared with three other lanes' tests, warm page cache, median of 50: listing the headers takes 0.07 ms (one file, 12 tensors), 0.4 ms (one file, 291 tensors, a 32-layer Llama), 0.55 ms (the same in 3 shards), 1.4 ms (14 shards, 723 tensors, an 80-layer Llama) and 17 ms (11 shards, 9,555 tensors, 1 MB of headers); the whole `checkpoint_files` call, with the model read and compared, 0.18, 2.4, 2.8, 6.9 and 23 ms. The plan's "under 1 ms" holds for reading the headers of a model of a few hundred tensors, not for the whole call.
 
 **Cases** are tests in `sdk/tests/test_lane_ak2_safetensors.py`, not in `cases.json`: a real file read as the `safetensors` package reads it, its data region cut, overwritten and removed; a sharded folder by hand and by `save_pretrained`; a tied weight `save_pretrained` writes once; a real Accelerate folder of two models; `module.` names; two unindexed shards; each refusal, a named pipe among them; a load naming two missing tensors, and one a shape that differs, through both engines; a refused folder through both; a real `Trainer` resume from a folder whose `model.safetensors` lost a tensor; a real `Trainer` resume of a Mixtral, above; and nothing raised under `python -W error`.
 
 **What it does not see.** A folder of pickled weights, FSDP's or DeepSpeed's included. A tensor whose data is missing or damaged in the file. A file in a sub-folder (a diffusers pipeline's `unet/`, for one). Which file the framework actually loaded: the comparison says what the folder holds, as section 1 says what a state dict holds.
 
-**Signed statements this would change, if signed:**
+**Signed statements this section amends (Nov 24, 2026):**
 
-- Section 3, the `folder` row of `why`: "file names only, no file opened" would read "no `.safetensors` weights in the folder, or their headers refused (`refused` says why)".
-- Section 4, the row "A folder" of the readings kept apart: a folder with `.safetensors` weights is read as any compared load.
-- Section 5, the bullet "A checkpoint folder", which proposed nothing: replaced by this section.
+- Section 3, the `folder` row of `why`: "file names only, no file opened" now reads "no `.safetensors` weights in the folder, or their headers refused (`refused` says why)".
+- Section 4, the row "A folder" of the readings kept apart: the row is now a folder with no `.safetensors` weights, or whose headers are refused; a folder with `.safetensors` weights is read as any compared load.
+- Section 5, the bullet "A checkpoint folder", which proposed nothing: it now names what this section does not read.
 - Section 6, "`checkpoint_files()` marks a folder load": it now compares one.
 - Two expectations in `sdk/tests/test_lane_ac1_checkpoint.py` that wrote an empty `model.safetensors` as a stand-in for its name and pinned `{"state": "unavailable", "why": "folder"}` exactly: the case `a_checkpoint_folder` through a session, and `test_a_folder_is_marked_at_a_load_and_not_at_a_save`. The empty file is now opened and refused, `refused: "short_file"`, `file: "model.safetensors"`, and both tests say so. `cases.json` is unchanged: the case's `tensors` is still `unavailable`, `folder`.
