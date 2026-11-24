@@ -2,7 +2,7 @@
 Gloo on the CPU with `probe=` set, and on rank 1 a sink that fails from step 5.
 
     RANK=0 WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=... \
-        python fsdp_probe_worker.py --flavor fsdp2|fsdp1|none --out DIR
+        python fsdp_probe_worker.py --flavor fsdp2|fsdp1|fsdp1-inner|none --out DIR
 
 It leaves, in DIR: `rank<r>.trace` (one line per stage, so the test can say where a rank was),
 `rank<r>.jsonl` (the records its sink was handed) and `probe-entered.rank<r>` (written by the
@@ -44,13 +44,19 @@ def shard(model: nn.Module, flavor: str) -> nn.Module:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
+    if flavor == "fsdp1-inner":
+        # One wrapper around the whole model, and TensorQuill is given the module inside it: what
+        # Lightning's FSDP strategy does with no wrap policy (the wrapper is outside the
+        # LightningModule its callback passes to `init`).
+        return FSDP(model, device_id=torch.device("cpu"), use_orig_params=True)
+
     # A unit per layer inside the root's: nested FSDP wrappers, as Lightning's wrap of the blocks makes.
     return FSDP(model, device_id=torch.device("cpu"), use_orig_params=True, auto_wrap_policy=ModuleWrapPolicy({nn.Linear}))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--flavor", choices=["fsdp2", "fsdp1", "none"], required=True)
+    parser.add_argument("--flavor", choices=["fsdp2", "fsdp1", "fsdp1-inner", "none"], required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     rank = int(os.environ["RANK"])
@@ -101,7 +107,7 @@ def main() -> int:
         return m(fixed)
 
     session = tensorquill.init(
-        model, sink=Sink(), every=EVERY, run_id=f"fsdp-probe-guard-{args.flavor}", probe=probe, probe_every=PROBE_EVERY,
+        model.module if args.flavor == "fsdp1-inner" else model, sink=Sink(), every=EVERY, run_id=f"fsdp-probe-guard-{args.flavor}", probe=probe, probe_every=PROBE_EVERY,
         heartbeat_seconds=None, stack_seconds=None,
     )
     say("session started")

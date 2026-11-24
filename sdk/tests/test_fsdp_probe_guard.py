@@ -11,7 +11,8 @@ Gloo and the other waited.
 Each case here is two real processes over Gloo on the CPU, with `probe=` set on both and a sink
 on rank 1 that fails from step 5, under a deadline that ends every process:
 
-- sharded, FSDP2 (`fully_shard`) and FSDP1 with nested wrappers: the probe callback is never
+- sharded, FSDP2 (`fully_shard`), FSDP1 with nested wrappers, and FSDP1 with one wrapper outside
+  the module `init` is given (Lightning's FSDP strategy with no wrap policy): the probe callback is never
   entered (it leaves a marker and raises if it is), both ranks train all 16 steps, the healthy
   rank's capture is whole, each rank says once that the probe is off, with `RuntimeWarning`
   made an error, and the evidence calls the probe's kinds unavailable with the reason;
@@ -104,7 +105,7 @@ def _where(run: dict) -> str:
     )
 
 
-@pytest.mark.parametrize("flavor", ["fsdp2", "fsdp1"])
+@pytest.mark.parametrize("flavor", ["fsdp2", "fsdp1", "fsdp1-inner"])
 def test_a_sharded_model_trains_to_the_end_with_the_probe_off_when_one_rank_stops(flavor: str, tmp_path: Path) -> None:
     run = _run(flavor, tmp_path / flavor)
     healthy, stopped = run["ranks"]
