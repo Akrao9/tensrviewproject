@@ -20,7 +20,7 @@ The first command needs bash or zsh, for `<(...)`. Two steps are needed for now.
 
 Add extras by naming them in the first command, for example `requirements.py rerun flight lightning`:
 
-- `rerun`: the Rerun viewer's SDK, for `--rerun` below.
+- `rerun`: the Rerun viewer's SDK, for `--rerun` below. Rerun's `rerun` command and viewer send anonymous usage analytics unless you run `rerun analytics disable` once, as each user on each machine that opens a recording; TensorQuill sends none (see [No telemetry](README.md#no-telemetry)).
 - `lightning`: PyTorch Lightning.
 - `huggingface`: Transformers and Accelerate.
 - `flight`: `pyarrow`, to stream to an ingest server and to run the Rust detectors.
@@ -313,7 +313,7 @@ rerun tensorquill-out/<run_id>.rrd
 
 The first command prints a summary of what the detectors found and writes `<run_id>.rank0.evidence.json`. For top-k routers recorded before `moe_top_k` existed, add `--top-k <k>`. It uses the Rust detectors when the binary and `pyarrow` are there (section 1), and otherwise the Python detectors with one warning; `--detectors python` asks for the Python ones without the warning.
 
-The second command opens the recording in the Rerun viewer. On a cluster, copy the `.rrd` to your laptop and open it there, or run `rerun --web-viewer <file>.rrd` on the node and forward its ports over SSH (the page is served on port 9090 by default). To render on a Linux node without a display driver, install a software Vulkan driver (`mesa-vulkan-drivers` on Ubuntu). Neither has been tested.
+The second command opens the recording in the Rerun viewer. On a cluster, copy the `.rrd` to your laptop and open it there, or run `rerun --web-viewer <file>.rrd` on the node and forward its ports over SSH (the page is served on port 9090 by default). `rerun analytics disable` does not reach the web viewer, which keeps its own analytics config in the browser with no on-or-off setting (read in Rerun 0.43.2's source, not traced on the network): to send nothing, open the file in the native viewer after running the command. To render on a Linux node without a display driver, install a software Vulkan driver (`mesa-vulkan-drivers` on Ubuntu). Neither has been tested.
 
 **A record the readers cannot place is refused.** Every record needs a `step`, an integer of 0 or more; `rank` and `attempt`, when present, must be integers of 0 or more, and `schema_version` 0 or 1. A Boolean, a float (also `1.0`), text or `null` is not an integer. Such a record refuses the whole file: the command prints one line, `tensorquill: error: attempt is 1.0 at <file>, line 4: tensorquill reads an integer of 0 or more`, exits with status 2 and writes no evidence. Nothing of the file is judged. The capture writes a `step=` or `start_step=` below 0 as given, and the file is then refused this way, so give steps of 0 or more.
 

@@ -73,7 +73,9 @@ def watch_accelerator(
       Accelerate in one process, turn it off and call `session.log` yourself.
     - **Checkpoints.** After `accelerator.save_state()` and `accelerator.load_state(folder)`, what
       the folder holds is recorded from its file names (`session.checkpoint_files`), so a resume
-      that left a component out is reported (`resume_incomplete`). `checkpoints=False` turns
+      that left a component out is reported (`resume_incomplete`); at a load the model's tensors
+      are also compared, from the folder's `.safetensors` headers alone (no tensor is read, and
+      a folder with no such file is not compared). `checkpoints=False` turns
       this off (the `Trainer` callback records its own checkpoint folders).
     - **Data wait.** The host time spent fetching batches from the `DataLoader` inside
       each prepared `DataLoaderShard` is recorded as `data_wait`
