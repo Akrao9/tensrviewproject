@@ -110,8 +110,16 @@ def test_a_port_taken_between_its_choice_and_the_listen_is_chosen_again(tmp_path
     between: on CI (Python 3.11, PyTorch 2.14, run 45494662452) rank 0 then ended with PyTorch's "The server
     socket has failed to listen on any local network address" and the case failed at the deadline. The
     harness chooses again; the case is not about ports."""
-    with socket.socket() as taken:
-        taken.bind(("127.0.0.1", 0))
+    # Taken on every address, as the port was on CI: PyTorch's store listens on all of them, and on macOS a
+    # port taken on 127.0.0.1 alone does not stop it.
+    try:
+        taken = socket.socket(socket.AF_INET6)
+        taken.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        taken.bind(("::", 0))
+    except OSError:  # no IPv6 here
+        taken = socket.socket()
+        taken.bind(("0.0.0.0", 0))
+    with taken:
         taken.listen(1)
         choices = iter([taken.getsockname()[1]])
         free = _free_port
