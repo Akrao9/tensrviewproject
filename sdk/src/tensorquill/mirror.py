@@ -318,9 +318,12 @@ def _log_into(session: Any, values: list[tuple[str, Any]]) -> None:
         marks = _written[id(session)] = {}
     mine = marks.get(where)
     if mine is None:
+        # The newest step was the step in progress until it ended: what the mirror stored there is
+        # still its own (the row's Python numbers are the same objects, also once copied to the CPU).
+        before = marks.get(("pending", where[1] - 1)) if where[0] == "newest" else None
         while len(marks) >= 2:  # the step in progress and the newest step are all a value can go on
             del marks[next(iter(marks))]
-        mine = marks[where] = {}
+        mine = marks[where] = dict(before) if before else {}
     take = {}
     for key, number in values:
         held = row.get(key, _MISSING)

@@ -70,6 +70,7 @@ def test_the_rust_report_reads_the_late_values_on_the_incidents_step(tmp_path):
     path = tmp_path / "run.jsonl"
     _run(path, 5)
     evidence = tensorquill.build_evidence(path, detectors="rust", server_binary=binary)
+    assert evidence.get("detectors") == "rust"  # judged by the Rust detectors, not the Python fallback
     kinds = {i["kind"] for i in evidence["incidents"]}
     assert "repeated_steps" not in kinds
     spike = [i for i in evidence["incidents"] if i.get("step") == SPIKE and "eval/loss" in (i.get("scalars") or {})]

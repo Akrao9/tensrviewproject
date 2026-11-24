@@ -1720,6 +1720,7 @@ class Session:
         self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
         self._late_said = False  # a scalar left out for want of a step in memory was said (`_no_step_for`)
+        self._late_traced: dict[str, Any] = {}  # logged late inside a compiled function (`_log_late`)
         self._ring_probe: list[dict[str, Any] | None] = []
         self._probe_off_written = False
         # Data progress (`data`): None until the first batch is noted, then every step has one.
@@ -2844,6 +2845,7 @@ class Session:
         a key naming those scalars, unchanged until a step ends, and the dictionary itself, or None
         when the value would be left out."""
         if self._evaluating.on:
+            self._take_traced_late()
             return ("newest", self._steps_committed), self._newest_scalars()
         return ("pending", self._steps_committed), self._pending_scalars
 
@@ -2854,6 +2856,13 @@ class Session:
         only when it is written; a tensor is never read here."""
         if not values:
             return
+        if torch.compiler.is_compiling():
+            # Traced: the ring is not read (its length, its steps and the held step would each be a
+            # guard that changes at every step, and the function would compile again). Kept here and
+            # put on the newest step by the next eager call (`_take_traced_late`).
+            self._late_traced.update(values)
+            return
+        self._take_traced_late()
         row = self._newest_scalars()
         if row is None:
             self._no_step_for(values, "logged inside session.phase(\"eval\") with no step in memory (before the "
@@ -2861,6 +2870,16 @@ class Session:
             return
         self._ring_scalars[-1] = {**row, **values}
         self._mark_held("scalars")
+
+    def _take_traced_late(self) -> None:
+        """Put on the newest step what a compiled function logged late (`_log_late`), eagerly: at the
+        next eager `log` under "eval", the mirror's next value, the next step's end, `flush()` and
+        `close()`. Emptied in place, so the traced function's guard on it holds."""
+        traced = self._late_traced
+        if traced:
+            values = dict(traced)
+            traced.clear()
+            self._log_late(values)
 
     def _attach_pending(self) -> None:
         """At `close()`: what was logged since the last step ended goes on the newest step in memory,
@@ -3390,6 +3409,7 @@ class Session:
         if self._stopped:
             self._count_stopped(step)
             return
+        self._take_traced_late()  # on the step it followed, before that step can be written below
         if self._launch_read is None or self._launch_parked:
             self._start_launch_read()  # the end of the first step: the launch's second read (contract 2)
         current = self._next_step if step is None else step
@@ -3578,6 +3598,7 @@ class Session:
         """Move the ring to the CPU and queue it for the sink."""
         if self._closed_call("flush()"):
             return
+        self._take_traced_late()
         self._flush(hold_newest=False)
 
     def _clear_ring_lists(self) -> None:
@@ -4183,6 +4204,7 @@ class Session:
         deadline = time.monotonic() + CLOSE_SECONDS
         if not self._stopped:
             self._close_by = deadline  # the last block may wait for room, up to the deadline (`_put`)
+            self._take_traced_late()
             self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
         if not self._stopped:
