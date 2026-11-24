@@ -30,7 +30,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 | Q2 | The heavy probe arrays: columns in the same row (Q2 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q3 | The scalar-only record travels in the same `.jsonl` and stream, with `seq` (Q3 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q4 | Scalar-only records are series only, never incident context (Q4 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
-| Q5 | With no step in memory and no `step=`, the value is left out with one warning per session, and the warning shows the explicit `session.log({...}, step=N)` for a baseline evaluation and for an evaluation after `flush()`; the mirror's case is a documented limit (section Q5). | **Owner, decided Nov 24** | "keep the one-time warning and show how to record the value explicitly. Cover both a baseline evaluation before training and an evaluation after flush()" |
+| Q5 | With no step in memory and no `step=`, the value is left out with one warning per session, which shows the explicit `session.log({...}, step=N)` for a baseline evaluation and for an evaluation after `flush()`. The Hugging Face callback passes `step=` itself, so `eval_on_start`'s baseline is recorded. The mirror's case is a documented limit. (e) is not taken now and stays compatible later (section Q5). | **The coordinator's choice on the owner's word, Nov 24** | owner: "keep the one-time warning and show how to record the value explicitly. Cover both a baseline evaluation before training and an evaluation after flush()", then "which is best decide" |
 | Q6 | At one series point, the scalar-only record with the highest `seq` wins (Q6 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q7 | The mirror ignores a tracker's own `step=` (Q7 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q8 | `compare` reads scalar-only records as series points (Q8 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
@@ -62,7 +62,10 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 
 ### Q5, decided Nov 24: a value with no step in memory and no `step=`
 
-**The owner's words:** "For Q5, when there is no training step in memory and the caller supplies no step=, keep the one-time warning and show how to record the value explicitly. Cover both a baseline evaluation before training and an evaluation after flush()". This is option (a), with the warning's text changed.
+**The owner's words:** "For Q5, when there is no training step in memory and the caller supplies no step=, keep the one-time warning and show how to record the value explicitly. Cover both a baseline evaluation before training and an evaluation after flush()".
+- Asked to weigh this against (e), the owner left the choice to the coordinator ("which is best decide").
+- **The coordinator's choice, on the owner's word:** the owner's wording, plus one addition, the adapter's explicit step. (e) is not taken now.
+- **Why:** only a value logged under "eval", or pending at `close()` after a flush, reaches the switch below. A plain `log()` before the first step, which is a one-line mirror user's baseline, already lands on step 0's record. So the values at stake come from code that already calls the session's API, or from TensorQuill's own adapters, and the addition covers the adapters.
 
 **What reaches `Session._no_step_for`**, which stays the one switch:
 - a value logged under `phase("eval")`, by the user or by the mirror, before any step was committed, or after `flush()` with no step since;
@@ -70,7 +73,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 
 A plain `log()` outside "eval" before the first step is not one of these. It is pending and lands on step 0's training record, as today.
 
-**What happens to it:** it is left out, with one warning per session, as in wave AK. No record is written. The warning now shows the explicit call that records it: `session.log({...}, step=N)`, which writes a scalar-only record (section 4.2).
+**What happens to it:** it is left out, with one warning per session, as in wave AK. No record is written. The warning now shows the explicit call that records it: `session.log({...}, step=N)`, which writes a scalar-only record (section 4.2). The Hugging Face callback does that itself (below).
 
 **Which step the warning suggests.** Both numbers are host integers the session already keeps, the ones `_record_manifest` uses for `after_step`, so no device is read.
 
@@ -96,9 +99,32 @@ A value pending at `close()` with no step at all (a session that never trained) 
 
 **Step 1 leaves the text as wave AK wrote it.** That text names protocol 5's record and no argument, and `step=` still raises `TypeError` until step 2. The push follows step 2, so no build tells a user to pass an argument that raises.
 
-**Weighed and not taken:**
-- (d) a record with a null step before the first step: `step` is a key in `identity.check`, the sender, the Arrow schema and the server's null-key check, so all four and every series reader would change.
-- (e) a record at `start_step` marked `before_step` was the simpler way to record a baseline with no null. (b) and (c), the next or the last step, without a mark.
+**The addition: the Hugging Face callback passes `step=` itself** (lane AL-5, step 2). It is the only TensorQuill adapter that records evaluation metrics after wave AK. Lightning's callback logs the loss only.
+- **When:** in `on_evaluate`, when the session has no step in memory. That is `eval_on_start`'s baseline, or an evaluation after a `flush()` with no step since. It calls `session.log(values, step=N)`, which writes a scalar-only record, so nothing is left out and no warning is said.
+  - With a step in memory, it logs as today: on the newest step, under "eval".
+- **Which `N`.** `Trainer` counts finished optimizer steps in `state.global_step`. The callback starts the session at `start_step = state.global_step` (`on_train_begin`), and the session numbers each step it ends from there. So after TensorQuill's step `n` has ended, `global_step` is `n + 1`.
+  - **No step ended in this session** (a baseline, also on a resume): `N = state.global_step`, which is `start_step` and the session's `_next_step`. It is 0 on a fresh run, the resumed step otherwise.
+  - **After a flush:** `N = state.global_step - 1`, the last step that ended, which is the session's `_next_step - 1`.
+  - The callback passes the session's own number. Lane AL-5's test shows the two agree on a real `Trainer` (with gradient accumulation too, since both count optimizer steps).
+- **What shares a step.**
+  - A baseline at `N = 0` shares its x with training step 0's record (`train/loss` and the rest). The names differ, so the series differ.
+  - When W&B or MLflow is active, the mirror also brings the `Trainer`'s logged baseline. It arrives outside "eval", before `on_evaluate`, so it is pending and lands on step 0's own record, as today. The callback's record holds the same values under the same names.
+  - By Q6 (decided) the scalar-only record wins at that series point. It is the same value.
+
+**What remains, stated as limits:**
+- **The mirror's values.** A value the mirror brings under "eval" with no step in memory is left out with the warning, which says so (Q7: the mirror passes no step). A documented limit.
+- **One point at step 0.** A baseline recorded at `step=0`, and an evaluation after step 0 recorded on step 0's own record under the same name, are one series point. By Q6 the scalar-only record wins, so the series shows the baseline and not the evaluation after step 0. The evaluation is still on step 0's record and in incident context.
+  - It happens only when an evaluation follows the very first step (`eval_steps=1`, or the user's own loop).
+  - It needs one README line, in the `scalars` passage (section 9).
+
+**Not taken now: (e), compatible later.**
+- **What (e) was:** a record at `start_step` marked `"before_step": true` for a value before the first step, the last finished step otherwise, and `"pending": true` for a value from `close()`.
+- **What it would add:** it would record everything `_no_step_for` leaves out, the mirror's values included, and it would remove the step-0 limit above (a "before" point sorts ahead of step 0's own).
+- **What it would cost:** one optional key, a reader ordering rule, and a placement the user did not state.
+- **Compatible later:** both keys are optional additions to a version-2 record, so they need no version change, and readers that ignore them read the record as today.
+- **What would make it worth taking:** a real job whose evaluations reach the session under "eval" with no step in memory and are lost. For example, a mirror user whose own loop sets `phase("eval")` around evaluations logged only to W&B. Or a user who meets the step-0 point.
+
+**Weighed and not taken:** (d) a record with a null step before the first step. `step` is a key in `identity.check`, the sender, the Arrow schema and the server's null-key check, so all four and every series reader would change.
 
 ## 1. `layers` and `moe_stats` as typed columns (lanes AL-1, AL-3)
 
@@ -292,7 +318,7 @@ There are four, not three.
   - `ts` is when `log` was called, in Unix seconds.
   - `scalars` holds numbers only, as `Session._scalar_values` gives them. A non-finite value is written as the sink's string.
 - **The capture writes one for an explicit `step=`.** It never writes one for a value logged without it that a step in memory takes, even one naming the step in progress.
-- **It writes none for a value with no step in memory and no `step=`** (Q5). That value is left out with one warning, which shows the explicit call.
+- **It writes none for a value with no step in memory and no `step=`** (Q5). That value is left out with one warning, which shows the explicit call. The Hugging Face callback passes `step=` itself in that situation, so its evaluation metrics are recorded.
 - **`step=` refuses, before anything is recorded:** a bool, a float, a negative integer and anything not an integer (case `scalar_log_refusals`). The refusals are `TypeError`, or `ValueError` for a negative.
 - **A tensor value is copied on its device** and read with the next flush, with that flush's records, so no sync is added.
 - **The writer writes it with the next block of step records, or at `close()`.** A stop of capture loses a pending one, as it loses pending steps.
@@ -350,7 +376,7 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
 
 ### 4.7 The cases
 
-`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`, `scalar_no_step_baseline_warning`, `scalar_no_step_baseline_on_a_resume_warning`, `scalar_no_step_after_flush_warning`, `scalar_no_step_pending_at_close_after_flush_warning`, `scalar_no_step_mirrored_warning`, `scalar_no_step_said_once`.
+`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`, `scalar_no_step_baseline_warning`, `scalar_no_step_baseline_on_a_resume_warning`, `scalar_no_step_after_flush_warning`, `scalar_no_step_pending_at_close_after_flush_warning`, `scalar_no_step_mirrored_warning`, `scalar_no_step_said_once`, `scalar_hf_eval_on_start_baseline`, `scalar_hf_eval_on_start_on_a_resume`, `scalar_baseline_and_step_0_share_a_point`.
 
 ## 5. The matrix
 
@@ -442,6 +468,8 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
     - A value with no step in memory and no `step=` is left out with one warning per session, which shows `session.log({...}, step=N)`: `start_step` for a baseline evaluation, the last finished step after `flush()`.
     - The mirror's values cannot carry a step, so the user logs such a value with `step=` themself.
     - This replaces wave AK's "comes with protocol 5's scalar-only record".
+    - The Hugging Face callback records `eval_on_start`'s baseline and an evaluation after `flush()` with an explicit step.
+    - The one line on step 0: a baseline logged with `step=0` and an evaluation after the first step, logged under the same name, are one point at step 0, and the series shows the baseline.
   - **The versions (AL-1, AL-2):** section 3's table; the older-server message; "a downgrade is not supported", with how it shows (Q9).
   - **The probe (AL-1):** the maps and histograms are in their own columns; the `.jsonl` is unchanged.
 
@@ -465,7 +493,7 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 
 | Lane | Owns | Does | Cases |
 |---|---|---|---|
-| AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases; wave AK's tests of the old warning text change with it |
+| AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `huggingface.py` (`on_evaluate`'s explicit step), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases, the two `scalar_hf_*` cases; wave AK's tests of the old warning text change with it |
 | AL-1′ | `flight.py`, `server_detect.py` | The record's row (`seq`, `record_version`). Scalar-only records set apart before `_stream`, `FollowedDetect` and `stream_order` | `scalar_record_keys` (row) |
 | AL-2′ | `ingest.rs`, `storage.rs`, `watchdog.rs` (`scalars_not_newer`) | Section 4.5 | `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart` |
 | AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6, and section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step`; the `python` targets of `layers_entry_not_object` and `layers_value_not_object`; the samples comparison of `moe_stats_diversity_refused` |

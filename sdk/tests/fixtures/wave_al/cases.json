@@ -16354,6 +16354,126 @@
      "after flush()"
     ]
    }
+  },
+  {
+   "name": "scalar_hf_eval_on_start_baseline",
+   "section": 4,
+   "about": "a Trainer with eval_on_start=True on a fresh run: the callback's on_evaluate finds no step in memory and logs the eval/* metrics with step=state.global_step (0), so one scalar-only record at step 0 is written and no warning is said",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "adapter": "huggingface",
+     "eval_on_start": true,
+     "resume_global_step": 0
+    },
+    "records_written": 1,
+    "record": {
+     "step": 0,
+     "seq": 0,
+     "names_start_with": "eval/"
+    },
+    "warnings": 0
+   }
+  },
+  {
+   "name": "scalar_hf_eval_on_start_on_a_resume",
+   "section": 4,
+   "about": "the same resumed from checkpoint-500: start_step and global_step are 500, so the record is at step 500",
+   "paths": [
+    "capture"
+   ],
+   "records": [],
+   "expect": {
+    "setup": {
+     "adapter": "huggingface",
+     "eval_on_start": true,
+     "resume_global_step": 500
+    },
+    "records_written": 1,
+    "record": {
+     "step": 500,
+     "seq": 0,
+     "names_start_with": "eval/"
+    },
+    "warnings": 0
+   }
+  },
+  {
+   "name": "scalar_baseline_and_step_0_share_a_point",
+   "section": 4,
+   "about": "a baseline recorded with step=0 and an evaluation after step 0 recorded on step 0's own record under the same name are one series point; by Q6 the scalar-only record wins, so the series shows the baseline, and step 0's record still holds the later value (a README line, section 9)",
+   "paths": [
+    "python",
+    "mcp_get_series"
+   ],
+   "records": [
+    {
+     "schema_version": 2,
+     "record": "scalars",
+     "run_id": "al_share",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "seq": 0,
+     "ts": 100.0,
+     "scalars": {
+      "eval/loss": 3.0
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_share",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0,
+     "scalars": {
+      "train/loss": 2.9,
+      "eval/loss": 2.8
+     }
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_share",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0,
+     "scalars": {
+      "train/loss": 2.7
+     }
+    }
+   ],
+   "expect": {
+    "series": {
+     "eval/loss": [
+      [
+       0,
+       3.0
+      ]
+     ],
+     "train/loss": [
+      [
+       0,
+       2.9
+      ],
+      [
+       1,
+       2.7
+      ]
+     ]
+    },
+    "step_0_record_eval_loss": 2.8,
+    "steps_judged": 2
+   },
+   "today": {
+    "python": "MalformedRecordError: schema_version is 2 at record 0 of the records passed: this tensorquill reads schema versions 0 and 1"
+   }
   }
  ]
 }
