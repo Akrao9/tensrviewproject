@@ -100,7 +100,7 @@ def test_moved_names_layers_for_a_name_arrow_cannot_encode_and_a_float_too_large
         moved: list = []
         record_to_row(_at(next(c for c in ROWS if c["name"] == name)), moved=moved)
         assert moved == ["layers"], name
-    record = {"schema_version": 1, "run_id": "r", "rank": 0, "step": 0,
+    record = {"schema_version": 1, "run_id": "r", "rank": 0, "step": 0, "ts": 1.0, "grad_norm": None,
               "layers": {"a": {"mean": 10**400, "std": 1.0}, "b": {"std": 2.0}}}
     moved = []
     row = record_to_row(record, moved=moved)
@@ -261,8 +261,12 @@ def test_the_sender_sends_every_case_record_with_moved_named_once():
         batch, steps, skipped = flight.rows_to_send(records, flight.flight_schema(), moved)
         assert skipped == 0 and steps == [r["step"] for r in records], case["name"]
         assert [row_to_record(r) for r in batch.to_pylist()] == records, case["name"]
-        if case["name"] == "moe_stats_int_past_int64":
-            assert moved == [(case["row_step"], "moe_stats")]
+        if case["name"] == "moe_stats_int_past_int64":  # once per row that holds the overflow
+            past = [r["step"] for r in records
+                    if any(isinstance(v, int) and v > 2**63 - 1 for e in r["moe_stats"].values() for v in e.values())]
+            assert case["row_step"] in past and moved == [(step, "moe_stats") for step in past]
+        else:
+            assert {key for _, key in moved} <= {"layers"}, case["name"]  # the lone surrogate's name only
 
 
 V4_COLUMNS = ("layers_json", "moe_stats_json", "probe_json")

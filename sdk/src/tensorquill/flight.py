@@ -17,17 +17,24 @@ import json
 import math
 import os
 import random
+import struct
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .identity import MalformedRecordError, _shown, check
+from .identity import SCHEMA_VERSIONS, MalformedRecordError, _shown, check
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 from .sink import _finite
 
-SCHEMA_VERSION = 1
+# The numbers of `WAVE_AL_CONTRACT.md` section 3, kept apart. `SCHEMA_VERSION` is the batch metadata's
+# (`app_metadata`): 2 for protocol 5's layout. A server that reads only 1 refuses the stream with
+# INVALID_ARGUMENT and acknowledges nothing (D6), which the sender says once (`OlderServer`).
+# `ROW_VERSION` is a row's `schema_version` column in protocol 5's layout (D7), and the record's own
+# version travels beside it in `record_version` (Q1 a). Readers tell a layout by its columns.
+SCHEMA_VERSION = 2
+ROW_VERSION = 2
 BATCH_STEPS = 50
 BATCH_SECONDS = 2.0
 BATCH_BYTES = 4 * 1024 * 1024
@@ -65,7 +72,10 @@ def _float(value: Any) -> float | None:
     if isinstance(value, bool):
         raise TypeError("bool is not a float")
     if isinstance(value, (int, float)):
-        return float(value)
+        value = float(value)
+        # One NaN for every NaN, so a line holding a bare `NaN` makes the same row as the sink's "nan"
+        # (L20), now that a struct field holds the float and not JSON text.
+        return _NON_FINITE["nan"] if math.isnan(value) else value
     if isinstance(value, str) and value in _NON_FINITE:
         return _NON_FINITE[value]  # JsonlSink writes non-finite numbers as these strings
     raise TypeError(f"not a number: {value!r}")
@@ -147,9 +157,11 @@ _FIELDS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "moe_top_k": ("moe_top_k", _map(_int)),
     "moe": ("moe_counts", _map(_list(_int))),
     "replica_spread": ("replica_spread", _map(_list(_float))),
-    "layers": ("layers_json", _ordered_json),
-    "moe_stats": ("moe_stats_json", _json),
-    "probe": ("probe_json", _ordered_json),  # attention modules in the model's order, as for layers
+    # Protocol 5's typed columns (`WAVE_AL_CONTRACT.md` sections 1 and 2): converted by `_structs` and
+    # `_split_probe`, never by the converter named here, and read back by `_structs_back` and `_probe_back`.
+    "layers": ("layers", _ordered_json),
+    "moe_stats": ("moe_stats", _json),
+    "probe": ("probe_json", _ordered_json),  # its light part; the maps and histograms have columns of their own
     "data": ("data_json", _json),
     "checkpoint": ("checkpoint_json", _json),
     "data_wait": ("data_wait", _float),
@@ -160,14 +172,38 @@ _KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # Capture always writes these two, as null when there is no value, so a null column reads
 # back as a present `None`. Every other null column reads back as an absent key.
 _ALWAYS = ("ts", "grad_norm")
-_COLUMNS = (*_KEY_COLUMNS, *(column for column, _ in _FIELDS.values()), "extra_json")
+_COLUMNS = (*_KEY_COLUMNS, *(column for column, _ in _FIELDS.values()), "probe_maps", "probe_histograms",
+            "record_version", "extra_json")
+
+# The struct maps of section 1.2: their fields in the capture's order (`capture.py` `STATS`,
+# `_router_stats`), and the fields that are Int64. Readers look a field up by name, so a field added
+# later (K3's `token_entropy`) is absent in an older part and needs no row version (D3).
+LAYER_FIELDS = ("mean", "std", "abs_max", "zero_frac")
+MOE_FIELDS = ("routed_tokens", "entropy", "diversity", "dead_experts", "dead_frac")
+_STRUCT_MAPS: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
+    "layers": (LAYER_FIELDS, frozenset()),
+    "moe_stats": (MOE_FIELDS, frozenset({"routed_tokens", "dead_experts"})),
+}
+# Protocol 4's JSON columns for the same keys: never written now, still read (section 3).
+_JSON_COLUMNS = {"layers": "layers_json", "moe_stats": "moe_stats_json"}
+_HIST_KEYS = ("lo", "hi", "counts", "nonfinite")
+_INT64 = (-(2**63), 2**63 - 1)
 
 
 def flight_schema() -> Any:
-    """The Arrow schema of one step per row (`schema_version` 1)."""
+    """The Arrow schema of one step per row, in protocol 5's layout (row `schema_version` 2,
+    `WAVE_AL_CONTRACT.md` sections 1 to 3): `layers` and `moe_stats` as maps of structs,
+    the probe's maps and histograms in `probe_maps` and `probe_histograms` beside `probe_json`, and the
+    record's own version in `record_version`. No map is marked `keys_sorted`: entries keep the
+    record's order (D1)."""
     import pyarrow as pa
 
-    f64 = pa.float64()
+    f64, f32, i64 = pa.float64(), pa.float32(), pa.int64()
+    layer = pa.struct([pa.field(name, f64) for name in LAYER_FIELDS])
+    ints = _STRUCT_MAPS["moe_stats"][1]
+    moe = pa.struct([pa.field(name, i64 if name in ints else f64) for name in MOE_FIELDS])
+    histogram = pa.struct([pa.field("lo", f64), pa.field("hi", f64), pa.field("counts", pa.list_(i64)),
+                           pa.field("nonfinite", i64)])
     return pa.schema(
         [
             pa.field("schema_version", pa.int32(), nullable=False),
@@ -190,14 +226,17 @@ def flight_schema() -> Any:
             pa.field("moe_top_k", pa.map_(pa.string(), pa.int32())),
             pa.field("moe_counts", pa.map_(pa.string(), pa.list_(pa.int64()))),
             pa.field("replica_spread", pa.map_(pa.string(), pa.list_(f64))),
-            pa.field("layers_json", pa.string()),
-            pa.field("moe_stats_json", pa.string()),
+            pa.field("layers", pa.map_(pa.string(), layer)),
+            pa.field("moe_stats", pa.map_(pa.string(), moe)),
             pa.field("probe_json", pa.string()),
+            pa.field("probe_maps", pa.map_(pa.string(), pa.list_(pa.list_(f32)))),
+            pa.field("probe_histograms", pa.map_(pa.string(), histogram)),
             pa.field("data_json", pa.string()),
             pa.field("checkpoint_json", pa.string()),
             pa.field("data_wait", f64),
             pa.field("step_time", f64),
             pa.field("system_json", pa.string()),
+            pa.field("record_version", pa.int32()),
             pa.field("extra_json", pa.string()),
         ]
     )
@@ -236,7 +275,14 @@ def _row(
     the others travel in `extra_json`, under the map's own key. Under `grad_norms` (`_NULL_REFUSED`)
     a refused entry also stays in the column, as null. With no entry held the whole value travels
     there and the column is null, as before. A map held whole is converted as before, so its row is
-    unchanged."""
+    unchanged.
+
+    `layers` and `moe_stats` are maps of structs and the probe is split by column (protocol 5,
+    `WAVE_AL_CONTRACT.md` sections 1 and 2; `_structs`, `_split_probe`). The row's `schema_version`
+    is `ROW_VERSION` and the record's own version is in `record_version` (section 3, Q1 a): null when
+    the record has no `schema_version` key. A record of a version this package does not read keeps
+    that version as its row's too, so a server drops and counts it as before (RS10) and never stores
+    it as a row it reads."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
     extra: dict[str, Any] = {}
     for key, value in record.items():
@@ -245,6 +291,17 @@ def _row(
         spec = _FIELDS.get(key)
         if spec is None or (value is None and key not in _ALWAYS):
             extra[key] = value
+            continue
+        if key in _STRUCT_MAPS:
+            held, refused, counted = _structs(value, *_STRUCT_MAPS[key])
+            row[spec[0]] = held
+            if refused is not _UNHELD:
+                extra[key] = refused
+            if counted and moved is not None:
+                moved.append(key)
+            continue
+        if key == "probe":
+            row["probe_json"], row["probe_maps"], row["probe_histograms"] = _split_probe(value)
             continue
         if key == "scalars" and isinstance(value, dict):
             # A logged bool is not a number in either engine (lane W3, DET-16): that one value is left
@@ -278,7 +335,9 @@ def _row(
             extra[key] = value
         if counted and moved is not None:
             moved.append(key)
-    row["schema_version"] = _int(record.get("schema_version", 0))
+    version = _int(record.get("schema_version", 0))
+    row["schema_version"] = ROW_VERSION if version in SCHEMA_VERSIONS else version
+    row["record_version"] = version if "schema_version" in record else None
     row["run_id"] = _str(record["run_id"])
     row["rank"] = _int(record.get("rank", 0))
     row["attempt"] = _int(record.get("attempt", 0))
@@ -349,6 +408,153 @@ def _fits(value: Any, arrow_type: Any) -> bool:
     return True
 
 
+def _encodable(name: Any) -> bool:
+    """Whether `name` can be an Arrow map's key: text that UTF-8 can encode (not a lone surrogate)."""
+    if not isinstance(name, str):
+        return False
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _int64(value: Any) -> int:
+    """An Int64 struct field's value: an integer that is not a bool (TypeError), within int64
+    (OverflowError, counted as `moved`)."""
+    value = _int(value)
+    if not _INT64[0] <= value <= _INT64[1]:
+        raise OverflowError(f"{value} is past int64")
+    return value
+
+
+def _structs(
+    value: Any, fields: tuple[str, ...], ints: frozenset[str],
+) -> tuple[list[tuple[str, Any]] | None, Any, bool]:
+    """A struct map (`layers`, `moe_stats`) as the column's pairs, what travels in `extra_json` under
+    its key (`_UNHELD` for nothing), and whether a field was refused by an overflow or by Arrow, which
+    `moved` names once per row (`WAVE_AL_CONTRACT.md` section 1.4, wave AJ's rule extended field by field):
+
+    - every field held: the struct;
+    - a field refused (a bool, a string but the sink's three, an explicit null, a number its type
+      cannot hold, a float in an Int64 field, a field the struct does not name): null in the struct,
+      and only that field under the entry's name;
+    - a field missing: null in the struct, nothing else, so it reads back absent;
+    - an entry that is not an object: a null struct in its place, and the entry whole;
+    - a name Arrow cannot encode: not in the map, and the entry whole (read after the column's entries);
+    - a value that is not an object, or one no entry of which is held: no column, and the value whole;
+    - `{}`: an empty map.
+
+    Entries keep the record's order, and nothing sorts them. Decided here, in Python, so a row is the
+    same with or without Arrow's check."""
+    if not isinstance(value, dict):
+        return None, value, False
+    held: list[tuple[str, Any]] = []
+    refused: dict[str, Any] = {}
+    counted = False
+    for name, entry in value.items():
+        if not _encodable(name):
+            refused[name] = entry
+            counted = counted or isinstance(name, str)  # Arrow's refusal of the text, not a type's
+            continue
+        if not isinstance(entry, dict):
+            held.append((name, None))
+            refused[name] = entry
+            continue
+        struct_value: dict[str, Any] = {}
+        bad: dict[str, Any] = {}
+        for field, field_value in entry.items():
+            if field not in fields or field_value is None:
+                bad[field] = field_value
+                continue
+            try:
+                struct_value[field] = _int64(field_value) if field in ints else _float(field_value)
+            except (TypeError, ValueError):
+                bad[field] = field_value
+            except Exception:  # noqa: BLE001  OverflowError: a number its type cannot hold
+                bad[field] = field_value
+                counted = True
+        held.append((name, struct_value))
+        if bad:
+            refused[name] = bad
+    if value and not held:
+        return None, value, counted
+    return held, refused if refused else _UNHELD, counted
+
+
+def _float32_exact(value: Any) -> bool:
+    """Whether a map value is exactly a float32 (D10), or one of the sink's non-finite strings."""
+    if isinstance(value, str):
+        return value in _NON_FINITE
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        as_float = float(value)
+        if not math.isfinite(as_float):
+            return True
+        return struct.unpack("f", struct.pack("f", as_float))[0] == value
+    except (OverflowError, struct.error):
+        return False
+
+
+def _number(value: Any) -> bool:
+    try:
+        return _float(value) is not None
+    except Exception:  # noqa: BLE001  a bool, other text, a number too large for a float
+        return False
+
+
+def _whole64(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and _INT64[0] <= value <= _INT64[1]
+
+
+def _histogram_held(entry: Any) -> bool:
+    """Whether `probe_histograms` holds a histogram as written: its four keys in the probe's order, `lo`
+    and `hi` numbers, `counts` and `nonfinite` int64 integers."""
+    if not isinstance(entry, dict) or tuple(entry) != _HIST_KEYS:
+        return False
+    counts = entry["counts"]
+    return (_number(entry["lo"]) and _number(entry["hi"]) and isinstance(counts, list)
+            and all(_whole64(c) for c in counts) and _whole64(entry["nonfinite"]))
+
+
+def _split_probe(probe: Any) -> tuple[str, list[tuple[str, Any]] | None, list[tuple[str, Any]] | None]:
+    """The probe as `probe_json`, `probe_maps` and `probe_histograms` (`WAVE_AL_CONTRACT.md` section 2.4).
+
+    - `probe_maps`, by the module's label: a module's `map` when every value is exactly a float32 or one
+      of the sink's non-finite strings, and the label can be a key. Any other map stays where it was.
+    - `probe_histograms`: every histogram or none, so their order is never split. One that is not held
+      as written keeps them all in `probe_json`, and so does an empty `histograms`.
+    - `probe_json`: the rest, in the probe's order, with each moved `map` and a moved `histograms` left
+      out. A probe that is not an object is all here."""
+    if not isinstance(probe, dict):
+        return _ordered_json(probe), None, None
+    light = dict(probe)
+    maps: list[tuple[str, Any]] | None = None
+    attention = probe.get("attention")
+    if isinstance(attention, dict):
+        pairs: list[tuple[str, Any]] = []
+        kept: dict[str, Any] = {}
+        for label, entry in attention.items():
+            grid = entry.get("map") if isinstance(entry, dict) else None
+            if (isinstance(grid, list) and _encodable(label)
+                    and all(isinstance(r, list) and all(_float32_exact(v) for v in r) for r in grid)):
+                pairs.append((label, [[_float(v) for v in r] for r in grid]))
+                kept[label] = {k: v for k, v in entry.items() if k != "map"}
+            else:
+                kept[label] = entry
+        if pairs:
+            maps, light["attention"] = pairs, kept
+    histograms_held: list[tuple[str, Any]] | None = None
+    histograms = probe.get("histograms")
+    if (isinstance(histograms, dict) and histograms
+            and all(_encodable(name) and _histogram_held(h) for name, h in histograms.items())):
+        histograms_held = [(name, {"lo": _float(h["lo"]), "hi": _float(h["hi"]), "counts": list(h["counts"]),
+                                   "nonfinite": h["nonfinite"]}) for name, h in histograms.items()]
+        del light["histograms"]
+    return _ordered_json(light), maps, histograms_held
+
+
 def records_to_batch(records: Iterable[Mapping[str, Any]]) -> Any:
     records = list(records)
     return rows_batch(records, [record_to_row(r) for r in records], flight_schema())
@@ -390,15 +596,37 @@ def _plain(value: Any) -> Any:
 
 def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
     """The inverse of `record_to_row`: a row read back from the server's Parquet parts
-    (`table.to_pylist()`) as the dict that `evidence.py` reads from a `.jsonl` file."""
+    (`table.to_pylist()`) as the dict that `evidence.py` reads from a `.jsonl` file.
+
+    A row of either layout (`WAVE_AL_CONTRACT.md` section 3), told by its columns, not its number:
+    protocol 5's (`record_version`, `layers` and `moe_stats` as maps, `probe_maps`, `probe_histograms`)
+    or protocol 4's (`layers_json`, `moe_stats_json`, the whole probe in `probe_json`). So `load_records`
+    reads a store of either layout, or a rank with parts of both. A struct's null field reads back
+    absent, and the fields it could not hold come back from `extra_json` (section 1.4)."""
     record: dict[str, Any] = {}
-    if row["schema_version"]:
+    if "record_version" in row:  # protocol 5's layout: the record's own version, null for none
+        if row["record_version"] is not None:
+            record["schema_version"] = row["record_version"]
+    elif row["schema_version"]:
         record["schema_version"] = row["schema_version"]
     record.update(run_id=row["run_id"], rank=row["rank"])
     if row.get("attempt"):
         record["attempt"] = row["attempt"]
     record["step"] = row["step"]
+    extra = json.loads(row["extra_json"]) if row.get("extra_json") else {}
     for key, (column, convert) in _FIELDS.items():
+        if key in _STRUCT_MAPS:
+            pairs = row.get(column)
+            if pairs is not None:
+                refused = extra.pop(key) if isinstance(extra.get(key), dict) else None
+                record[key] = _structs_back(pairs, refused)
+            elif row.get(_JSON_COLUMNS[key]) is not None:
+                record[key] = json.loads(row[_JSON_COLUMNS[key]])
+            continue
+        if key == "probe":
+            if row.get(column) is not None:
+                record[key] = _probe_back(row)
+            continue
         value = row.get(column)
         if value is None:
             if key in _ALWAYS:
@@ -409,14 +637,50 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
             record[key] = {k: _plain(v) for k, v in value}  # an empty map stays a dict
         else:
             record[key] = _plain(value)
-    if row.get("extra_json"):
-        extra = json.loads(row["extra_json"])
+    if extra:
         for key in _SPLIT:
             # The entries the column could not hold, beside those it did (wave AJ, A3).
             if key in record and isinstance(extra.get(key), dict):
                 record[key] = {**record[key], **extra.pop(key)}
         record.update(extra)
     return record
+
+
+def _structs_back(pairs: Iterable[tuple[str, Any]], refused: Mapping[str, Any] | None) -> dict[str, Any]:
+    """A struct map read back in its stored order: each struct without its null fields, an entry's
+    refused fields merged into it, a null struct replaced by the entry it held the place of, and a name
+    the map does not hold appended (section 1.4)."""
+    value: dict[str, Any] = {}
+    for name, entry in pairs:
+        value[name] = None if entry is None else {k: _plain(v) for k, v in entry.items() if v is not None}
+    for name, more in (refused or {}).items():
+        if isinstance(value.get(name), dict) and isinstance(more, dict):
+            value[name] = {**value[name], **more}
+        else:
+            value[name] = more
+    return value
+
+
+def _probe_back(row: Mapping[str, Any]) -> Any:
+    """The probe from `probe_json`, with `histograms` put back first, as the capture writes it, and each
+    module's `map` back on its entry (section 2.4). A row of protocol 4's layout has the whole probe in
+    `probe_json`."""
+    probe = json.loads(row["probe_json"])
+    if not isinstance(probe, dict):
+        return probe
+    histograms = row.get("probe_histograms")
+    if histograms is not None:
+        probe = {"histograms": {name: {"lo": _plain(h["lo"]), "hi": _plain(h["hi"]), "counts": list(h["counts"]),
+                                       "nonfinite": h["nonfinite"]} for name, h in histograms}, **probe}
+    maps = row.get("probe_maps")
+    if maps is not None:
+        attention = probe.get("attention")
+        if not isinstance(attention, dict):
+            attention = probe["attention"] = {}
+        for label, grid in maps:
+            entry = attention.get(label)
+            attention[label] = {**(entry if isinstance(entry, dict) else {}), "map": [[_plain(v) for v in r] for r in grid]}
+    return probe
 
 
 _MAP_COLUMNS = frozenset(
@@ -698,6 +962,31 @@ class BatchRefused(ConnectionError):
     the sender's `last_error` after such a stream. Its bytes are not sent again."""
 
 
+class OlderServer(ConnectionError):
+    """The server refused the stream's batch metadata version (`SCHEMA_VERSION`): it speaks an older
+    protocol than this tensorquill (`WAVE_AL_CONTRACT.md` section 5; D6). The sender's `last_error` while
+    it does, said once on stderr. Nothing is acknowledged, so every line stays in the local file and
+    goes once the server is upgraded; the sender keeps trying."""
+
+
+_REFUSED_VERSION = f"schema_version {SCHEMA_VERSION} is not supported; this server reads version "
+
+
+def _older_server_reads(text: str) -> str | None:
+    """The batch metadata version a server reads, when `text` is its refusal of this package's
+    (`ingest.rs`: "schema_version N is not supported; this server reads version M", sent as
+    INVALID_ARGUMENT); else None."""
+    at = text.find(_REFUSED_VERSION)
+    if at < 0:
+        return None
+    digits = ""
+    for c in text[at + len(_REFUSED_VERSION):]:
+        if not c.isdigit():
+            break
+        digits += c
+    return digits or None
+
+
 class LocalFileUnreadable(OSError):
     """The local `.jsonl` file cannot be read: it was deleted or moved, or is not readable.
     This is not "nothing left to send": `close()` returns False and says so."""
@@ -790,6 +1079,7 @@ class FlightSender:
         self.refused_batches = 0
         self.last_refused: dict[str, Any] | None = None
         self._said_refused = False
+        self._said_older = False  # a server of an older protocol (`OlderServer`) is said once per sender
         self._life: dict[str, Any] | None = None  # the stream now open: when, and what it carried
         self._location = _location(endpoint)
         self._token = token if token is not None else os.environ.get(TOKEN_ENV)
@@ -924,11 +1214,24 @@ class FlightSender:
                         f"{column}, {self.refused_batches} batch(es) so far; the stream goes on from byte "
                         f"{named['end_byte_offset']} ({self._scrub(str(error))[:200]})"
                     )
+                older = self._older(error)
+                if older is not None:
+                    self.last_error = older
                 self._note_stream_end(error)
             if self._progress:
                 self._progress = False
                 ceiling = self._backoff_base
                 self._reported = False
+            elif isinstance(self.last_error, OlderServer):
+                # Said once per sender, in place of the outage's line: retrying cannot help until the
+                # server is upgraded, and the sender keeps trying for when it is.
+                self._reported = True
+                if not self._said_older:
+                    self._said_older = True
+                    try:
+                        print(f"tensorquill: {self.last_error}. Training continues; said once.", file=sys.stderr)
+                    except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
+                        pass
             elif not self._reported and not self._closing.is_set():
                 # Say once per outage that nothing is arriving: a wrong token or address
                 # would otherwise stay silent until close(). close() reports on its own.
@@ -1073,6 +1376,25 @@ class FlightSender:
             }
         except Exception:  # noqa: BLE001  explaining a failure must never be one
             pass
+
+    def _older(self, error: BaseException) -> OlderServer | None:
+        """An `OlderServer` when the stream that ended with `error` was refused for its batch metadata
+        version, else None. The refusal can be the error itself (the server's status, raised by a write
+        or the close), or what the ack reader or `writer.close()` met, behind another error (a stream
+        that asked for the store with an empty batch and got no answer). Never raises."""
+        try:
+            life = self._life or {}
+            texts = [f"{error}", f"{life.get('ack_error') or ''}", f"{life.get('close_error') or ''}"]
+            reads = next((found for found in map(_older_server_reads, texts) if found is not None), None)
+            if reads is None:
+                return None
+            return OlderServer(
+                f"the server at {self.endpoint} speaks an older protocol: upgrade tensorquill-server "
+                f"(pip install -U tensorquill-server). It reads batch schema_version {reads} and this tensorquill "
+                f"sends version {SCHEMA_VERSION}, so it acknowledges nothing; {self.path} keeps every line, and "
+                "they are sent once the server is upgraded")
+        except Exception:  # noqa: BLE001  explaining a failure must never be one
+            return None
 
     def _scrub(self, text: str) -> str:
         """`text` with the token cut out, should a server or library ever echo it."""
