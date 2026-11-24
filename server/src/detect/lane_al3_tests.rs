@@ -780,13 +780,14 @@ fn detect_takes_row_version_2_and_names_the_three_it_reads() {
     );
 }
 
-/// A row version this server stores is one `detect` reads: the live server's list (lane AL-2's,
-/// `ingest::SUPPORTED_ROW_VERSIONS`) and `detect`'s may differ only until the seam joins them.
+/// A row version this server stores is one `detect` reads: both read the one list,
+/// `ingest::SUPPORTED_ROW_VERSIONS`, which holds protocol 4's 0 and 1 and protocol 5's 2 (section 3).
 #[test]
 fn every_version_the_server_stores_is_one_detect_reads() {
+    assert_eq!(crate::ingest::SUPPORTED_ROW_VERSIONS.to_vec(), vec![0, 1, 2]);
     let typed = batch(&run(), TYPED);
     let at = typed.schema().index_of("schema_version").unwrap();
-    for version in crate::ingest::SUPPORTED_ROW_VERSIONS.into_iter().chain([2]) {
+    for version in crate::ingest::SUPPORTED_ROW_VERSIONS {
         let mut columns = typed.columns().to_vec();
         columns[at] = Arc::new(Int32Array::from_iter_values((0..40).map(|_| version)));
         let rows = RecordBatch::try_new(typed.schema(), columns).unwrap();
