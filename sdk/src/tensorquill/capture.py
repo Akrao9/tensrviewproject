@@ -501,6 +501,10 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
+# `Session.log`'s `step=` when not given: any value given, None included, is refused.
+_NO_STEP: Any = object()
+
+
 def _warn(message: str, stacklevel: int = 2) -> None:
     """`warnings.warn(message, RuntimeWarning)` for code the training thread reaches, which must
     never raise into training. Under `python -W error` (or any filter that makes a
@@ -1715,6 +1719,7 @@ class Session:
         # is of an update already ended (`_record_scaler`, `_SCALER_LATE`).
         self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
+        self._late_said = False  # a scalar left out for want of a step in memory was said (`_no_step_for`)
         self._ring_probe: list[dict[str, Any] | None] = []
         self._probe_off_written = False
         # Data progress (`data`): None until the first batch is noted, then every step has one.
@@ -2315,12 +2320,7 @@ class Session:
     def _add_to_newest(self, name: str, value: Any) -> None:
         """Add `value` to the scalar `name` of the newest step in the ring (or set it there): the
         loss back-propagated for an optimizer that steps after the lead ended the step."""
-        pending, self._pending_scalars = self._pending_scalars, {}
-        try:
-            self.log({name: value})  # the same checks and the same copy on the device as `log`
-            new = self._pending_scalars[name]
-        finally:
-            self._pending_scalars = pending
+        new = self._scalar_values({name: value})[name]  # the same checks and the same copy on the device as `log`
         row = dict(self._ring_scalars[-1])
         row[name] = new if row.get(name) is None else row[name] + new
         self._ring_scalars[-1] = row
@@ -2771,7 +2771,7 @@ class Session:
             # its record has no key, as the count is not known there.
             self._clip_step_calls += 1
 
-    def log(self, values: Mapping[str, Any] | None = None, **named: Any) -> None:
+    def log(self, values: Mapping[str, Any] | None = None, *, step: Any = _NO_STEP, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
 
         `session.log({"train/loss": loss})` or `session.log(loss=loss)`. Values are
@@ -2782,10 +2782,40 @@ class Session:
         next step. A name logged twice in one step keeps the last value. Images, tables
         and other non-scalar values raise `TypeError`; pass the tracker the same values
         it already logs, not a replacement for it.
+
+        Under `session.phase("eval")` (or `set_phase("eval")`, which the Lightning and Hugging
+        Face callbacks set) a value is recorded on the newest step, the one the evaluation
+        followed, while that step is still in memory: it is the ring's last row, or the step
+        kept back when the ring last filled, until the next step ends, a `flush()` or `close()`.
+        A value still pending at `close()` goes there too, unless that step already holds its
+        name. With no step in memory (before the first step, or after `flush()` with no step
+        since) it is left out, said once per session in a warning (`_no_step_for`). A record
+        already written is never changed.
+
+        `step=` raises `TypeError`: an explicit step comes with protocol 5's scalar-only record.
+        A key `"step"` in the dictionary is an ordinary scalar.
         """
         if self._closed_call("log()"):
             return
-        items = dict(values or {}, **named)
+        if step is not _NO_STEP:
+            raise TypeError(
+                "session.log(..., step=...): an explicit step is not supported yet; it comes with protocol 5's "
+                "scalar-only record. A value logged inside session.phase(\"eval\") is recorded on the newest step, "
+                "and a key \"step\" in the dictionary is an ordinary scalar."
+            )
+        converted = self._scalar_values(dict(values or {}, **named))
+        # The phase as the hooks read it (`_Evaluating`): a compiled step that logs guards on that
+        # one flag, which its hooks already read, and not on the phase's name.
+        if self._evaluating.on:
+            self._log_late(converted)
+        else:
+            self._pending_scalars.update(converted)
+
+    @staticmethod
+    def _scalar_values(items: Mapping[Any, Any]) -> dict[str, Any]:
+        """`log`'s checks and copies: Python numbers as `int` or `float`, a one-element tensor copied
+        on its own device (never read). Raises before anything is recorded."""
+        out: dict[str, Any] = {}
         for name, value in items.items():
             if not isinstance(name, str) or not name:
                 raise TypeError(f"scalar names must be non-empty strings, got {name!r}")
@@ -2797,13 +2827,77 @@ class Session:
                     raise ValueError(f"{name}: expected one value, got shape {tuple(tensor.shape)}")
                 # A copy, so the value neither keeps a larger tensor alive nor changes later.
                 dtype = torch.float32 if tensor.device.type == "mps" else torch.float64
-                self._pending_scalars[name] = tensor.reshape(()).to(dtype, copy=True)
+                out[name] = tensor.reshape(()).to(dtype, copy=True)
             elif isinstance(value, numbers.Real):
-                self._pending_scalars[name] = (
-                    int(value) if isinstance(value, numbers.Integral) else float(value)
-                )
+                out[name] = int(value) if isinstance(value, numbers.Integral) else float(value)
             else:
                 raise TypeError(f"{name}: expected a number or one-element tensor, got {type(value).__name__}")
+        return out
+
+    def _newest_scalars(self) -> dict[str, Any] | None:
+        """The scalars of the newest step still in memory (the ring's last row, or the step kept back
+        when the ring filled, which is then its only row), or None when no step is."""
+        return self._ring_scalars[-1] if self._steps else None
+
+    def _scalars_for_log(self) -> tuple[tuple[str, int], dict[str, Any] | None]:
+        """Where `log` records a value now, for the mirror's explicit-wins rule (`mirror._log_into`):
+        a key naming those scalars, unchanged until a step ends, and the dictionary itself, or None
+        when the value would be left out."""
+        if self._evaluating.on:
+            return ("newest", self._steps_committed), self._newest_scalars()
+        return ("pending", self._steps_committed), self._pending_scalars
+
+    def _log_late(self, values: dict[str, Any]) -> None:
+        """Values logged after the newest step ended (under the "eval" phase): on that step while it is
+        in memory, a name logged again keeping the last value. A held step's row is replaced, not
+        changed in place, and marked (`_mark_held`), so its scalars are read again, in one transfer,
+        only when it is written; a tensor is never read here."""
+        if not values:
+            return
+        row = self._newest_scalars()
+        if row is None:
+            self._no_step_for(values, "logged inside session.phase(\"eval\") with no step in memory (before the "
+                                      "first step, or after flush() with no step since)")
+            return
+        self._ring_scalars[-1] = {**row, **values}
+        self._mark_held("scalars")
+
+    def _attach_pending(self) -> None:
+        """At `close()`: what was logged since the last step ended goes on the newest step in memory,
+        but for a name that step already holds (a loop that logs its loss after `optimizer.step()`
+        has every loss one step late, and the last one pending: it does not replace the step's own)."""
+        pending, self._pending_scalars = self._pending_scalars, {}
+        if not pending:
+            return
+        row = self._newest_scalars()
+        if row is None:
+            self._no_step_for(pending, "pending at close() with no step in memory (no step ended, or none since "
+                                       "flush())")
+            return
+        added = {name: value for name, value in pending.items() if name not in row}
+        if added:
+            self._ring_scalars[-1] = {**row, **added}
+            self._mark_held("scalars")
+
+    def _no_step_for(self, values: Mapping[str, Any], why: str) -> None:
+        """A scalar with no step in memory to be recorded on: left out, and said once per session.
+
+        The coordinator's reading of the owner's decision of Nov 24 (OPEN_BUGS, section 20), which
+        the owner may overrule: a record already written is never changed, and the value is not put
+        on a later step, as it was before (a baseline evaluation on step 0, a value after `flush()`
+        on the next step). Protocol 5's scalar-only record is to give it a place. This is the one
+        place that decides it."""
+        if self._late_said:
+            return
+        self._late_said = True
+        names = sorted(values)
+        shown = ", ".join(repr(n) for n in names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+        _warn(
+            f"TensorQuill left out the scalar{'s' if len(names) != 1 else ''} {shown}: {why}. A step already "
+            "written is never changed, and the value is not put on a later step; a scalar with a step of its own "
+            "comes with protocol 5's scalar-only record. Said once per session.",
+            stacklevel=4,
+        )
 
     def data(
         self,
@@ -4089,6 +4183,7 @@ class Session:
         deadline = time.monotonic() + CLOSE_SECONDS
         if not self._stopped:
             self._close_by = deadline  # the last block may wait for room, up to the deadline (`_put`)
+            self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
         if not self._stopped:
             try:

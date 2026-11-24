@@ -30,7 +30,9 @@ tensors already on the CPU, of a real dtype. A tensor anywhere else is skipped u
 ignored. W&B's `step` and `commit` and MLflow's `step` are ignored: the value is recorded through
 `session.log`, on the step it would give it, so several calls in one step (`commit=False`) add up there, and a key mirrored twice in a
 step keeps its last value. A key the session got from `session.log` itself in this step (the
-caller, or an adapter) is never replaced by a mirrored one.
+caller, or an adapter) is never replaced by a mirrored one. Under `phase("eval")` that step is the
+newest one still in memory (`Session.log`), and the same holds there: neither an explicit value
+logged after it ended nor its own value from before is replaced by a mirrored one.
 
 The wrappers are shared by every session that mirrors, installed by the first and taken out when
 the last one closes or stops; a name that someone else has wrapped again since is left as it is,
@@ -72,10 +74,10 @@ class _Patch:
 
 
 # The sessions that mirror, in the order they began; the names wrapped while any is open; what the
-# mirror stored in each session's step in progress (`_log_into`); and every wrapper made, weakly.
+# mirror stored where each session records a value (`_log_into`); and every wrapper made, weakly.
 _sessions: list[Any] = []
 _patches: list[_Patch] = []
-_written: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+_written: dict[int, dict[tuple[str, int], dict[str, Any]]] = {}
 _ours: "weakref.WeakSet[Callable[..., Any]]" = weakref.WeakSet()
 _lock = threading.RLock()  # install and removal only; never taken on a tracker's call
 _depth = threading.local()
@@ -297,22 +299,31 @@ def _record(values: list[tuple[str, Any]]) -> None:
 
 
 def _log_into(session: Any, values: list[tuple[str, Any]]) -> None:
-    """`session.log` the values whose key the step in progress does not hold from anyone else.
+    """`session.log` the values whose key the step they go on does not hold from anyone else.
 
-    The step's scalars are `session._pending_scalars`, a new dictionary at each step
-    (`Session._commit`). The mirror remembers, for that dictionary, the object it stored under each
-    key: a key holding anything else was logged by the caller or an adapter, and is kept."""
+    Where `session.log` puts a value now is `session._scalars_for_log()`: the step in progress, or,
+    under the "eval" phase, the newest step still in memory (lane AK-5), each named by a key that
+    changes when a step ends. The mirror remembers, for each of the last two such places, the object
+    it stored under each key: a key holding anything else was logged by the caller or an adapter, or
+    was the step's own before it ended, and is kept. With nowhere to go the value is passed to
+    `session.log` all the same, which leaves it out and says so once."""
     if session._closed or session._stopped:
         return
-    pending = session._pending_scalars
+    where, row = session._scalars_for_log()
+    if row is None:
+        session.log(dict(values))
+        return
     marks = _written.get(id(session))
-    if marks is None or marks[0] is not pending:
-        marks = (pending, {})
-        _written[id(session)] = marks
-    mine = marks[1]
+    if not isinstance(marks, dict):
+        marks = _written[id(session)] = {}
+    mine = marks.get(where)
+    if mine is None:
+        while len(marks) >= 2:  # the step in progress and the newest step are all a value can go on
+            del marks[next(iter(marks))]
+        mine = marks[where] = {}
     take = {}
     for key, number in values:
-        held = pending.get(key, _MISSING)
+        held = row.get(key, _MISSING)
         if held is not _MISSING and mine.get(key, _MISSING) is not held:
             continue
         take[key] = number
@@ -321,8 +332,9 @@ def _log_into(session: Any, values: list[tuple[str, Any]]) -> None:
     try:
         session.log(take)
     finally:
-        if session._pending_scalars is pending:
+        now, row = session._scalars_for_log()
+        if now == where and row is not None:
             for key in take:
-                stored = pending.get(key, _MISSING)
+                stored = row.get(key, _MISSING)
                 if stored is not _MISSING:
                     mine[key] = stored

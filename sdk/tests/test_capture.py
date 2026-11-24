@@ -600,14 +600,14 @@ def test_log_records_scalars_for_the_step_in_progress():
         opt.zero_grad()
         if step == 0:
             peaks.zero_()  # a logged view is copied, so later changes do not reach it
-    session.log(after_last_step=1.0)  # belongs to a step that never ends: not written
+    session.log(after_last_step=1.0, tokens=99)  # pending at close: on the newest step (lane AK-5), but for a name it holds
     session.close()
 
     scalars = [record["scalars"] for record in sink.records]
     assert [s["tokens"] for s in scalars] == [16, 16, 16]
     assert [s["peak"] for s in scalars] == [1.0, 0.0, 0.0]
     assert [s["train/loss"] for s in scalars] == pytest.approx(losses)
-    assert all("after_last_step" not in s for s in scalars)
+    assert ["after_last_step" in s for s in scalars] == [False, False, True] and scalars[2]["after_last_step"] == 1.0
     session.log(x=1.0)  # a closed session does nothing (lane U1, C04): no raise, no warning, nothing written
     assert len(sink.records) == 3
 

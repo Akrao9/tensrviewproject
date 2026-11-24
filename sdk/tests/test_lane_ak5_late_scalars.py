@@ -237,6 +237,10 @@ def test_step_as_a_keyword_is_refused_and_a_step_key_is_a_scalar():
 
 def test_the_repository_passes_no_step_keyword_to_session_log():
     """Searched before refusing `step=`: no example, test or page passes it to `session.log`."""
+    import re
+
+    # A call with a value for `step` (the refusal's own words, `step=...)`, are not a call).
+    call = re.compile(r"session\.log\([^)]*\bstep\s*=\s*(?!\.\.\.)")
     found = []
     for path in list((SDK / "examples").rglob("*.py")) + list((SDK / "src").rglob("*.py")) + [
         SDK / "README.md", SDK / "RUN_ON_YOUR_JOB.md", SDK / "AGENT_INSTRUCTIONS.md",
@@ -244,7 +248,7 @@ def test_the_repository_passes_no_step_keyword_to_session_log():
         if not path.exists():
             continue
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if "session.log(" in line and "step=" in line.split("session.log(", 1)[1]:
+            if call.search(line):
                 found.append(f"{path.name}:{number}")
     assert found == []
 
