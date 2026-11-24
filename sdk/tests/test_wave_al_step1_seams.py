@@ -87,7 +87,7 @@ def test_the_pages_give_protocol_5_and_quote_a_binary_of_protocol_4():
         assert message in readme, message
     for page in (readme, guide):
         assert "needs protocol 4" not in page
-        assert "(protocol 4)" not in page
+        assert "same version (protocol 4)" not in page  # history ("Since Nov 21, 2026 (protocol 4) ...") stays
 
 
 # --- 2. One row-version list -------------------------------------------------------------------
