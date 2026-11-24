@@ -210,6 +210,11 @@ def _protocol_4_report(records: list[dict]) -> dict:
     try:
         for name in saved:
             setattr(flight, name, getattr(v4, name))
+        # The stream must really be protocol 4's, or a target here would pass for a wrong reason.
+        import pyarrow as pa
+        from tensorquill.server_detect import records_stream
+
+        assert "layers_json" in pa.ipc.open_stream(records_stream(records)).schema.names
         return server_report(records)
     finally:
         for name, value in saved.items():

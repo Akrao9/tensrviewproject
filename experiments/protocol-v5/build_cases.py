@@ -19,7 +19,8 @@ at `5c286ed`): the base sent those, and since step 1 (`92e471a`) the tree's bina
 base's did, while the Python readers are the base's until step 2. So it runs on the base and on step
 1's joined tree alike, and gives the same file: run on `92e471a`'s descendants with this tree's
 binary, it reproduced the file written at the base, all but `base`, which records the commit it ran
-on. Step 2 changes the Python readers; from then on `today` is the file's, not a rerun's.
+on. Step 2 changes the Python readers (AL-4') and protocol 4's `layers_json` read (AL-3'); from then on
+`today` is the file's, not a rerun's.
 """
 
 from __future__ import annotations
@@ -50,9 +51,9 @@ KINDS = sorted(("activation_spike", "activation_drift", "dead_activations", "non
 # Protocol 4 rows a protocol 5 binary keeps reading as the base did, not as the clean records read (the
 # owner, Nov 24, item 4): `expect` is today's report on that path, and the case says why.
 KNOWN_V4 = {
-    "layers_name_arrow_cannot_encode": "not fixed (the owner, Nov 24): on protocol 4's row the whole layers map "
-    "travels in extra_json, so Rust reads no layer, while Python reads the record's layers; pinned on each side "
-    "by lane AL-S1",
+    "layers_name_arrow_cannot_encode": "not fixed (the owner, Nov 24): on protocol 4's row the whole layers map is in "
+    "layers_json, the name written as the JSON escape of a lone surrogate, which Rust's JSON reader refuses, so Rust "
+    "reads no layer of that row, while Python reads the record's layers; pinned on each side by lane AL-S1",
 }
 LOCATION_KEYS = ("layers", "modules", "gradients", "routers", "router", "parameters", "experts")
 
@@ -96,10 +97,18 @@ def brief(incident: dict) -> dict:
 def protocol_4_rows():
     """`server_report` sends protocol 4's rows while this is open: its stream takes `_row`,
     `flight_schema` and `rows_batch` from `tensorquill.flight` when it is called."""
+    import pyarrow as pa
+
+    from tensorquill.server_detect import records_stream
+
     saved = {name: getattr(flight, name) for name in ("_row", "flight_schema", "rows_batch")}
     try:
         for name in saved:
             setattr(flight, name, getattr(v4, name))
+        # If the stream stops taking them from `flight`, the reports would be protocol 5's: refuse.
+        probe = [{"schema_version": 1, "run_id": "probe", "rank": 0, "attempt": 1, "step": 0, "ts": 0.0}]
+        if "layers_json" not in pa.ipc.open_stream(records_stream(probe)).schema.names:
+            raise SystemExit("server_detect's stream no longer takes its rows from tensorquill.flight")
         yield
     finally:
         for name, value in saved.items():

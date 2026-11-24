@@ -1,8 +1,8 @@
 # Wave AL contract: protocol 5
 
-Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has since moved to `5749a89`, tests only). This is Phase 2 item 1 of the v1 plan, in two gated steps under one protocol bump: the typed columns and the probe split first (sections 1 to 3), the scalar-only record second (section 4). The pinned-memory flush, `grads=N`, K2, K3, the catalog and compaction are not in it.
+Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch). Step 1 merged into `trial/ai-wave` at `92e471a` (lanes AL-2, AL-3 and AL-1), and this branch was brought to it. This is Phase 2 item 1 of the v1 plan, in two gated steps under one protocol bump: the typed columns and the probe split first (sections 1 to 3), the scalar-only record second (section 4). The pinned-memory flush, `grads=N`, K2, K3, the catalog and compaction are not in it.
 
-- **Shared cases:** `sdk/tests/fixtures/wave_al/cases.json`, written by `experiments/protocol-v5/build_cases.py`. Each case says what every path must report, and what the base reports today. The builder runs on the base and on step 1's joined tree alike: it sends protocol 4's rows (`flight_v4.py`, frozen) to the tree's binary, which reads them as the base's did, and on `92e471a`'s tree it reproduced the file all but its `base` field. `sdk/tests/test_wave_al_contract.py` reads them.
+- **Shared cases:** `sdk/tests/fixtures/wave_al/cases.json`, written by `experiments/protocol-v5/build_cases.py`. Each case says what every path must report, and what the base reports today. The builder runs on the base and on step 1's joined tree alike: it sends protocol 4's rows (`flight_v4.py`, frozen) to the tree's binary, which reads them as the base's did, and on `92e471a`'s tree it reproduced the file all but its `base` field. That holds until step 2, whose lanes AL-4′ (the Python readers) and AL-3′ (protocol 4's `layers_json`) change what `today` would be; from then on `today` is the file's, not a rerun's. `sdk/tests/test_wave_al_contract.py` reads them.
 - **Measurements:** `experiments/protocol-v5/` (`prototype.py`, `captures.py`, `live.py`, `measure.py`, `rust-reader/`), results in `results/`. The results up to `eab810a` ran on this Mac's CPU against the base's protocol 4 release binary, with no product code changed; a "v5" figure there is the prototype's layout, sent to and stored by the protocol 4 server. Since step 1 merged (`92e471a`), `captures.py` and `measure.py` run the SDK's own `flight` against the tree's own server (`experiments/protocol-v5/README.md`).
 - **Read by:** the coordinating session that cuts the lanes, and the lanes of section 9.
 
@@ -193,17 +193,17 @@ A value pending at `close()` with no step at all (a session that never trained) 
   - Python raises `AttributeError: 'int' object has no attribute 'get'`.
   - Rust's `Members<LayerStats>` fails on the entry and drops every layer of every row: the activation kinds are `not_configured`.
 - **`layers_value_not_object`:** Python raises `AttributeError: 'list' object has no attribute 'items'`. Rust already reads no layers.
-- **`layers_name_arrow_cannot_encode`:** Rust loses every layer. Arrow refuses the key, so the whole map goes to `extra_json` today. Under section 1.4 only that entry does.
+- **`layers_name_arrow_cannot_encode`:** Rust loses every layer. Today's row (protocol 4) holds the whole map in `layers_json`, the name written as the JSON escape of a lone surrogate (`\ud800`), which Rust's JSON reader refuses, so it reads no layer of the row; Python's reader takes it. Under section 1.4 Arrow refuses the name as a key, so only that entry goes to `extra_json`.
 
 **Who fixes them:**
 - Python (lane AL-4′, in step 2 with the other Python readers) skips an entry that is not an object, and a `layers` value that is not an object, as absent.
 - Rust (lane AL-3, with AL-1's layout) reads the rest of the map.
 
-**A row whose only layers are null structs holds no layer (the owner, Nov 24, S5).** Every entry not an object, each a null struct in its place: Rust reads the row as one with `layers {}` already, since a null struct is absent. Python counts a non-empty `layers` object as holding layers (`evidence.py` near line 1013, `layers_not_read_not_checked`, and near line 3354, the input counts). Lane AL-4′ makes it count only entries that are objects, so both engines read such a row as one with no layer. The owner approved this as a change of detector behaviour in Python (section 7). Case `layers_only_entries_not_object`: its `python` path is AL-4′'s target; its Rust paths are pins.
+**A row whose only layers are null structs holds no layer (the owner, Nov 24, S5).** Every entry not an object, each a null struct in its place: Rust reads the row as one with `layers {}` already, since a null struct is absent. Python counts a non-empty `layers` object as holding layers (`evidence.py` near line 1013, `layers_not_read_not_checked`, and near line 3354, the input counts). Lane AL-4′ makes it count only entries that are objects, so both engines read such a row as one with no layer. The owner approved this as a change of detector behaviour in Python (section 7). Case `layers_only_entries_not_object`: its `python` path is AL-4′'s target; its Rust paths are pins. It holds the input count's side (near line 3354): a Python that skipped the entries but still counted the object would report the activation kinds `checked` where `not_configured` is expected. The `layers_not_read` coverage's side (near line 1013) is AL-4′'s own test, since no case record says `layers_not_read`.
 
 **Protocol 4's rows (the owner, Nov 24, S4).** A protocol 5 binary reads a protocol 4 row as the base did: each case's `rust_raw_v4` path (`detect` given the rows `flight_v4.py` writes, as an older SDK sends them) is pinned at today's report, but for two:
 - **`layers_entry_not_object`: step 2's fix.** Lane AL-3′ (`detect.rs`) reads `layers_json` entry by entry, so an entry that is not an object is absent and the rest of the map is read, as section 1.5 reads the null struct. Python reads a protocol 4 row through `row_to_record` into the same record, so AL-4′'s `python` target is its side, and Python and Rust read the same old row. Target: `layers_entry_not_object-rust_raw_v4-target`.
-- **`layers_name_arrow_cannot_encode`: not fixed, a known difference.** On a protocol 4 row the whole `layers` map travels in `extra_json`, so Rust reads no layer, while Python reads the record's layers. The case's `known_difference` says so, its `rust_raw_v4` expectation is today's report, and lane AL-S1 pins it on each side.
+- **`layers_name_arrow_cannot_encode`: not fixed, a known difference.** On a protocol 4 row the whole `layers` map is in `layers_json`, the name written as the JSON escape of a lone surrogate, which Rust's JSON reader refuses: Rust reads no layer of that row, while Python reads the record's layers. AL-3′'s per-entry read does not change this. The case's `known_difference` says so, its `rust_raw_v4` expectation is today's report, and lane AL-S1 pins it on each side.
 
 **Every other case gives today's results in both engines,** and the tests pin them (`-pin` in their IDs). That includes `moe_stats_diversity_refused`:
 - Python reads `float(true)` as a diversity of 1.0, where Rust takes it from the counts. Both still report the same `moe_imbalance`.
@@ -211,7 +211,7 @@ A value pending at `close()` with no step at all (a session that never trained) 
 
 ### 1.6 The round trip on the recorded captures
 
-`captures.py` sent every record of the seven captures (`granite-full`, `granite`, `granite-no-grads`, `granite-router-only`, `dense`, both `trainer`) through the prototype and back through a real Arrow batch: 3,800 records, none unequal, none with a map out of order. The rows that carry `extra_json` (13, 13, 0, 0, 8, 8, 8) hold `optimizer_ownership` and `weight_dtypes`, as today; none holds a refused field.
+`captures.py` sent every record of the seven captures (`granite-full`, `granite`, `granite-no-grads`, `granite-router-only`, `dense`, both `trainer`) through the prototype and back through a real Arrow batch (at the base; since step 1, through the SDK's own `flight`, with the same figures and every row equal to the prototype's): 3,800 records, none unequal, none with a map out of order. The rows that carry `extra_json` (13, 13, 0, 0, 8, 8, 8) hold `optimizer_ownership` and `weight_dtypes`, as today; none holds a refused field.
 
 ### 1.7 The cases
 
@@ -590,7 +590,7 @@ Under Q4 (a), `detect.rs`'s only step 2 work is AL-3′'s. Under Q4 (b) it would
 
 ## 10. What the sibling clones do
 
-- **arrow-rs** (`/Users/ak/Documents/tensrview/arrow-rs`, main of Nov 14; the server pins 60.1.0).
+- **arrow-rs** (the sibling clone beside this repository, main of Nov 14; the server pins 60.1.0).
   - `DataType::Map(field, keys_sorted)` is `List<entries: Struct<key, value>>`. Its keys "should be hashable and unique", which is not enforced.
   - A map read from Parquet takes its `keys_sorted` flag from the stored Arrow schema (`parquet/src/arrow/schema/complex.rs`), or `false` without one (`array_reader/map_array.rs`). Nothing in the read path sorts entries; D1 measured that order holds.
   - `ArrowWriter::write` refuses a batch of another schema, so a part has one.

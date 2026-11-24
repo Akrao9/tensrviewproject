@@ -1,6 +1,6 @@
 {
  "contract": "WAVE_AL_CONTRACT.md",
- "base": "44848820988e422f0f0ceb9d821f647584ee9c7f",
+ "base": "258095a06659eb75051c2b267876b949791b4156",
  "how_to_read": [
   "Base trial/ai-wave f71d8e0. The base field is the commit the file was last written on; today and expect are the base's (its Python readers, and protocol 4's rows through a binary that reads them as the base's did). The rules are WAVE_AL_CONTRACT.md.",
   "paths: row = flight.record_to_row and row_to_record in protocol 5's layout; python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_raw_v4 = tensorquill-server detect given protocol 4's rows (experiments/protocol-v5/flight_v4.py), as an older SDK sends them; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
@@ -10172,7 +10172,7 @@
     }
    },
    "known_difference": {
-    "rust_raw_v4": "not fixed (the owner, Nov 24): on protocol 4's row the whole layers map travels in extra_json, so Rust reads no layer, while Python reads the record's layers; pinned on each side by lane AL-S1"
+    "rust_raw_v4": "not fixed (the owner, Nov 24): on protocol 4's row the whole layers map is in layers_json, the name written as the JSON escape of a lone surrogate, which Rust's JSON reader refuses, so Rust reads no layer of that row, while Python reads the record's layers; pinned on each side by lane AL-S1"
    }
   },
   {
