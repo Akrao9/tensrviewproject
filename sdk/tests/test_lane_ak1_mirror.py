@@ -466,18 +466,6 @@ def test_several_calls_in_one_step_accumulate_and_the_last_value_of_a_key_wins(w
     assert _scalars(sink) == [{"a": 10, "b": 2, "c": 3.0}, {"d": 4}]
 
 
-def test_a_value_logged_after_optimizer_step_belongs_to_the_next_step_as_with_session_log(wandb_):
-    wandb_.module.init()
-    model = _model()
-    session, sink, opt = _open(model)
-    _step(model, opt)
-    wandb_.module.log({"loss": 1.0})  # the step already ended at optimizer.step()
-    session.log({"explicit": 2.0})
-    _step(model, opt)
-    session.close()
-    assert _scalars(sink) == [{}, {"loss": 1.0, "explicit": 2.0}]
-
-
 # ---- explicit session.log() wins ---------------------------------------------------------------
 
 

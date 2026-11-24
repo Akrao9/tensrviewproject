@@ -1,8 +1,9 @@
 """Lane AK-1: the scalar mirror against the real `wandb` and `mlflow` packages, where installed.
 
-Neither is installed in the project's test interpreter, so both tests skip there; the stand-ins in
-`test_lane_ak1_mirror.py` cover the same behaviour. These run W&B offline and MLflow on a local
-file store: no network, no API key.
+Neither is installed in the project's `.venv` (or in CI), so these skip there and the stand-ins in
+`test_lane_ak1_mirror.py` cover the same behaviour; the owner's `.venv-trackers` has both. W&B runs
+offline (and disabled) in a temporary `WANDB_DIR`, MLflow on a SQLite store in a temporary folder
+(MLflow 3.18 refuses a `file:` store): no network, no API key.
 """
 
 from __future__ import annotations
@@ -55,9 +56,39 @@ def test_real_wandb_in_both_orders(tmp_path, monkeypatch, tensorquill_first, mod
     assert wandb.Run.__dict__["log"] is original
 
 
-def test_real_mlflow_on_a_local_file_store(tmp_path):
+def test_real_wandb_finished_and_a_new_run_while_the_session_is_open(tmp_path, monkeypatch):
+    wandb = pytest.importorskip("wandb")
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    monkeypatch.setenv("WANDB_SILENT", "true")
+    before_init = wandb.log
+    torch.manual_seed(0)
+    model = nn.Linear(4, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    first = wandb.init(project="ak1", mode="offline")
+    session = _open(model)
+    second = None
+    try:
+        wandb.log({"a": 1.0})
+        first.finish()
+        with pytest.raises(wandb.Error):
+            wandb.log({"a": 9.0})  # W&B's own pre-init error, unchanged
+        second = wandb.init(project="ak1", mode="offline")
+        assert wandb.log is not before_init
+        wandb.log({"b": 2.0})
+        _step(model, opt)
+    finally:
+        if second is not None:
+            second.finish()
+        session.close()
+    assert [r.get("scalars", {}) for r in session._sink.records] == [{"a": 1.0, "b": 2.0}]
+
+
+def test_real_mlflow_on_a_local_sqlite_store(tmp_path, monkeypatch):
     mlflow = pytest.importorskip("mlflow")
-    mlflow.set_tracking_uri((tmp_path / "mlruns").as_uri())
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    mlflow.set_tracking_uri(uri)
     original = (mlflow.log_metric, mlflow.log_metrics)
     torch.manual_seed(0)
     model = nn.Linear(4, 1)
@@ -67,9 +98,10 @@ def test_real_mlflow_on_a_local_file_store(tmp_path):
         with mlflow.start_run():
             mlflow.log_metric("loss", 0.5)  # MLflow's own step 0 is not TensorQuill's
             mlflow.log_metrics({"eval/acc": 0.25}, step=1000)
+            mlflow.tracking.fluent.log_metric("lr", 0.01)  # the defining module's own name
             _step(model, opt)
     finally:
         session.close()
     scalars = [r.get("scalars", {}) for r in session._sink.records]
-    assert scalars == [{"loss": 0.5, "eval/acc": 0.25}]
+    assert scalars == [{"loss": 0.5, "eval/acc": 0.25, "lr": 0.01}]
     assert (mlflow.log_metric, mlflow.log_metrics) == original

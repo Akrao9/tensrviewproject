@@ -27,8 +27,8 @@ tracker refused records nothing.
 Accepted values: `int` and `float` (not `bool`), NumPy integer and floating scalars, and 0-D
 tensors already on the CPU, of a real dtype. A tensor anywhere else is skipped unread: no
 `.item()`, no copy, no sync. Media, strings, lists, nested dictionaries and anything else are
-ignored. W&B's `step` and `commit` and MLflow's `step` are ignored: the value goes to the step in
-progress, so several calls in one step (`commit=False`) add up there, and a key mirrored twice in a
+ignored. W&B's `step` and `commit` and MLflow's `step` are ignored: the value is recorded through
+`session.log`, on the step it would give it, so several calls in one step (`commit=False`) add up there, and a key mirrored twice in a
 step keeps its last value. A key the session got from `session.log` itself in this step (the
 caller, or an adapter) is never replaced by a mirrored one.
 

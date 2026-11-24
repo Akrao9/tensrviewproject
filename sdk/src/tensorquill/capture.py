@@ -4820,8 +4820,8 @@ def init(
             other optimizer is not read, and the evidence says so (`not_checked`).
         mirror_scalars: also record, as `session.log` would, the plain numbers this process logs
             through `wandb.log` / `wandb.Run.log` and `mlflow.log_metric` / `mlflow.log_metrics`,
-            on TensorQuill's step in progress (W&B's `step` and `commit` and MLflow's `step` are
-            ignored), so incidents and `compare` have the loss and evaluation numbers beside them.
+            on the step `session.log` would give them (W&B's `step` and `commit` and MLflow's
+            `step` are ignored), so incidents and `compare` have the loss and evaluation numbers beside them.
             Python `int` and `float` (not `bool`), NumPy scalars and 0-D tensors already on the CPU
             are taken; a tensor on a GPU is skipped unread (no sync), and images, tables, strings
             and lists are ignored. A key this session got from `session.log` in the same step
