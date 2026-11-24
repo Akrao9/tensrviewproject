@@ -1,0 +1,506 @@
+{
+ "started": "2026-11-24 13:53:13",
+ "load_at_start": [
+  4.7880859375,
+  6.625,
+  8.11865234375
+ ],
+ "cpu_count": 8,
+ "python": "3.12.3",
+ "pyarrow": "26.0.1",
+ "bench_store": {
+  "ranks": 64,
+  "steps": 1000,
+  "shape": {
+   "blocks": 24,
+   "experts": 32,
+   "top_k": 8
+  },
+  "parts": 1280,
+  "bytes": 310767368,
+  "write_seconds": 4.9
+ },
+ "part_bytes": {
+  "v4": 4855064,
+  "v5": 4367619
+ },
+ "rounds": [
+  {
+   "load_before": 5.27,
+   "v4": {
+    "checksum": 44203.27124582506,
+    "layers_decode": {
+     "max_ms": 4.894585000000001,
+     "median_ms": 4.894585000000001,
+     "min_ms": 4.894585000000001,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 4.26496,
+     "median_ms": 4.26496,
+     "min_ms": 4.26496,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 24.607248000000002,
+     "median_ms": 24.607248000000002,
+     "min_ms": 24.607248000000002,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "v5": {
+    "checksum": 44203.271245824806,
+    "layers_decode": {
+     "max_ms": 0.175371,
+     "median_ms": 0.175371,
+     "min_ms": 0.175371,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 0.06775000000000002,
+     "median_ms": 0.06775000000000002,
+     "min_ms": 0.06775000000000002,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 18.722084999999996,
+     "median_ms": 18.722084999999996,
+     "min_ms": 18.722084999999996,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "python_load_records_v4_ms": 399.9457500176504,
+   "python_records_v4": 1000,
+   "python_load_records_v5_ms": 317.0752909500152,
+   "python_records_v5": 1000
+  },
+  {
+   "load_before": 5.27,
+   "v4": {
+    "checksum": 44203.27124582506,
+    "layers_decode": {
+     "max_ms": 4.86367,
+     "median_ms": 4.86367,
+     "min_ms": 4.86367,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 4.261831000000001,
+     "median_ms": 4.261831000000001,
+     "min_ms": 4.261831000000001,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 18.274500999999997,
+     "median_ms": 18.274500999999997,
+     "min_ms": 18.274500999999997,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "v5": {
+    "checksum": 44203.271245824806,
+    "layers_decode": {
+     "max_ms": 0.17870599999999998,
+     "median_ms": 0.17870599999999998,
+     "min_ms": 0.17870599999999998,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 0.06870900000000003,
+     "median_ms": 0.06870900000000003,
+     "min_ms": 0.06870900000000003,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 19.202000999999996,
+     "median_ms": 19.202000999999996,
+     "min_ms": 19.202000999999996,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "python_load_records_v4_ms": 341.9671250740066,
+   "python_records_v4": 1000,
+   "python_load_records_v5_ms": 303.9442920126021,
+   "python_records_v5": 1000
+  },
+  {
+   "load_before": 5.27,
+   "v4": {
+    "checksum": 44203.27124582506,
+    "layers_decode": {
+     "max_ms": 4.884377000000001,
+     "median_ms": 4.884377000000001,
+     "min_ms": 4.884377000000001,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 4.286083,
+     "median_ms": 4.286083,
+     "min_ms": 4.286083,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 17.508831,
+     "median_ms": 17.508831,
+     "min_ms": 17.508831,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "v5": {
+    "checksum": 44203.271245824806,
+    "layers_decode": {
+     "max_ms": 0.180167,
+     "median_ms": 0.180167,
+     "min_ms": 0.180167,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 0.06841500000000003,
+     "median_ms": 0.06841500000000003,
+     "min_ms": 0.06841500000000003,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 20.39471,
+     "median_ms": 20.39471,
+     "min_ms": 20.39471,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "python_load_records_v4_ms": 275.87999997194856,
+   "python_records_v4": 1000,
+   "python_load_records_v5_ms": 308.1133330706507,
+   "python_records_v5": 1000
+  },
+  {
+   "load_before": 5.27,
+   "v4": {
+    "checksum": 44203.27124582506,
+    "layers_decode": {
+     "max_ms": 4.862291,
+     "median_ms": 4.862291,
+     "min_ms": 4.862291,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 4.2759990000000005,
+     "median_ms": 4.2759990000000005,
+     "min_ms": 4.2759990000000005,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 19.391832,
+     "median_ms": 19.391832,
+     "min_ms": 19.391832,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "v5": {
+    "checksum": 44203.271245824806,
+    "layers_decode": {
+     "max_ms": 0.191917,
+     "median_ms": 0.191917,
+     "min_ms": 0.191917,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 0.06895900000000003,
+     "median_ms": 0.06895900000000003,
+     "min_ms": 0.06895900000000003,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 20.943669999999997,
+     "median_ms": 20.943669999999997,
+     "min_ms": 20.943669999999997,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "python_load_records_v4_ms": 348.29837502911687,
+   "python_records_v4": 1000,
+   "python_load_records_v5_ms": 239.34991599526256,
+   "python_records_v5": 1000
+  },
+  {
+   "load_before": 5.27,
+   "v4": {
+    "checksum": 44203.27124582506,
+    "layers_decode": {
+     "max_ms": 4.915836,
+     "median_ms": 4.915836,
+     "min_ms": 4.915836,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 4.2747079999999995,
+     "median_ms": 4.2747079999999995,
+     "min_ms": 4.2747079999999995,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 17.979376,
+     "median_ms": 17.979376,
+     "min_ms": 17.979376,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "v5": {
+    "checksum": 44203.271245824806,
+    "layers_decode": {
+     "max_ms": 0.18045899999999998,
+     "median_ms": 0.18045899999999998,
+     "min_ms": 0.18045899999999998,
+     "rounds": 1
+    },
+    "moe_stats_decode": {
+     "max_ms": 0.07141900000000002,
+     "median_ms": 0.07141900000000002,
+     "min_ms": 0.07141900000000002,
+     "rounds": 1
+    },
+    "parts": 20,
+    "probe_json_as_value": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "probe_json_skipped": {
+     "max_ms": 0.0,
+     "median_ms": 0.0,
+     "min_ms": 0.0,
+     "rounds": 1
+    },
+    "read_part": {
+     "max_ms": 19.817377,
+     "median_ms": 19.817377,
+     "min_ms": 19.817377,
+     "rounds": 1
+    },
+    "rows": 1000
+   },
+   "python_load_records_v4_ms": 334.9521670024842,
+   "python_records_v4": 1000,
+   "python_load_records_v5_ms": 303.19224996492267,
+   "python_records_v5": 1000
+  }
+ ],
+ "summary": {
+  "v4": {
+   "read_part": {
+    "median": 18.274500999999997,
+    "min": 17.508831,
+    "max": 24.607248000000002,
+    "n": 5
+   },
+   "layers_decode": {
+    "median": 4.884377000000001,
+    "min": 4.862291,
+    "max": 4.915836,
+    "n": 5
+   },
+   "moe_stats_decode": {
+    "median": 4.2747079999999995,
+    "min": 4.261831000000001,
+    "max": 4.286083,
+    "n": 5
+   },
+   "python_load_records_ms": {
+    "median": 341.9671250740066,
+    "min": 275.87999997194856,
+    "max": 399.9457500176504,
+    "n": 5
+   }
+  },
+  "v5": {
+   "read_part": {
+    "median": 19.817377,
+    "min": 18.722084999999996,
+    "max": 20.943669999999997,
+    "n": 5
+   },
+   "layers_decode": {
+    "median": 0.180167,
+    "min": 0.175371,
+    "max": 0.191917,
+    "n": 5
+   },
+   "moe_stats_decode": {
+    "median": 0.06870900000000003,
+    "min": 0.06775000000000002,
+    "max": 0.07141900000000002,
+    "n": 5
+   },
+   "python_load_records_ms": {
+    "median": 303.9442920126021,
+    "min": 239.34991599526256,
+    "max": 317.0752909500152,
+    "n": 5
+   }
+  }
+ },
+ "rows": 1000,
+ "detect_store_bench": [
+  {
+   "load_before": 5.27,
+   "exit": 0,
+   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 72.60 / 89.19\n    of which JSON decoding alone (measured apart): 34.79 / 40.83\n  writing the Parquet parts: 142.58 / 172.86\n  writing incidents.json for every rank: 13.33 / 16.47\n  reading the parts back (not on the live path): 57.99 / 83.63\n  detectors per step: 22.69 us\nreplay of one rank (1000 steps): 43 ms\nreplay of all 64 ranks at once (64000 steps): 605 ms\n",
+   "stderr": ""
+  },
+  {
+   "load_before": 4.93,
+   "exit": 0,
+   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 72.75 / 77.17\n    of which JSON decoding alone (measured apart): 34.70 / 35.35\n  writing the Parquet parts: 141.72 / 149.40\n  writing incidents.json for every rank: 13.42 / 16.47\n  reading the parts back (not on the live path): 58.45 / 66.97\n  detectors per step: 22.73 us\nreplay of one rank (1000 steps): 41 ms\nreplay of all 64 ranks at once (64000 steps): 585 ms\n",
+   "stderr": ""
+  },
+  {
+   "load_before": 5.02,
+   "exit": 0,
+   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 72.83 / 80.02\n    of which JSON decoding alone (measured apart): 34.86 / 35.34\n  writing the Parquet parts: 140.99 / 146.72\n  writing incidents.json for every rank: 13.46 / 15.69\n  reading the parts back (not on the live path): 58.14 / 65.03\n  detectors per step: 22.76 us\nreplay of one rank (1000 steps): 42 ms\nreplay of all 64 ranks at once (64000 steps): 580 ms\n",
+   "stderr": ""
+  },
+  {
+   "load_before": 4.55,
+   "exit": 0,
+   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 72.66 / 75.43\n    of which JSON decoding alone (measured apart): 34.65 / 34.92\n  writing the Parquet parts: 140.80 / 154.87\n  writing incidents.json for every rank: 13.56 / 14.43\n  reading the parts back (not on the live path): 58.83 / 68.52\n  detectors per step: 22.71 us\nreplay of one rank (1000 steps): 42 ms\nreplay of all 64 ranks at once (64000 steps): 581 ms\n",
+   "stderr": ""
+  },
+  {
+   "load_before": 4.67,
+   "exit": 0,
+   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 72.72 / 74.96\n    of which JSON decoding alone (measured apart): 34.75 / 36.29\n  writing the Parquet parts: 140.96 / 153.82\n  writing incidents.json for every rank: 13.44 / 14.59\n  reading the parts back (not on the live path): 58.19 / 68.09\n  detectors per step: 22.72 us\nreplay of one rank (1000 steps): 42 ms\nreplay of all 64 ranks at once (64000 steps): 592 ms\n",
+   "stderr": ""
+  }
+ ],
+ "load_at_end": [
+  4.3369140625,
+  6.23095703125,
+  7.8798828125
+ ]
+}

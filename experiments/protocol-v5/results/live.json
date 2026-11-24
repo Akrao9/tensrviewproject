@@ -1,0 +1,252 @@
+{
+ "binary_protocol": "4",
+ "order": {
+  "sent_order": [
+   "model.layers.0",
+   "model.layers.1",
+   "model.layers.2",
+   "model.layers.10",
+   "model.layers.11",
+   "model.layers.3",
+   "model.layers.20"
+  ],
+  "on_part": {
+   "pyarrow": [
+    [
+     "model.layers.0",
+     "model.layers.1",
+     "model.layers.2",
+     "model.layers.10",
+     "model.layers.11",
+     "model.layers.3",
+     "model.layers.20"
+    ]
+   ],
+   "rust": [
+    [
+     "model.layers.0",
+     "model.layers.1",
+     "model.layers.2",
+     "model.layers.10",
+     "model.layers.11",
+     "model.layers.3",
+     "model.layers.20"
+    ]
+   ]
+  },
+  "after_restart": {
+   "part-00000000-00000004.parquet": {
+    "pyarrow": [
+     [
+      "model.layers.0",
+      "model.layers.1",
+      "model.layers.2",
+      "model.layers.10",
+      "model.layers.11",
+      "model.layers.3",
+      "model.layers.20"
+     ]
+    ],
+    "rust": [
+     [
+      "model.layers.0",
+      "model.layers.1",
+      "model.layers.2",
+      "model.layers.10",
+      "model.layers.11",
+      "model.layers.3",
+      "model.layers.20"
+     ]
+    ]
+   },
+   "part-00000005-00000009.parquet": {
+    "pyarrow": [
+     [
+      "model.layers.0",
+      "model.layers.1",
+      "model.layers.2",
+      "model.layers.10",
+      "model.layers.11",
+      "model.layers.3",
+      "model.layers.20"
+     ]
+    ],
+    "rust": [
+     [
+      "model.layers.0",
+      "model.layers.1",
+      "model.layers.2",
+      "model.layers.10",
+      "model.layers.11",
+      "model.layers.3",
+      "model.layers.20"
+     ]
+    ]
+   }
+  },
+  "acks": [
+   {
+    "ack": {
+     "end_byte_offset": 1000,
+     "store_id": "ce71536b4b44c9382eaefb83a8f580f5"
+    },
+    "seconds": 0.33457416703458875
+   },
+   {
+    "ack": {
+     "end_byte_offset": 1000,
+     "store_id": "ce71536b4b44c9382eaefb83a8f580f5"
+    },
+    "seconds": 0.3319507499691099
+   }
+  ],
+  "kept": true,
+  "rebuilds": 1,
+  "report_rows": 10,
+  "stderr": "tensorquill-server: store ID ce71536b4b44c9382eaefb83a8f580f5\ntensorquill-server: the stream of order rank 0 ended (code Ok); received 1 batches, 5 rows, 11671 bytes; acknowledged to offset 1000; the request had ended first; the response was open; open 0.3 s"
+ },
+ "old_server_typed": {
+  "acks": [
+   {
+    "end_byte_offset": 1000,
+    "store_id": "81070f592827fbfc5852fffe4d1a0961"
+   },
+   {
+    "end_byte_offset": 2000,
+    "store_id": "81070f592827fbfc5852fffe4d1a0961"
+   },
+   {
+    "end_byte_offset": 3000,
+    "store_id": "81070f592827fbfc5852fffe4d1a0961"
+   }
+  ],
+  "parts": [
+   "part-00000000-00000049.parquet",
+   "part-00000050-00000099.parquet",
+   "part-00000100-00000119.parquet"
+  ],
+  "server_incidents": [],
+  "server_kind_checks_activation_spike": {
+   "enough_history": false,
+   "needs": "layers (full capture)",
+   "records": 0,
+   "records_needed": 11,
+   "value": "not_configured"
+  },
+  "python_on_the_records": [
+   [
+    "activation_spike",
+    115,
+    null
+   ]
+  ],
+  "python_kind_checks_activation_spike": {
+   "value": "checked",
+   "records": 120,
+   "records_needed": 11,
+   "enough_history": true,
+   "needs": "layers (full capture)"
+  }
+ },
+ "old_server_row_v2": {
+  "acks": [
+   {
+    "ack": {
+     "end_byte_offset": 1000,
+     "store_id": "c97fca96bf70e625d7a8cf68dc81cbc5"
+    },
+    "seconds": 0.001974791055545211
+   }
+  ],
+  "parts": [],
+  "dropped_rows": 5,
+  "dropped_row_keys": {
+   "unsupported_schema_version": 5
+  },
+  "stderr": "annot be stored: 5 of a schema_version this server does not read (5 such rows since the server started)\ntensorquill-server: the stream of rowv2 rank 0 ended (code Ok); received 1 batches, 5 rows, 11671 bytes; acknowledged to offset 1000; the request had ended first; the response was open; open 0.0 s"
+ },
+ "old_server_meta_v2": {
+  "acks": [
+   {
+    "ack": null,
+    "seconds": 0.0004941249499097466
+   },
+   {
+    "error": "ArrowInvalid: Flight returned invalid argument error, with message: schema_version 2 is not supported; this server reads version 1. gRPC client debug context: INVALID_ARGUMENT:schema_version 2 is not supported; this server reads version 1. Client context: OK"
+   }
+  ],
+  "parts": [],
+  "stderr": "0e55e9f13c86aad6\ntensorquill-server: the stream of metav2 rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 5 rows, 11672 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s"
+ },
+ "old_python_on_v5_part": {
+  "v4-accepted": {
+   "loaded": 120,
+   "layers_in_first_record": false,
+   "incidents": [],
+   "kind_checks_activation_spike": {
+    "value": "not_configured",
+    "records": 0,
+    "records_needed": 11,
+    "enough_history": false,
+    "needs": "layers (full capture)"
+   }
+  },
+  "v5": {
+   "raised": "MalformedRecordError: schema_version is 2 at /var/folders/n_/yn1f8vmd6p1d7p8p0fqfbf0c0000gn/T/tmpd2ddrp99/oldpy-v5/runs/oldpy/rank=0/attempt=1/part-00000000-00000119.parquet, row 0: this tensorquill reads schema versions 0 and 1"
+  },
+  "the_same_records_from_jsonl": [
+   [
+    "activation_spike",
+    115
+   ]
+  ]
+ },
+ "watermark": {
+  "acks": [
+   {
+    "end_byte_offset": 1000,
+    "store_id": "86844f795a25adefd3c2235b4a52412e"
+   },
+   {
+    "end_byte_offset": 1000,
+    "store_id": "86844f795a25adefd3c2235b4a52412e"
+   }
+  ],
+  "stored_steps": [
+   0,
+   1,
+   2,
+   3,
+   1000
+  ],
+  "rank_counts": {
+   "last_step": null,
+   "rows_not_newer": 6
+  },
+  "lost": [
+   4,
+   5,
+   6,
+   7,
+   8,
+   9
+  ],
+  "stderr": "rst; the response was open; open 0.3 s\ntensorquill-server: store ID 86844f795a25adefd3c2235b4a52412e\ntensorquill-server: the stream of watermark rank 0 ended (code Ok); received 1 batches, 6 rows, 9947 bytes; acknowledged to offset 1000; the request had ended first; the response was open; open 0.0 s"
+ },
+ "struct_field_added": {
+  "part-00000000-00000000.parquet": {
+   "pyarrow_by_name": {
+    "diversity": 0.5,
+    "token_entropy": "absent"
+   },
+   "rust_by_name": "absent"
+  },
+  "part-00000001-00000001.parquet": {
+   "pyarrow_by_name": {
+    "diversity": 0.5,
+    "token_entropy": 0.7
+   },
+   "rust_by_name": 0.7
+  }
+ }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "part-reader"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "WAVE_AL_CONTRACT.md's measurements: reads a stored part the way detect.rs does (Storage::read_part) and times the JSON columns against the prototype's typed ones. Not product code."
+
+# Its own workspace: never part of the server's build.
+[workspace]
+
+[[bin]]
+name = "part-reader"
+path = "src/main.rs"
+
+[dependencies]
+tensorquill-server = { path = "../../../server", default-features = false }
+arrow = "60.1.0"
+object_store = "0.14.2"
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "async", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
