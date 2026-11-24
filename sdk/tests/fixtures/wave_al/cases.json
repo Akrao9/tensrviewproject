@@ -16186,7 +16186,7 @@
   {
    "name": "scalar_log_refusals",
    "section": 4,
-   "about": "session.log(..., step=s) refuses, before anything is recorded: a bool, a float, a negative integer or text as s (TypeError or ValueError, as log refuses a bad value); with no step= the rules of wave AK hold (owner's question 6 for a value with no step in memory)",
+   "about": "session.log(..., step=s) refuses, before anything is recorded: a bool, a float, a negative integer or text as s (TypeError or ValueError, as log refuses a bad value); with no step= the rules of wave AK hold (owner's question Q5 for a value with no step in memory)",
    "paths": [
     "capture"
    ],

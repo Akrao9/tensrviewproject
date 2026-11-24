@@ -344,7 +344,7 @@ def section_4() -> list[dict]:
         {"today_raises": "MalformedRecordError"}, ("today",))
     add("scalar_log_refusals", "session.log(..., step=s) refuses, before anything is recorded: a bool, a float, a "
         "negative integer or text as s (TypeError or ValueError, as log refuses a bad value); with no step= the rules "
-        "of wave AK hold (owner's question 6 for a value with no step in memory)",
+        "of wave AK hold (owner's question Q5 for a value with no step in memory)",
         [], {"refused_steps": [True, 1.5, -1, "3"], "written": 0}, ("capture",))
     return cases
 
