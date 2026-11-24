@@ -4,7 +4,14 @@
         .venv/bin/python experiments/protocol-v5/live.py --out experiments/protocol-v5/results/live.json
 
 Each check starts its own server on a fresh store in a temporary folder, sends with a plain
-pyarrow Flight client (`put`), and reads what the server stored. Nothing under sdk/src or
+pyarrow Flight client (`put`), and reads what the server stored.
+
+These checks describe the base (`f71d8e0`): `results/live.json` was made with that tree's protocol 4
+binary. Since step 1 merged (`92e471a`) the tree's own binary is protocol 5's, so to reproduce
+`live.json` point `TENSORQUILL_SERVER_BIN` at a binary built from the base, and for
+`old_python_on_v5_part` run it with the base's SDK on `PYTHONPATH` in place of this tree's. The rows are unchanged:
+protocol 4's come from `flight_v4.py` (frozen at `5c286ed`), the typed ones from `prototype.py`.
+`measure.py` imports `Server` and `put` from here. Nothing under sdk/src or
 server/src is changed. The checks (WAVE_AL_CONTRACT.md, the "today" of each cell):
 
 - `order`: layers in the model's order (`model.layers.2` before `model.layers.10`) as the prototype's
@@ -36,6 +43,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+if not os.environ.get("PYTHONPATH"):  # this tree's SDK, unless another is named (the base's, above)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "src"))
 
 import pyarrow as pa  # noqa: E402
 import pyarrow.flight as flight  # noqa: E402
@@ -43,7 +52,8 @@ import pyarrow.parquet as pq  # noqa: E402
 
 import prototype as p5  # noqa: E402
 from tensorquill import evidence  # noqa: E402
-from tensorquill import flight as v4  # noqa: E402
+
+v4 = p5.v4  # protocol 4's row functions, frozen (flight_v4.py), as the base wrote them
 
 HERE = Path(__file__).resolve().parent
 BINARY = os.environ.get("TENSORQUILL_SERVER_BIN")

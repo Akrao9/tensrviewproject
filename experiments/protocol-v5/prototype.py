@@ -1,8 +1,12 @@
 """A prototype of protocol 5's row layout, for WAVE_AL_CONTRACT.md's measurements. Not product code.
 
-It builds on `tensorquill.flight` (protocol 4) without changing it: `record_to_row_v5` takes the
-v4 row of the record without `layers`, `moe_stats` and `probe`, and adds the typed columns the
-contract proposes; `row_to_record_v5` is its inverse. `flight_schema_v5` is the Arrow schema.
+It builds on protocol 4's row functions: `record_to_row_v5` takes the v4 row of the record without
+`layers`, `moe_stats` and `probe`, and adds the typed columns the contract proposes;
+`row_to_record_v5` is its inverse. `flight_schema_v5` is the Arrow schema. Since lane AL-1 merged
+(`92e471a`) `tensorquill.flight` writes protocol 5's layout itself, so the v4 row comes from
+`flight_v4.py` beside this file, a frozen copy of `flight.py`'s row functions at `5c286ed`; the
+prototype's rows are unchanged. Lane AL-1's `record_to_row` gives the prototype's row on every record
+of the section 1 and 2 cases (`test_wave_al_contract.py`).
 
 What the prototype holds, and where a value it cannot hold goes (the contract's section 2):
 
@@ -40,7 +44,24 @@ import math
 import struct
 from typing import Any, Mapping
 
-from tensorquill import flight as v4
+
+def _flight_v4() -> Any:
+    """`flight_v4.py` beside this file, loaded by path: the prototype is loaded by path too, from the
+    tests and from the scripts here, so it adds nothing to `sys.path`."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    name = "tensorquill_protocol_v5_experiment_flight_v4"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().with_name("flight_v4.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+v4 = _flight_v4()
 
 LAYER_FIELDS = ("mean", "std", "abs_max", "zero_frac")
 MOE_FIELDS = ("routed_tokens", "entropy", "diversity", "dead_experts", "dead_frac")

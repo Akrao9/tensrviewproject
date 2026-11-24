@@ -5,11 +5,19 @@ What runs here, on the base and on every lane's tree:
 - The document: every case is named on the page, in its section, with the fields its paths need.
 - The cases against the prototype (`experiments/protocol-v5/prototype.py`): each case's `row` is
   what the prototype gives, its round trip holds and keeps each map's order. This keeps the cases and
-  the page's layout one thing; the prototype is not product code.
+  the page's layout one thing; the prototype is not product code. It is built on protocol 4's row
+  functions, frozen beside it in `flight_v4.py` (`flight.py` at `5c286ed`), as it was measured.
+- `flight` itself (lane AL-1, merged at `92e471a`): each case's `row` and round trip, and the
+  prototype's row on every record of every section 1 and 2 case, `clean_records` included.
+- The `rust_sdk` path (`build_evidence(detectors="rust")`) of every case that names it, against the
+  case's `rust_raw` expectation: ordinary tests since the joined tree (92e471a).
+- The `rust_raw_v4` path (the owner, Nov 24): `detect` given protocol 4's rows, as an older SDK sends
+  them, reads them as the base did. `layers_entry_not_object`'s is lane AL-3′'s target (step 2);
+  `layers_name_arrow_cannot_encode`'s is a known difference, pinned at today's report.
 - Pins: where the base already reports on `records` what the contract asks (`expect`), the engine
   paths are ordinary tests, so no lane can move them.
-- Targets: where the base does not (a refused entry today, the row layout, the scalar-only record),
-  the test is a strict expected failure (`xfail(strict=True)`, as the repository marks work a lane
+- Targets: where the base does not (a refused entry today, the scalar-only record; the row layout
+  until lane AL-1 landed), the test is a strict expected failure (`xfail(strict=True)`, as the repository marks work a lane
   has not landed). The lane named in its reason turns it into an ordinary test by removing the mark
   when its change makes it pass; a target that passes before that fails the run (strict).
 - Section 4.8, on `tensorquill.init` and `Session.log` themselves: a value logged late inside a compiled
@@ -39,10 +47,19 @@ PAGE = (ROOT / DOCUMENT["contract"]).read_text()
 EXPERIMENTS = ROOT / "experiments" / "protocol-v5"
 ROWS = [c for c in CASES if c["section"] in (1, 2)]
 SCALAR = [c for c in CASES if c["section"] == 4]
-LANE_ROW = "lane AL-1 (flight.py, server_detect.py): protocol 5's row layout, contract sections 1 and 2"
 LANE_RUST = "lanes AL-1 and AL-3 joined (flight.py's layout, detect.rs' reader): contract sections 1 and 2"
 LANE_PY = "lane AL-4' (evidence.py, step 2): an entry the column cannot hold is absent to every detector, contract section 1.5"
+LANE_PY_NO_LAYER = ("lane AL-4' (evidence.py, step 2): an entry that is not an object is absent, and a row whose only "
+                    "layers are such entries holds no layer (the owner's approved change, Nov 24), contract sections 1.5 and 7")
+LANE_RUST_V4 = ("lane AL-3' (detect.rs, step 2): protocol 4's layers_json read entry by entry, so an entry that is not "
+                "an object is absent and the rest are read (the owner, Nov 24), contract sections 1.5 and 9")
 LANE_SCALAR = "step 2 of the wave (contract section 4): the scalar-only record"
+# Targets whose lanes have landed: they pass on the joined tree and are ordinary tests now. A case's
+# `today` stays the base's (f71d8e0), so the mark is decided here, not by `today == expect`.
+LANDED = {
+    ("layers_entry_not_object", "rust_raw"),  # lanes AL-1 and AL-3, merged at 92e471a
+    ("layers_name_arrow_cannot_encode", "rust_raw"),  # lanes AL-1 and AL-3, merged at 92e471a
+}
 
 
 def _prototype():
@@ -135,11 +152,11 @@ def _jsonable(value):
     return value
 
 
-@pytest.mark.xfail(strict=True, reason=LANE_ROW)
 @pytest.mark.parametrize("case", ROWS, ids=[c["name"] for c in ROWS])
 def test_flight_gives_the_row(case):
-    """Lane AL-1's target: `flight.record_to_row` gives the case's row in protocol 5's layout, and
-    `row_to_record` gives the record back."""
+    """Lane AL-1's (landed at 92e471a): `flight.record_to_row` gives the case's row in protocol 5's
+    layout, and `row_to_record` gives the record back."""
+    pytest.importorskip("pyarrow")  # flight_schema() imports it; CI's plain jobs have none
     from tensorquill import flight
 
     record = next(r for r in case["records"] if r["step"] == case["row_step"])
@@ -155,6 +172,24 @@ def test_flight_gives_the_row(case):
     assert flight.row_to_record(row) == record
 
 
+@pytest.mark.parametrize("case", ROWS, ids=[c["name"] for c in ROWS])
+def test_flight_gives_the_prototype_s_row_on_every_record(case):
+    """`flight.record_to_row` gives the measured prototype's row, every column, on every record of the
+    case (`records` and `clean_records`), so section 6's prototype figures are the product's layout.
+    The prototype's `seq` is step 2's (section 4.4): not in step 1's schema, compared once it is."""
+    pytest.importorskip("pyarrow")
+    from tensorquill import flight
+
+    p5 = _prototype()
+    assert set(p5.flight_schema_v5().names) ^ set(flight.flight_schema().names) <= {"seq"}
+    for record in [*case["records"], *(case.get("clean_records") or [])]:
+        row = flight.record_to_row(copy.deepcopy(record))
+        prototype = p5.record_to_row_v5(copy.deepcopy(record))
+        assert set(prototype) ^ set(row) <= {"seq"}, record["step"]
+        for column in set(row) & set(prototype):
+            assert _jsonable(row[column]) == _jsonable(prototype[column]), (record["step"], column)
+
+
 def _brief(incident: dict) -> dict:
     out = {"kind": incident["kind"], "step": incident.get("step")}
     for key in ("layers", "modules", "gradients", "routers", "router", "parameters", "experts"):
@@ -162,6 +197,28 @@ def _brief(incident: dict) -> dict:
             value = incident[key]
             out[key] = sorted(value) if isinstance(value, dict) else value
     return out
+
+
+def _protocol_4_report(records: list[dict]) -> dict:
+    """`server_report` on protocol 4's rows (`flight_v4.py`, frozen at 5c286ed), as an older SDK sends them:
+    its stream takes `_row`, `flight_schema` and `rows_batch` from `tensorquill.flight` when called."""
+    from tensorquill import flight
+    from tensorquill.server_detect import server_report
+
+    v4 = _prototype().v4
+    saved = {name: getattr(flight, name) for name in ("_row", "flight_schema", "rows_batch")}
+    try:
+        for name in saved:
+            setattr(flight, name, getattr(v4, name))
+        # The stream must really be protocol 4's, or a target here would pass for a wrong reason.
+        import pyarrow as pa
+        from tensorquill.server_detect import records_stream
+
+        assert "layers_json" in pa.ipc.open_stream(records_stream(records)).schema.names
+        return server_report(records)
+    finally:
+        for name, value in saved.items():
+            setattr(flight, name, value)
 
 
 def _engine(path: str, records: list[dict], kinds: list[str]) -> dict:
@@ -172,7 +229,7 @@ def _engine(path: str, records: list[dict], kinds: list[str]) -> dict:
                 "run_state": (built.get("run_state") or {}).get("state")}
     from tensorquill.server_detect import server_report
 
-    report = server_report(copy.deepcopy(records))
+    report = _protocol_4_report(copy.deepcopy(records)) if path == "rust_raw_v4" else server_report(copy.deepcopy(records))
     return {"incidents": [_brief(i) for i in report["incidents"]],
             "kind_checks": {k: (report["kind_checks"].get(k) or {}).get("value") for k in kinds}}
 
@@ -180,20 +237,44 @@ def _engine(path: str, records: list[dict], kinds: list[str]) -> dict:
 def _engine_params():
     out = []
     for case in ROWS:
-        for path in ("python", "rust_raw"):
+        for path in ("python", "rust_raw", "rust_raw_v4"):
             if path not in case["paths"] or path not in case["expect"]:
                 continue
             pinned = case["today"].get(path) == case["expect"][path]
+            landed = (case["name"], path) in LANDED
             marks = []
-            if path == "rust_raw":
+            if path in ("rust_raw", "rust_raw_v4"):
                 from tensorquill.server_detect import find_binary
 
                 marks.append(pytest.mark.skipif(find_binary() is None or importlib.util.find_spec("pyarrow") is None,
                                                 reason="tensorquill-server is not built, or pyarrow is not installed"))
-            if not pinned:
-                marks.append(pytest.mark.xfail(strict=True, reason=LANE_PY if path == "python" else LANE_RUST))
-            out.append(pytest.param(case, path, marks=marks, id=f"{case['name']}-{path}-{'pin' if pinned else 'target'}"))
+            if not pinned and not landed:
+                reason = {"python": LANE_PY_NO_LAYER if case["name"] == "layers_only_entries_not_object" else LANE_PY,
+                          "rust_raw": LANE_RUST, "rust_raw_v4": LANE_RUST_V4}[path]
+                marks.append(pytest.mark.xfail(strict=True, reason=reason))
+            kind = "pin" if pinned else "landed" if landed else "target"
+            out.append(pytest.param(case, path, marks=marks, id=f"{case['name']}-{path}-{kind}"))
     return out
+
+
+RUST_SDK = [c for c in ROWS if "rust_sdk" in c["paths"] and "rust_raw" in c["expect"]]
+
+
+@pytest.mark.parametrize("case", RUST_SDK, ids=[c["name"] for c in RUST_SDK])
+def test_the_sdk_s_rust_path_reports_the_rust_expectation(case):
+    """The case's `rust_sdk` path, `build_evidence(detectors="rust")` (lane AL-3's reader fed by lane
+    AL-1's rows), reports on `records` what `expect["rust_raw"]` says. The cases record no `today` for
+    this path; it holds on the joined tree (92e471a), so it is an ordinary test."""
+    pytest.importorskip("pyarrow")
+    from tensorquill.server_detect import find_binary
+
+    if find_binary() is None:
+        pytest.skip("tensorquill-server is not built")
+    want = case["expect"]["rust_raw"]
+    built = evidence.build_evidence(copy.deepcopy(case["records"]), detectors="rust")
+    assert built["detectors"] == "rust"
+    assert [_brief(i) for i in built["incidents"]] == want["incidents"]
+    assert {k: (built["kind_checks"].get(k) or {}).get("value") for k in sorted(want["kind_checks"])} == want["kind_checks"]
 
 
 @pytest.mark.parametrize(("case", "path"), _engine_params())

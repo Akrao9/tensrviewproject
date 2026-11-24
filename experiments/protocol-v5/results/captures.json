@@ -45,7 +45,12 @@
    "not_equal_count": 0,
    "order_differs": [],
    "order_differs_count": 0,
+   "prototype_row_differs": [],
+   "prototype_row_differs_count": 0,
    "records": 400,
+   "row_versions": [
+    2
+   ],
    "rows_with_extra_json": 8
   },
   "sizes": {
@@ -95,7 +100,12 @@
    "not_equal_count": 0,
    "order_differs": [],
    "order_differs_count": 0,
+   "prototype_row_differs": [],
+   "prototype_row_differs_count": 0,
    "records": 650,
+   "row_versions": [
+    2
+   ],
    "rows_with_extra_json": 13
   },
   "sizes": {
@@ -150,7 +160,12 @@
    "not_equal_count": 0,
    "order_differs": [],
    "order_differs_count": 0,
+   "prototype_row_differs": [],
+   "prototype_row_differs_count": 0,
    "records": 650,
+   "row_versions": [
+    2
+   ],
    "rows_with_extra_json": 0
   },
   "sizes": {
@@ -200,7 +215,12 @@
    "not_equal_count": 0,
    "order_differs": [],
    "order_differs_count": 0,
+   "prototype_row_differs": [],
+   "prototype_row_differs_count": 0,
    "records": 650,
+   "row_versions": [
+    2
+   ],
    "rows_with_extra_json": 0
   },
   "sizes": {
@@ -251,7 +271,12 @@
    "not_equal_count": 0,
    "order_differs": [],
    "order_differs_count": 0,
+   "prototype_row_differs": [],
+   "prototype_row_differs_count": 0,
    "records": 650,
+   "row_versions": [
+    2
+   ],
    "rows_with_extra_json": 13
   },
   "sizes": {
@@ -320,7 +345,12 @@
    "not_equal_count": 0,
    "order_differs": [],
    "order_differs_count": 0,
+   "prototype_row_differs": [],
+   "prototype_row_differs_count": 0,
    "records": 400,
+   "row_versions": [
+    2
+   ],
    "rows_with_extra_json": 8
   },
   "sizes": {
@@ -384,7 +414,12 @@
    "not_equal_count": 0,
    "order_differs": [],
    "order_differs_count": 0,
+   "prototype_row_differs": [],
+   "prototype_row_differs_count": 0,
    "records": 400,
+   "row_versions": [
+    2
+   ],
    "rows_with_extra_json": 8
   },
   "sizes": {

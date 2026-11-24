@@ -8,7 +8,7 @@
  "cpu_count": 8,
  "python": "3.12.3",
  "pyarrow": "26.0.1",
- "source": "/Users/ak/Downloads/runs/dense-layer8/dense.jsonl",
+ "source": "dense-layer8/dense.jsonl",
  "records": 400,
  "rounds": [
   {

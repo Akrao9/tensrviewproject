@@ -1,10 +1,11 @@
 {
  "contract": "WAVE_AL_CONTRACT.md",
- "base": "afbf14cdbb266baab12b8cfb45584990bb1a4e9c",
+ "base": "258095a06659eb75051c2b267876b949791b4156",
  "how_to_read": [
-  "Base trial/ai-wave f71d8e0 (the base field: the commit these were computed on). The rules are WAVE_AL_CONTRACT.md.",
-  "paths: row = flight.record_to_row and row_to_record in protocol 5's layout; python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
+  "Base trial/ai-wave f71d8e0. The base field is the commit the file was last written on; today and expect are the base's (its Python readers, and protocol 4's rows through a binary that reads them as the base's did). The rules are WAVE_AL_CONTRACT.md.",
+  "paths: row = flight.record_to_row and row_to_record in protocol 5's layout; python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_raw_v4 = tensorquill-server detect given protocol 4's rows (experiments/protocol-v5/flight_v4.py), as an older SDK sends them; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
   "Sections 1 and 2: row is what record_to_row must give at row.step (typed columns as [name, value] pairs in stored order, non-finite floats as the sink's strings, null for a null column or a null struct; probe_json as text; extra as extra_json parsed, null for none), and row_to_record(record_to_row(r)) == r with the map's order kept. expect is today's engines on clean_records (or on records when there are none): every engine path must report that on records. today is the base on records (never recomputed).",
+  "known_difference: a path whose expect is today's, not the clean records' report, and why (the owner's word).",
   "Section 4: expect is written from the contract's rules; series maps a scalar name to [step, value] points in step order.",
   "measured: the results file under experiments/protocol-v5/ that shows the case's today on a real server."
  ],
@@ -17,6 +18,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -2047,6 +2049,42 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "activation_spike",
+       "step": 35,
+       "modules": [
+        {
+         "baseline": 3.06,
+         "module": "model.layers.2",
+         "ratio": 19.607843137254903,
+         "score": 1280.183461486586,
+         "stat": "abs_max",
+         "value": 60.0
+        },
+        {
+         "baseline": 3.06,
+         "module": "model.layers.10",
+         "ratio": 19.607843137254903,
+         "score": 1280.183461486586,
+         "stat": "abs_max",
+         "value": 60.0
+        }
+       ]
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -2122,6 +2160,42 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "activation_spike",
+       "step": 35,
+       "modules": [
+        {
+         "baseline": 3.06,
+         "module": "model.layers.2",
+         "ratio": 19.607843137254903,
+         "score": 1280.183461486586,
+         "stat": "abs_max",
+         "value": 60.0
+        },
+        {
+         "baseline": 3.06,
+         "module": "model.layers.10",
+         "ratio": 19.607843137254903,
+         "score": 1280.183461486586,
+         "stat": "abs_max",
+         "value": 60.0
+        }
+       ]
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -2133,6 +2207,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -2212,6 +2287,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -2241,6 +2329,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -2252,6 +2353,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -2938,6 +3040,28 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "non_finite",
+       "step": 10,
+       "layers": [
+        "model.layers.3"
+       ],
+       "gradients": []
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -2985,6 +3109,28 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "non_finite",
+       "step": 10,
+       "layers": [
+        "model.layers.3"
+       ],
+       "gradients": []
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -2996,6 +3142,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -4223,6 +4370,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -4252,6 +4412,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -4263,6 +4436,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -5490,6 +5664,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -5519,6 +5706,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -5530,6 +5730,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -6185,6 +6386,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -6214,6 +6428,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -6225,6 +6452,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -6918,6 +7146,28 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "non_finite",
+       "step": 9,
+       "layers": [
+        "model.layers.1"
+       ],
+       "gradients": []
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -6965,6 +7215,28 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "non_finite",
+       "step": 9,
+       "layers": [
+        "model.layers.1"
+       ],
+       "gradients": []
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -6976,6 +7248,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -8203,6 +8476,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -8232,6 +8518,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -8243,6 +8542,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -9333,6 +9633,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -9362,6 +9675,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -9373,6 +9699,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk"
    ],
    "records": [
@@ -9787,6 +10114,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -9816,7 +10156,23 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
+   },
+   "known_difference": {
+    "rust_raw_v4": "not fixed (the owner, Nov 24): on protocol 4's row the whole layers map is in layers_json, the name written as the JSON escape of a lone surrogate, which Rust's JSON reader refuses, so Rust reads no layer of that row, while Python reads the record's layers; pinned on each side by lane AL-S1"
    }
   },
   {
@@ -9827,6 +10183,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -10072,6 +10429,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -10101,6 +10471,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -10112,6 +10495,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk"
    ],
    "records": [
@@ -10222,6 +10606,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -10251,6 +10648,484 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
+    }
+   }
+  },
+  {
+   "name": "layers_only_entries_not_object",
+   "section": 1,
+   "about": "every layers entry is not an object: each is a null struct in its place and travels whole in extra_json, so the row holds no layer; the activation kinds read it as a record with layers {} in both engines (Python's count of a non-empty layers object changes, the owner's approved change)",
+   "paths": [
+    "row",
+    "python",
+    "rust_raw",
+    "rust_raw_v4",
+    "rust_sdk",
+    "live_server"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.2": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.3": 5
+     },
+     "grad_norm": 1.0
+    }
+   ],
+   "clean_records": [
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 4,
+     "ts": 4.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 5,
+     "ts": 5.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 6,
+     "ts": 6.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 7,
+     "ts": 7.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 8,
+     "ts": 8.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 9,
+     "ts": 9.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 10,
+     "ts": 10.0,
+     "layers": {},
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_allnotobj",
+     "rank": 0,
+     "attempt": 1,
+     "step": 11,
+     "ts": 11.0,
+     "layers": {},
+     "grad_norm": 1.0
+    }
+   ],
+   "row_step": 3,
+   "row": {
+    "step": 3,
+    "schema_version": 2,
+    "record_version": 1,
+    "seq": null,
+    "layers": [
+     [
+      "model.layers.0",
+      null
+     ],
+     [
+      "model.layers.1",
+      null
+     ],
+     [
+      "model.layers.2",
+      null
+     ],
+     [
+      "model.layers.10",
+      null
+     ],
+     [
+      "model.layers.11",
+      null
+     ],
+     [
+      "model.layers.3",
+      null
+     ]
+    ],
+    "extra": {
+     "layers": {
+      "model.layers.0": 5,
+      "model.layers.1": 5,
+      "model.layers.10": 5,
+      "model.layers.11": 5,
+      "model.layers.2": 5,
+      "model.layers.3": 5
+     }
+    },
+    "round_trip": true,
+    "order_kept": true
+   },
+   "today": {
+    "row": {
+     "layers_json": "{\"model.layers.0\":5,\"model.layers.1\":5,\"model.layers.2\":5,\"model.layers.10\":5,\"model.layers.11\":5,\"model.layers.3\":5}",
+     "moe_stats_json": null,
+     "extra": null,
+     "round_trip": true
+    },
+    "python": {
+     "raises": "AttributeError: 'int' object has no attribute 'get'"
+    },
+    "rust_raw": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
+    }
+   },
+   "expect": {
+    "python": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     },
+     "run_state": "healthy"
+    },
+    "rust_raw": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -10262,6 +11137,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -10670,6 +11546,19 @@
       "moe_imbalance": "checked",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -10699,6 +11588,19 @@
       "moe_imbalance": "checked",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -10710,6 +11612,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -11461,6 +12364,19 @@
       "moe_imbalance": "checked",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -11490,6 +12406,19 @@
       "moe_imbalance": "checked",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -11501,6 +12430,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -12606,6 +13536,25 @@
       "moe_imbalance": "checked",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "moe_imbalance",
+       "step": 14,
+       "router": "model.layers.0.block_sparse_moe.router"
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -12647,6 +13596,25 @@
       "moe_imbalance": "checked",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "moe_imbalance",
+       "step": 14,
+       "router": "model.layers.0.block_sparse_moe.router"
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -12658,6 +13626,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk"
    ],
    "records": [
@@ -12895,6 +13864,19 @@
       "moe_imbalance": "checked",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -12913,6 +13895,19 @@
      "run_state": "healthy"
     },
     "rust_raw": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "not_configured",
+      "activation_spike": "not_configured",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "not_configured",
+      "moe_imbalance": "checked",
+      "non_finite": "checked"
+     }
+    },
+    "rust_raw_v4": {
      "incidents": [],
      "kind_checks": {
       "activation_drift": "not_configured",
@@ -13061,6 +14056,7 @@
     "row",
     "python",
     "rust_raw",
+    "rust_raw_v4",
     "rust_sdk",
     "live_server"
    ],
@@ -13949,6 +14945,36 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "attention_collapse",
+       "step": 9,
+       "modules": [
+        {
+         "baseline": 0.8,
+         "baseline_probes": 4,
+         "heads": 2,
+         "module": "model.layers.0",
+         "ratio": 0.125,
+         "score": null,
+         "score_note": "short_history",
+         "value": 0.1
+        }
+       ]
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "checked",
+      "attention_logit_growth": "checked",
+      "attention_uniform": "checked",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -14012,6 +15038,36 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [
+      {
+       "kind": "attention_collapse",
+       "step": 9,
+       "modules": [
+        {
+         "baseline": 0.8,
+         "baseline_probes": 4,
+         "heads": 2,
+         "module": "model.layers.0",
+         "ratio": 0.125,
+         "score": null,
+         "score_note": "short_history",
+         "value": 0.1
+        }
+       ]
+      }
+     ],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "checked",
+      "attention_logit_growth": "checked",
+      "attention_uniform": "checked",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -14022,7 +15078,8 @@
    "paths": [
     "row",
     "python",
-    "rust_raw"
+    "rust_raw",
+    "rust_raw_v4"
    ],
    "records": [
     {
@@ -14130,6 +15187,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "checked",
+      "attention_logit_growth": "checked",
+      "attention_uniform": "checked",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -14159,6 +15229,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "checked",
+      "attention_logit_growth": "checked",
+      "attention_uniform": "checked",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -14169,7 +15252,8 @@
    "paths": [
     "row",
     "python",
-    "rust_raw"
+    "rust_raw",
+    "rust_raw_v4"
    ],
    "records": [
     {
@@ -14329,6 +15413,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "checked",
+      "attention_logit_growth": "checked",
+      "attention_uniform": "checked",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -14358,6 +15455,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "checked",
+      "attention_logit_growth": "checked",
+      "attention_uniform": "checked",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -14368,7 +15478,8 @@
    "paths": [
     "row",
     "python",
-    "rust_raw"
+    "rust_raw",
+    "rust_raw_v4"
    ],
    "records": [
     {
@@ -14449,6 +15560,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "unavailable",
+      "attention_logit_growth": "unavailable",
+      "attention_uniform": "unavailable",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -14478,6 +15602,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "unavailable",
+      "attention_logit_growth": "unavailable",
+      "attention_uniform": "unavailable",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -14488,7 +15625,8 @@
    "paths": [
     "row",
     "python",
-    "rust_raw"
+    "rust_raw",
+    "rust_raw_v4"
    ],
    "records": [
     {
@@ -14569,6 +15707,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "unavailable",
+      "attention_logit_growth": "unavailable",
+      "attention_uniform": "unavailable",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -14598,6 +15749,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "unavailable",
+      "attention_logit_growth": "unavailable",
+      "attention_uniform": "unavailable",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -14608,7 +15772,8 @@
    "paths": [
     "row",
     "python",
-    "rust_raw"
+    "rust_raw",
+    "rust_raw_v4"
    ],
    "records": [
     {
@@ -14711,6 +15876,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -14740,6 +15918,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    }
   },
@@ -14750,7 +15941,8 @@
    "paths": [
     "row",
     "python",
-    "rust_raw"
+    "rust_raw",
+    "rust_raw_v4"
    ],
    "records": [
     {
@@ -14860,6 +16052,19 @@
       "moe_imbalance": "not_configured",
       "non_finite": "checked"
      }
+    },
+    "rust_raw_v4": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
     }
    },
    "expect": {
@@ -14878,6 +16083,19 @@
      "run_state": "healthy"
     },
     "rust_raw": {
+     "incidents": [],
+     "kind_checks": {
+      "activation_drift": "checked",
+      "activation_spike": "checked",
+      "attention_collapse": "not_configured",
+      "attention_logit_growth": "not_configured",
+      "attention_uniform": "not_configured",
+      "dead_activations": "checked",
+      "moe_imbalance": "not_configured",
+      "non_finite": "checked"
+     }
+    },
+    "rust_raw_v4": {
      "incidents": [],
      "kind_checks": {
       "activation_drift": "checked",
