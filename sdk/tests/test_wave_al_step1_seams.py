@@ -1,13 +1,19 @@
-"""Wave AL, step 1's seam (`WAVE_AL_CONTRACT.md` sections 3, 5 and 9): what no lane owned.
+"""Wave AL, step 1's seam (`WAVE_AL_CONTRACT.md` sections 3, 5 and 9): what no lane owned, and the
+owner's answers to the lanes' decisions (Nov 24, 2026).
 
 1. Protocol 5: `server_detect.PROTOCOL` and `PROTOCOL` in `server/src/main.rs` are both 5 (D13), each
    with a line saying what 5 changed, and this tree's binary prints it. The pages give the same number.
 2. One row-version list in the server: `ingest::SUPPORTED_ROW_VERSIONS` is what ingest stores and
    what `detect` reads (0, 1 and 2).
+3. One wording of the server's refusal of a batch metadata version, read by both sides from
+   `fixtures/wave_al/refusal.json`: the sender recognises a protocol 4 server's and this server's.
+4. The known differences on a name Arrow cannot encode, the Python side (the Rust side is in
+   `server/src/detect/lane_al3_tests.rs`).
+5. The limit of lane AL-1's row-version rule: a record of version 2 is stored and its part refused.
+6. The README's passages on the versions, an older server, a downgrade and the probe's columns.
 
-Every test here runs without pyarrow and without the server binary, but the one that runs the binary,
-which skips without it. None needs git history.
-"""
+Every test here runs without pyarrow and without the server binary, but the ones that start the binary,
+which skip without it. None needs git history."""
 
 from __future__ import annotations
 
@@ -320,3 +326,85 @@ def test_under_the_lane_s_rule_a_record_of_version_99_is_dropped_and_counted_and
     from tensorquill import evidence
 
     assert [r["step"] for r in evidence.load_records(store / "runs" / run_id)] == [0, 1, 2, 4]
+
+
+# --- 6. The README's passages on protocol 5 (section 9: the versions, an older server, the probe) ---
+
+
+STREAMING = README[README.index("## Streaming to an ingest server\n"):README.index("\n## Detector benchmark on 64 ranks")]
+
+
+def versions_passage() -> str:
+    """From "**Protocol 5's versions.**" to the end of the streaming section."""
+    return STREAMING[STREAMING.index("**Protocol 5's versions.**"):]
+
+
+def version_table() -> dict[str, list[str]]:
+    """The passage's table, by its first cell: the four numbers of section 3."""
+    rows = [line for line in versions_passage().splitlines() if line.startswith("| ")]
+    cells = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in rows]
+    assert cells[0] == ["Number", "Where", "Protocol 5 (before)", "What it gates"], cells[0]
+    return {row[0]: row[1:] for row in cells[1:]}
+
+
+def test_the_version_table_gives_section_3_s_four_numbers_as_the_code_has_them():
+    table = version_table()
+    assert list(table) == ["The protocol", "Batch metadata `schema_version`", "Row `schema_version`",
+                           "Record `schema_version`"]
+    protocol, metadata, row, record = table.values()
+    assert "`server_detect.PROTOCOL`" in protocol[0] and protocol[1].startswith(f"{sd.PROTOCOL} (4)")
+    assert "`flight.SCHEMA_VERSION`" in metadata[0] and metadata[1].startswith(f"{flight.SCHEMA_VERSION} (1)")
+    assert "`flight.ROW_VERSION`" in row[0] and row[1].startswith(f"{flight.ROW_VERSION} (0 or 1: the record's own), with the record's own version in `record_version`")
+    assert "`identity.SCHEMA_VERSIONS`" in record[0]
+    assert record[1].startswith(" or ".join(map(str, identity.SCHEMA_VERSIONS)) + ", unchanged")
+    # What the server takes and stores, as `ingest.rs` has it.
+    ingest = server_source("ingest.rs")
+    assert "pub const SCHEMA_VERSIONS: [i64; 2] = [1, 2];" in ingest
+    assert "the server takes 1 and 2" in metadata[1]
+    assert "this server reads versions 1 and 2" in ingest and "this server reads versions 1 and 2" in metadata[2]
+    assert "the server stores 0, 1 and 2" in row[1]
+    assert "`unsupported_schema_version`" in row[2] and "`tensorquill-server detect` refuses the input" in row[2]
+    # Not step 2 of the wave: no scalar-only record is described as built.
+    assert "scalar-only" not in versions_passage() and "scalars-" not in versions_passage()
+
+
+def test_the_older_server_message_the_readme_quotes_is_the_senders():
+    from types import SimpleNamespace
+
+    passage = flat(versions_passage())
+    quoted = re.search(r"`(the server at <endpoint> speaks an older protocol[^`]*)`", passage).group(1)
+    stand_in = SimpleNamespace(endpoint="grpc://host:50051", path=Path("run.rank0.jsonl"), _life={})
+    refused = ConnectionError("INVALID_ARGUMENT: schema_version 2 is not supported; this server reads version 1")
+    said = str(flight.FlightSender._older(stand_in, refused))
+    assert said.startswith(quoted.replace("<endpoint>", "grpc://host:50051")), (said, quoted)
+    for words in ("`schema_version 2 is not supported; this server reads version 1`", "stores nothing",
+                  "says once, on stderr and in `session._sink.sender.last_error`", "keeps every line",
+                  "A sender older than protocol 5 streams to a protocol 5 server as before"):
+        assert words in passage, words
+
+
+def test_the_readme_says_a_downgrade_is_not_supported_and_how_it_shows():
+    passage = flat(versions_passage())
+    start = passage.index("**A downgrade is not supported.**")
+    downgrade = passage[start:start + 900]
+    for words in ("A protocol 4 server", "protocol 5 parts", "without a word", "no layers", "no MoE statistics",
+                  "no attention maps", "refuses a store that holds protocol 5 parts, naming the part and the row"):
+        assert words in downgrade, words
+
+
+def test_the_columns_bullet_gives_protocol_5_s_columns_and_the_probe_split():
+    [columns] = [line for line in STREAMING.splitlines() if line.startswith("- **Columns.**")]
+    for words in ("`layers` and `moe_stats` are typed columns", "in the model's order", "`probe_maps`",
+                  "`probe_histograms`", "`probe_json`", "The `.jsonl` file holds the whole probe",
+                  "`layers_json` and `moe_stats_json`", "still read", "`extra_json`"):
+        assert words in columns, words
+    assert "`layers`, `moe_stats` and `probe` are JSON strings" not in columns
+
+
+def test_the_identity_rules_name_the_row_versions_detect_reads():
+    identity_section = flat(README[README.index("**A record's identity fields.**"):
+                                   README.index("**Several refused batches in a row.**")])
+    assert "| `schema_version` | read as 0, the legacy version | the integer 0 or 1 |" in identity_section
+    assert "a row the server stores carries row version 2, with the record's own in `record_version`" in identity_section
+    assert "and a `schema_version` other than 0, 1 or 2." in identity_section
+    assert "other than 0 or 1" not in identity_section
