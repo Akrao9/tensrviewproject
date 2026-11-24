@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -46,7 +47,26 @@ def _free_port() -> int:
         return listener.getsockname()[1]
 
 
+PORT_TAKEN = "failed to listen on any local network address"  # PyTorch's TCPStore, when the port is in use
+
+
+def _port_taken(out: Path) -> bool:
+    log = out / "rank0.log"
+    return log.exists() and PORT_TAKEN in log.read_text(errors="replace")
+
+
 def _run(flavor: str, out: Path) -> dict:
+    """One case, with the port chosen again (three times at most) when another process took it between
+    `_free_port` and rank 0's listen: that is this harness's race, not what the case is about."""
+    for last in (False, False, True):
+        run = _run_once(flavor, out)
+        if last or not _port_taken(out):
+            break
+        shutil.rmtree(out)
+    return run
+
+
+def _run_once(flavor: str, out: Path) -> dict:
     """Both ranks of one case: whether each ended inside the deadline, its exit status, its trace,
     the records its sink was handed and its output. Every process is ended before this returns."""
     out.mkdir()
@@ -70,6 +90,8 @@ def _run(flavor: str, out: Path) -> dict:
     try:
         while time.monotonic() - start < DEADLINE and any(p.poll() is None for p in procs):
             time.sleep(0.1)
+            if procs[0].poll() is not None and _port_taken(out):
+                break  # rank 1 would wait for a store that never came up: ended below, chosen again in `_run`
         in_time = [p.poll() is not None for p in procs]
     finally:
         for p in procs:
