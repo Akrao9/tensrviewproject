@@ -11,6 +11,7 @@ which skips without it. None needs git history.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from tensorquill import flight, identity
 from tensorquill import server_detect as sd
 
 SDK = Path(__file__).resolve().parents[1]
@@ -98,3 +100,32 @@ def test_the_server_keeps_one_row_version_list_read_by_ingest_and_detect():
     assert not re.search(r"\bconst ROW_VERSIONS\b", detect)
     assert "!SUPPORTED_ROW_VERSIONS.contains(" in ingest  # what ingest stores (RS10)
     assert "!crate::ingest::SUPPORTED_ROW_VERSIONS.contains(" in detect  # what `check_keys` reads
+
+
+# --- 3. One wording for the server's refusal, read by both sides (the owner's seam note) ------------
+
+REFUSAL = json.loads((Path(__file__).parent / "fixtures" / "wave_al" / "refusal.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("server", ["protocol_4_server", "this_server"])
+def test_the_sender_recognises_both_wordings_of_the_refusal_and_reads_the_versions(server):
+    """A protocol 4 server's singular "reads version 1" and this server's plural "reads versions 1 and
+    2" (pinned on the server's side by lane_al2_protocol5_test.rs) are both an older server to a sender
+    of the refused version, and the versions it reads are read out of each."""
+    case = REFUSAL[server]
+    assert flight._older_server_reads(case["text"], case["sent"]) == case["reads"]
+    wrapped = f"Flight returned invalid argument error, with message: {case['text']}. gRPC client debug context: x"
+    assert flight._older_server_reads(wrapped, case["sent"]) == case["reads"]
+    assert flight._older_server_reads(case["text"], case["sent"] + 1) is None  # another sender's version
+
+
+def test_the_sender_of_this_package_says_an_older_server_reads_its_versions():
+    from types import SimpleNamespace
+
+    assert REFUSAL["protocol_4_server"]["sent"] == flight.SCHEMA_VERSION
+    stand_in = SimpleNamespace(endpoint="grpc://host:50051", path=Path("run.rank0.jsonl"), _life={})
+    singular = str(flight.FlightSender._older(stand_in, ConnectionError(REFUSAL["protocol_4_server"]["text"])))
+    assert "It reads batch schema_version 1 and this tensorquill sends version 2" in singular
+    plural = REFUSAL["this_server"]["text"].replace("schema_version 3 ", "schema_version 2 ").replace("1 and 2", "1 and 3")
+    said = str(flight.FlightSender._older(stand_in, ConnectionError(plural)))
+    assert "It reads batch schema_versions 1 and 3 and this tensorquill sends version 2" in said

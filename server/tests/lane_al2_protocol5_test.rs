@@ -378,6 +378,30 @@ async fn report_through(root: &Path, last_step: i64) -> serde_json::Value {
     );
 }
 
+/// The server's refusal of a batch metadata version it does not read is the text both sides pin in
+/// `sdk/tests/fixtures/wave_al/refusal.json` (`this_server`), the plural form a later sender's
+/// `_older_server_reads` must recognise beside a protocol 4 server's singular (the owner's seam note,
+/// Nov 24, 2026). The Python side reads the same file (`test_wave_al_step1_seams.py`).
+#[tokio::test]
+async fn the_refusal_of_an_unread_metadata_version_is_the_shared_fixtures_text() {
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../sdk/tests/fixtures/wave_al/refusal.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let this_server = &fixture["this_server"];
+    let sent = this_server["sent"].as_i64().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path()).await;
+    let refused = send_one(&server, batch_v5(0..5, 2), sent, 100)
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert_eq!(refused.message(), this_server["text"].as_str().unwrap());
+}
+
 /// Section 3: a protocol 5 server takes batch metadata versions 1 and 2, and refuses any other with
 /// `INVALID_ARGUMENT` naming both versions it reads, before storing or acknowledging anything. Fails
 /// on the base (`5c286ed`): version 2 is refused, "this server reads version 1" (D6).
