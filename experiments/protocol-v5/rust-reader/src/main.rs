@@ -1,13 +1,13 @@
 //! WAVE_AL_CONTRACT.md's Rust-side measurements. Not product code.
 //!
 //! `part-reader keys <store> <part> <column>`: reads `<part>` whole with the server's own
-//! `Storage::read_part_whole` (every column, `probe_maps` and `probe_histograms` included) and prints,
+//! `Storage::read_part` (every column, `probe_maps` and `probe_histograms` included) and prints,
 //! for the first row, the keys of the map column `<column>` in stored order, as JSON `[[...]]`. With
 //! `<column>` written `map.field` it prints, for the first entry of the first row, the struct field
 //! `field` looked up by name, or `"absent"` when the part's struct has no such field.
 //!
 //! `part-reader bench <rounds> <part>...`: for every part, the time to read it with
-//! `Storage::read_part` (since lane AL-2 the read `detect::replay` makes: it leaves out `probe_maps`
+//! `Storage::read_part_for_detect` (the read `detect::replay` makes: it leaves out `probe_maps`
 //! and `probe_histograms`, and reads a part without them whole), and the time to decode what the detectors read from its layer and router
 //! statistics: from `layers_json` / `moe_stats_json` with a copy of `detect.rs`' own visitors
 //! (`Members<LayerStats>`, `Members<RouterStats>`), or from the prototype's typed `layers` /
@@ -286,7 +286,7 @@ async fn bench(rounds: usize, paths: &[String]) -> Result<(), Box<dyn std::error
         rows = 0;
         for location in &locations {
             let started = Instant::now();
-            let batches = storage.read_part(location).await?;
+            let batches = storage.read_part_for_detect(location).await?;
             read += ms(started);
             for batch in &batches {
                 rows += batch.num_rows();
@@ -373,7 +373,7 @@ async fn bench(rounds: usize, paths: &[String]) -> Result<(), Box<dyn std::error
 /// `part-reader write <rounds> <part>...`: each part read once, then written to memory `rounds`
 /// times with the WriterProperties of `Storage::write_part` (Zstd at its default level), as the server
 /// writes a part before it acknowledges it. Prints the median, spread and bytes per part. The part is
-/// read whole (`read_part_whole`): the server writes the probe's maps and histograms with the rest.
+/// read whole (`read_part`): the server writes the probe's maps and histograms with the rest.
 async fn write(rounds: usize, paths: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
@@ -382,7 +382,7 @@ async fn write(rounds: usize, paths: &[String]) -> Result<(), Box<dyn std::error
     let mut out = Vec::new();
     for path in paths {
         let location = object_store::path::Path::from_absolute_path(std::path::absolute(path)?)?;
-        let batches = storage.read_part_whole(&location).await?;
+        let batches = storage.read_part(&location).await?;
         let mut times = Vec::new();
         let mut size = 0;
         for _ in 0..rounds {
@@ -407,7 +407,7 @@ async fn write(rounds: usize, paths: &[String]) -> Result<(), Box<dyn std::error
 async fn keys(part: &str, column_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let storage = Storage::from_url("/")?;
     let location = object_store::path::Path::from_absolute_path(std::path::absolute(part)?)?;
-    let batches = storage.read_part_whole(&location).await?;
+    let batches = storage.read_part(&location).await?;
     let batch = &batches[0];
     let (name, field) = match column_name.split_once('.') {
         Some((name, field)) => (name, Some(field)),
