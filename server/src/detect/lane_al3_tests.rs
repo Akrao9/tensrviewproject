@@ -21,7 +21,7 @@ use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
-use super::{detect_stream, detect_stream_samples, judge, report, Thresholds};
+use super::{detect_follow, detect_run, detect_stream, detect_stream_samples, judge, report, Thresholds};
 
 /// One entry of a struct map as a record holds it: an object's fields in the record's order, or a
 /// value that is not an object.
@@ -791,5 +791,40 @@ fn every_version_the_server_stores_is_one_detect_reads() {
         columns[at] = Arc::new(Int32Array::from_iter_values((0..40).map(|_| version)));
         let rows = RecordBatch::try_new(typed.schema(), columns).unwrap();
         detect_stream(stream(&[rows]).as_slice(), &Arc::default()).unwrap_or_else(|error| panic!("{version}: {error}"));
+    }
+}
+
+/// `detect --run` and `detect --follow` read typed rows as `detect` does: the same reader and the
+/// same key check. `--follow` is given the run in two looks, the second appended to the first.
+#[test]
+fn detect_run_and_detect_follow_read_typed_rows() {
+    let recs = run();
+    let (typed, json_rows) = (batch(&recs, TYPED), batch(&recs, Layout::Json));
+    let thresholds = Arc::<Thresholds>::default();
+    let typed_run = detect_run(std::slice::from_ref(&typed), &thresholds).unwrap();
+    assert_eq!(
+        typed_run,
+        detect_run(std::slice::from_ref(&json_rows), &thresholds).unwrap()
+    );
+    assert!(typed_run.to_string().contains("\"activation_spike\""), "{typed_run}");
+
+    let mut input = Vec::new();
+    for look in [batch(&recs[..20], TYPED), batch(&recs[20..], TYPED)] {
+        let bytes = stream(&[look]);
+        input.extend((bytes.len() as u64).to_le_bytes());
+        input.extend(bytes);
+    }
+    let mut out = Vec::new();
+    detect_follow(input.as_slice(), &thresholds, false, &mut out).unwrap();
+    let lines: Vec<Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["follow"]["mode"], "append", "{}", lines[1]);
+    let whole = detect_stream(stream(&[json_rows]).as_slice(), &thresholds).unwrap();
+    for key in ["incidents", "kind_checks", "not_checked"] {
+        assert_eq!(lines[1][key], whole[key], "{key}");
     }
 }
