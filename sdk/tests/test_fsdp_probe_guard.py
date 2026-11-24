@@ -105,6 +105,22 @@ def _where(run: dict) -> str:
     )
 
 
+def test_a_port_taken_between_its_choice_and_the_listen_is_chosen_again(tmp_path: Path, monkeypatch) -> None:
+    """The port is chosen here and listened on by rank 0 a moment later, and another process can take it in
+    between: on CI (Python 3.11, PyTorch 2.14, run 45494662452) rank 0 then ended with PyTorch's "The server
+    socket has failed to listen on any local network address" and the case failed at the deadline. The
+    harness chooses again; the case is not about ports."""
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        choices = iter([taken.getsockname()[1]])
+        free = _free_port
+        monkeypatch.setattr(sys.modules[__name__], "_free_port", lambda: next(choices, None) or free())
+        run = _run("fsdp2", tmp_path / "fsdp2")
+    assert [(r["in_time"], r["code"]) for r in run["ranks"]] == [(True, 0), (True, 0)], _where(run)
+    assert run["seconds"] < DEADLINE, "the taken port was waited out to the deadline"
+
+
 @pytest.mark.parametrize("flavor", ["fsdp2", "fsdp1", "fsdp1-inner"])
 def test_a_sharded_model_trains_to_the_end_with_the_probe_off_when_one_rank_stops(flavor: str, tmp_path: Path) -> None:
     run = _run(flavor, tmp_path / flavor)
