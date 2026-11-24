@@ -370,9 +370,11 @@ def test_an_index_naming_a_shard_that_is_absent(tmp_path):
     json.dumps({"weight_map": {"head.weight": 3}}),
     json.dumps({"weight_map": {"head.weight": "../elsewhere/model.safetensors"}}),
     json.dumps({"weight_map": {"head.weight": "/abs/model.safetensors"}}),
+    json.dumps({"weight_map": {"head.weight": "pytorch_model-00001-of-00001.bin"}}),  # a pickle is never opened
 ])
 def test_an_index_that_cannot_be_read(tmp_path, index):
     save(tmp_path / "ckpt", {"head.weight": torch.zeros(2, 4)}, "model-00001-of-00001.safetensors")
+    (tmp_path / "ckpt" / "pytorch_model-00001-of-00001.bin").write_bytes(b"\x80\x04" + b"\x00" * 64)
     (tmp_path / "ckpt" / "model.safetensors.index.json").write_text(index)
     why, reason, file = refused(tmp_path / "ckpt")
     assert (why, file) == ("folder", "model.safetensors.index.json")
