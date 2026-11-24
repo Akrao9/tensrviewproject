@@ -50,7 +50,8 @@ TensorQuill, change the interpreter's collector once in each arm, between steps 
 `--hold-at` (so in neither step's time): `freeze` moves every object made so far out of the
 collector's reach (`gc.freeze()`), `collect` runs the full collection the process owes now
 (`gc.collect()`), `threshold` raises generation 2's threshold so no full collection runs after it.
-Each arm keeps what it did as `gc_hold`, with the counts right after. The default, `none`, changes
+Each arm keeps what it did as `gc_hold`, with the counts right after; a collection the hold itself
+runs is tagged `hold` and listed as `gc_held_by_script`, apart from training's collections. The default, `none`, changes
 nothing. The load average of the machine is kept with each arm and with the summary.
 
 Exit status: 0 when both arms were measured in every round, 1 when an arm process failed or wrote no
@@ -98,25 +99,36 @@ def run_arm(args) -> dict[str, Any]:
         if phase == "start":
             began_gc[0] = time.perf_counter()
         else:
-            collections.append({"step": len(step_ms), "in_next": len(next_ms) == len(step_ms) and in_next[0],
-                                "generation": info.get("generation"), "collected": info.get("collected"),
-                                "thread": threading.current_thread().name, "ms": (time.perf_counter() - began_gc[0]) * 1e3})
+            row = {"step": len(step_ms), "in_next": len(next_ms) == len(step_ms) and in_next[0],
+                   "generation": info.get("generation"), "collected": info.get("collected"),
+                   "thread": threading.current_thread().name, "ms": (time.perf_counter() - began_gc[0]) * 1e3}
+            if holding[0]:
+                row["hold"] = True  # the script's own `--hold-gc` collection, between two steps
+            collections.append(row)
 
     in_next = [False]
+    holding = [False]
     hold: list[dict[str, Any] | None] = [None]
 
     def hold_collector() -> None:
         """The controlled arm (lane AK-4): the script, never the SDK, changes the collector once,
         between two steps, so the change is in neither step's time."""
-        if args.hold_gc == "freeze":
-            gc.freeze()  # the heap built so far is never scanned again
-        elif args.hold_gc == "collect":
-            gc.collect()  # pay what the collector owes now, before the timed steps
-        elif args.hold_gc == "threshold":
-            low, middle, _ = gc.get_threshold()
-            gc.set_threshold(low, middle, 10**9)  # no full collection for the rest of the arm
+        holding[0] = True
+        try:
+            _hold(args.hold_gc)
+        finally:
+            holding[0] = False
         hold[0] = {"kind": args.hold_gc, "step": len(step_ms), "count_after": list(gc.get_count()),
                    "frozen": gc.get_freeze_count(), "threshold_after": list(gc.get_threshold())}
+
+    def _hold(kind: str) -> None:
+        if kind == "freeze":
+            gc.freeze()  # the heap built so far is never scanned again
+        elif kind == "collect":
+            gc.collect()  # pay what the collector owes now, before the timed steps
+        elif kind == "threshold":
+            low, middle, _ = gc.get_threshold()
+            gc.set_threshold(low, middle, 10**9)  # no full collection for the rest of the arm
 
     def train() -> None:
         batches = iter(loader)
@@ -247,10 +259,15 @@ def summarize(results: dict[str, list[dict]], names: list[int], slack_ms: float)
                 # The step's time outside next(): the forward, backward, optimizer step and TensorQuill's own work.
                 worst_rest_by_round=[{"round": r["round"], "ms": max(r["rest_ms"]), "step": r["rest_ms"].index(max(r["rest_ms"])),
                                       "over_median_ms": max(r["rest_ms"]) - statistics.median(r["rest_ms"])} for r in measured],
-                gc_over_1ms=[{"round": r["round"], **c} for r in measured for c in r.get("gc_collections", []) if c["ms"] >= 1.0],
-                gc_collections=sum(len(r.get("gc_collections", [])) for r in measured),
-                gc_by_generation={str(g): sum(c.get("generation") == g for r in measured for c in r.get("gc_collections", []))
+                # Training's collections; the script's own `--hold-gc` one, between steps, kept apart.
+                gc_over_1ms=[{"round": r["round"], **c} for r in measured for c in r.get("gc_collections", [])
+                             if c["ms"] >= 1.0 and not c.get("hold")],
+                gc_collections=sum(not c.get("hold") for r in measured for c in r.get("gc_collections", [])),
+                gc_by_generation={str(g): sum(c.get("generation") == g and not c.get("hold")
+                                              for r in measured for c in r.get("gc_collections", []))
                                   for g in range(3)},
+                gc_held_by_script=[{"round": r["round"], **c} for r in measured for c in r.get("gc_collections", [])
+                                   if c.get("hold")],
                 step_ms_median_by_round=[statistics.median(r["step_ms"]) for r in measured],
                 step_ms_mean_by_round=[statistics.fmean(r["step_ms"]) for r in measured],
             )
