@@ -9,6 +9,8 @@ What runs here, on the base and on every lane's tree:
   functions, frozen beside it in `flight_v4.py` (`flight.py` at `5c286ed`), as it was measured.
 - `flight` itself (lane AL-1, merged at `92e471a`): each case's `row` and round trip, and the
   prototype's row on every record of every section 1 and 2 case, `clean_records` included.
+- The `rust_sdk` path (`build_evidence(detectors="rust")`) of every case that names it, against the
+  case's `rust_raw` expectation: ordinary tests since the joined tree (92e471a).
 - Pins: where the base already reports on `records` what the contract asks (`expect`), the engine
   paths are ordinary tests, so no lane can move them.
 - Targets: where the base does not (a refused entry today, the row layout, the scalar-only record),
@@ -222,6 +224,26 @@ def _engine_params():
             kind = "pin" if pinned else "landed" if landed else "target"
             out.append(pytest.param(case, path, marks=marks, id=f"{case['name']}-{path}-{kind}"))
     return out
+
+
+RUST_SDK = [c for c in ROWS if "rust_sdk" in c["paths"] and "rust_raw" in c["expect"]]
+
+
+@pytest.mark.parametrize("case", RUST_SDK, ids=[c["name"] for c in RUST_SDK])
+def test_the_sdk_s_rust_path_reports_the_rust_expectation(case):
+    """The case's `rust_sdk` path, `build_evidence(detectors="rust")` (lane AL-3's reader fed by lane
+    AL-1's rows), reports on `records` what `expect["rust_raw"]` says. The cases record no `today` for
+    this path; it holds on the joined tree (92e471a), so it is an ordinary test."""
+    pytest.importorskip("pyarrow")
+    from tensorquill.server_detect import find_binary
+
+    if find_binary() is None:
+        pytest.skip("tensorquill-server is not built")
+    want = case["expect"]["rust_raw"]
+    built = evidence.build_evidence(copy.deepcopy(case["records"]), detectors="rust")
+    assert built["detectors"] == "rust"
+    assert [_brief(i) for i in built["incidents"]] == want["incidents"]
+    assert {k: (built["kind_checks"].get(k) or {}).get("value") for k in sorted(want["kind_checks"])} == want["kind_checks"]
 
 
 @pytest.mark.parametrize(("case", "path"), _engine_params())
