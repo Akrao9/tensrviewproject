@@ -407,7 +407,22 @@ session = tensorquill.init(model, routers=..., endpoint="grpc://127.0.0.1:50051"
 - **The server** writes `{store}/runs/{run_id}/rank={rank}/attempt={attempt}/part-{first step}-{last step}.parquet`, one row per step. It listens on loopback by default; any other address needs `TENSORQUILL_TOKEN` (the sender reads the same variable and sends it as a Bearer token) or `--allow-unauthenticated`, with optional TLS (`--tls-cert` and `--tls-key` on the server, `grpcs://` and `TENSORQUILL_TLS_CA` for a custom CA on the sender). On `SIGTERM` it writes what it holds and exits. It buffers at most 128 MiB across all ranks and refuses batches beyond that, which the sender retries.
 - **Run IDs** may hold only letters, digits, `-`, `_` and `.` on the server, because the ID becomes a directory name.
 - **A run resumed from an earlier step under the same run ID** is a new attempt. The server checks each row against its own attempt, so the steps written again are kept, in their own `attempt=` directory, and a resend of old lines after a lost offset file still stores nothing twice.
-- **Columns.** Numbers and name-to-number maps are typed columns; `layers`, `moe_stats` and `probe` are JSON strings (`layers_json`, `moe_stats_json`, `probe_json`; `layers_json` keeps the model's key order, which the activation detectors use to say which block showed a change first, while the other two are written with sorted keys; Parquet parts sent by a version before Nov 15, 2026 have `layers` sorted by name, so "first" there is first by name); anything else travels in `extra_json`, so a row converts back to exactly the record in the `.jsonl` file. The choices behind this are in the plan's Decisions section.
+- **Columns.** Numbers and name-to-number maps are typed columns. Since protocol 5 (Nov 24, 2026) `layers` and `moe_stats` are typed columns too: a map from each layer or router to a struct of its statistics (`mean`, `std`, `abs_max` and `zero_frac` for a layer; `routed_tokens`, `entropy`, `diversity`, `dead_experts` and `dead_frac` for a router), in the model's order, which the activation detectors use to say which block showed a change first. A field or entry its column cannot hold (such as a Boolean, other text, or a field no struct names) travels in `extra_json`, and the rest of the map is kept. The probe is split three ways: its attention maps go to `probe_maps` (one float32 grid per module, by the module's label), its histograms to `probe_histograms`, and the rest stays in `probe_json`. No detector reads the maps or the histograms, and a rank the server rebuilds from its store does not load them. The `.jsonl` file holds the whole probe, as before. Parts written before protocol 5 have `layers_json` and `moe_stats_json` instead (JSON text: `layers_json` in the model's order, `moe_stats_json` with sorted keys; parts sent by a version before Nov 15, 2026 have `layers` sorted by name, so "first" there is first by name) and the whole probe in `probe_json`, and they are still read. Anything else travels in `extra_json`, so a row converts back to exactly the record in the `.jsonl` file. The choices behind this are in the plan's Decisions section, and the version numbers below.
+
+**Protocol 5's versions.** Since Nov 24, 2026 the SDK and `tensorquill-server` speak protocol 5 (`WAVE_AL_CONTRACT.md`). Four numbers are involved, kept apart, and each gates something different:
+
+| Number | Where | Protocol 5 (before) | What it gates |
+| --- | --- | --- | --- |
+| The protocol | `server_detect.PROTOCOL`; what `tensorquill-server protocol` prints | 5 (4) | Whether the SDK runs a binary's `detect` and `detect --follow`: only the same number is taken (see [The Rust detectors on a local file](#the-rust-detectors-on-a-local-file)). The live stream does not check it |
+| Batch metadata `schema_version` | each batch the sender streams (`flight.SCHEMA_VERSION`) | 2 (1); the server takes 1 and 2 | The live stream: the server refuses any other with `INVALID_ARGUMENT`, "schema_version N is not supported; this server reads versions 1 and 2", and acknowledges nothing |
+| Row `schema_version` | each stored row (`flight.ROW_VERSION`) | 2 (0 or 1: the record's own), with the record's own version in `record_version`; the server stores 0, 1 and 2 | Live, a row of any other version is dropped and counted under `unsupported_schema_version` in the rank's entry of its run's `watchdog.json` (`dropped_row_keys`); offline, `tensorquill-server detect` refuses the input |
+| Record `schema_version` | each line of the `.jsonl` file (`identity.SCHEMA_VERSIONS`) | 0 or 1, unchanged | Every offline reader: a record of another version refuses the whole input, naming it |
+
+A layout is told by its columns, not by a number: `load_records` and the server's detectors read protocol 4 parts, protocol 5 parts, or a rank holding both (a rank whose protocol 4 backlog meets protocol 5 rows has parts of each, since a part has one schema). Nothing is converted, and protocol 4 parts are read for as long as they are stored.
+
+**An older server or an older SDK.** A sender older than protocol 5 streams to a protocol 5 server as before: its batches are stored as sent, in parts of their own. A `tensorquill-server` older than protocol 5 refuses this SDK's stream with `schema_version 2 is not supported; this server reads version 1` and stores nothing. The sender then says once, on stderr and in `session._sink.sender.last_error`: `the server at <endpoint> speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server)`, and keeps trying. Training is not affected, the local file keeps every line, and the lines are sent once the server is upgraded.
+
+**A downgrade is not supported.** A protocol 4 server started again on a store that holds protocol 5 parts reads them without a word: their steps have no layers, no MoE statistics and no attention maps to it, so it judges no layer and no router statistic there. An SDK older than protocol 5 refuses a store that holds protocol 5 parts, naming the part and the row. Once a store holds protocol 5 parts, keep the server and the SDK at protocol 5 or later.
 
 ## Detector benchmark on 64 ranks
 
@@ -1057,7 +1072,7 @@ Wave AF, Nov 21, 2026 (`WAVE_AF_CONTRACT.md`).
 | `attempt` | read as 0 | an integer of 0 or more |
 | `step` | not valid | an integer of 0 or more |
 
-A Boolean, a float (also a whole one, `1.0`), text and `null` are not integers. `run_id` is read as before.
+A Boolean, a float (also a whole one, `1.0`), text and `null` are not integers. `run_id` is read as before. The table is for the record, as the `.jsonl` file holds it: a row the server stores carries row version 2, with the record's own in `record_version` (see [Protocol 5's versions](#streaming-to-an-ingest-server)).
 
 **Offline, a record that is not valid refuses the whole input**, and nothing of it is judged: a missing observation never reads as a clean check.
 
@@ -1065,7 +1080,7 @@ A Boolean, a float (also a whole one, `1.0`), text and `null` are not integers. 
 - The command line, with `--watch`, `compare` and either engine, prints one line, `tensorquill: error: attempt is 1.0 at run.rank0.jsonl, line 4: tensorquill reads an integer of 0 or more`, and exits with status 2.
 - The MCP tools that read records answer with a tool error holding that text, and answer the next call.
 - `python -m tensorquill runs` and the MCP `list_runs` do not raise: such a file is listed as a run with no evidence.
-- `tensorquill-server detect`, with or without `--run`, exits with status 1 and one line naming the row, the field and the value, for a negative `rank`, `attempt` or `step` and a `schema_version` other than 0 or 1.
+- `tensorquill-server detect`, with or without `--run`, exits with status 1 and one line naming the row, the field and the value, for a negative `rank`, `attempt` or `step` and a `schema_version` other than 0, 1 or 2.
 - The capture writes a `step=` or `start_step=` below 0 as given; such a file is then refused, so give steps of 0 or more.
 
 **The sender and live ingest.**

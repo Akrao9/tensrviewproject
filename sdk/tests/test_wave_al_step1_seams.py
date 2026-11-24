@@ -343,6 +343,7 @@ def version_table() -> dict[str, list[str]]:
     """The passage's table, by its first cell: the four numbers of section 3."""
     rows = [line for line in versions_passage().splitlines() if line.startswith("| ")]
     cells = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in rows]
+    cells = [row for row in cells if set("".join(row)) != {"-"}]  # not the separator row
     assert cells[0] == ["Number", "Where", "Protocol 5 (before)", "What it gates"], cells[0]
     return {row[0]: row[1:] for row in cells[1:]}
 
