@@ -6,6 +6,7 @@ What `WAVE_AL_CONTRACT.md` cites. Nothing here is product code, and nothing here
 |---|---|
 | `prototype.py` | Protocol 5's row layout as the contract states it (sections 1 to 4), built on today's `flight.py`. `layout="v4-accepted"` writes a row version the protocol 4 server stores |
 | `captures.py` → `results/captures.json` | The seven GPU captures in `~/Downloads/runs` (read only): their real keys, map shapes, and the round trip through the prototype |
+| `captures.py --fixtures` → `results/fixtures.json` | Every record of the repository's shared case files (`sdk/tests/fixtures/*/*.json`; no Gate 1 held-out file), its round trip through the prototype against today's |
 | `live.py` → `results/live.json` | Today's behaviour with protocol 5's data, against a real server: map order through Flight, Parquet and a restart; an old server and old Python readers given the new layout and versions; the step watermark and a future step; a struct field added later |
 | `measure.py ack` → `results/ack.json` | One rank: a probe batch's acknowledgement, its part's bytes and its Parquet write, for today, the prototype, and no probe |
 | `measure.py live64` → `results/live64.json` | 64 ranks at 65 ms a step through the server's own `live_streams` example, for the same three arms |
@@ -22,6 +23,7 @@ cargo build --release --offline --manifest-path experiments/protocol-v5/rust-rea
 export PYTHONPATH=$PWD/sdk/src TENSORQUILL_SERVER_BIN=$PWD/server/target/release/tensorquill-server
 PY=/path/to/.venv/bin/python
 $PY experiments/protocol-v5/captures.py --out experiments/protocol-v5/results/captures.json
+$PY experiments/protocol-v5/captures.py --fixtures experiments/protocol-v5/results/fixtures.json
 $PY experiments/protocol-v5/live.py --out experiments/protocol-v5/results/live.json
 $PY experiments/protocol-v5/measure.py ack --rounds 7 --out experiments/protocol-v5/results/ack.json
 $PY experiments/protocol-v5/measure.py live64 --rounds 5 --out experiments/protocol-v5/results/live64.json

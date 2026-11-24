@@ -81,6 +81,16 @@ def flight_schema_v5(token_entropy: bool = False) -> Any:
     return pa.schema(fields)
 
 
+_SCHEMA: Any = None
+
+
+def _schema_v5() -> Any:
+    global _SCHEMA
+    if _SCHEMA is None:
+        _SCHEMA = flight_schema_v5()
+    return _SCHEMA
+
+
 def _encodable(name: Any) -> bool:
     if not isinstance(name, str):
         return False
@@ -190,8 +200,11 @@ def split_probe(probe: Any) -> tuple[Any, Any, Any]:
 
 def record_to_row_v5(record: Mapping[str, Any], layout: str = "v5", token_entropy: bool = False) -> dict[str, Any]:
     scalar_record = record.get("schema_version") == 2
-    rest = {k: v for k, v in record.items() if k not in _MOVED and not (scalar_record and k == "seq")}
-    row = v4._row(rest)
+    # A scalar-only record's `record` and `seq` are its row's `seq` column (contract section 4.4).
+    rest = {k: v for k, v in record.items() if k not in _MOVED and not (scalar_record and k in ("seq", "record"))}
+    # With Arrow's check, as `flight.rows_batch` redoes a row Arrow refuses (wave AJ): the result for a
+    # row Arrow takes is the same either way.
+    row = v4._row(rest, _schema_v5())
     extra = json.loads(row.pop("extra_json")) if row.get("extra_json") else {}
     for column in ("layers_json", "moe_stats_json"):
         row.pop(column)
@@ -240,12 +253,16 @@ def row_to_record_v5(row: Mapping[str, Any]) -> dict[str, Any]:
              if k not in ("layers", "moe_stats", "probe_json", "probe_maps", "probe_histograms", "seq",
                           "record_version", "extra_json")}
     plain["layers_json"] = plain["moe_stats_json"] = plain["probe_json"] = None
-    plain["extra_json"] = None
+    extra = json.loads(row["extra_json"]) if row.get("extra_json") else {}
+    # Everything but the struct maps' refused fields goes through today's reader, which merges wave
+    # AJ's refused map entries and puts every other key of extra_json on the record.
+    rest = {k: v for k, v in extra.items() if k not in ("layers", "moe_stats")}
+    plain["extra_json"] = json.dumps(rest) if rest else None
+    extra = {k: v for k, v in extra.items() if k in ("layers", "moe_stats")}
     plain["schema_version"] = row.get("record_version") or 0
     record = v4.row_to_record(plain)
     if row.get("record_version") is None:
         record.pop("schema_version", None)
-    extra = json.loads(row["extra_json"]) if row.get("extra_json") else {}
     rebuilt: dict[str, Any] = {}
     for key in ("layers", "moe_stats"):
         pairs = row.get(key)
@@ -278,10 +295,15 @@ def row_to_record_v5(row: Mapping[str, Any]) -> dict[str, Any]:
         if key == "ts" and "layers" in rebuilt:
             out["layers"] = rebuilt.pop("layers")
     out.update(rebuilt)
-    for key, value in extra.items():
+    for key, value in extra.items():  # a struct map's whole value, when the column held none of it
         out[key] = value
     if row.get("seq") is not None:
-        out["seq"] = row["seq"]
+        # A scalar-only record (section 4.4): `record` comes back from `seq`, and the columns a step
+        # record always carries (`flight._ALWAYS`) come back only when the row holds a value.
+        for key in v4._ALWAYS:
+            if out.get(key) is None and row.get(key) is None:
+                out.pop(key, None)
+        out = {"schema_version": out.pop("schema_version"), "record": "scalars", **out, "seq": row["seq"]}
     return out
 
 

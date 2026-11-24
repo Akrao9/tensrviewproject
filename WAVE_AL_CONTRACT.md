@@ -16,7 +16,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 | D2 | `layers` has four fields and `moe_stats` five: `routed_tokens`, `entropy`, `diversity`, `dead_experts`, `dead_frac`. The architecture page's `moe_stats` struct is wrong. | Decided | `capture.py` `STATS` and `_router_stats`; every record of the seven captures (`results/captures.json`) |
 | D3 | `token_entropy` (K3) is not reserved. Readers look struct fields up by name, and K3 adds the field when it lands. | Decided | `results/live.json`, `struct_field_added`: one pyarrow reader and the Rust reader read a part without the field as absent and one with it as its value |
 | D4 | Wave AJ's rule extended to struct entries, field by field, with a null struct keeping an unreadable entry's place (section 1.4). | Decided | the order rule (D1) and the round trip on every case and capture |
-| D5 | `row_to_record(record_to_row(r)) == r` with every map's order kept, on all 3,800 records of the seven captures. | Decided | `results/captures.json`: 0 not equal, 0 out of order |
+| D5 | `row_to_record(record_to_row(r)) == r` with every map's order kept, on all 3,800 records of the seven captures. On the 8,463 records of the repository's shared case files, the round trip is the same as today's. | Decided | `results/captures.json`: 0 not equal, 0 out of order. `results/fixtures.json`: 8,446 the same as today's round trip, 17 refused by both (wave AF's invalid identities), 0 different |
 | D6 | The batch metadata `schema_version` goes from 1 to 2 for protocol 5's layout. | Decided | `results/live.json`: a protocol 4 server given the typed layout under version 1 stores it and judges no layer (`old_server_typed`); under row version 2 alone it drops the rows and acknowledges them, so they are lost to it (`old_server_row_v2`); under metadata version 2 it refuses the stream and acknowledges nothing (`old_server_meta_v2`) |
 | D7 | A row of protocol 5's layout carries row `schema_version` 2. | Decided | `results/live.json`, `old_python_on_v5_part`: today's `load_records` reads a typed part with row version 1 as a run with no layers (`activation_spike` `not_configured`, no incident); with row version 2 it refuses the part naming it |
 | D8 | A scalar-only row is never in a `part-*` file and never moves the step watermark. | Decided | `results/live.json`, `watermark`: a row of step 1000 in a part makes the server drop steps 4 to 9 after a restart, from the part's footer |
@@ -48,8 +48,7 @@ Each question lists its options with what each costs. The recommended option is 
 - **(b) Everything a protocol 5 SDK writes is version 2:** every record and every row.
   - Costs: an older SDK can read no new file, even one identical to a protocol 4 file apart from its version. Every step record the capture writes changes by one byte. Tests that assert `schema_version == 1` change. No golden file is expected to change, since the evidence carries its own `schema_version` and not the records'.
   - What it saves: no `record_version` column, and one meaning for the row's version.
-- **(c) Nothing is refused:** an older SDK reads protocol 5's parts with no layers and no maps.
-  - Not recommended: it is the silent case D7 measured.
+- **Not offered:** nothing refused at all. That is the silent reading D7 measured, and D7 is decided.
 
 **Q2. The heavy probe arrays** (section 2.3 has the measurements).
 - **(a) Recommended: columns in the same row.**
@@ -182,12 +181,12 @@ Each question lists its options with what each costs. The recommended option is 
 - **`layers_name_arrow_cannot_encode`:** Rust loses every layer. Arrow refuses the key, so the whole map goes to `extra_json` today. Under section 1.4 only that entry does.
 
 **Who fixes them:**
-- Python (lane AL-4) skips an entry that is not an object, and a `layers` value that is not an object, as absent.
+- Python (lane AL-4′, in step 2 with the other Python readers) skips an entry that is not an object, and a `layers` value that is not an object, as absent.
 - Rust (lane AL-3, with AL-1's layout) reads the rest of the map.
 
 **Every other case gives today's results in both engines,** and the tests pin them (`-pin` in their IDs). That includes `moe_stats_diversity_refused`:
 - Python reads `float(true)` as a diversity of 1.0, where Rust takes it from the counts. Both still report the same `moe_imbalance`.
-- The difference shows only in the per-step `samples` (`build_evidence` against `detect --samples`). Lane AL-4 makes Python fall back to the counts there as Rust does, and adds that comparison as its test.
+- The difference shows only in the per-step `samples` (`build_evidence` against `detect --samples`). Lane AL-4′ makes Python fall back to the counts there as Rust does, and adds that comparison as its test.
 
 ### 1.6 The round trip on the recorded captures
 
@@ -396,13 +395,17 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 
 ## 6. Before-numbers and the acceptance figures (lanes AL-2, AL-3)
 
+**What the "prototype" arm leaves out.** The protocol 4 server reads none of the prototype's typed columns: it judges no layer and no router statistic on them (`old_server_typed`). So in `ack` and `live64` the prototype arm's detectors skip the layer work that the `v4` and no-probe arms do.
+- That flatters its acknowledgements only after the part is written: the detectors run after the acknowledgement. They show through the next batch's wait, and the `after_probe` batches in `ack` are no slower in either arm.
+- The acceptance figures are ratios against a no-probe arm in the same layout, measured by the lane with protocol 5's own server, where the detectors read both arms alike.
+
 **Where they were measured.** This Mac: 8 cores, Apple M1 Pro, Python 3.12.3, pyarrow 26.0.1, the release binary of this tree. Each run records the one-minute load average before it: 4 to 11 throughout, from other sessions on the machine. Medians are given with the lowest and highest values. The plan's figures are corrected in section 8.
 
 | What | Today (protocol 4) | Prototype (protocol 5 layout, protocol 4 server) | Acceptance figure for the wave, and how it is measured |
 |---|---|---|---|
 | One rank: a probe batch, sent to acknowledged (`measure.py ack`, 7 rounds, 4 probe batches each) | 14.6 ms (12.3 to 20.5) | 9.1 ms (8.0 to 12.9) | At most 1.7 times a plain batch's acknowledgement on the same run, against 2.4 today (plain: 6.2 and 5.6 ms). `measure.py ack`, 5 or more rounds |
 | Its Parquet part | 743 KB; write alone 5.5 ms | 539 KB; 4.9 ms | At most 75% of today's bytes on the dense capture's probe parts. `measure.py ack` |
-| 64 ranks at 65 ms a step, every other part a probe (`measure.py live64`: the server's own `live_streams` example, 8 source ranks replayed as 64, `--flush-steps 50`, 5 rounds, load 2.8 to 9.2). Sent to acknowledged, median of the rounds' values (lowest to highest round) | median 76.6 ms (66.9 to 115.2), p99 197 (179 to 368), worst 206 (187 to 379); one round of five had 42 of 448 acknowledgements over 250 ms. Without any probe: median 50.3, p99 85.3 (85 to 97), worst 88.9 | median 52.6 (49.4 to 69.4), p99 117 (116 to 173), worst 122 (119 to 194); none over 250 ms | p99 at most 1.5 times the no-probe arm's p99 in the same run (today 2.3, prototype 1.4), and no acknowledgement over 250 ms in any of 5 rounds. `measure.py live64` |
+| 64 ranks at 65 ms a step, every other part a probe (`measure.py live64`: the server's own `live_streams` example, 8 source ranks replayed as 64, `--flush-steps 50`, 5 rounds, load 2.8 to 9.2). Sent to acknowledged, median of the rounds' values (lowest to highest round) | median 76.6 ms (66.9 to 115.2), p99 197 (179 to 368), worst 206 (187 to 379); one round of five had 42 of 448 acknowledgements over 250 ms. Without any probe: median 50.3, p99 85.3 (85 to 97), worst 88.9 | median 52.6 (49.4 to 69.4), p99 117 (116 to 173), worst 122 (119 to 194); none over 250 ms | p99 at most 1.5 times the p99 of a no-probe arm in protocol 5's layout, on the same server and run (here: today 2.3, prototype 1.4, against the protocol 4 no-probe arm), and no acknowledgement over 250 ms in any of 5 rounds. `measure.py live64` |
 | Decoding what the detectors read of the layer and router statistics: 1,000 Granite-shaped rows (24 blocks, 32 experts), with `detect.rs`' own visitors against the typed maps (`measure.py decode`, `rust-reader bench`, 5 rounds, load 4.6 to 5.3) | `layers_json` 4.88 ms (4.86 to 4.92), `moe_stats_json` 4.27 ms (4.26 to 4.29) | `layers` 0.18 ms (0.18 to 0.19), `moe_stats` 0.069 ms (0.068 to 0.071) | Both under 0.5 ms per 1,000 rows. `rust-reader bench` on the lane's parts |
 | The detectors' whole time per flush of 64 ranks of 50 steps, one thread (`detect_store --bench`, the server's own example, 64 ranks × 1,000 steps, 5 runs) | 72.7 ms (72.6 to 72.8); of which the JSON decoding measured apart, 34.7 ms (34.65 to 34.86), 48% | Not measurable without product code. Expected about 39 ms: today's time without the decoding, plus the typed decode at 1 ms per 3,200 rows | At most 50 ms on the same store in protocol 5's layout, with `detect_store --bench` on the same machine. Today's 72.7 is to be re-measured beside it, and the figure is then at most 0.7 times today's |
 | Its parts | 4.86 MB for 1,000 rows | 4.37 MB (−10%); `read_part` 19.8 ms against 18.3 ms (nested columns decode a little slower) | No figure: the replay is not on the live path |
@@ -448,22 +451,23 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 ## 9. The lanes
 
 **Two gated steps, one protocol bump, one push.**
-- Step 1 is sections 1 to 3; step 2 is section 4.
-- `PROTOCOL` becomes 5 in step 1, and the push follows step 2.
+- Step 1 is sections 1 to 3; step 2 is section 4. The Python readers change only in step 2, as the plan has it.
 - Lanes are split by file, and two lanes never own one file.
-- A lane's tests are its cases' paths. Its targets in `test_wave_al_contract.py` lose their `xfail` mark when they pass on its branch. The live-server, `runs` and MCP paths are tests each lane writes for its cases, failing first.
+- **`PROTOCOL` stays 4 in every lane's own tree.** The coordinator raises it to 5 in both `server_detect.py` and `main.rs` in step 1's seam commit. So each lane's tree keeps its `rust_raw` pins passing with a binary built from it.
+- **Targets that need two lanes are judged on the joined tree,** with `--runxfail`, as wave AJ did. A `rust_raw` target needs AL-1's layout and AL-3's reader.
+- A lane's tests are its cases' paths. Its targets in `test_wave_al_contract.py` lose their `xfail` mark when they pass on its branch, or at the merge for a joined target. The live-server, `runs` and MCP paths are tests each lane writes for its cases, failing first.
+- **No lane owns `sdk/README.md`.** Each lane writes its passage in its report, and the coordinator puts them in at the seam, with the README's version table and the test that reads it.
 
 **Step 1: typed columns, the probe split, the versions.**
 
 | Lane | Owns | Does | Cases it must make pass |
 |---|---|---|---|
-| AL-1 | `flight.py`, `server_detect.py` | Protocol 5's row layout: `flight_schema`, `record_to_row`, `row_to_record`, `rows_batch` for sections 1, 2 and 3. Metadata version 2. The older-server message. `PROTOCOL = 5` | every section 1 and 2 case's `row` path (`test_flight_gives_the_row`) |
-| AL-2 | `ingest.rs`, `storage.rs`, `main.rs` | Metadata versions 1 and 2; row versions 0, 1 and 2. `PROTOCOL` 5. A read of a part that projects away `probe_maps` and `probe_histograms`, for replay | the matrix's server rows; `layers_model_order` on a live server across a restart |
-| AL-3 | `detect.rs`, `detect/` | Reads `layers` and `moe_stats` from the typed columns where a batch has them, and the JSON columns where it does not. `non_finite` also reads the refused fields in `extra_json`. Never reads `probe_maps` or `probe_histograms` | every section 1 and 2 case's `rust_raw` and `rust_sdk` paths, live server included |
-| AL-4 | `evidence.py`, `identity.py` | Section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts. Reads a store of either layout through `row_to_record` | the `python` targets of `layers_entry_not_object` and `layers_value_not_object`; the samples comparison of `moe_stats_diversity_refused` |
+| AL-1 | `flight.py`, `server_detect.py` | Protocol 5's row layout: `flight_schema`, `record_to_row`, `row_to_record`, `rows_batch` for sections 1, 2 and 3 (`load_records` reads a store of either layout through it). Metadata version 2. The older-server message | every section 1 and 2 case's `row` path (`test_flight_gives_the_row`); `moved` for `moe_stats_int_past_int64` |
+| AL-2 | `ingest.rs`, `storage.rs`, `main.rs` (but `PROTOCOL`), `watchdog.rs`, `server/examples/` | Metadata versions 1 and 2; row versions 0, 1 and 2. A read of a part that projects away `probe_maps` and `probe_histograms`, for replay. `live_streams` sends metadata version 2 for a source in protocol 5's layout (it writes 1 today, `live_streams.rs` line 264), so section 6's runs can be made | the matrix's server rows; `layers_model_order` on a live server across a restart |
+| AL-3 | `detect.rs`, `detect/` | Reads `layers` and `moe_stats` from the typed columns where a batch has them, and the JSON columns where it does not. `non_finite` also reads the refused fields in `extra_json`. Never reads `probe_maps` or `probe_histograms`. `check_keys` takes row version 2 (it exits on anything but 0 or 1 today) | every section 1 and 2 case's `rust_raw` and `rust_sdk` paths, live server included (joined with AL-1) |
 
 - **AL-1 first.** AL-2 and AL-3 can start beside it: AL-2's projection and AL-3's dual reader need only the column names of sections 1.2 and 2.4.
-- **AL-4 is the one Python reader change in step 1.** It is small, and it does not depend on the layout.
+- **What step 1 leaves standing:** Python still raises on `layers_entry_not_object` and `layers_value_not_object`, as it does today, while Rust reads them. Their `python` targets are step 2's (AL-4′).
 - **The step's gate:**
   - the whole SDK suite and `cargo test` with this tree's binary;
   - the golden and Gate 1 comparisons;
@@ -476,8 +480,8 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 |---|---|---|---|
 | AL-5 | `capture.py` (`Session.log`, `_no_step_for` as Q5 decides, the writer's block), `sink.py` if needed | Writes the record of section 4.2 | `scalar_record_keys` (capture), `scalar_log_refusals` |
 | AL-1′ | `flight.py`, `server_detect.py` | The record's row (`seq`, `record_version`). Scalar-only records set apart before `_stream`, `FollowedDetect` and `stream_order` | `scalar_record_keys` (row) |
-| AL-2′ | `ingest.rs`, `storage.rs` | Section 4.5 | `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart` |
-| AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6 | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step` |
+| AL-2′ | `ingest.rs`, `storage.rs`, `watchdog.rs` (`scalars_not_newer`) | Section 4.5 | `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart` |
+| AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6, and section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step`; the `python` targets of `layers_entry_not_object` and `layers_value_not_object`; the samples comparison of `moe_stats_diversity_refused` |
 
 `detect.rs` has nothing to do in step 2 under Q4 (a). Under Q4 (b) it gains a lane, and the cases gain context expectations.
 
@@ -485,11 +489,11 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 
 - **arrow-rs** (`/Users/ak/Documents/tensrview/arrow-rs`, main of Nov 14; the server pins 60.1.0).
   - `DataType::Map(field, keys_sorted)` is `List<entries: Struct<key, value>>`. Its keys "should be hashable and unique", which is not enforced.
-  - The Parquet reader builds every map with `keys_sorted = false` (`parquet/src/arrow/array_reader/map_array.rs`), and nothing in the path sorts. D1 measured that order holds.
+  - A map read from Parquet takes its `keys_sorted` flag from the stored Arrow schema (`parquet/src/arrow/schema/complex.rs`), or `false` without one (`array_reader/map_array.rs`). Nothing in the read path sorts entries; D1 measured that order holds.
   - `ArrowWriter::write` refuses a batch of another schema, so a part has one.
   - `ProjectionMask::roots` and `leaves` (`parquet/src/arrow/mod.rs`) read only the columns asked for.
 - **wandb** (`core/internal/stream/handler.go` near line 994): a `log` with a `step` below the current one is ignored, with "Tried to log to step N that is less than the current step M … this data will be ignored", and pointed to `define_metric` for out-of-order axes. TensorQuill's scalar-only record takes out-of-order steps, since `seq` and not `step` orders it, and never touches the training step.
 - **MLflow** (`mlflow/store/tracking/dbmodels/models.py`): a metric row's key is `(key, timestamp, step, run_uuid, value, is_nan)`, so the same value at the same time is stored once and every other value of a step is kept as history. `latest_metrics` keeps one row per key. TensorQuill deduplicates by its own `(run, rank, attempt, seq)`, which a replay repeats exactly, and reads the highest `seq` at a step.
 - **InfluxDB 3** (`influxdb3_write/src/write_buffer/queryable_buffer.rs`, `sort_dedupe_persist`): a write's identity is its series and time, deduplicated at persist, last write winning. Its tables are flat columns, with no map or struct, and a field written with another type is refused (`influxdb3_catalog` `InvalidColumnType`). Read for the dedup rule; not copied.
 - **datafusion-ducklake**: evolves `list`, `struct` and `map` columns recursively, with per-file name mappings (README). That is the by-name field lookup D3 asks for. It depends on DataFusion, a rejected non-goal, so ideas only, as the ledger already decided.
-- **datafusion:** not needed. The detectors read Arrow arrays directly.
+- **datafusion:** not read for this contract. The detectors read Arrow arrays directly, and DataFusion is a rejected non-goal.

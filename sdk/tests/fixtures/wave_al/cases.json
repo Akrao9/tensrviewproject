@@ -1,6 +1,6 @@
 {
  "contract": "WAVE_AL_CONTRACT.md",
- "base": "f71d8e0932ba64eb687937ce7835b579e82fcc7c",
+ "base": "afbf14cdbb266baab12b8cfb45584990bb1a4e9c",
  "how_to_read": [
   "Base trial/ai-wave f71d8e0 (the base field: the commit these were computed on). The rules are WAVE_AL_CONTRACT.md.",
   "paths: row = flight.record_to_row and row_to_record in protocol 5's layout; python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
@@ -15068,10 +15068,8 @@
     "seq": 0,
     "record_version": 2,
     "schema_version": 2,
-    "extra": {
-     "record": "scalars"
-    },
-    "round_trip": false
+    "extra": null,
+    "round_trip": true
    },
    "today": {
     "python": "MalformedRecordError: schema_version is 2 at record 4 of the records passed: this tensorquill reads schema versions 0 and 1"

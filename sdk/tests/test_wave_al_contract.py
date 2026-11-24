@@ -38,8 +38,8 @@ EXPERIMENTS = ROOT / "experiments" / "protocol-v5"
 ROWS = [c for c in CASES if c["section"] in (1, 2)]
 SCALAR = [c for c in CASES if c["section"] == 4]
 LANE_ROW = "lane AL-1 (flight.py, server_detect.py): protocol 5's row layout, contract sections 1 and 2"
-LANE_RUST = "lane AL-3 (detect.rs, detect/): the typed columns and the refused-field rule, contract sections 1 and 2"
-LANE_PY = "lane AL-4 (evidence.py): an entry the column cannot hold is absent to every detector, contract section 1"
+LANE_RUST = "lanes AL-1 and AL-3 joined (flight.py's layout, detect.rs' reader): contract sections 1 and 2"
+LANE_PY = "lane AL-4' (evidence.py, step 2): an entry the column cannot hold is absent to every detector, contract section 1.5"
 LANE_SCALAR = "step 2 of the wave (contract section 4): the scalar-only record"
 
 
@@ -67,13 +67,16 @@ def test_the_document_and_the_page():
 
 
 def test_the_measurements_the_page_cites_are_recorded():
-    for name in ("captures.json", "live.json", "ack.json", "live64.json", "decode.json"):
+    for name in ("captures.json", "fixtures.json", "live.json", "ack.json", "live64.json", "decode.json"):
         assert (EXPERIMENTS / "results" / name).is_file(), name
     captures = json.loads((EXPERIMENTS / "results" / "captures.json").read_text())
     assert len(captures) == 7
     for name, found in captures.items():
         trip = found["round_trip"]
         assert trip["not_equal_count"] == 0 and trip["order_differs_count"] == 0, name
+    fixtures = json.loads((EXPERIMENTS / "results" / "fixtures.json").read_text())
+    for name, found in fixtures.items():
+        assert found["differs_count"] == found["raised_count"] == found["order_differs_count"] == 0, name
     live = json.loads((EXPERIMENTS / "results" / "live.json").read_text())
     assert live["order"]["kept"] is True
     assert live["watermark"]["lost"] == [4, 5, 6, 7, 8, 9]
@@ -103,6 +106,21 @@ def test_the_prototype_gives_each_row(case):
     if isinstance(probe, dict):
         for key in ("attention", "histograms"):
             assert list((back["probe"] or {}).get(key) or {}) == list(probe.get(key) or {}), key
+
+
+def test_the_prototype_gives_the_scalar_record_row():
+    """Section 4.4: a scalar-only record's row carries `seq` and `record_version` 2, nothing in
+    `extra_json` (`record` comes back from `seq`), and reads back as the record."""
+    pa = pytest.importorskip("pyarrow")
+    p5 = _prototype()
+    case = next(c for c in SCALAR if c["name"] == "scalar_record_keys")
+    record = next(r for r in case["records"] if r.get("schema_version") == 2)
+    assert list(record) == case["expect"]["keys"]
+    row = p5.record_to_row_v5(copy.deepcopy(record))
+    assert (row["seq"], row["record_version"], row["schema_version"], row["extra_json"]) == (0, 2, 2, None)
+    assert case["row"] == {"seq": 0, "record_version": 2, "schema_version": 2, "extra": None, "round_trip": True}
+    back = p5.row_to_record_v5(pa.RecordBatch.from_pylist([row], schema=p5.flight_schema_v5()).to_pylist()[0])
+    assert back == record
 
 
 def _jsonable(value):

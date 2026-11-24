@@ -119,10 +119,94 @@ def round_trip(records: list[dict]) -> dict:
             "rows_with_extra_json": extra_rows}
 
 
+RECORD_KEYS = {"ts", "grad_norm", "grad_norms", "layers", "moe", "moe_stats", "scalars", "probe", "lr", "weight_norms",
+               "update_rms", "replica", "replica_spread", "data", "checkpoint", "system", "step_skipped"}
+FIXTURES = Path(__file__).resolve().parents[2] / "sdk" / "tests" / "fixtures"
+
+
+def fixture_records() -> dict[str, list[dict]]:
+    """Every record in the repository's shared case files (`sdk/tests/fixtures/*/*.json`, wave AL's own
+    left out), found as any object with an integer `step` and a `run_id` or a record's field. No Gate 1 held-out file is
+    there (`sdk/tests/golden` holds evidence, not records, and is not read)."""
+    found: dict[str, list[dict]] = {}
+
+    def walk(value, into):
+        if isinstance(value, dict):
+            step = value.get("step")
+            if isinstance(step, int) and not isinstance(step, bool) and ("run_id" in value or RECORD_KEYS & set(value)):
+                # A case's record that names no run (the behaviour cases) gets one, as a capture always writes it.
+                into.append(value if "run_id" in value else {"run_id": "fixture", **value})
+                return
+            for v in value.values():
+                walk(v, into)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v, into)
+
+    for path in sorted(FIXTURES.glob("*/*.json")):
+        if path.parent.name == "wave_al" or "unseen" in path.name:
+            continue
+        into: list[dict] = []
+        walk(json.loads(path.read_text()), into)
+        if into:
+            found[str(path.relative_to(FIXTURES))] = into
+    return found
+
+
+def fixtures_round_trip() -> dict:
+    """Each fixture record alone through the prototype and back (one record a batch, so a record Arrow
+    or the converter refuses is named, not its neighbours)."""
+    from tensorquill import flight as v4
+
+    schema, schema4 = p5.flight_schema_v5(), v4.flight_schema()
+    out = {}
+    for name, records in fixture_records().items():
+        both_raise, raised, unequal, order, same = [], [], [], [], 0
+        for index, record in enumerate(records):
+            # Today's round trip is the baseline: a hand-made record without `ts` comes back with
+            # `ts: None` (`flight._ALWAYS`), and one whose identity is not valid raises, in both.
+            try:
+                today = v4.row_to_record(v4.rows_batch([record], [v4._row(record)], schema4).to_pylist()[0])
+            except Exception as error:  # noqa: BLE001
+                today = f"{type(error).__name__}"
+            try:
+                row = p5.record_to_row_v5(record)
+                back = p5.row_to_record_v5(pa.RecordBatch.from_pylist([row], schema=schema).to_pylist()[0])
+            except Exception as error:  # noqa: BLE001
+                if isinstance(today, str):
+                    both_raise.append(index)
+                else:
+                    raised.append([index, f"{type(error).__name__}: {str(error)[:160]}"])
+                continue
+            if isinstance(today, str):
+                raised.append([index, f"only today raises: {today}"])
+            elif json.dumps(back, sort_keys=True, default=str) != json.dumps(today, sort_keys=True, default=str):
+                unequal.append([index, sorted(k for k in set(today) | set(back)
+                                              if json.dumps(today.get(k), sort_keys=True, default=str) != json.dumps(back.get(k), sort_keys=True, default=str))])
+            elif order_of(today) != order_of(back):
+                order.append(index)
+            else:
+                same += 1
+        out[name] = {"records": len(records), "same_as_today": same, "both_raise": len(both_raise),
+                     "raised": raised[:10], "raised_count": len(raised),
+                     "differs_from_today": unequal[:10], "differs_count": len(unequal), "order_differs_count": len(order)}
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--fixtures", type=Path, help="write the shared fixtures' round trip here and stop")
     args = parser.parse_args()
+    if args.fixtures:
+        result = fixtures_round_trip()
+        args.fixtures.parent.mkdir(parents=True, exist_ok=True)
+        args.fixtures.write_text(json.dumps(result, indent=1, sort_keys=True, default=str) + "\n")
+        for name, found in result.items():
+            print(name, found["records"], "same", found["same_as_today"], "both raise", found["both_raise"], "raised",
+                  found["raised_count"], "differs", found["differs_count"], "order", found["order_differs_count"],
+                  found["raised"][:2], found["differs_from_today"][:3])
+        return
     report = {}
     for name in CAPTURES:
         path = RUNS / name
