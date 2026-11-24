@@ -24,7 +24,7 @@
 //! `end_byte_offset` alone, as before). Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
-//! 0, 1 or 2 (`STORED_ROW_VERSIONS`), cannot be stored: it is dropped and counted, with a line on
+//! 0, 1 or 2 (`SUPPORTED_ROW_VERSIONS`), cannot be stored: it is dropped and counted, with a line on
 //! stderr and in the rank's entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`),
 //! and the rest of its
 //! batch is kept and acknowledged (RS10). A batch whose key column is missing or of another type
@@ -2144,16 +2144,13 @@ const KEY_COLUMNS: [(&str, DataType); 5] = [
     ("schema_version", DataType::Int32),
 ];
 
-/// The row versions (`schema_version`) the offline modes read (`detect::check_keys`): 1 and 0, which
-/// `flight.py` writes for a record that names none. Protocol 5's row version 2 is taken there by
-/// `detect.rs` itself (lane AL-3 of wave AL); what ingest stores is `STORED_ROW_VERSIONS`.
-pub const SUPPORTED_ROW_VERSIONS: [i32; 2] = [0, 1];
-
-/// The row versions (`schema_version`) this server stores: 0 and 1, a protocol 4 sender's, and 2, a
-/// row of protocol 5's layout (`WAVE_AL_CONTRACT.md` section 3, D7, from Nov 24, 2026). A row of any
-/// other version is dropped and counted under `unsupported_schema_version` (RS10, decided by the
-/// author on Nov 20, 2026).
-pub const STORED_ROW_VERSIONS: [i32; 3] = [0, 1, 2];
+/// The row versions (`schema_version`) this server stores and its offline modes read
+/// (`detect::check_keys`): 0 and 1, a protocol 4 sender's (0 is what `flight.py` wrote for a record
+/// that named none), and 2, a row of protocol 5's layout (`WAVE_AL_CONTRACT.md` section 3, D7, from
+/// Nov 24, 2026). Live, a row of any other version is dropped and counted under
+/// `unsupported_schema_version` (RS10, decided by the author on Nov 20, 2026); offline, it refuses
+/// the input. One list for both, so a row the server stores is always one `detect` reads.
+pub const SUPPORTED_ROW_VERSIONS: [i32; 3] = [0, 1, 2];
 
 /// The key under which rows of a version this server does not read are counted.
 pub const UNSUPPORTED_SCHEMA_VERSION: &str = "unsupported_schema_version";
@@ -2167,7 +2164,7 @@ struct Refused {
 
 /// Drops the rows that cannot be stored and says how many, by key (RS10): first the rows whose run,
 /// rank, step, attempt or schema version is null, by the first null key of each row in that order;
-/// then, of the rest, the rows whose `schema_version` is not one of `STORED_ROW_VERSIONS`. The
+/// then, of the rest, the rows whose `schema_version` is not one of `SUPPORTED_ROW_VERSIONS`. The
 /// rest of the batch is kept: until Nov 19, 2026 one null key refused the whole batch, which ended
 /// the stream, and its sender, which sends from its offset again, stored nothing more for the rank;
 /// until Nov 20, 2026 a row's version was not looked at. The batch is checked whole before any of
@@ -2218,7 +2215,7 @@ fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Re
         .expect("checked above");
     let mut rows = 0;
     for (row, kept) in keep.iter_mut().enumerate() {
-        if *kept && !STORED_ROW_VERSIONS.contains(&versions.value(row)) {
+        if *kept && !SUPPORTED_ROW_VERSIONS.contains(&versions.value(row)) {
             *kept = false;
             rows += 1;
         }

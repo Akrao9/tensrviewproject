@@ -5410,12 +5410,6 @@ fn follow_append(
     Ok((from_rows, before as u64))
 }
 
-/// The row versions (`schema_version`) the offline modes read: 0 and 1, protocol 4's, and 2, the
-/// version of a row in protocol 5's layout (`WAVE_AL_CONTRACT.md` section 3, D7). Kept here, not
-/// read from `ingest::SUPPORTED_ROW_VERSIONS`, while wave AL's lanes are apart; the live server's
-/// list is to name the same three once its lane is joined to this one.
-pub(crate) const ROW_VERSIONS: [i32; 3] = [0, 1, 2];
-
 /// The key columns of rows given to the offline modes (`detect` and `detect --run`), checked
 /// before anything is judged: a `run_id` string, a `rank` int32 and a `step` int64, none of
 /// them null, and an `attempt` int64 without nulls when the column is there. A batch with no
@@ -5424,8 +5418,9 @@ pub(crate) const ROW_VERSIONS: [i32; 3] = [0, 1, 2];
 /// attempt 0. Live ingest checks its own (`ingest.rs`).
 ///
 /// The values, too (wave AF, section 1 of `WAVE_AF_CONTRACT.md`): a `rank`, `attempt` or `step`
-/// below 0, and a `schema_version` (when the column is there) that is not one of [`ROW_VERSIONS`],
-/// refuse the input with one line that names the column, the
+/// below 0, and a `schema_version` (when the column is there) that is not one of
+/// [`crate::ingest::SUPPORTED_ROW_VERSIONS`] (0, 1 and 2 since protocol 5: the versions the live
+/// server stores, one list for both), refuse the input with one line that names the column, the
 /// value and the row. Until then they were judged: a report of rank -3, or of a row of version 99.
 /// `before` is the number of rows of the input before this batch, so the row named is the row's
 /// place in the whole input, 1-based, in the order the batches were given. A null names its row
@@ -5486,8 +5481,10 @@ pub(crate) fn check_keys(batch: &RecordBatch, before: usize) -> Result<(), Strin
         if steps.value(at) < 0 {
             return Err(negative("step", at, steps.value(at)));
         }
-        if let Some(versions) = versions.filter(|versions| !ROW_VERSIONS.contains(&versions.value(at))) {
-            let (last, rest) = ROW_VERSIONS.split_last().expect("versions");
+        if let Some(versions) =
+            versions.filter(|versions| !crate::ingest::SUPPORTED_ROW_VERSIONS.contains(&versions.value(at)))
+        {
+            let (last, rest) = crate::ingest::SUPPORTED_ROW_VERSIONS.split_last().expect("versions");
             let rest: Vec<String> = rest.iter().map(i32::to_string).collect();
             return Err(format!(
                 "row {}: schema_version is {}; this server reads versions {} and {last}; the input is refused",
