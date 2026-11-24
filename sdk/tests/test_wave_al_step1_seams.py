@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -188,3 +189,134 @@ def test_python_names_a_non_finite_field_of_a_name_arrow_cannot_encode_where_rus
 
     found = [incident for incident in evidence.build_evidence(back)["incidents"] if incident["kind"] == "non_finite"]
     assert found and found[0]["step"] == 1 and "bad\ud800" in json.dumps(found[0], ensure_ascii=False), found
+
+
+# --- 5. The limit of lane AL-1's row-version rule, pinned (the owner, on AL-1's decision 1) -------------
+# A record keeps its own version as its row's when no reader takes it (99 -> row 99, which a server
+# drops and counts, RS10), but the version readers take, 0 and 1, and also 2 get row version 2. So a
+# record of version 2, which step 1's package does not read (step 2 makes it the scalar-only record,
+# in the same push), is stored, and `load_records` then refuses the part holding it.
+
+try:
+    import pyarrow as pa
+    import pyarrow.flight as pa_flight
+    import pyarrow.parquet as pq
+except ImportError:
+    pa = pa_flight = pq = None
+
+needs_server = pytest.mark.skipif(BINARY is None or pa is None,
+                                  reason="needs the server binary and pyarrow (TENSORQUILL_SERVER_BIN)")
+
+
+def test_a_record_of_version_2_gets_row_version_2_with_its_own_in_record_version():
+    record = {"schema_version": 2, "run_id": "v2", "rank": 0, "attempt": 1, "step": 2, "grad_norm": 1.0}
+    row = flight._row(record)  # the sender's row, which `rows_to_send` builds without the identity check
+    assert (row["schema_version"], row["record_version"]) == (flight.ROW_VERSION, 2) == (2, 2)
+    row = flight._row({**record, "schema_version": 99})
+    assert (row["schema_version"], row["record_version"]) == (99, 99)  # a version no reader takes
+
+
+class _Server:
+    def __init__(self, store: Path) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "TENSORQUILL_TOKEN"}
+        self.process = subprocess.Popen([BINARY, "--listen", "127.0.0.1:0", "--store", str(store),
+                                         "--watchdog-seconds", "0.5", "--flush-seconds", "0.2"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        line = self.process.stdout.readline()
+        assert "listening on" in line, line
+        self.endpoint = f"grpc://127.0.0.1:{int(line.rsplit(':', 1)[1])}"
+
+    def close(self) -> None:
+        import signal
+
+        self.process.send_signal(signal.SIGTERM)
+        self.process.wait(30)
+        self.process.stdout.close()
+        self.process.stderr.close()
+
+
+def _records(run_id: str, versions: dict[int, int]) -> list[dict]:
+    return [{"schema_version": versions.get(step, 1), "run_id": run_id, "rank": 0, "attempt": 1, "step": step,
+             "ts": float(step), "grad_norm": 1.0} for step in range(5)]
+
+
+def _stored(store: Path, run_id: str) -> tuple[Path, list, list, dict]:
+    """The run's one part, its row and record versions, and the rank's entry in `watchdog.json`."""
+    [part] = sorted((store / "runs" / run_id).rglob("part-*.parquet"))
+    table = pq.read_table(part, partitioning=None)
+    status = json.loads((store / "runs" / run_id / "watchdog.json").read_text())
+    [entry] = status["ranks"] if isinstance(status["ranks"], list) else status["ranks"].values()
+    return part, table.column("schema_version").to_pylist(), table.column("record_version").to_pylist(), entry
+
+
+def _refusal(store: Path, run_id: str) -> str:
+    from tensorquill import evidence
+
+    with pytest.raises(identity.MalformedRecordError) as raised:
+        evidence.load_records(store / "runs" / run_id)
+    return str(raised.value)
+
+
+@needs_server
+def test_this_server_stores_a_record_of_version_2_and_load_records_refuses_its_part(tmp_path):
+    store, run_id = tmp_path / "store", "v2"
+    path = tmp_path / f"{run_id}.rank0.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in _records(run_id, {2: 2})))
+    server = _Server(store)
+    try:
+        assert flight.send_file(path, server.endpoint, run_id, 0, timeout=60) is True  # every byte acknowledged
+        time.sleep(1.5)  # a watchdog pass writes the rank's status
+    finally:
+        server.close()
+    part, rows, records, entry = _stored(store, run_id)
+    assert (rows, records) == ([2] * 5, [1, 1, 2, 1, 1])
+    assert "dropped_rows" not in entry and "dropped_row_keys" not in entry, entry  # not dropped, not counted
+    assert _refusal(store, run_id) == f"schema_version is 2 at {part}, row 2: this tensorquill reads schema versions 0 and 1"
+
+
+@needs_server
+def test_load_records_refuses_a_part_holding_a_record_version_it_does_not_take_under_row_version_2(tmp_path):
+    """The lane's reason for its rule, run: had a version 99 record been given row version 2, as the
+    contract first had it, this server would store it and `load_records` would refuse the whole part."""
+    store, run_id = tmp_path / "store", "v99"
+    rows = [flight._row(record) for record in _records(run_id, {3: 99})]
+    rows[3]["schema_version"] = 2
+    assert rows[3]["record_version"] == 99
+    batch = pa.RecordBatch.from_pylist(rows, schema=flight.flight_schema())
+    server = _Server(store)
+    try:
+        client = pa_flight.FlightClient(server.endpoint)
+        writer, reader = client.do_put(pa_flight.FlightDescriptor.for_path("runs", run_id, "rank=0"), batch.schema)
+        metadata = {"schema_version": flight.SCHEMA_VERSION, "run_id": run_id, "rank": 0, "min_step": 0,
+                    "max_step": 4, "end_byte_offset": 5}
+        writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
+        assert json.loads(reader.read().to_pybytes())["end_byte_offset"] == 5
+        writer.done_writing()
+        writer.close()
+        client.close()
+        time.sleep(1.5)
+    finally:
+        server.close()
+    part, row_versions, records, entry = _stored(store, run_id)
+    assert (row_versions, records) == ([2] * 5, [1, 1, 1, 99, 1])
+    assert "dropped_row_keys" not in entry, entry
+    assert _refusal(store, run_id) == f"schema_version is 99 at {part}, row 3: this tensorquill reads schema versions 0 and 1"
+
+
+@needs_server
+def test_under_the_lane_s_rule_a_record_of_version_99_is_dropped_and_counted_and_the_rest_is_read(tmp_path):
+    store, run_id = tmp_path / "store", "v99rule"
+    path = tmp_path / f"{run_id}.rank0.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in _records(run_id, {3: 99})))
+    server = _Server(store)
+    try:
+        assert flight.send_file(path, server.endpoint, run_id, 0, timeout=60) is True
+        time.sleep(1.5)
+    finally:
+        server.close()
+    _, row_versions, records, entry = _stored(store, run_id)
+    assert (row_versions, records) == ([2] * 4, [1] * 4)
+    assert entry["dropped_row_keys"] == {"unsupported_schema_version": 1}, entry
+    from tensorquill import evidence
+
+    assert [r["step"] for r in evidence.load_records(store / "runs" / run_id)] == [0, 1, 2, 4]
