@@ -428,7 +428,10 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
   - `_commit` returns before its drain;
   - `close()` drains nothing.
   
-  So `_no_step_for` is never reached. This is read, not run; a scratch run confirms it once the machine is free.
+  So `_no_step_for` is never reached. A scratch run on Nov 24 confirms it on torch 2.15 and 2.6. The evaluation after step 1 is compiled as one frame, or run eagerly. Capture stops before step 2, then step 2 runs and `close()` is called. At `every` 1 and 4 alike:
+  - no record has step 1 (at `every` 1 only step 0 is written; at `every` 4, none);
+  - no "left out" warning is said;
+  - the stop's warning is said once and is the only warning.
 
 **Tests.** `test_wave_al_contract.py`:
 - `test_a_value_logged_late_inside_a_compiled_function_reaches_its_step`, at `every` 1 and 4, is the target. It is `xfail(strict=True, raises=AssertionError)`, so a compile that fails, or a scenario that does not reach the flush, fails the run instead of passing as expected.
