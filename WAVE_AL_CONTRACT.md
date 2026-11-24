@@ -423,9 +423,17 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
   A value in `_late_traced` belongs to the newest step (rule 5), which is in the ring or held. So it is lost together with that step: no record is left for it to reach. The stop's own warning already says it: "the steps already handed to the writer are written, no later step is".
 - **It cannot be closed** without writing after a stop, which wave C03's decision rules out: a stopped writer takes nothing, and a scalar-only record would have to pass through the same writer.
 - **So it stays a stated limit,** and no "left out" warning is added: the stop's warning is the one said. Case `scalar_compiled_late_at_a_stop`, which the base already gives.
+- **Lane AK-5's report words this differently.** Its item 11 puts the stop with the cases that leave the value out "with the one warning". At `f71d8e0` that warning is the stop's own, not `_no_step_for`'s:
+  - `_closed_call` makes every public call on a stopped session return at once;
+  - `_commit` returns before its drain;
+  - `close()` drains nothing.
+  
+  So `_no_step_for` is never reached. This is read, not run; a scratch run confirms it once the machine is free.
 
 **Tests.** `test_wave_al_contract.py`:
 - `test_a_value_logged_late_inside_a_compiled_function_reaches_its_step`, at `every` 1 and 4, is the target. It is `xfail(strict=True, raises=AssertionError)`, so a compile that fails, or a scenario that does not reach the flush, fails the run instead of passing as expected.
+  - The evaluation runs after steps 0 and 1. Requiring one compiled frame for both calls holds item 3 too: a fix that made it recompile fails the run.
+  - Like wave AK's compiled tests, it runs unguarded on CI's whole matrix.
 - `test_the_same_value_logged_eagerly_reaches_its_step` pins the eager twin.
 - The stop case is AL-5's own test to write, failing first if it does not hold.
 

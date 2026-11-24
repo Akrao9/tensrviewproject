@@ -361,18 +361,20 @@ def section_4() -> list[dict]:
     # f71d8e0, not run here; `today` is what the code does, which the contract test's target and pin show.
     setup = {"model": "Linear(4, 4) then Linear(4, 1), the first frozen at init",
              "init": {"every": [1, 4], "weights": 1, "updates": True}, "optimizer": "AdamW", "steps": 3,
-             "evaluation_after_step": 1}
+             "evaluated_after_steps": [0, 1]}
     add("scalar_eager_late_before_unfreeze",
-        "the reference: a model whose first layer is frozen at init runs steps 0 and 1; then, under "
-        "session.phase(\"eval\"), an evaluation run eagerly logs eval/x; the first layer is made trainable before "
-        "step 2, whose optimizer pre-step hook flushes the ring (_take_unfrozen) before step 2 ends. eval/x is on "
-        "step 1's own record, at every=1 and every=4, and no left-out warning is said", [],
+        "the reference: a model whose first layer is frozen at init runs steps 0 and 1, each followed by an "
+        "evaluation run eagerly under session.phase(\"eval\") that logs eval/x; the first layer is made trainable "
+        "before step 2, whose optimizer pre-step hook flushes the ring (_take_unfrozen) before step 2 ends. The "
+        "eval/x logged after step 1 is on step 1's own record, at every=1 and every=4, and no left-out warning is "
+        "said", [],
         {"setup": {**setup, "compiled": False, "unfrozen_before_step": 2}, "step_1_scalars_hold": ["eval/x"],
          "left_out_warnings": 0, "unfreeze_warnings": 1}, ("capture",),
         today={"capture": "the same as expect (read in capture.py at f71d8e0; pinned by "
                           "test_the_same_value_logged_eagerly_reaches_its_step)"})
     add("scalar_compiled_late_before_unfreeze",
-        "the same evaluation under torch.compile(fullgraph=True), compiled once: the traced log puts eval/x in "
+        "the same evaluation under torch.compile(fullgraph=True), compiled once for both calls: the traced log puts "
+        "eval/x in "
         "_late_traced; the flush for the newly trainable parameter writes step 1 without draining it, and step 2's "
         "end then finds no step in memory. Fixed: eval/x on step 1's own record, as in the eager twin, and no "
         "left-out warning (section 4.8)", [],

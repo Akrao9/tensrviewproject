@@ -232,9 +232,11 @@ UNFROZEN = "frozen when the session started"
 
 
 def _late_before_unfreeze(compiled: bool, every: int):
-    """Section 4.8's scenario: the first layer frozen at `init`; steps 0 and 1; an evaluation under
-    "eval" logs `eval/x`; the layer is made trainable, so step 2's pre-step hook flushes the ring
-    (`_take_unfrozen`) before step 2 ends. Returns step 1's scalars, the value logged and the warnings.
+    """Section 4.8's scenario: the first layer frozen at `init`; steps 0 and 1, each followed by an
+    evaluation under "eval" that logs `eval/x`; the layer is made trainable, so step 2's pre-step hook
+    flushes the ring (`_take_unfrozen`) before step 2 ends. Returns step 1's scalars, the value logged
+    after step 1 and the warnings. The evaluation is mirrored on wave AK's compiled tests, which run
+    unguarded on CI's whole matrix (torch 2.6 to 2.15).
 
     Raises `RuntimeError`, never `AssertionError`, when the scenario itself is not reached (the
     evaluation not compiled as one frame, or no unfreeze flush), so the strict target below cannot
@@ -277,9 +279,9 @@ def _late_before_unfreeze(compiled: bool, every: int):
                 model(torch.randn(8, 4)).pow(2).mean().backward()
                 opt.step()  # the TensorQuill step ends here (auto_step)
                 opt.zero_grad()
-                if step == 1:
+                if step in (0, 1):  # twice, so one frame for both shows nothing recompiled (section 4.8, item 3)
                     with session.phase("eval"):
-                        logged = evaluate(torch.ones(8, 4)).item()
+                        logged = evaluate(torch.full((8, 4), float(step + 1))).item()
         finally:
             session.close()
             if compiled:
