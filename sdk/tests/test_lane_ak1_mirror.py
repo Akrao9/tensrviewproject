@@ -727,6 +727,14 @@ for i in range(3):
 session.close()
 print("trained", len(sink.records), len(w.calls), len(m.calls))
 print("scalars", [r.get("scalars") for r in sink.records])
+# PyTorch 2.6 imports `torch.distributed.nn.jit.instantiator` with `torch.distributed`, and that module
+# keeps a `tempfile.TemporaryDirectory()` it never cleans up: at exit Python warns (ResourceWarning,
+# "Implicitly cleaning up"), which `-W error` prints as a traceback. It is PyTorch's, with or without
+# TensorQuill's mirror; it is cleaned up here so that no warning has to be filtered and the parent can
+# still require an empty-of-tracebacks standard error.
+_instantiator = sys.modules.get("torch.distributed.nn.jit.instantiator")
+if _instantiator is not None and hasattr(_instantiator, "_TEMP_DIR"):
+    _instantiator._TEMP_DIR.cleanup()
 """
 
 

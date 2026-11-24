@@ -544,6 +544,14 @@ _FROZEN_RUN = textwrap.dedent(
 
 
 def test_a_run_that_logs_only_before_the_step_writes_the_same_bytes_as_the_base(tmp_path):
+    # The comparison needs the lane's base commit. A shallow checkout (CI's) or a source tree with
+    # no repository does not have it: the test is then a stated skip, not a failure.
+    try:
+        known = subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", BASE + "^{commit}"], capture_output=True)
+    except OSError:
+        pytest.skip("git is not installed, so the lane's base commit cannot be read")
+    if known.returncode != 0:
+        pytest.skip(f"the lane's base commit {BASE[:7]} is not in this checkout (a shallow clone, or no repository)")
     base = tmp_path / "base"
     base.mkdir()
     archive = subprocess.run(["git", "-C", str(REPO), "archive", BASE, "sdk/src"], capture_output=True, check=True)
