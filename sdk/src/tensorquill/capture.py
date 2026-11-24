@@ -501,6 +501,10 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
+# `Session.log`'s `step=` when not given: any value given, None included, is refused.
+_NO_STEP: Any = object()
+
+
 def _warn(message: str, stacklevel: int = 2) -> None:
     """`warnings.warn(message, RuntimeWarning)` for code the training thread reaches, which must
     never raise into training. Under `python -W error` (or any filter that makes a
@@ -1307,6 +1311,7 @@ class _Plan:
     probe_blocks: list[tuple[str, nn.Module]]
     head: tuple[str | None, str | None, str | None]
     scaler: Any
+    mirror_scalars: bool = False  # wrap the trackers' logging calls (`mirror.py`)
 
 
 def _plan_session(
@@ -1325,6 +1330,7 @@ def _plan_session(
     scaler: Any,
     ends_step: Any = None,
     auto_step: bool = True,
+    mirror_scalars: bool = False,
 ) -> _Plan:
     """Every check `init` and `Session` make of the model and the options, and what they work
     out from them, with nothing changed: no hook, thread, file or global. `init` runs it before
@@ -1350,6 +1356,8 @@ def _plan_session(
         raise ValueError("replica_every must be a positive integer")
     if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
         raise ValueError("probe_every must be a positive integer")
+    if not isinstance(mirror_scalars, bool):
+        raise ValueError(f"mirror_scalars must be True or False, not {type(mirror_scalars).__name__}")
     probe_fn = probe_callable(probe) if probe is not None else None
     probe_off = None
     if probe_fn is not None:
@@ -1398,6 +1406,7 @@ def _plan_session(
         replicas=replicas,
         selected=selected, routers=planned_routers, probe_blocks=probe_blocks, head=head,
         scaler=scaler if scaler is not None and scaler.is_enabled() else None,
+        mirror_scalars=mirror_scalars,
     )
 
 
@@ -1479,6 +1488,7 @@ class Session:
         updates: bool = False,
         probe_head: str | bool | None = None,
         ends_step: Any = None,
+        mirror_scalars: bool = False,
         _plan: _Plan | None = None,
     ) -> None:
         # Every check first, with nothing changed (`_plan_session`); `init` has made them already.
@@ -1486,6 +1496,7 @@ class Session:
             model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
             replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
             replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
+            mirror_scalars=mirror_scalars,
         )
         # The optimizer whose step ends each step (`init(ends_step=...)`, wave AE section 3), weakly
         # held, or None for the default lead; and the steps of this model's other optimizers before it
@@ -1708,6 +1719,8 @@ class Session:
         # is of an update already ended (`_record_scaler`, `_SCALER_LATE`).
         self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
+        self._late_said = False  # a scalar left out for want of a step in memory was said (`_no_step_for`)
+        self._late_traced: dict[str, Any] = {}  # logged late inside a compiled function (`_log_late`)
         self._ring_probe: list[dict[str, Any] | None] = []
         self._probe_off_written = False
         # Data progress (`data`): None until the first batch is noted, then every step has one.
@@ -1825,9 +1838,10 @@ class Session:
         auto_step: bool, data_wait: bool,
     ) -> None:
         """What the session changes outside itself, each registered in `undo` as it is made: the
-        forward hooks, the heartbeat's step counter, the writer thread, the clipping, scaler and
-        optimizer hooks and the data-loader timer; last, the end marker of an earlier run is
-        removed, the one effect that is not undone, so it happens only once all else has."""
+        forward hooks, the heartbeat's step counter, the writer thread, the clipping and scaler
+        hooks, the scalar mirror, the optimizer hooks and the data-loader timer; last, the end
+        marker of an earlier run is removed, the one effect that is not undone, so it happens only
+        once all else has."""
         undo.append(lambda: [handle.remove() for handle in self._handles])
         self._handles += [
             module.register_forward_hook(
@@ -1891,6 +1905,11 @@ class Session:
         if self._scaler is not None:
             self._watch_scaler(self._scaler)
             undo.append(self._unwatch_scaler)
+        if plan.mirror_scalars:
+            from . import mirror  # the trackers' `log` wrappers, shared by every session that mirrors
+
+            mirror.watch(self)
+            undo.append(lambda: mirror.unwatch(self))
         if auto_step:
             # Run eagerly where `optimizer.step()` is called inside a function `torch.compile` traces
             # (`init` there too, say): traced, these hooks would make Dynamo warn on what it cannot
@@ -2302,12 +2321,7 @@ class Session:
     def _add_to_newest(self, name: str, value: Any) -> None:
         """Add `value` to the scalar `name` of the newest step in the ring (or set it there): the
         loss back-propagated for an optimizer that steps after the lead ended the step."""
-        pending, self._pending_scalars = self._pending_scalars, {}
-        try:
-            self.log({name: value})  # the same checks and the same copy on the device as `log`
-            new = self._pending_scalars[name]
-        finally:
-            self._pending_scalars = pending
+        new = self._scalar_values({name: value})[name]  # the same checks and the same copy on the device as `log`
         row = dict(self._ring_scalars[-1])
         row[name] = new if row.get(name) is None else row[name] + new
         self._ring_scalars[-1] = row
@@ -2758,7 +2772,7 @@ class Session:
             # its record has no key, as the count is not known there.
             self._clip_step_calls += 1
 
-    def log(self, values: Mapping[str, Any] | None = None, **named: Any) -> None:
+    def log(self, values: Mapping[str, Any] | None = None, *, step: Any = _NO_STEP, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
 
         `session.log({"train/loss": loss})` or `session.log(loss=loss)`. Values are
@@ -2769,10 +2783,40 @@ class Session:
         next step. A name logged twice in one step keeps the last value. Images, tables
         and other non-scalar values raise `TypeError`; pass the tracker the same values
         it already logs, not a replacement for it.
+
+        Under `session.phase("eval")` (or `set_phase("eval")`, which the Lightning and Hugging
+        Face callbacks set) a value is recorded on the newest step, the one the evaluation
+        followed, while that step is still in memory: it is the ring's last row, or the step
+        kept back when the ring last filled, until the next step ends, a `flush()` or `close()`.
+        A value still pending at `close()` goes there too, unless that step already holds its
+        name. With no step in memory (before the first step, or after `flush()` with no step
+        since) it is left out, said once per session in a warning (`_no_step_for`). A record
+        already written is never changed.
+
+        `step=` raises `TypeError`: an explicit step comes with protocol 5's scalar-only record.
+        A key `"step"` in the dictionary is an ordinary scalar.
         """
         if self._closed_call("log()"):
             return
-        items = dict(values or {}, **named)
+        if step is not _NO_STEP:
+            raise TypeError(
+                "session.log(..., step=...): an explicit step is not supported yet; it comes with protocol 5's "
+                "scalar-only record. A value logged inside session.phase(\"eval\") is recorded on the newest step, "
+                "and a key \"step\" in the dictionary is an ordinary scalar."
+            )
+        converted = self._scalar_values(dict(values or {}, **named))
+        # The phase as the hooks read it (`_Evaluating`): a compiled step that logs guards on that
+        # one flag, which its hooks already read, and not on the phase's name.
+        if self._evaluating.on:
+            self._log_late(converted)
+        else:
+            self._pending_scalars.update(converted)
+
+    @staticmethod
+    def _scalar_values(items: Mapping[Any, Any]) -> dict[str, Any]:
+        """`log`'s checks and copies: Python numbers as `int` or `float`, a one-element tensor copied
+        on its own device (never read). Raises before anything is recorded."""
+        out: dict[str, Any] = {}
         for name, value in items.items():
             if not isinstance(name, str) or not name:
                 raise TypeError(f"scalar names must be non-empty strings, got {name!r}")
@@ -2784,13 +2828,95 @@ class Session:
                     raise ValueError(f"{name}: expected one value, got shape {tuple(tensor.shape)}")
                 # A copy, so the value neither keeps a larger tensor alive nor changes later.
                 dtype = torch.float32 if tensor.device.type == "mps" else torch.float64
-                self._pending_scalars[name] = tensor.reshape(()).to(dtype, copy=True)
+                out[name] = tensor.reshape(()).to(dtype, copy=True)
             elif isinstance(value, numbers.Real):
-                self._pending_scalars[name] = (
-                    int(value) if isinstance(value, numbers.Integral) else float(value)
-                )
+                out[name] = int(value) if isinstance(value, numbers.Integral) else float(value)
             else:
                 raise TypeError(f"{name}: expected a number or one-element tensor, got {type(value).__name__}")
+        return out
+
+    def _newest_scalars(self) -> dict[str, Any] | None:
+        """The scalars of the newest step still in memory (the ring's last row, or the step kept back
+        when the ring filled, which is then its only row), or None when no step is."""
+        return self._ring_scalars[-1] if self._steps else None
+
+    def _scalars_for_log(self) -> tuple[tuple[str, int], dict[str, Any] | None]:
+        """Where `log` records a value now, for the mirror's explicit-wins rule (`mirror._log_into`):
+        a key naming those scalars, unchanged until a step ends, and the dictionary itself, or None
+        when the value would be left out."""
+        if self._evaluating.on:
+            self._take_traced_late()
+            return ("newest", self._steps_committed), self._newest_scalars()
+        return ("pending", self._steps_committed), self._pending_scalars
+
+    def _log_late(self, values: dict[str, Any]) -> None:
+        """Values logged after the newest step ended (under the "eval" phase): on that step while it is
+        in memory, a name logged again keeping the last value. A held step's row is replaced, not
+        changed in place, and marked (`_mark_held`), so its scalars are read again, in one transfer,
+        only when it is written; a tensor is never read here."""
+        if not values:
+            return
+        if torch.compiler.is_compiling():
+            # Traced: the ring is not read (its length, its steps and the held step would each be a
+            # guard that changes at every step, and the function would compile again). Kept here and
+            # put on the newest step by the next eager call (`_take_traced_late`).
+            self._late_traced.update(values)
+            return
+        self._take_traced_late()
+        row = self._newest_scalars()
+        if row is None:
+            self._no_step_for(values, "logged inside session.phase(\"eval\") with no step in memory (before the "
+                                      "first step, or after flush() with no step since)")
+            return
+        self._ring_scalars[-1] = {**row, **values}
+        self._mark_held("scalars")
+
+    def _take_traced_late(self) -> None:
+        """Put on the newest step what a compiled function logged late (`_log_late`), eagerly: at the
+        next eager `log` under "eval", the mirror's next value, the next step's end, `flush()` and
+        `close()`. Emptied in place, so the traced function's guard on it holds."""
+        traced = self._late_traced
+        if traced:
+            values = dict(traced)
+            traced.clear()
+            self._log_late(values)
+
+    def _attach_pending(self) -> None:
+        """At `close()`: what was logged since the last step ended goes on the newest step in memory,
+        but for a name that step already holds (a loop that logs its loss after `optimizer.step()`
+        has every loss one step late, and the last one pending: it does not replace the step's own)."""
+        pending, self._pending_scalars = self._pending_scalars, {}
+        if not pending:
+            return
+        row = self._newest_scalars()
+        if row is None:
+            self._no_step_for(pending, "pending at close() with no step in memory (no step ended, or none since "
+                                       "flush())")
+            return
+        added = {name: value for name, value in pending.items() if name not in row}
+        if added:
+            self._ring_scalars[-1] = {**row, **added}
+            self._mark_held("scalars")
+
+    def _no_step_for(self, values: Mapping[str, Any], why: str) -> None:
+        """A scalar with no step in memory to be recorded on: left out, and said once per session.
+
+        The coordinator's reading of the owner's decision of Nov 24 (OPEN_BUGS, section 20), which
+        the owner may overrule: a record already written is never changed, and the value is not put
+        on a later step, as it was before (a baseline evaluation on step 0, a value after `flush()`
+        on the next step). Protocol 5's scalar-only record is to give it a place. This is the one
+        place that decides it."""
+        if self._late_said:
+            return
+        self._late_said = True
+        names = sorted(values)
+        shown = ", ".join(repr(n) for n in names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+        _warn(
+            f"TensorQuill left out the scalar{'s' if len(names) != 1 else ''} {shown}: {why}. A step already "
+            "written is never changed, and the value is not put on a later step; a scalar with a step of its own "
+            "comes with protocol 5's scalar-only record. Said once per session.",
+            stacklevel=4,
+        )
 
     def data(
         self,
@@ -3283,6 +3409,7 @@ class Session:
         if self._stopped:
             self._count_stopped(step)
             return
+        self._take_traced_late()  # on the step it followed, before that step can be written below
         if self._launch_read is None or self._launch_parked:
             self._start_launch_read()  # the end of the first step: the launch's second read (contract 2)
         current = self._next_step if step is None else step
@@ -3471,6 +3598,7 @@ class Session:
         """Move the ring to the CPU and queue it for the sink."""
         if self._closed_call("flush()"):
             return
+        self._take_traced_late()
         self._flush(hold_newest=False)
 
     def _clear_ring_lists(self) -> None:
@@ -3886,7 +4014,7 @@ class Session:
             self._queue.put_nowait(None)
         except queue.Full:
             pass
-        for undo in (lambda: _unwatch_clipping(self), lambda: datawait.unwatch(self)):
+        for undo in (lambda: _unwatch_clipping(self), lambda: datawait.unwatch(self), self._unwatch_mirror):
             try:
                 undo()
             except Exception:  # noqa: BLE001
@@ -4019,6 +4147,14 @@ class Session:
         state for these calls: its one warning was given when it stopped."""
         return self._closed or self._stopped
 
+    def _unwatch_mirror(self) -> None:
+        """Stop mirroring tracker scalars into this session (`mirror.py`), taking the wrappers out
+        when it was the last session to mirror. Nothing when it never mirrored or the module was
+        never loaded."""
+        mirror = sys.modules.get(__package__ + ".mirror")
+        if mirror is not None:
+            mirror.unwatch(self)
+
     def close(self, *, _exception: BaseException | None = None) -> None:
         """Flush what is left and stop the writer. Forward hooks stay on the model, because
         removing a hook from a compiled module triggers a recompile. Once the records file is
@@ -4050,6 +4186,7 @@ class Session:
             lambda: [handle.remove() for handle in self._optimizer_handles],
             lambda: _unwatch_clipping(self),
             self._unwatch_scaler,
+            self._unwatch_mirror,
         ):
             try:
                 undo()
@@ -4067,6 +4204,8 @@ class Session:
         deadline = time.monotonic() + CLOSE_SECONDS
         if not self._stopped:
             self._close_by = deadline  # the last block may wait for room, up to the deadline (`_put`)
+            self._take_traced_late()
+            self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
         if not self._stopped:
             try:
@@ -4619,6 +4758,7 @@ def init(
     data_wait: bool = False,
     updates: bool = False,
     ends_step: Any = None,
+    mirror_scalars: bool = True,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -4795,6 +4935,20 @@ def init(
             on a GPU. It also records the total gradient norm on every step, which the rule
             needs (per-parameter gradient norms, unless clipping was seen that step). Any
             other optimizer is not read, and the evidence says so (`not_checked`).
+        mirror_scalars: also record, as `session.log` would, the plain numbers this process logs
+            through `wandb.log` / `wandb.Run.log` and `mlflow.log_metric` / `mlflow.log_metrics`,
+            on the step `session.log` would give them (W&B's `step` and `commit` and MLflow's
+            `step` are ignored), so incidents and `compare` have the loss and evaluation numbers beside them.
+            Python `int` and `float` (not `bool`), NumPy scalars and 0-D tensors already on the CPU
+            are taken; a tensor on a GPU is skipped unread (no sync), and images, tables, strings
+            and lists are ignored. A key this session got from `session.log` in the same step
+            (yours, or an adapter's) is kept. The tracker's call, arguments, return value and
+            errors are unchanged; the mirror never raises, reads no API key, calls no server and
+            never reads `wandb.run.step`. Only a tracker already imported when `init` runs is
+            wrapped (none is imported here): import `wandb` or `mlflow` first. `wandb.init()` may
+            come before or after. A function bound before `init` (`from mlflow import log_metric`)
+            and `MlflowClient` calls are not seen. The wrappers come off when the last session that
+            mirrors closes or stops. See `mirror.py` and the README. `False` installs nothing.
     """
     mode = capture if capture is not None else ("routers" if routers else "full")
     if mode not in CAPTURE_MODES:
@@ -4818,6 +4972,7 @@ def init(
         model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
         replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
         replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
+        mirror_scalars=mirror_scalars,
     )
     # What `init` opens is undone if a later step fails (`_undo`): the default sink and its file,
     # the run manifest, the stream to a server. A sink the caller passed in is never closed here.
@@ -4877,6 +5032,7 @@ def init(
             data_wait=data_wait,
             updates=updates,
             ends_step=ends_step,
+            mirror_scalars=mirror_scalars,
             _plan=plan,
         )
     except BaseException:

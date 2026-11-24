@@ -11,6 +11,7 @@ import atexit
 import inspect
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -127,9 +128,28 @@ class TensorQuillCallback(TrainerCallback):
         if self.session is not None:
             self.session.tick()  # one evaluation batch: the pause is working, not stuck
 
-    def on_evaluate(self, args: Any, state: Any, control: Any, **_: Any) -> None:
-        if self.session is not None:
-            self.session.set_phase("checkpoint" if getattr(control, "should_save", False) else "train")
+    def on_step_begin(self, args: Any, state: Any, control: Any, **_: Any) -> None:
+        # An "eval" phase still set when a training step begins (announced and not followed by an
+        # evaluation) would send this step's loss to the step before (`Session.log`).
+        if self.session is not None and self.session._phase == "eval":
+            self.session.set_phase("train")
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, metrics: Any = None, **_: Any) -> None:
+        if self.session is None:
+            return
+        # The `Trainer` logs these through `on_log` just before, which a W&B logger the mirror
+        # watches also sees; recorded here, explicitly, they win over the mirrored copy. Under the
+        # "eval" phase, so on the step the evaluation followed; set here too, since with several
+        # evaluation datasets each one ends with its own `on_evaluate`.
+        try:
+            values = _evaluation_scalars(metrics)
+            if values:
+                if self.session._phase != "eval":
+                    self.session.set_phase("eval")
+                self.session.log(values)
+        except Exception:  # noqa: BLE001  nothing here may stop the Trainer
+            pass
+        self.session.set_phase("checkpoint" if getattr(control, "should_save", False) else "train")
 
     def on_save(self, args: Any, state: Any, control: Any, **_: Any) -> None:
         if self.session is not None:
@@ -272,6 +292,39 @@ def _passed_through(exception: BaseException, training: tuple[int, Any] | None) 
             return True
         tb = tb.tb_next
     return False
+
+
+# What `Trainer.evaluate` adds beside the metrics (`speed_metrics` and the model's preparation time,
+# under the metric prefix), and `epoch`, which `Trainer.log` writes into the same dictionary.
+_BOOKKEEPING = ("_runtime", "_samples_per_second", "_steps_per_second", "_tokens_per_second",
+                "_model_preparation_time")
+
+
+def _evaluation_scalars(metrics: Any) -> dict[str, int | float]:
+    """The numbers among the metrics `Trainer.evaluate` gives `on_evaluate`, under the names the
+    `Trainer`'s own loggers use (`rewrite_logs` in `transformers/integrations/integration_utils.py`:
+    `eval_x` as `eval/x`, `test_x` as `test/x`, anything else as `train/x`), so a value a W&B logger
+    also logs is the same key. Left out: the bookkeeping (`epoch`, run times, rates), `bool`, and
+    anything that is not an `int` or a `float` (the `Trainer` has already turned tensors and NumPy
+    values into Python numbers)."""
+    if not isinstance(metrics, Mapping):
+        return {}
+    out: dict[str, int | float] = {}
+    for key, value in metrics.items():
+        if not isinstance(key, str) or not key or key == "epoch" or key.endswith(_BOOKKEEPING):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if isinstance(value, int) and not -(2**63) <= value < 2**63:
+            continue
+        if key.startswith("eval_"):
+            name = "eval/" + key[len("eval_"):]
+        elif key.startswith("test_"):
+            name = "test/" + key[len("test_"):]
+        else:
+            name = "train/" + key
+        out[name] = value
+    return out
 
 
 def _checkpoint_folder(args: Any, state: Any, given: Any = None) -> Path | None:
