@@ -614,6 +614,8 @@ def _router_hook(
     ids_start[2 * experts + 2] = 1  # the ids were checked; no routing map
     scores_start = torch.zeros_like(ids_start)
     scores_start[2 * experts + 5] = 1  # counted from the top-k of scores
+    # The same two as int32, which is what one forward is counted into (see `count`).
+    ids_start32, scores_start32 = ids_start.to(torch.int32), scores_start.to(torch.int32)
     no_ids = torch.zeros(2, dtype=counts.dtype, device=counts.device)
     map_checked = torch.tensor([0, 1, 1, 0, 0], dtype=counts.dtype, device=counts.device)
     unchecked_map = torch.zeros(experts + 7, dtype=counts.dtype, device=counts.device)
@@ -767,20 +769,28 @@ def _router_hook(
         # matrix of assignments by experts (16,384 tokens at top-8 over 256 experts: 33.5 million
         # entries a forward). Integer adds, so the counts are exact in any order, and PyTorch takes
         # a deterministic path for `index_add_` on CUDA when deterministic algorithms are on.
+        # One forward is counted into int32 and widened into the int64 `counts` after: on a GPU
+        # Inductor lowers an accumulating index write itself except into int64 or bool, where it
+        # calls PyTorch's `index_put_` (a sort of the indices and a bounds check per router).
+        # Measured on an A100 with PyTorch 2.14.1 at Granite's shape (24 routers, 1,024 tokens,
+        # top-8 of 32): 6.6 ms a step less than into int64, with equal counts. A forward of 2**31
+        # assignments or more (a shape, so no sync and no data-dependent branch) keeps int64.
         # Accumulate across gradient-accumulation microbatches; `_commit` zeroes `counts`.
         if idx is not None:
             flat = idx.detach().reshape(-1).to(torch.int64)
+            narrow = flat.numel() < 2**31
             if spec.indices is not None or logits is None:
                 # Ids the router or its `indices=` function gave: those below 0 are no assignment
                 # (counted at slot E, not refused), those at or above n_experts at slot E + 1, which
                 # refuses the router at the flush (`_judge_index_ranges`). Every slot is in range, so
                 # no device assert. Device work only; no sync here.
                 slot = torch.where(flat < 0, experts, torch.where(flat >= experts, experts + 1, flat))
-                hits = ids_start.clone()
+                hits = (ids_start32 if narrow else ids_start).clone()
             else:
                 slot = flat  # top-k of logits: always in range, nothing to check
-                hits = scores_start.clone()
-            hits.index_add_(0, slot, torch.ones_like(slot))
+                hits = (scores_start32 if narrow else scores_start).clone()
+            hits.index_add_(0, slot, torch.ones_like(slot, dtype=hits.dtype))
+            hits = hits.to(counts.dtype)
         if torch.compiler.is_compiling():
             _add_compiled(counts, hits)
         else:
