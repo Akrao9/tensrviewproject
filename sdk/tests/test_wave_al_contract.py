@@ -12,6 +12,8 @@ What runs here, on the base and on every lane's tree:
   the test is a strict expected failure (`xfail(strict=True)`, as the repository marks work a lane
   has not landed). The lane named in its reason turns it into an ordinary test by removing the mark
   when its change makes it pass; a target that passes before that fails the run (strict).
+- Section 4.8, on `tensorquill.init` and `Session.log` themselves: a value logged late inside a compiled
+  function before the flush for a newly trainable parameter (a target), and its eager twin (a pin).
 
 The Rust paths need the server binary (`TENSORQUILL_SERVER_BIN`, or one beside the interpreter) and
 are skipped without it; anything that needs pyarrow is skipped without it (CI's plain jobs have none).
@@ -221,6 +223,93 @@ def test_a_scalar_record_is_read_and_never_a_training_step(case):
     assert [i["kind"] for i in built["incidents"]] == [i["kind"] for i in alone["incidents"]]
     assert built["kind_checks"] == alone["kind_checks"]
     assert "repeated_steps" not in [i["kind"] for i in built["incidents"]]
+
+
+LANE_LATE = ("lane AL-5 (capture.py, step 2): a value logged late inside a compiled function is drained before the "
+             "flush for a newly trainable parameter, contract section 4.8")
+LEFT_OUT = "left out the scalar"
+UNFROZEN = "frozen when the session started"
+
+
+def _late_before_unfreeze(compiled: bool, every: int):
+    """Section 4.8's scenario: the first layer frozen at `init`; steps 0 and 1; an evaluation under
+    "eval" logs `eval/x`; the layer is made trainable, so step 2's pre-step hook flushes the ring
+    (`_take_unfrozen`) before step 2 ends. Returns step 1's scalars, the value logged and the warnings.
+
+    Raises `RuntimeError`, never `AssertionError`, when the scenario itself is not reached (the
+    evaluation not compiled as one frame, or no unfreeze flush), so the strict target below cannot
+    pass for a wrong reason or fail for one."""
+    import warnings
+
+    import torch
+    from torch import nn
+
+    import tensorquill
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 1))
+    model[0].requires_grad_(False)
+    sink = tensorquill.MemorySink()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    session = None
+
+    def evaluate(x):
+        with torch.no_grad():
+            value = model(x).pow(2).mean()
+        session.log({"eval/x": value})
+        return value
+
+    counter = None
+    if compiled:
+        from torch._dynamo.testing import CompileCounter
+
+        torch._dynamo.reset()
+        counter = CompileCounter()
+        evaluate = torch.compile(evaluate, backend=counter, fullgraph=True)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=sink, every=every, weights=1, updates=True, run_id="al_late",
+                                   heartbeat_seconds=None, stack_seconds=None)
+        try:
+            for step in range(3):
+                if step == 2:
+                    model[0].requires_grad_(True)  # trainable now: this step's pre-step hook flushes the ring
+                model(torch.randn(8, 4)).pow(2).mean().backward()
+                opt.step()  # the TensorQuill step ends here (auto_step)
+                opt.zero_grad()
+                if step == 1:
+                    with session.phase("eval"):
+                        logged = evaluate(torch.ones(8, 4)).item()
+        finally:
+            session.close()
+            if compiled:
+                torch._dynamo.reset()
+    messages = [str(w.message) for w in caught]
+    if compiled and counter.frame_count != 1:
+        raise RuntimeError(f"the evaluation compiled {counter.frame_count} frames, not one: the traced path was not taken")
+    if sum(UNFROZEN in m for m in messages) != 1:
+        raise RuntimeError(f"no flush for a newly trainable parameter: {messages}")
+    step_1 = next(r for r in sink.records if r["step"] == 1).get("scalars", {})
+    return step_1, logged, messages
+
+
+@pytest.mark.parametrize("every", [1, 4])
+def test_the_same_value_logged_eagerly_reaches_its_step(every):
+    """Case `scalar_eager_late_before_unfreeze`, pinned: the reference the compiled run must match."""
+    step_1, logged, messages = _late_before_unfreeze(False, every)
+    assert step_1.get("eval/x") == pytest.approx(logged)
+    assert not [m for m in messages if LEFT_OUT in m]
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=LANE_LATE)
+@pytest.mark.parametrize("every", [1, 4])
+def test_a_value_logged_late_inside_a_compiled_function_reaches_its_step(every):
+    """Case `scalar_compiled_late_before_unfreeze`, the target: on step 1's own record, as eagerly, and no
+    left-out warning. Today the flush for the unfrozen layer writes step 1 without draining
+    `_late_traced`, and the value is left out with a warning that names the wrong cause."""
+    step_1, logged, messages = _late_before_unfreeze(True, every)
+    assert not [m for m in messages if LEFT_OUT in m]
+    assert step_1.get("eval/x") == pytest.approx(logged)
 
 
 def test_a_scalar_record_is_refused_by_the_base_readers():

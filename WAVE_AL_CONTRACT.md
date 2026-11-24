@@ -8,7 +8,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 
 ## Where each decision stands
 
-**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided all nine on Nov 24 (the next section).
+**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided all nine on Nov 24 (the next section), and the same day brought one fault left open by wave AK into this wave (row L1, section 4.8).
 
 | # | Decision | Stands | Evidence |
 |---|---|---|---|
@@ -35,6 +35,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 | Q7 | The mirror ignores a tracker's own `step=` (Q7 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q8 | `compare` reads scalar-only records as series points (Q8 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q9 | A downgrade is documented as unsupported (Q9 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
+| L1 | A value logged late inside a compiled function reaches its step's own record when a frozen parameter becomes trainable before the next step ends (step 2, lane AL-5). The stop of capture stays a stated limit (section 4.8). | **Owner, decided Nov 24** | "this will be fixed in AL", relayed by the coordinator; the place and the limit are this contract's recommendation |
 
 ## The owner's decisions
 
@@ -304,7 +305,7 @@ There are four, not three.
 
 - **`Session.log(..., step=...)` raises `TypeError`** naming protocol 5, for any value, `None` included. A dictionary key `"step"` is an ordinary scalar.
 - **`Session._no_step_for` is the one place that decides a value with no step in memory.** That is a baseline evaluation before the first step, a value after `flush()`, or one pending at `close()` after such a flush. It leaves the value out with one warning per session.
-- **Open from wave AK:** a scalar logged late inside a compiled function before the newly-trainable-parameter flush. It is not this wave's.
+- **From wave AK, now this wave's:** a scalar logged late inside a compiled function, then a flush because a frozen parameter became trainable. Wave AK left it open. The owner reversed that on Nov 24: "this will be fixed in AL". It is step 2 work for lane AL-5 (section 4.8).
 
 ### 4.2 The record
 
@@ -377,7 +378,56 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
 
 ### 4.7 The cases
 
-`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`, `scalar_no_step_baseline_warning`, `scalar_no_step_baseline_on_a_resume_warning`, `scalar_no_step_after_flush_warning`, `scalar_no_step_pending_at_close_after_flush_warning`, `scalar_no_step_mirrored_warning`, `scalar_no_step_said_once`, `scalar_hf_eval_on_start_baseline`, `scalar_hf_eval_on_start_on_a_resume`, `scalar_baseline_and_step_0_share_a_point`.
+`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`, `scalar_no_step_baseline_warning`, `scalar_no_step_baseline_on_a_resume_warning`, `scalar_no_step_after_flush_warning`, `scalar_no_step_pending_at_close_after_flush_warning`, `scalar_no_step_mirrored_warning`, `scalar_no_step_said_once`, `scalar_hf_eval_on_start_baseline`, `scalar_hf_eval_on_start_on_a_resume`, `scalar_baseline_and_step_0_share_a_point`, `scalar_eager_late_before_unfreeze`, `scalar_compiled_late_before_unfreeze`, `scalar_compiled_late_at_a_stop` (section 4.8).
+
+### 4.8 A value logged late inside a compiled function (lane AL-5; the owner, Nov 24)
+
+**The fault.** From lane AK-5's report, item 11, read again in `capture.py` at `f71d8e0`.
+- **Where a traced value waits.** Traced, `_log_late` reads nothing of the ring: its length, its step numbers and the held step would each be a guard that changes at every step. It puts the value in `_late_traced`. Eager code moves it onto the newest step (`_take_traced_late`) at:
+  - the next step's end (the start of `_commit`);
+  - `flush()` and `close()`;
+  - an eager late `log`;
+  - the mirror's next value (`_scalars_for_log`).
+- **The one path that writes the newest step without draining it is `_take_unfrozen`.** It runs on the first step on which a parameter frozen at `init` is trainable, from the optimizer's pre-step hook, or from a hand `record_grads()`. Before that step's gradients are read, it calls `_flush(hold_newest=False)`.
+  - That writes step k, the step the evaluation followed, whether it is the ring's last row or the held step (at `every=1`).
+  - Then `_commit` of step k+1 drains the buffer, finds no step in memory, and leaves the value out through `_no_step_for`.
+  - The warning gives the wrong cause: "before the first step, or after flush() with no step since".
+- **The same value logged eagerly is kept.** Eager `_log_late` puts it on the ring's last row at once, before that flush. So today an evaluation under `torch.compile` loses a value that the same evaluation run eagerly keeps.
+
+**What the fix must make true.**
+1. A value logged late inside a compiled function, after step k ended and before that flush, is on step k's own record. This is exactly where the same value logged eagerly is, at every `every`: on the ring's last row and on the held step alike. Case `scalar_compiled_late_before_unfreeze`. Its eager twin, `scalar_eager_late_before_unfreeze`, is the reference, and the base already gives it.
+2. No "left out" warning is said for it. The unfreeze warning is said once, as today.
+3. The evaluation still compiles once, as in wave AK's test (`frame_count == 1`). The fix is on the eager side only, and nothing the traced function reads changes.
+4. **The rule, not just the call site: every path that hands the newest step to the writer drains `_late_traced` first.** Today that is `_commit`, `flush()` and `close()`, and the fix adds `_take_unfrozen`.
+   - The form that also covers a later caller is a drain at the start of `_flush`, after its stop check.
+   - The drains in `flush()` and `close()` may stay; a second drain finds the buffer empty.
+   - In `close()` the drain stays before `_attach_pending`, as today.
+5. Only then can the stop of capture be stated as below: a value in the buffer always belongs to a step not yet handed to the writer (or to no step, section Q5's cases).
+
+**Where the value goes: step k's own record (recommended), not a scalar-only record.**
+- **Step k's own record, recommended.**
+  - It is where the value belongs, and where the eager run puts it, so compiling an evaluation changes nothing that is recorded.
+  - Step k is still in memory when the buffer is drained, so wave AK's rule that a record already written is never changed still holds.
+  - It needs nothing from protocol 5: one drain before a flush. So it is the smallest change, and AL-5 can land it first in its branch, ahead of the scalar-only record.
+- **A scalar-only record at step k, not recommended.**
+  - By Q6 it would win at the series point, so the series would be right.
+  - But step k's own record would lack the value. An incident's `scalars` context, read from the training record (Q4 a), would then differ from the eager run's.
+  - A protocol 4 reader would refuse the file over a value that the eager run writes as version 1.
+
+**The stop of capture: a stated limit, like the steps not yet handed to the writer.**
+- **What happens.** Capture stops (`_stop`) on a sink error, a writer that falls behind, a close timeout or a flush that raised. Then:
+  - the ring and the held step are cleared;
+  - every public call returns at once;
+  - `close()` drains nothing.
+  
+  A value in `_late_traced` belongs to the newest step (rule 5), which is in the ring or held. So it is lost together with that step: no record is left for it to reach. The stop's own warning already says it: "the steps already handed to the writer are written, no later step is".
+- **It cannot be closed** without writing after a stop, which wave C03's decision rules out: a stopped writer takes nothing, and a scalar-only record would have to pass through the same writer.
+- **So it stays a stated limit,** and no "left out" warning is added: the stop's warning is the one said. Case `scalar_compiled_late_at_a_stop`, which the base already gives.
+
+**Tests.** `test_wave_al_contract.py`:
+- `test_a_value_logged_late_inside_a_compiled_function_reaches_its_step`, at `every` 1 and 4, is the target. It is `xfail(strict=True, raises=AssertionError)`, so a compile that fails, or a scenario that does not reach the flush, fails the run instead of passing as expected.
+- `test_the_same_value_logged_eagerly_reaches_its_step` pins the eager twin.
+- The stop case is AL-5's own test to write, failing first if it does not hold.
 
 ## 5. The matrix
 
@@ -471,6 +521,8 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
     - This replaces wave AK's "comes with protocol 5's scalar-only record".
     - The Hugging Face callback records `eval_on_start`'s baseline and an evaluation after `flush()` with an explicit step.
     - The one line on step 0: a baseline logged with `step=0` and an evaluation after the first step, logged under the same name, are one point at step 0, and the series shows the baseline.
+    - Under `torch.compile`, a value logged under "eval" lands on the step it followed, as the same value logged eagerly does, also when a frozen parameter becomes trainable on the next step (section 4.8).
+    - After capture stops, values logged since the last step written are lost with that step, compiled or not.
   - **The versions (AL-1, AL-2):** section 3's table; the older-server message; "a downgrade is not supported", with how it shows (Q9).
   - **The probe (AL-1):** the maps and histograms are in their own columns; the `.jsonl` is unchanged.
 
@@ -494,7 +546,7 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 
 | Lane | Owns | Does | Cases |
 |---|---|---|---|
-| AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `huggingface.py` (`on_evaluate`'s explicit step), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases, the two `scalar_hf_*` cases; wave AK's tests of the old warning text change with it |
+| AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `huggingface.py` (`on_evaluate`'s explicit step), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases, the two `scalar_hf_*` cases; wave AK's tests of the old warning text change with it. Section 4.8's drain before the flush of a newly trainable parameter: `scalar_compiled_late_before_unfreeze` (`test_a_value_logged_late_inside_a_compiled_function_reaches_its_step`), keeping `scalar_eager_late_before_unfreeze` and `scalar_compiled_late_at_a_stop` |
 | AL-1′ | `flight.py`, `server_detect.py` | The record's row (`seq`, `record_version`). Scalar-only records set apart before `_stream`, `FollowedDetect` and `stream_order` | `scalar_record_keys` (row) |
 | AL-2′ | `ingest.rs`, `storage.rs`, `watchdog.rs` (`scalars_not_newer`) | Section 4.5 | `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart` |
 | AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6, and section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step`; the `python` targets of `layers_entry_not_object` and `layers_value_not_object`; the samples comparison of `moe_stats_diversity_refused` |

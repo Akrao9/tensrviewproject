@@ -356,6 +356,41 @@ def section_4() -> list[dict]:
         add(name, about, [], expect, ("capture",))
     series = json.loads('{"name": "scalar_baseline_and_step_0_share_a_point", "section": 4, "about": "a baseline recorded with step=0 and an evaluation after step 0 recorded on step 0\'s own record under the same name are one series point; by Q6 the scalar-only record wins, so the series shows the baseline, and step 0\'s record still holds the later value (a README line, section 9)", "paths": ["python", "mcp_get_series"], "records": [{"schema_version": 2, "record": "scalars", "run_id": "al_share", "rank": 0, "attempt": 1, "step": 0, "seq": 0, "ts": 100.0, "scalars": {"eval/loss": 3.0}}, {"schema_version": 1, "run_id": "al_share", "rank": 0, "attempt": 1, "step": 0, "ts": 0.0, "grad_norm": 1.0, "scalars": {"train/loss": 2.9, "eval/loss": 2.8}}, {"schema_version": 1, "run_id": "al_share", "rank": 0, "attempt": 1, "step": 1, "ts": 1.0, "grad_norm": 1.0, "scalars": {"train/loss": 2.7}}], "expect": {"series": {"eval/loss": [[0, 3.0]], "train/loss": [[0, 2.9], [1, 2.7]]}, "step_0_record_eval_loss": 2.8, "steps_judged": 2}}')
     add(series["name"], series["about"], series["records"], series["expect"], tuple(series["paths"]))
+    # Section 4.8 (the owner, Nov 24: "this will be fixed in AL"): a value logged late inside a compiled
+    # function, before the flush for a newly trainable parameter. Written by hand from capture.py at
+    # f71d8e0, not run here; `today` is what the code does, which the contract test's target and pin show.
+    setup = {"model": "Linear(4, 4) then Linear(4, 1), the first frozen at init",
+             "init": {"every": [1, 4], "weights": 1, "updates": True}, "optimizer": "AdamW", "steps": 3,
+             "evaluation_after_step": 1}
+    add("scalar_eager_late_before_unfreeze",
+        "the reference: a model whose first layer is frozen at init runs steps 0 and 1; then, under "
+        "session.phase(\"eval\"), an evaluation run eagerly logs eval/x; the first layer is made trainable before "
+        "step 2, whose optimizer pre-step hook flushes the ring (_take_unfrozen) before step 2 ends. eval/x is on "
+        "step 1's own record, at every=1 and every=4, and no left-out warning is said", [],
+        {"setup": {**setup, "compiled": False, "unfrozen_before_step": 2}, "step_1_scalars_hold": ["eval/x"],
+         "left_out_warnings": 0, "unfreeze_warnings": 1}, ("capture",),
+        today={"capture": "the same as expect (read in capture.py at f71d8e0; pinned by "
+                          "test_the_same_value_logged_eagerly_reaches_its_step)"})
+    add("scalar_compiled_late_before_unfreeze",
+        "the same evaluation under torch.compile(fullgraph=True), compiled once: the traced log puts eval/x in "
+        "_late_traced; the flush for the newly trainable parameter writes step 1 without draining it, and step 2's "
+        "end then finds no step in memory. Fixed: eval/x on step 1's own record, as in the eager twin, and no "
+        "left-out warning (section 4.8)", [],
+        {"setup": {**setup, "compiled": True, "unfrozen_before_step": 2}, "frames_compiled": 1,
+         "step_1_scalars_hold": ["eval/x"], "left_out_warnings": 0, "unfreeze_warnings": 1}, ("capture",),
+        today={"capture": "step 1's record lacks eval/x, and one left-out warning is said that names the wrong "
+                          "cause (read in capture.py at f71d8e0; the strict target "
+                          "test_a_value_logged_late_inside_a_compiled_function_reaches_its_step shows it)",
+               "warning_contains": ["with no step in memory (before the first step, or after flush() with no step "
+                                    "since)"]})
+    add("scalar_compiled_late_at_a_stop",
+        "a stated limit: the compiled evaluation logs eval/x after step 1, then capture stops (_stop: a sink error, "
+        "a writer behind, a flush that raised) before step 1 is handed to the writer. Step 1 and eval/x are lost "
+        "together; the stop's own warning is the one said, and no left-out warning", [],
+        {"setup": {"compiled": True, "evaluation_after_step": 1, "stop": "before step 1 is handed to the writer"},
+         "records_with_step_1": 0, "left_out_warnings": 0, "stop_warnings": 1,
+         "warning_contains": ["the steps already handed to the writer are written, no later step is"]}, ("capture",),
+        today={"capture": "the same as expect (read in capture.py at f71d8e0; lane AL-5's own test)"})
     return cases
 
 
