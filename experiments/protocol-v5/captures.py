@@ -1,13 +1,19 @@
-"""The recorded GPU captures against protocol 5's prototype layout (WAVE_AL_CONTRACT.md, section 2).
+"""The recorded GPU captures against protocol 5's layout (WAVE_AL_CONTRACT.md, section 2, D5).
 
-    PYTHONPATH=<worktree>/sdk/src .venv/bin/python -I experiments/protocol-v5/captures.py [--out results/captures.json]
+    .venv/bin/python -I experiments/protocol-v5/captures.py [--out experiments/protocol-v5/results/captures.json]
+    .venv/bin/python -I experiments/protocol-v5/captures.py --fixtures experiments/protocol-v5/results/fixtures.json
 
 For each of the seven captures in ~/Downloads/runs (read only, never written): the real keys of
 `layers`, `moe_stats` and `probe` entries and their value types; the attention maps' shapes, whether
-every value is exactly a float32, and whether any is not finite; then every record through
-`record_to_row_v5` and `row_to_record_v5` (through a real Arrow batch and back, so Arrow's own
-conversion is in the loop), checked with `==` and with the order of every map whose order the
-readers use (layers, moe_stats, probe.attention, probe.histograms). Nothing is timed here.
+every value is exactly a float32, and whether any is not finite; then every record through the SDK's
+own `flight` (protocol 5's layout since lane AL-1, `92e471a`): `record_to_row`, a real Arrow batch
+(`rows_batch`, 50 records each) and `row_to_record` on the batch's rows, checked with `==` and with
+the order of every map whose order the readers use (layers, moe_stats, probe.attention,
+probe.histograms). Each row is also compared, every column, with the measured prototype's
+(`prototype.py`; its `seq` is step 2's). Nothing is timed here.
+
+`--fixtures`: every record of the repository's shared case files, alone, through `flight` and back,
+against protocol 4's round trip (`flight_v4.py`, frozen at `5c286ed`) as today's.
 """
 
 from __future__ import annotations
@@ -21,10 +27,16 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# This tree's SDK first, with -I or without: an interpreter whose tensorquill is installed from another
+# checkout (an editable install) would otherwise give that checkout's flight.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "src"))
 
 import pyarrow as pa  # noqa: E402
 
 import prototype as p5  # noqa: E402
+from tensorquill import flight  # noqa: E402
+
+v4 = p5.v4  # protocol 4's row functions, frozen (flight_v4.py)
 
 RUNS = Path.home() / "Downloads" / "runs"
 CAPTURES = (
@@ -100,15 +112,30 @@ def survey(path: Path) -> dict:
             "maps": maps, "sizes": sizes, "empty_layers": empty_layers}
 
 
+def _jsonable(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return "nan" if math.isnan(value) else ("inf" if value > 0 else "-inf")
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return value
+
+
 def round_trip(records: list[dict]) -> dict:
-    schema = p5.flight_schema_v5()
-    failures, order_failures, extra_rows = [], [], 0
+    schema = flight.flight_schema()
+    failures, order_failures, extra_rows, prototype_differs, versions = [], [], 0, [], set()
     for start in range(0, len(records), 50):
         chunk = records[start:start + 50]
-        rows = [p5.record_to_row_v5(r) for r in chunk]
+        rows = [flight.record_to_row(r) for r in chunk]
         extra_rows += sum(1 for r in rows if r.get("extra_json"))
-        batch = pa.RecordBatch.from_pylist(rows, schema=schema)
-        back = [p5.row_to_record_v5(r) for r in batch.to_pylist()]
+        for record, row in zip(chunk, rows):
+            prototype = p5.record_to_row_v5(record)
+            if set(row) != set(prototype) - {"seq"} or any(_jsonable(row[k]) != _jsonable(prototype[k]) for k in row):
+                prototype_differs.append(record["step"])
+        batch = flight.rows_batch(chunk, rows, schema)
+        versions.update(batch.column("schema_version").to_pylist())
+        back = [flight.row_to_record(r) for r in batch.to_pylist()]
         for original, again in zip(chunk, back):
             if original != again:
                 failures.append(original["step"])
@@ -116,7 +143,8 @@ def round_trip(records: list[dict]) -> dict:
                 order_failures.append(original["step"])
     return {"records": len(records), "not_equal": failures[:20], "not_equal_count": len(failures),
             "order_differs": order_failures[:20], "order_differs_count": len(order_failures),
-            "rows_with_extra_json": extra_rows}
+            "rows_with_extra_json": extra_rows, "row_versions": sorted(versions),
+            "prototype_row_differs": prototype_differs[:20], "prototype_row_differs_count": len(prototype_differs)}
 
 
 RECORD_KEYS = {"ts", "grad_norm", "grad_norms", "layers", "moe", "moe_stats", "scalars", "probe", "lr", "weight_norms",
@@ -154,11 +182,9 @@ def fixture_records() -> dict[str, list[dict]]:
 
 
 def fixtures_round_trip() -> dict:
-    """Each fixture record alone through the prototype and back (one record a batch, so a record Arrow
-    or the converter refuses is named, not its neighbours)."""
-    from tensorquill import flight as v4
-
-    schema, schema4 = p5.flight_schema_v5(), v4.flight_schema()
+    """Each fixture record alone through `flight` (protocol 5) and back (one record a batch, so a record
+    Arrow or the converter refuses is named, not its neighbours), against protocol 4's round trip."""
+    schema, schema4 = flight.flight_schema(), v4.flight_schema()
     out = {}
     for name, records in fixture_records().items():
         both_raise, raised, unequal, order, same = [], [], [], [], 0
@@ -170,8 +196,7 @@ def fixtures_round_trip() -> dict:
             except Exception as error:  # noqa: BLE001
                 today = f"{type(error).__name__}"
             try:
-                row = p5.record_to_row_v5(record)
-                back = p5.row_to_record_v5(pa.RecordBatch.from_pylist([row], schema=schema).to_pylist()[0])
+                back = flight.row_to_record(flight.rows_batch([record], [flight._row(record)], schema).to_pylist()[0])
             except Exception as error:  # noqa: BLE001
                 if isinstance(today, str):
                     both_raise.append(index)
@@ -207,6 +232,8 @@ def main() -> None:
                   found["raised_count"], "differs", found["differs_count"], "order", found["order_differs_count"],
                   found["raised"][:2], found["differs_from_today"][:3])
         return
+    if flight.ROW_VERSION != 2 or "layers" not in flight.flight_schema().names:
+        raise SystemExit(f"{flight.__file__} writes protocol 4's rows: run this with this tree's SDK")
     report = {}
     for name in CAPTURES:
         path = RUNS / name

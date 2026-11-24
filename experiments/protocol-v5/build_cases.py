@@ -14,7 +14,12 @@ Each case's inputs are written here by hand. What is computed, and from what:
 - `today` (what the base does with `records`, run here, never recomputed by the tests): the Python
   engine and the raw Rust report, and the row's round trip through today's `flight.py`.
 
-Only the base's tree is run: nothing here imports a lane's code.
+Only the base's tree is run: nothing here imports a lane's code. So it reproduces `cases.json` only on
+a tree whose SDK and binary are the base's: the contract's own commits, up to `099b921`, before step 1
+merged (`92e471a`). On a later tree `flight` writes protocol 5 and the engines read it, so `today`
+would not be the base's; it refuses to run there. To check the file byte for byte, check out the
+builder's commit (a `git worktree` or `git archive` of it), build its binary, and run it there: only
+the `base` field differs, which records the commit it ran on.
 """
 
 from __future__ import annotations
@@ -397,6 +402,10 @@ def section_4() -> list[dict]:
 
 
 def main() -> None:
+    if "layers_json" not in v4.flight_schema().names:
+        raise SystemExit(f"{v4.__file__} writes protocol 5's rows: build_cases.py computes `today` with the base's "
+                         "engines and reproduces cases.json only on the base's tree (up to 099b921, before step 1 "
+                         "merged). Run it in a checkout of that commit, with a binary built there.")
     rust = find_binary() is not None
     cases = section_1() + section_2()
     for case in cases:
