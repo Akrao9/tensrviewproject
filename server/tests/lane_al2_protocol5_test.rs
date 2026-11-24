@@ -4,8 +4,9 @@
 //! - Batch metadata `schema_version` 1 and 2 are both taken; any other is refused, naming both.
 //! - Row `schema_version` 0, 1 and 2 are stored; any other is dropped and counted (RS10).
 //! - A protocol 4 sender works unchanged: its batches are stored as received, in parts of their own.
-//! - The replay read of a part (`Storage::read_part`, what `detect::replay` calls) leaves out
-//!   `probe_maps` and `probe_histograms`, so a replay never decodes them.
+//! - The detectors' read of a part (`Storage::read_part_for_detect`, what `detect::replay` calls)
+//!   leaves out `probe_maps` and `probe_histograms`, so a replay never decodes them. `Storage::read_part`
+//!   reads every column (the owner's choice at the seam, Nov 24, 2026: a read loses nothing by default).
 //! - A restart over a store of protocol 4 parts, of protocol 5 parts, or of both, replays every part
 //!   by its columns; the step watermark is from the parts' names and footers, as before.
 //! - `layers_model_order`: the `layers` map keeps the model's entry order on the part and in the
@@ -479,12 +480,13 @@ async fn a_protocol_4_sender_is_stored_as_received_and_each_layout_has_parts_of_
     assert!(names(&read_whole(&parts[1])[0]).contains(&"layers".to_string()));
 }
 
-/// Section 2.4: the replay read of a part (`Storage::read_part`, which `detect::replay` calls) leaves
-/// out `probe_maps` and `probe_histograms` and keeps every other column, in order, with its values,
-/// `probe_json` and the typed `layers` included. A protocol 4 part, which has neither, is read whole.
-/// Fails on the base: every column is decoded.
+/// Section 2.4: the detectors' read of a part (`Storage::read_part_for_detect`, which `detect::replay`
+/// calls) leaves out `probe_maps` and `probe_histograms` and keeps every other column, in order, with
+/// its values, `probe_json` and the typed `layers` included. A protocol 4 part, which has neither, is
+/// read whole. `Storage::read_part` reads every column of either. (Lane AL-2 built the projection as
+/// `read_part` and the whole read as `read_part_whole`; the owner swapped the names at the seam.)
 #[tokio::test]
-async fn the_replay_read_of_a_part_leaves_out_the_probe_maps_and_histograms() {
+async fn the_detectors_read_of_a_part_leaves_out_the_probe_arrays_and_read_part_keeps_them() {
     let dir = tempfile::tempdir().unwrap();
     let storage = storage(dir.path());
     let sent = batch_v5(0..5, 2);
@@ -492,7 +494,7 @@ async fn the_replay_read_of_a_part_leaves_out_the_probe_maps_and_histograms() {
         .write_part(RUN, 0, ATTEMPT, std::slice::from_ref(&sent), 0, 4)
         .await
         .unwrap();
-    let read = storage.read_part(&written).await.unwrap();
+    let read = storage.read_part_for_detect(&written).await.unwrap();
     let kept: Vec<String> = names(&sent)
         .into_iter()
         .filter(|name| name != "probe_maps" && name != "probe_histograms")
@@ -506,13 +508,15 @@ async fn the_replay_read_of_a_part_leaves_out_the_probe_maps_and_histograms() {
             "{name}"
         );
     }
-    // What a tool that sends stored parts again reads (`examples/live_streams.rs`): every column.
-    assert_eq!(storage.read_part_whole(&written).await.unwrap(), vec![sent]);
+    // The plain read, what a tool that sends stored parts again reads (`examples/live_streams.rs`):
+    // every column.
+    assert_eq!(storage.read_part(&written).await.unwrap(), vec![sent]);
     let old = batch_v4(5..10, 1);
     let written = storage
         .write_part(RUN, 0, ATTEMPT, std::slice::from_ref(&old), 5, 9)
         .await
         .unwrap();
+    assert_eq!(storage.read_part_for_detect(&written).await.unwrap(), vec![old.clone()]);
     assert_eq!(storage.read_part(&written).await.unwrap(), vec![old]);
 }
 
@@ -575,7 +579,7 @@ async fn restart_over(layout: Stored) {
     let storage = storage(root);
     let order: Vec<String> = MODEL_ORDER.iter().map(|name| name.to_string()).collect();
     for part in &stored {
-        let read = storage.read_part(&location(root, part)).await.unwrap();
+        let read = storage.read_part_for_detect(&location(root, part)).await.unwrap();
         if names(&read[0]).contains(&"layers".to_string()) {
             assert!(
                 layer_keys(&read).iter().all(|keys| *keys == order),
