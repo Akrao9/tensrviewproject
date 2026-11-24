@@ -650,3 +650,68 @@ print("ok")
     done = subprocess.run([sys.executable, "-W", "error", "-c", script], capture_output=True, text=True, env=env,
                           timeout=300)
     assert done.returncode == 0 and done.stdout.strip().endswith("ok"), done.stderr[-4000:]
+
+
+# --- a model whose saved names are not its own --------------------------------------------------
+
+
+def test_a_trainer_resume_of_a_moe_model_names_the_experts_it_did_not_restore(tmp_path):
+    """Transformers 5 holds a Mixtral's experts fused (`mlp.experts.gate_up_proj`) and
+    `save_pretrained` writes them back in the original per-expert format
+    (`block_sparse_moe.experts.0.w1.weight`; `revert_weight_conversion` in modeling_utils.py). The
+    `Trainer` resumes with `model.load_state_dict(state_dict, False)` on that file
+    (`_load_from_checkpoint`), so the fused experts and the router keep their fresh values: the
+    folder reads `compared` with them `missing`, and that is what happened. A pin of a true finding,
+    not a matching rule: `from_pretrained` would have converted the names, and a folder loaded that
+    way, recorded by hand, would read the same."""
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "MixtralForCausalLM"):
+        pytest.skip("no Mixtral in this transformers")
+    from tensorquill.huggingface import TensorQuillCallback
+
+    config = transformers.MixtralConfig(hidden_size=16, intermediate_size=16, num_hidden_layers=1,
+                                        num_attention_heads=2, num_key_value_heads=2, vocab_size=32,
+                                        num_local_experts=4)
+    seen = {}
+
+    class Experts(transformers.TrainerCallback):
+        def on_train_begin(self, args, state, control, model=None, **kwargs):
+            seen.setdefault("begin", []).append(model.model.layers[0].mlp.experts.gate_up_proj.detach().clone())
+
+        def on_train_end(self, args, state, control, model=None, **kwargs):
+            seen.setdefault("end", []).append(model.model.layers[0].mlp.experts.gate_up_proj.detach().clone())
+
+    class Data(torch.utils.data.Dataset):
+        def __len__(self):
+            return 64
+
+        def __getitem__(self, i):
+            ids = torch.randint(0, 32, (8,), generator=torch.Generator().manual_seed(i))
+            return {"input_ids": ids, "labels": ids}
+
+    def train(steps, sink, seed, resume=None):
+        args = transformers.TrainingArguments(
+            output_dir=str(tmp_path / "out"), max_steps=steps, save_steps=2, per_device_train_batch_size=8,
+            report_to=[], use_cpu=True, logging_steps=1, disable_tqdm=True)
+        torch.manual_seed(seed)
+        trainer = transformers.Trainer(model=transformers.MixtralForCausalLM(config), args=args, train_dataset=Data(),
+                                       callbacks=[TensorQuillCallback(sink=sink, run_id="ak2-moe"), Experts()])
+        trainer.train(resume_from_checkpoint=resume)
+
+    first, second = tensorquill.MemorySink(), tensorquill.MemorySink()
+    train(2, first, seed=0)
+    folder = tmp_path / "out" / "checkpoint-2"
+    names = expected_listing(folder / "model.safetensors")
+    assert "model.layers.0.mlp.experts.gate_up_proj" not in names  # written in the original format
+    time.sleep(0.01)
+    train(4, second, seed=1, resume=str(folder))
+    assert not torch.equal(seen["begin"][1], seen["end"][0])  # the resumed run did not get the saved experts
+    [load] = [r["checkpoint"]["load"] for r in second.records if "load" in r.get("checkpoint", {})]
+    tensors = load["tensors"]
+    assert (tensors["state"], tensors["entry"], tensors["by"]) == ("compared", "model.safetensors", "name")
+    assert {"model.layers.0.mlp.experts.gate_up_proj", "model.layers.0.mlp.experts.down_proj"} <= set(
+        tensors["missing"]["names"])
+    assert any(".experts.0." in name for name in tensors["unexpected"]["names"])
+    evidence = ev.build_evidence(first.records + second.records, detectors="python")
+    finding = _resume_finding(evidence)[-1]
+    assert finding["finding"] == "missing_tensors" and "model.layers.0.mlp.experts.gate_up_proj" in finding["tensors"]
