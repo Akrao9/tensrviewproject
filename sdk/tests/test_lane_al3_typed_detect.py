@@ -32,16 +32,19 @@ import pytest
 
 from tensorquill import server_detect
 
-pa = pytest.importorskip("pyarrow")
-
 ROOT = Path(__file__).parents[2]
 CASES = json.loads((Path(__file__).parent / "fixtures" / "wave_al" / "cases.json").read_text())["cases"]
 ROWS = [c for c in CASES if c["section"] in (1, 2) and "rust_raw" in c["expect"]]
 TARGETS = {"layers_entry_not_object", "layers_name_arrow_cannot_encode", "layers_value_not_object"}
 BINARY = server_detect.find_binary()
 
-pytestmark = pytest.mark.skipif(BINARY is None or not os.path.isfile(BINARY),
-                                reason="tensorquill-server is not built (TENSORQUILL_SERVER_BIN)")
+# Marks, not a module-level skip, so that a run of this file alone on CI's plain jobs (no pyarrow, no
+# binary) collects every test and skips each, as the whole suite does.
+pytestmark = [
+    pytest.mark.skipif(importlib.util.find_spec("pyarrow") is None, reason="pyarrow is not installed"),
+    pytest.mark.skipif(BINARY is None or not os.path.isfile(BINARY),
+                       reason="tensorquill-server is not built (TENSORQUILL_SERVER_BIN)"),
+]
 
 
 def _flight_is_protocol_4() -> bool:
@@ -60,6 +63,8 @@ def _prototype():
 
 def _typed_stream(records: list[dict], token_entropy: bool = False) -> bytes:
     """One rank's records as protocol 5's rows, in the order `detect` is sent them."""
+    import pyarrow as pa
+
     if not _flight_is_protocol_4():
         return server_detect.records_stream(records)
     p5 = _prototype()
