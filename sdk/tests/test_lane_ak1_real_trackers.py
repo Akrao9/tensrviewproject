@@ -26,10 +26,11 @@ def _step(model, opt):
     opt.zero_grad()
 
 
+@pytest.mark.parametrize("mode", ["offline", "disabled"])
 @pytest.mark.parametrize("tensorquill_first", [False, True])
-def test_real_wandb_offline_in_both_orders(tmp_path, monkeypatch, tensorquill_first):
+def test_real_wandb_in_both_orders(tmp_path, monkeypatch, tensorquill_first, mode):
     wandb = pytest.importorskip("wandb")
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", mode)
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     monkeypatch.setenv("WANDB_SILENT", "true")
     original = wandb.Run.__dict__["log"]
@@ -38,9 +39,9 @@ def test_real_wandb_offline_in_both_orders(tmp_path, monkeypatch, tensorquill_fi
     opt = torch.optim.SGD(model.parameters(), lr=0.01)
     if tensorquill_first:
         session = _open(model)
-        run = wandb.init(project="ak1", mode="offline")
+        run = wandb.init(project="ak1", mode=mode)
     else:
-        run = wandb.init(project="ak1", mode="offline")
+        run = wandb.init(project="ak1", mode=mode)
         session = _open(model)
     try:
         assert wandb.log({"loss": 0.5, "flag": True}) is None

@@ -13,7 +13,9 @@ imported here):
   to the new run's bound `log` (`wandb/sdk/lib/module.py`, `set_global(log=run.log)`), which
   holds the function that was on the class when the run was made: the class wrapper catches a run
   made after `init`, the module wrapper a run made before it. `wandb.finish()` puts W&B's pre-init
-  stub back, and the class wrapper catches the next run again.
+  stub back, and the class wrapper catches the next run again. A subclass of `Run` defined by then
+  with a `log` of its own is wrapped too: `wandb.init(mode="disabled")` makes a `NoopRun` whose
+  `log` does not call `Run.log`.
 - MLflow: `log_metric` and `log_metrics` on `mlflow` and on `mlflow.tracking.fluent`, which
   defines them (`mlflow/__init__.py` re-exports them by name). `MlflowClient` is not wrapped.
 
@@ -131,13 +133,34 @@ def _install_found() -> None:
         if not isinstance(run_class, type):
             run_class = _own(sys.modules.get("wandb.sdk.wandb_run")).get("Run")
         if isinstance(run_class, type):
-            _wrap(run_class, "log", _wandb_values, method=True)
+            for cls in _with_subclasses(run_class):
+                # A subclass with a `log` of its own, such as the `NoopRun` that
+                # `wandb.init(mode="disabled")` makes (`wandb/sdk/lib/noop_run.py`), whose `log`
+                # does not call `Run.log`. One defined after `init` is not seen.
+                _wrap(cls, "log", _wandb_values, method=True)
         _wrap(wandb, "log", _wandb_values, method=False)
     for name in ("mlflow", "mlflow.tracking.fluent"):
         module = sys.modules.get(name)
         if module is not None:
             _wrap(module, "log_metric", _mlflow_metric, method=False)
             _wrap(module, "log_metrics", _mlflow_metrics, method=False)
+
+
+def _with_subclasses(cls: type) -> list[type]:
+    """`cls` and every subclass of it defined so far, each once, read with `type.__subclasses__`
+    (no import, no attribute of the tracker's)."""
+    found: list[type] = []
+    todo = [cls]
+    while todo and len(found) < 256:
+        current = todo.pop()
+        if any(current is seen for seen in found):
+            continue
+        found.append(current)
+        try:
+            todo.extend(type.__subclasses__(current))
+        except Exception:  # noqa: BLE001
+            pass
+    return found
 
 
 def _wrap(owner: Any, name: str, extract: Callable[[tuple, dict], list], *, method: bool) -> None:
