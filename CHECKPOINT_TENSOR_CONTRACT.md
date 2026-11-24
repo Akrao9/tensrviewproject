@@ -217,3 +217,56 @@ At the trial merge both engines are run on every `records` case and held to the 
 | A shape | `a_shape_that_differs` |
 | Reading the model | `a_model_whose_state_export_gathers`, `a_model_that_replaces_its_parameter_walk`, `the_comparison_raises` |
 | Not compared | `a_checkpoint_folder`, `a_save_is_not_compared` |
+
+## 8. Proposed, awaiting the author's sign-off: a checkpoint folder's tensors (lane AK-2, Nov 24, 2026)
+
+**Not signed.** This section is lane AK-2's proposal, built and tested on CPU in wave AK (the plan's Phase 1, item 3). Nothing above it is rewritten. Where it would change a signed statement, the statement is named at the end, and stays as written until the author signs.
+
+**What is read.** At `session.checkpoint_files(folder, event="load")` the model's weights in the folder are listed by name and shape from `.safetensors` headers only (`safetensors_listing` in `data.py`). A `.safetensors` file starts with N, an unsigned little-endian 64-bit integer, then N bytes of UTF-8 JSON naming each tensor's `dtype`, `shape` and `data_offsets`, with `__metadata__`, which is not a tensor. From each file those 8 + N bytes are read with plain reads, and nothing after them: no tensor byte, so a file whose data region is cut off or overwritten lists the same. `data_offsets` are not read. The `safetensors` package is not imported. A file is checked with `stat` before it is opened, so a named pipe or a device is never opened. Pickled weights (`.bin`, `.pt`, `.pth`, `.pkl`) are never opened.
+
+**The entries.** Read in the layouts that Transformers, Accelerate and DeepSpeed write (read in their source on Nov 24, 2026):
+
+| In the folder | Entry | Written by |
+|---|---|---|
+| `X.safetensors.index.json` and the shards its `weight_map` names | One entry, `X.safetensors.index.json`: the shards' tensors together | `save_pretrained` with `max_shard_size` (`model-0000k-of-0000n.safetensors`), so a `Trainer` checkpoint of a large model |
+| Any other `X.safetensors` | One entry each, `X.safetensors` | `save_pretrained` unsharded (`model.safetensors`); Accelerate's `save_state` (`model.safetensors` for the first prepared model, `model_1.safetensors` for the second, and so on: separate models, never one) |
+| No `.safetensors` file | None: `unavailable`, `folder`, exactly as before this section | FSDP through Accelerate or the `Trainer` (`pytorch_model_fsdp.bin`, `pytorch_model_fsdp_0/`), DeepSpeed (`*_model_states.pt`), Accelerate's `safe_serialization=False` |
+
+**Which entry is compared.** The entries go through section 2's rules 2 to 6, unchanged: names made comparable (wrappers, one prefix), the half filter, and tied weights. An entry is read by its file's stem as a state dict's entry is read by its key: `model.safetensors` and `model.safetensors.index.json` are conventional (`model`), `model_1.safetensors` and an unindexed shard are not. Rule 1 does not apply: the loader names a folder, not a file, so `by` is `name` or `names`, never `loader`. `entry` is the file compared. So one Accelerate folder of two different models compares the session's model with the file whose names are its own, and two shards whose index is gone read `ambiguous`. Two models of the same architecture in one Accelerate folder both pass the filter, and rule 2 compares `model.safetensors`, the first prepared model's, whichever the session watches.
+
+**What `components` says.** The folder's components are read from its file names as before (`files_manifest`), whatever the comparison finds. Section 2's table, which takes `components.model` away at `not_identified`, is not applied to a folder: a file named `model.safetensors` is the model's by the framework that wrote it.
+
+**What is refused.** Never raised. The load's `tensors` is then `{"state": "unavailable", "why": "folder", "refused": ..., "file": ...}`, with `tensor` where one tensor is at fault. `why` stays `folder`, the word both engines already pass on, so both read such a load exactly as they read a folder before this section; `refused`, `file` and `tensor` stay in the record, as `closest` does.
+
+| `refused` | When |
+|---|---|
+| `short_file` | Fewer than 8 bytes |
+| `header_too_large` | N over 100,000,000, the format's own cap (the `safetensors` package refuses it as "header too large") |
+| `header_past_end` | N larger than the file after its first 8 bytes |
+| `not_utf8`, `not_json`, `not_an_object` | The header, or an index, is not UTF-8, not JSON, or not a JSON object |
+| `bad_entry` | A tensor entry that is not an object, or has no non-empty string `dtype`, or no `shape` that is a list of whole numbers from 0 up (`true` is not a number) |
+| `bad_index` | An index without a `weight_map` of names to strings, or naming a shard by a path rather than a file name in the folder |
+| `shard_absent` | An index names a shard that is not in the folder |
+| `duplicate_tensor` | The same tensor name in two shards of one index |
+| `unreadable` | A file that is not a regular file, or cannot be opened or read |
+| `too_many_files` | More than 1,024 index and weight files |
+| `too_many_header_bytes` | More than 32 MiB of headers and indexes in all |
+| `no_tensors` | Headers that name no tensor |
+
+One file refused refuses the folder: the other entries are not compared, since the rules choose among all of them. A comparison that raises reads `{"state": "unavailable", "why": "error"}`, as section 1 says.
+
+**A save** opens no file and carries no `tensors`, as decision 4 says.
+
+**The bounds, for the author to confirm.** 1,024 files and 32 MiB of headers at one load, chosen, not derived: the largest published models are sharded into fewer than 200 files (not measured here), and at the 110 bytes a tensor's entry took in the measured headers, 32 MiB is about 300,000 tensors. Read at the cap, the JSON would take about half a second, once, at the load (extrapolated from the 1 MB measurement below, not measured). Measured on an 8-core laptop, warm page cache, median of 50: listing the headers takes 0.07 ms (one file, 12 tensors), 0.4 ms (one file, 291 tensors, a 32-layer Llama), 0.55 ms (the same in 3 shards), 1.4 ms (14 shards, 723 tensors, an 80-layer Llama) and 17 ms (11 shards, 9,555 tensors, 1 MB of headers); the whole `checkpoint_files` call, with the model read and compared, 0.18, 2.4, 2.8, 6.9 and 23 ms. The plan's "under 1 ms" holds for reading the headers of a model of a few hundred tensors, not for the whole call.
+
+**Cases** are tests in `sdk/tests/test_lane_ak2_safetensors.py`, not in `cases.json`: a real file read as the `safetensors` package reads it, its data region cut, overwritten and removed; a sharded folder by hand and by `save_pretrained`; a tied weight `save_pretrained` writes once; a real Accelerate folder of two models; `module.` names; two unindexed shards; each refusal, a named pipe among them; a load naming two missing tensors, and one a shape that differs, through both engines; a refused folder through both; a real `Trainer` resume from a folder whose `model.safetensors` lost a tensor; and nothing raised under `python -W error`.
+
+**What it does not see.** A folder of pickled weights, FSDP's or DeepSpeed's included. A tensor whose data is missing or damaged in the file. A file in a sub-folder (a diffusers pipeline's `unet/`, for one). Which file the framework actually loaded: the comparison says what the folder holds, as section 1 says what a state dict holds.
+
+**Signed statements this would change, if signed:**
+
+- Section 3, the `folder` row of `why`: "file names only, no file opened" would read "no `.safetensors` weights in the folder, or their headers refused (`refused` says why)".
+- Section 4, the row "A folder" of the readings kept apart: a folder with `.safetensors` weights is read as any compared load.
+- Section 5, the bullet "A checkpoint folder", which proposed nothing: replaced by this section.
+- Section 6, "`checkpoint_files()` marks a folder load": it now compares one.
+- Two expectations in `sdk/tests/test_lane_ac1_checkpoint.py` that wrote an empty `model.safetensors` as a stand-in for its name and pinned `{"state": "unavailable", "why": "folder"}` exactly: the case `a_checkpoint_folder` through a session, and `test_a_folder_is_marked_at_a_load_and_not_at_a_save`. The empty file is now opened and refused, `refused: "short_file"`, `file: "model.safetensors"`, and both tests say so. `cases.json` is unchanged: the case's `tensors` is still `unavailable`, `folder`.

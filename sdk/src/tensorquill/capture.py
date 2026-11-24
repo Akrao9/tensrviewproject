@@ -2869,7 +2869,16 @@ class Session:
         """`checkpoint` for a checkpoint folder, as the Hugging Face `Trainer` and Accelerate's
         `save_state` write: the components are read from the file names (`optimizer.pt`,
         `scheduler.pt`, `scaler.pt`, `rng_state*.pth` or `random_states_*.pkl`, the model's
-        weights, `trainer_state.json` or `sampler*.bin` for the data position). No file is opened."""
+        weights, `trainer_state.json` or `sampler*.bin` for the data position).
+
+        At a load the model's weights in the folder are also compared with the model given to
+        `init`, by name and shape, as `checkpoint` compares a state dict (`tensors` on the
+        manifest; CHECKPOINT_TENSOR_CONTRACT.md, the folder section): `model.safetensors.index.json`
+        and its shards, or the `.safetensors` files, of each of which only the 8-byte header length
+        and the JSON header are read, never a tensor's bytes. A folder with only pickled weights
+        (`.bin`, `.pt`) is not opened, and a header that cannot be trusted is refused: both read
+        `{"state": "unavailable", "why": "folder"}`, a refusal with its reason. A save opens no
+        file."""
         if self._closed_call("checkpoint_files()"):
             return
         try:
@@ -2877,8 +2886,13 @@ class Session:
         except OSError:
             return
         manifest = files_manifest(names)
-        if event == "load":  # no file is opened, so no tensor name is known
-            manifest["tensors"] = dict(FOLDER_TENSORS)
+        if event == "load":
+            from .data import folder_tensor_coverage  # here, not in the import block other lanes edit
+
+            try:
+                manifest["tensors"] = folder_tensor_coverage(folder, self._model, names)
+            except Exception:  # noqa: BLE001  nothing here may stop the training
+                manifest["tensors"] = {**FOLDER_TENSORS, "why": "error"}
         self._record_manifest(manifest, event)
 
     def _record_manifest(self, manifest: dict[str, Any], event: str) -> None:
