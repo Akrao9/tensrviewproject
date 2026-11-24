@@ -465,24 +465,31 @@ _log = logging.getLogger("tensorquill")
 
 def _sharded(model: nn.Module) -> str | None:
     """How `model` is sharded across ranks, or None: FSDP1 (a `FullyShardedDataParallel` wrapper,
-    at the root or nested), FSDP2 (a module `fully_shard` was applied to, or a parameter that is a
-    DTensor with a `Shard` placement, which is what a module inside one holds).
+    at the root or nested, or a module inside one: FSDP1 marks every module it manages with
+    `_is_fsdp_managed_module` and every original parameter it flattened with `_fsdp_flattened`),
+    FSDP2 (a module `fully_shard` was applied to, or a parameter that is a DTensor with a `Shard`
+    placement, which is what a module inside one holds).
 
     Under either, a forward is a collective: each sharded unit gathers its parameters from every
     rank. Read from types and attributes on this rank alone, so asking adds no collective, and
     anything unexpected reads as not sharded: this is asked at `init`, which it must never fail.
-    Not seen: a model sharded after `init`, and a module inside an FSDP1 wrapper passed without
-    the wrapper (its parameters are plain tensors)."""
+    Not seen: a model sharded after `init`."""
     try:
         fsdp = sys.modules.get("torch.distributed.fsdp")  # not imported: nothing here is FSDP's
         v1 = getattr(fsdp, "FullyShardedDataParallel", None)
         v2 = getattr(fsdp, "FSDPModule", None)
-        if isinstance(v1, type) or isinstance(v2, type):
-            for module in model.modules():
-                if isinstance(v1, type) and isinstance(module, v1):
-                    return "FSDP1, FullyShardedDataParallel"
-                if isinstance(v2, type) and isinstance(module, v2):
-                    return "FSDP2, fully_shard"
+        for module in model.modules():
+            if isinstance(v1, type) and isinstance(module, v1):
+                return "FSDP1, FullyShardedDataParallel"
+            if isinstance(v2, type) and isinstance(module, v2):
+                return "FSDP2, fully_shard"
+            # Inside a wrapper that is not part of `model` (Lightning's FSDP strategy with no wrap
+            # policy wraps the LightningModule, and its callback passes the LightningModule).
+            if getattr(module, "_is_fsdp_managed_module", False) is True:
+                return "FSDP1, inside a FullyShardedDataParallel wrapper"
+        for parameter in model.parameters():
+            if getattr(parameter, "_fsdp_flattened", False) is True:
+                return "FSDP1, inside a FullyShardedDataParallel wrapper"
         if _DTensor is not None:
             for parameter in model.parameters():
                 if isinstance(parameter, _DTensor) and any(
