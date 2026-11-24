@@ -2096,7 +2096,9 @@ def detect_attention_anomalies(
     One incident per kind: the step of the first probe, the probe that confirmed it, the
     modules whose run started there (in the probe's order, at most ATTN_MODULES), how many,
     and how many probes were part of a confirmed run in all. `not_checked` gets a `probe`
-    entry when any probe failed (`{"error": ...}` in place of its results). Too few probes for
+    entry when any probe failed (`{"error": ...}` in place of its results), or, when none did,
+    when the capture said the probe was given and not run (`{"not_run": why}`, once: a sharded
+    model). Too few probes for
     a module to be judged and confirmed is not an entry: the kinds are then `checked` without
     enough history yet (`kind_checks`, `RECORDS_NEEDED`), and the run is not degraded for it.
     """
@@ -2106,8 +2108,15 @@ def detect_attention_anomalies(
     affected: dict[str, set[int]] = {}
     probe_steps: list[int] = []
     asked, failed, first_failure = 0, 0, None
+    off: tuple[int, Any] | None = None  # the capture's note that `probe=` was given and is not run
     for record in sorted(records, key=lambda r: r["step"]):
         probe = record.get("probe")
+        if isinstance(probe, dict) and "not_run" in probe:
+            # Not a probe that was asked for and failed: the capture turned the probe off and says
+            # why, once (a sharded model, where a probe's forward would be a collective).
+            if off is None:
+                off = (int(record["step"]), probe["not_run"])
+            continue
         if isinstance(probe, dict):
             asked += 1
             if "error" in probe:
@@ -2188,6 +2197,14 @@ def detect_attention_anomalies(
             "kinds": list(ATTN_KINDS),
             "reason": f"{failed} of {asked} probe{'s' if asked != 1 else ''} failed, the first at step {step}:"
                       f" {error if isinstance(error, str) else json.dumps(error, separators=(',', ':'))}",
+            "step": step,
+        })
+    elif not_checked is not None and off is not None:
+        step, why = off
+        not_checked.append({
+            "check": "probe",
+            "kinds": list(ATTN_KINDS),
+            "reason": f"the probe was not run: {why if isinstance(why, str) else json.dumps(why, separators=(',', ':'))}",
             "step": step,
         })
     return [found[kind] for kind in ATTN_KINDS if kind in found]

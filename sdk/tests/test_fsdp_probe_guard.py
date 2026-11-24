@@ -91,7 +91,7 @@ def _run(flavor: str, out: Path) -> dict:
             "log": (out / f"rank{rank}.log").read_text(),
         })
     if any(r["code"] == 77 for r in ranks):
-        pytest.skip(f"PyTorch {torch.__version__} cannot shard this model on the CPU with {flavor}: "
+        pytest.skip(f"PyTorch {torch.__version__} cannot train this sharded model on the CPU with {flavor}: "
                     + " | ".join(r["log"].strip().splitlines()[-1] for r in ranks if r["code"] == 77))
     return {"ranks": ranks, "seconds": time.monotonic() - start}
 
@@ -150,3 +150,53 @@ def test_without_sharding_the_probe_still_runs_on_both_ranks(tmp_path: Path) -> 
     assert [step for step, _ in probes] == list(range(PROBE_EVERY - 1, STEPS, PROBE_EVERY)), probes
     assert all("error" not in keys and "not_run" not in keys for _, keys in probes), probes
     assert all(SAID not in r["log"] for r in run["ranks"])
+
+
+def test_a_note_that_the_probe_is_off_is_not_a_failed_probe_and_a_failure_beside_it_is_the_entry() -> None:
+    note = {"step": 0, "probe": {"not_run": "the model is sharded across ranks (FSDP2, fully_shard)"}}
+    plain = [{"step": step} for step in range(1, 4)]
+    not_checked: list[dict] = []
+    assert detect_attention_anomalies([note, *plain], not_checked=not_checked) == []
+    assert not_checked == [{
+        "check": "probe", "kinds": list(ATTN_KINDS), "step": 0,
+        "reason": "the probe was not run: the model is sharded across ranks (FSDP2, fully_shard)",
+    }]
+    failed = {"step": 1, "probe": {"error": "RuntimeError: CUDA out of memory"}}
+    not_checked = []
+    detect_attention_anomalies([note, failed], not_checked=not_checked)
+    assert [entry["reason"] for entry in not_checked] == ["1 of 1 probe failed, the first at step 1: RuntimeError: CUDA out of memory"]
+
+
+def test_a_model_that_is_not_sharded_keeps_its_probe_and_detection_never_raises() -> None:
+    from torch import nn
+
+    import tensorquill
+    from tensorquill.capture import _sharded
+    from tensorquill.sink import MemorySink
+
+    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 2))
+    assert _sharded(model) is None
+
+    class Odd(nn.Module):
+        def modules(self):  # noqa: ANN202
+            raise RuntimeError("no modules to list")
+
+    assert _sharded(Odd()) is None  # what cannot be read is not called sharded, and `init` goes on
+
+    calls = []
+    fixed = torch.randn(2, 4)
+
+    def probe(m):  # noqa: ANN001, ANN202
+        calls.append(1)
+        return m(fixed)
+
+    sink = MemorySink()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    with tensorquill.init(model, sink=sink, every=2, probe=probe, probe_every=2, heartbeat_seconds=None, stack_seconds=None):
+        for _ in range(4):
+            model(torch.randn(3, 4)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+    assert len(calls) == 2
+    probes = [r["probe"] for r in sink.records if "probe" in r]
+    assert len(probes) == 2 and all("not_run" not in p and "error" not in p for p in probes)

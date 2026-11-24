@@ -8,7 +8,8 @@ It leaves, in DIR: `rank<r>.trace` (one line per stage, so the test can say wher
 `rank<r>.jsonl` (the records its sink was handed) and `probe-entered.rank<r>` (written by the
 probe callback before anything else, each time it is entered). Under sharding the callback then
 raises: a probe entered there is the failure the test is about, whatever the SDK does with it.
-Exit status 77 with one line on stderr when this PyTorch cannot shard the model on the CPU.
+Exit status 77 with one line on stderr when this PyTorch cannot shard the model, or run one
+forward and backward of it, on the CPU (tried before TensorQuill is started).
 """
 
 from __future__ import annotations
@@ -64,8 +65,13 @@ def main() -> int:
     if args.flavor != "none":
         try:
             model = shard(model, args.flavor)
+            # One training forward and backward before TensorQuill is there, the same on every rank:
+            # PyTorch 2.6's FSDP2 raises in its first forward on the CPU (its CPU stream has no
+            # `record_event`), which is PyTorch's and not what this test is about.
+            model(torch.zeros(2, 16)).sum().backward()
+            model.zero_grad()
         except Exception as error:  # noqa: BLE001
-            print(f"cannot shard on the CPU with {args.flavor} on PyTorch {torch.__version__}: {error!r}", file=sys.stderr)
+            print(f"cannot train a sharded model on the CPU with {args.flavor} on PyTorch {torch.__version__}: {error!r}", file=sys.stderr)
             return 77
     say(f"model ready ({args.flavor})")
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)

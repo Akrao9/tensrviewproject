@@ -2967,6 +2967,8 @@ impl<'de> Deserialize<'de> for AttentionStats {
 #[derive(Default)]
 struct Probe<'a> {
     error: Option<Value>,
+    /// The capture's note that `probe=` was given and is not run (a sharded model), with why.
+    not_run: Option<Value>,
     attention: Option<Members<'a, AttentionStats>>,
 }
 
@@ -2983,6 +2985,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Probe<'a> {
                 while let Some(Key(key)) = map.next_key()? {
                     match key.as_ref() {
                         "error" => probe.error = Some(map.next_value()?),
+                        "not_run" => probe.not_run = Some(map.next_value()?),
                         // Not an object: the probe is not read at all, as Python skips it.
                         "attention" => probe.attention = Some(map.next_value()?),
                         _ => {
@@ -3047,6 +3050,8 @@ struct Attention {
     asked: u64,
     failed: u64,
     first_failure: Option<(i64, String)>,
+    /// The first note that the probe was given and not run, as (step, why). Not a probe asked.
+    off: Option<(i64, String)>,
 }
 
 impl Attention {
@@ -3063,6 +3068,15 @@ impl Attention {
         let Ok(probe) = serde_json::from_str::<Probe>(text) else {
             return;
         };
+        if let Some(why) = &probe.not_run {
+            // Not a probe that was asked for and failed, as Python reads it: nothing else of it is read.
+            self.asked -= 1;
+            if self.off.is_none() {
+                let said = why.as_str().map_or_else(|| why.to_string(), str::to_owned);
+                self.off = Some((step, said));
+            }
+            return;
+        }
         // The measurement `attention_trends` reads a probe's modules whether or not it says
         // `error`, as Python's does; the rules below do not.
         if let Some(Members(attention)) = &probe.attention {
@@ -3201,12 +3215,22 @@ impl Attention {
         }
     }
 
-    /// The `probe` entry of `not_checked`: probes that failed. A failed probe leaves its
+    /// The `probe` entry of `not_checked`: probes that failed, or, when none did, the capture's
+    /// note that the probe was given and not run (a sharded model). A failed probe leaves its
     /// step unjudged, and a rule that must hold on probes in a row may have missed a change.
     /// Too few probes to judge is not an entry: the attention kinds are then `checked`
     /// without enough history ([`RankDetectors::kind_checks`]), which degrades nothing.
     fn probe_not_checked(&self) -> Option<Value> {
-        let (step, said) = self.first_failure.as_ref()?;
+        let Some((step, said)) = self.first_failure.as_ref() else {
+            // No probe failed: the capture's note that the probe is off, when it left one.
+            let (step, why) = self.off.as_ref()?;
+            return Some(json!({
+                "check": "probe",
+                "kinds": ATTN_KINDS,
+                "reason": format!("the probe was not run: {why}"),
+                "step": step,
+            }));
+        };
         Some(json!({
             "check": "probe",
             "kinds": ATTN_KINDS,
@@ -6144,6 +6168,24 @@ mod tests {
         let odd = judge(0, &[probe_rows(&[Some(r#"{"error":{"code":3}}"#)])], &usual()).unwrap();
         let said = odd.not_checked().last().unwrap()["reason"].clone();
         assert_eq!(said, r#"1 of 1 probe failed, the first at step 0: {"code":3}"#);
+
+        // The capture turned the probe off (a sharded model) and said so once: not a probe that
+        // failed, and the attention kinds are unavailable with its reason, as Python reports it.
+        let note = r#"{"not_run":"the model is sharded across ranks (FSDP2, fully_shard)"}"#;
+        let off = judge(0, &[probe_rows(&[Some(note), None, None])], &usual()).unwrap();
+        let reason = "the probe was not run: the model is sharded across ranks (FSDP2, fully_shard)";
+        let entry = json!({"check": "probe", "kinds": attention, "reason": reason, "step": 0});
+        assert_eq!(off.not_checked().last(), Some(&entry));
+        let checks = off.kind_checks();
+        assert_eq!(values(&checks, "unavailable"), attention);
+        assert_eq!(checks["attention_collapse"]["reason"], reason);
+        // A failed probe beside the note: the failure is the entry, counted over the probes asked.
+        let both = judge(0, &[probe_rows(&[Some(note), Some(failed)])], &usual()).unwrap();
+        let said = both.not_checked().last().unwrap()["reason"].clone();
+        assert_eq!(
+            said,
+            "1 of 1 probe failed, the first at step 1: RuntimeError: CUDA out of memory"
+        );
     }
 
     #[test]

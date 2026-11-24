@@ -463,6 +463,37 @@ def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: 
 _log = logging.getLogger("tensorquill")
 
 
+def _sharded(model: nn.Module) -> str | None:
+    """How `model` is sharded across ranks, or None: FSDP1 (a `FullyShardedDataParallel` wrapper,
+    at the root or nested), FSDP2 (a module `fully_shard` was applied to, or a parameter that is a
+    DTensor with a `Shard` placement, which is what a module inside one holds).
+
+    Under either, a forward is a collective: each sharded unit gathers its parameters from every
+    rank. Read from types and attributes on this rank alone, so asking adds no collective, and
+    anything unexpected reads as not sharded: this is asked at `init`, which it must never fail.
+    Not seen: a model sharded after `init`, and a module inside an FSDP1 wrapper passed without
+    the wrapper (its parameters are plain tensors)."""
+    try:
+        fsdp = sys.modules.get("torch.distributed.fsdp")  # not imported: nothing here is FSDP's
+        v1 = getattr(fsdp, "FullyShardedDataParallel", None)
+        v2 = getattr(fsdp, "FSDPModule", None)
+        if isinstance(v1, type) or isinstance(v2, type):
+            for module in model.modules():
+                if isinstance(v1, type) and isinstance(module, v1):
+                    return "FSDP1, FullyShardedDataParallel"
+                if isinstance(v2, type) and isinstance(module, v2):
+                    return "FSDP2, fully_shard"
+        if _DTensor is not None:
+            for parameter in model.parameters():
+                if isinstance(parameter, _DTensor) and any(
+                    type(placement).__name__ == "Shard" for placement in parameter.placements
+                ):
+                    return "FSDP2, sharded DTensor parameters"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _warn(message: str, stacklevel: int = 2) -> None:
     """`warnings.warn(message, RuntimeWarning)` for code the training thread reaches, which must
     never raise into training. Under `python -W error` (or any filter that makes a
@@ -1261,6 +1292,7 @@ class _Plan:
     grad_every: int
     weight_every: int
     probe_fn: Callable[[nn.Module], Any] | None
+    probe_off: str | None  # why `probe=` was given and is not run (`_sharded`), said once
     params: list[tuple[str, torch.Tensor]]
     replicas: list[tuple[str, torch.Tensor]]
     selected: list[tuple[str, nn.Module]]
@@ -1312,6 +1344,19 @@ def _plan_session(
     if isinstance(probe_every, bool) or not isinstance(probe_every, int) or probe_every < 1:
         raise ValueError("probe_every must be a positive integer")
     probe_fn = probe_callable(probe) if probe is not None else None
+    probe_off = None
+    if probe_fn is not None:
+        # The author, Nov 24, 2026: on a sharded model the probe is off. Its forward would be a
+        # collective, and a rank that skipped it (a stopped session) or left it part-way (a probe
+        # that raised) leaves its peers' collectives to meet its next training ones: on two Gloo
+        # ranks one process aborted and the other waited. Not an error: the rest is captured.
+        how = _sharded(model)
+        if how is not None:
+            probe_fn = None
+            probe_off = (
+                f"the model is sharded across ranks ({how}), so a probe's forward would be a collective"
+                " that every rank must enter"
+            )
     if ends_step is not None:
         # Wave AE, section 3, this page's reading: refused here, never inside a step.
         if not isinstance(ends_step, torch.optim.Optimizer):
@@ -1342,7 +1387,8 @@ def _plan_session(
         probe_blocks = _select_layers(model, "blocks")
         head = find_head(model, probe_head)
     return _Plan(
-        grad_every=grad_every, weight_every=weight_every, probe_fn=probe_fn, params=params, replicas=replicas,
+        grad_every=grad_every, weight_every=weight_every, probe_fn=probe_fn, probe_off=probe_off, params=params,
+        replicas=replicas,
         selected=selected, routers=planned_routers, probe_blocks=probe_blocks, head=head,
         scaler=scaler if scaler is not None and scaler.is_enabled() else None,
     )
@@ -1453,6 +1499,17 @@ class Session:
         self._replica_projection = replica_projection
         self.probe_every = probe_every
         self._probe_fn = plan.probe_fn
+        # `probe=` was given and is not run: written once, in place of a probe's results, on the
+        # first step's record (`_commit`), and said once below.
+        self._probe_off = plan.probe_off
+        if self._probe_off is not None:
+            said = (
+                f"TensorQuill: the probe is off for this session: {self._probe_off}. A rank that skipped it or"
+                " left it part-way would leave the ranks' collectives mismatched. Everything else is captured as"
+                " usual; the record of the first step says so under `probe`, and the checks that read the probe"
+                " are reported as unavailable."
+            )
+            _warn(said, stacklevel=4)  # never raises, whatever the warning filters (`_warn`)
         self._model = model
         self.auto_step = auto_step
         self._sink = sink
@@ -1645,6 +1702,7 @@ class Session:
         self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
         self._ring_probe: list[dict[str, Any] | None] = []
+        self._probe_off_written = False
         # Data progress (`data`): None until the first batch is noted, then every step has one.
         self._data_step: DataStep | None = None
         self._ring_data: list[dict[str, Any] | None] = []
@@ -2201,7 +2259,7 @@ class Session:
             self._grad[:, 2:].zero_()
             self._mark_held("grad")
             self._ring_weight_seen[-1] = {"ownership": self._optimizer_ownership(), "dtypes": self._weight_dtypes}
-        if first and self._ring_probe[-1] is not None:
+        if first and self._probe_fn is not None and self._ring_probe[-1] is not None:
             # The probe ran when the lead ended the step, before any follower was known: it runs
             # again once every optimizer of this iteration has stepped. Later probes wait (`_commit`).
             self._probe_owed = True
@@ -3328,6 +3386,9 @@ class Session:
         probe_due = self._cadence_probe()
         self._steps.append(current)
         self._ring_probe.append(None)
+        if self._probe_off is not None and not self._probe_off_written:
+            self._probe_off_written = True
+            self._ring_probe[-1] = {"not_run": self._probe_off}
         self._ring_lr.append(self._pending_lr)
         self._ring_ts.append(time.time())  # when the step ended, Unix seconds
         self._pending_lr = None
