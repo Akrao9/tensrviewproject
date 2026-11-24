@@ -2,7 +2,7 @@
 
 What `WAVE_AL_CONTRACT.md` cites. Nothing here is product code, and nothing here changes `sdk/src` or `server/src`. Every run was made on an 8-core Apple M1 Pro with Python 3.12.3 and pyarrow 26.0.1. Each result file records the load average before each round.
 
-**Two trees.** The result files up to `eab810a` were measured on the base, against its protocol 4 release binary, with the prototype standing in for protocol 5's layout. Since step 1 merged (`92e471a`), `tensorquill.flight` writes protocol 5's layout and the tree's binary reads it. So `captures.py` and `measure.py` now run the SDK's own `flight` against this tree's server. Protocol 4's rows, for the "today" arm and the prototype, come from `flight_v4.py`, a frozen copy. `live.py` and `build_cases.py` describe the base and run only there.
+**Two trees.** The result files up to `eab810a` were measured on the base, against its protocol 4 release binary, with the prototype standing in for protocol 5's layout. Since step 1 merged (`92e471a`), `tensorquill.flight` writes protocol 5's layout and the tree's binary reads it. So `captures.py` and `measure.py` now run the SDK's own `flight` against this tree's server. Protocol 4's rows, for the "today" arm and the prototype, come from `flight_v4.py`, a frozen copy. `live.py` describes the base and runs only there. `build_cases.py` runs on both trees alike (below).
 
 | File | What it is |
 |---|---|
@@ -14,7 +14,7 @@ What `WAVE_AL_CONTRACT.md` cites. Nothing here is product code, and nothing here
 | `measure.py ack` → `results/ack.json` | One rank: a probe batch's acknowledgement, its part's bytes and its Parquet write. Arms: `v4` (protocol 4's rows, metadata 1), `v5` (the SDK's protocol 5 rows, metadata 2), `none` (no probe, protocol 5's layout) |
 | `measure.py live64` → `results/live64.json` | 64 ranks at 65 ms a step through the server's own `live_streams` example, for the same three arms |
 | `measure.py decode` → `results/decode.json` | The detectors' JSON decoding against the typed columns (`rust-reader bench`); `detect_store --bench` on 64 ranks × 1,000 steps in protocol 5's layout and in protocol 4's, interleaved; Python's `load_records` on both layouts |
-| `build_cases.py` → `sdk/tests/fixtures/wave_al/cases.json` | The shared cases: `row` from the prototype, `expect` and `today` from the base's engines. It runs only on the base's tree, up to `099b921`, and refuses a protocol 5 tree |
+| `build_cases.py` → `sdk/tests/fixtures/wave_al/cases.json` | The shared cases: `row` from the prototype, `expect` and `today` from the base's engines. Its Rust reports are made from protocol 4's rows (`flight_v4.py`) through the tree's binary, which reads them as the base's did, so it gives the same file on the base and on step 1's joined tree, all but the `base` field (the commit it ran on). Step 2 changes the Python readers; from then on `today` is the file's |
 | `rust-reader/` | Reads a part whole with `Storage::read_part_whole` (`keys`), times reading with `Storage::read_part` (since lane AL-2, the projected read replay makes) and decoding (`bench`), and times a whole part's Parquet write with the server's writer settings (`write`) |
 
 ## Running them on this tree
@@ -27,6 +27,7 @@ export TENSORQUILL_SERVER_BIN=$PWD/server/target/release/tensorquill-server
 PY=/path/to/.venv/bin/python
 $PY -I experiments/protocol-v5/captures.py --out experiments/protocol-v5/results/captures.json
 $PY -I experiments/protocol-v5/captures.py --fixtures experiments/protocol-v5/results/fixtures.json
+PYTHONPATH=$PWD/sdk/src $PY experiments/protocol-v5/build_cases.py
 $PY experiments/protocol-v5/measure.py ack --rounds 7 --out experiments/protocol-v5/results/ack.json
 $PY experiments/protocol-v5/measure.py live64 --rounds 7 --out experiments/protocol-v5/results/live64.json
 $PY experiments/protocol-v5/measure.py decode --rounds 7 --out experiments/protocol-v5/results/decode.json

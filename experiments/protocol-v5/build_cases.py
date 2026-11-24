@@ -11,19 +11,20 @@ Each case's inputs are written here by hand. What is computed, and from what:
   `clean_records` (the same records with every refused part removed, or in the form today's code
   reads correctly); the v5 engines must report on `records` what today's report on the clean ones.
   For section 4, written by hand from the contract's rules.
-- `today` (what the base does with `records`, run here, never recomputed by the tests): the Python
-  engine and the raw Rust report, and the row's round trip through today's `flight.py`.
+- `today` (what the base does with `records`, never recomputed by the tests): the Python engine and
+  the raw Rust report, and the row's round trip through protocol 4's `flight.py`.
 
-Only the base's tree is run: nothing here imports a lane's code. So it reproduces `cases.json` only on
-a tree whose SDK and binary are the base's: the contract's own commits, up to `099b921`, before step 1
-merged (`92e471a`). On a later tree `flight` writes protocol 5 and the engines read it, so `today`
-would not be the base's; it refuses to run there. To check the file byte for byte, check out the
-builder's commit (a `git worktree` or `git archive` of it), build its binary, and run it there: only
-the `base` field differs, which records the commit it ran on.
+The Rust reports are made from protocol 4's rows (`flight_v4.py`, `flight.py`'s row functions frozen
+at `5c286ed`): the base sent those, and since step 1 (`92e471a`) the tree's binary reads them as the
+base's did, while the Python readers are the base's until step 2. So it runs on the base and on step
+1's joined tree alike, and gives the same file: run on `92e471a`'s descendants with this tree's
+binary, it reproduced the file written at the base, all but `base`, which records the commit it ran
+on. Step 2 changes the Python readers; from then on `today` is the file's, not a rerun's.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import math
@@ -37,13 +38,22 @@ sys.path.insert(0, str(HERE))
 
 import prototype as p5  # noqa: E402
 from tensorquill import evidence  # noqa: E402
-from tensorquill import flight as v4  # noqa: E402
+from tensorquill import flight  # noqa: E402
 from tensorquill.server_detect import find_binary, server_report  # noqa: E402
+
+v4 = p5.v4  # protocol 4's row functions, frozen (flight_v4.py)
 
 OUT = ROOT / "sdk" / "tests" / "fixtures" / "wave_al" / "cases.json"
 FORWARD = ["model.layers.0", "model.layers.1", "model.layers.2", "model.layers.10", "model.layers.11", "model.layers.3"]
 KINDS = sorted(("activation_spike", "activation_drift", "dead_activations", "non_finite", "moe_imbalance",
                 "attention_collapse", "attention_uniform", "attention_logit_growth"))
+# Protocol 4 rows a protocol 5 binary keeps reading as the base did, not as the clean records read (the
+# owner, Nov 24, item 4): `expect` is today's report on that path, and the case says why.
+KNOWN_V4 = {
+    "layers_name_arrow_cannot_encode": "not fixed (the owner, Nov 24): on protocol 4's row the whole layers map "
+    "travels in extra_json, so Rust reads no layer, while Python reads the record's layers; pinned on each side "
+    "by lane AL-S1",
+}
 LOCATION_KEYS = ("layers", "modules", "gradients", "routers", "router", "parameters", "experts")
 
 
@@ -82,6 +92,20 @@ def brief(incident: dict) -> dict:
     return out
 
 
+@contextlib.contextmanager
+def protocol_4_rows():
+    """`server_report` sends protocol 4's rows while this is open: its stream takes `_row`,
+    `flight_schema` and `rows_batch` from `tensorquill.flight` when it is called."""
+    saved = {name: getattr(flight, name) for name in ("_row", "flight_schema", "rows_batch")}
+    try:
+        for name in saved:
+            setattr(flight, name, getattr(v4, name))
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(flight, name, value)
+
+
 def engines(records: list[dict], rust: bool) -> dict:
     out: dict = {}
     try:
@@ -93,7 +117,8 @@ def engines(records: list[dict], rust: bool) -> dict:
         out["python"] = {"raises": f"{type(error).__name__}: {str(error)[:200]}"}
     if rust:
         try:
-            report = server_report(copy.deepcopy(records))
+            with protocol_4_rows():
+                report = server_report(copy.deepcopy(records))
             out["rust_raw"] = {"incidents": [brief(i) for i in report["incidents"]],
                                "kind_checks": {k: (report["kind_checks"].get(k) or {}).get("value") for k in KINDS}}
         except Exception as error:  # noqa: BLE001
@@ -192,6 +217,13 @@ def section_1() -> list[dict]:
     add("layers_value_not_object", "a layers value that is not an object travels whole in extra_json and the column is null",
         [rec("al_list", s, layers=[1, 2], grad_norm=1.0) for s in range(3)],
         [rec("al_list", s, grad_norm=1.0) for s in range(3)], 0, paths=("row", "python", "rust_raw", "rust_sdk"))
+    # The owner, Nov 24 (step 1's lane decisions, item 5): a row whose only layers are null structs holds
+    # no layer, in both engines; Python's input count is the owner's approved change (lane AL-4').
+    add("layers_only_entries_not_object", "every layers entry is not an object: each is a null struct in its place "
+        "and travels whole in extra_json, so the row holds no layer; the activation kinds read it as a record with "
+        "layers {} in both engines (Python's count of a non-empty layers object changes, the owner's approved change)",
+        run_of_layers("al_allnotobj", 12, odd={n: 5 for n in FORWARD}),
+        [{**r, "layers": {}} for r in run_of_layers("al_allnotobj", 12)], 3)
     router = "model.layers.0.block_sparse_moe.router"
     def moe_rec(run, s, stats, counts=None):
         counts = counts or [10, 10, 10, 10]
@@ -402,11 +434,9 @@ def section_4() -> list[dict]:
 
 
 def main() -> None:
-    if "layers_json" not in v4.flight_schema().names:
-        raise SystemExit(f"{v4.__file__} writes protocol 5's rows: build_cases.py computes `today` with the base's "
-                         "engines and reproduces cases.json only on the base's tree (up to 099b921, before step 1 "
-                         "merged). Run it in a checkout of that commit, with a binary built there.")
     rust = find_binary() is not None
+    if not rust:
+        raise SystemExit("tensorquill-server is not built: the Rust reports need it (TENSORQUILL_SERVER_BIN)")
     cases = section_1() + section_2()
     for case in cases:
         records, clean = case["records"], case.get("clean_records")
@@ -415,6 +445,15 @@ def main() -> None:
         case["expect"] = engines(clean if clean is not None else records, rust)
         if clean is None:
             case.pop("clean_records")
+        if "rust_raw" in case["paths"]:
+            # A protocol 4 row on a protocol 5 binary (the owner, Nov 24, item 4): the report the base made,
+            # since today's rust_raw is protocol 4's rows already. Read as before, but for lane AL-3′'s one fix.
+            case["paths"].insert(case["paths"].index("rust_raw") + 1, "rust_raw_v4")
+            case["today"]["rust_raw_v4"] = case["today"]["rust_raw"]
+            case["expect"]["rust_raw_v4"] = case["expect"]["rust_raw"]
+            if case["name"] in KNOWN_V4:
+                case["expect"]["rust_raw_v4"] = case["today"]["rust_raw_v4"]
+                case["known_difference"] = {"rust_raw_v4": KNOWN_V4[case["name"]]}
     for case in section_4():
         if case["name"] in ("scalar_record_keys",):
             row = p5.record_to_row_v5(next(r for r in case["records"] if r.get("schema_version") == 2))
@@ -434,9 +473,12 @@ def main() -> None:
         "contract": "WAVE_AL_CONTRACT.md",
         "base": base_sha(),
         "how_to_read": [
-            "Base trial/ai-wave f71d8e0 (the base field: the commit these were computed on). The rules are WAVE_AL_CONTRACT.md.",
+            "Base trial/ai-wave f71d8e0. The base field is the commit the file was last written on; today and expect are "
+            "the base's (its Python readers, and protocol 4's rows through a binary that reads them as the base's did). "
+            "The rules are WAVE_AL_CONTRACT.md.",
             "paths: row = flight.record_to_row and row_to_record in protocol 5's layout; python = build_evidence(detectors='python'); "
-            "rust_raw = server_detect.server_report; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release "
+            "rust_raw = server_detect.server_report; rust_raw_v4 = tensorquill-server detect given protocol 4's rows "
+            "(experiments/protocol-v5/flight_v4.py), as an older SDK sends them; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release "
             "server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; "
             "mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
             "Sections 1 and 2: row is what record_to_row must give at row.step (typed columns as [name, value] pairs in stored order, "
@@ -444,6 +486,7 @@ def main() -> None:
             "parsed, null for none), and row_to_record(record_to_row(r)) == r with the map's order kept. expect is today's engines on "
             "clean_records (or on records when there are none): every engine path must report that on records. today is the base on "
             "records (never recomputed).",
+            "known_difference: a path whose expect is today's, not the clean records' report, and why (the owner's word).",
             "Section 4: expect is written from the contract's rules; series maps a scalar name to [step, value] points in step order.",
             "measured: the results file under experiments/protocol-v5/ that shows the case's today on a real server.",
         ],

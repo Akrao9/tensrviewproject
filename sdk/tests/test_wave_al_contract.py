@@ -11,6 +11,9 @@ What runs here, on the base and on every lane's tree:
   prototype's row on every record of every section 1 and 2 case, `clean_records` included.
 - The `rust_sdk` path (`build_evidence(detectors="rust")`) of every case that names it, against the
   case's `rust_raw` expectation: ordinary tests since the joined tree (92e471a).
+- The `rust_raw_v4` path (the owner, Nov 24): `detect` given protocol 4's rows, as an older SDK sends
+  them, reads them as the base did. `layers_entry_not_object`'s is lane AL-3′'s target (step 2);
+  `layers_name_arrow_cannot_encode`'s is a known difference, pinned at today's report.
 - Pins: where the base already reports on `records` what the contract asks (`expect`), the engine
   paths are ordinary tests, so no lane can move them.
 - Targets: where the base does not (a refused entry today, the scalar-only record; the row layout
@@ -46,6 +49,10 @@ ROWS = [c for c in CASES if c["section"] in (1, 2)]
 SCALAR = [c for c in CASES if c["section"] == 4]
 LANE_RUST = "lanes AL-1 and AL-3 joined (flight.py's layout, detect.rs' reader): contract sections 1 and 2"
 LANE_PY = "lane AL-4' (evidence.py, step 2): an entry the column cannot hold is absent to every detector, contract section 1.5"
+LANE_PY_NO_LAYER = ("lane AL-4' (evidence.py, step 2): an entry that is not an object is absent, and a row whose only "
+                    "layers are such entries holds no layer (the owner's approved change, Nov 24), contract sections 1.5 and 7")
+LANE_RUST_V4 = ("lane AL-3' (detect.rs, step 2): protocol 4's layers_json read entry by entry, so an entry that is not "
+                "an object is absent and the rest are read (the owner, Nov 24), contract sections 1.5 and 9")
 LANE_SCALAR = "step 2 of the wave (contract section 4): the scalar-only record"
 # Targets whose lanes have landed: they pass on the joined tree and are ordinary tests now. A case's
 # `today` stays the base's (f71d8e0), so the mark is decided here, not by `today == expect`.
@@ -192,6 +199,23 @@ def _brief(incident: dict) -> dict:
     return out
 
 
+def _protocol_4_report(records: list[dict]) -> dict:
+    """`server_report` on protocol 4's rows (`flight_v4.py`, frozen at 5c286ed), as an older SDK sends them:
+    its stream takes `_row`, `flight_schema` and `rows_batch` from `tensorquill.flight` when called."""
+    from tensorquill import flight
+    from tensorquill.server_detect import server_report
+
+    v4 = _prototype().v4
+    saved = {name: getattr(flight, name) for name in ("_row", "flight_schema", "rows_batch")}
+    try:
+        for name in saved:
+            setattr(flight, name, getattr(v4, name))
+        return server_report(records)
+    finally:
+        for name, value in saved.items():
+            setattr(flight, name, value)
+
+
 def _engine(path: str, records: list[dict], kinds: list[str]) -> dict:
     if path == "python":
         built = evidence.build_evidence(copy.deepcopy(records), detectors="python")
@@ -200,7 +224,7 @@ def _engine(path: str, records: list[dict], kinds: list[str]) -> dict:
                 "run_state": (built.get("run_state") or {}).get("state")}
     from tensorquill.server_detect import server_report
 
-    report = server_report(copy.deepcopy(records))
+    report = _protocol_4_report(copy.deepcopy(records)) if path == "rust_raw_v4" else server_report(copy.deepcopy(records))
     return {"incidents": [_brief(i) for i in report["incidents"]],
             "kind_checks": {k: (report["kind_checks"].get(k) or {}).get("value") for k in kinds}}
 
@@ -208,19 +232,21 @@ def _engine(path: str, records: list[dict], kinds: list[str]) -> dict:
 def _engine_params():
     out = []
     for case in ROWS:
-        for path in ("python", "rust_raw"):
+        for path in ("python", "rust_raw", "rust_raw_v4"):
             if path not in case["paths"] or path not in case["expect"]:
                 continue
             pinned = case["today"].get(path) == case["expect"][path]
             landed = (case["name"], path) in LANDED
             marks = []
-            if path == "rust_raw":
+            if path in ("rust_raw", "rust_raw_v4"):
                 from tensorquill.server_detect import find_binary
 
                 marks.append(pytest.mark.skipif(find_binary() is None or importlib.util.find_spec("pyarrow") is None,
                                                 reason="tensorquill-server is not built, or pyarrow is not installed"))
             if not pinned and not landed:
-                marks.append(pytest.mark.xfail(strict=True, reason=LANE_PY if path == "python" else LANE_RUST))
+                reason = {"python": LANE_PY_NO_LAYER if case["name"] == "layers_only_entries_not_object" else LANE_PY,
+                          "rust_raw": LANE_RUST, "rust_raw_v4": LANE_RUST_V4}[path]
+                marks.append(pytest.mark.xfail(strict=True, reason=reason))
             kind = "pin" if pinned else "landed" if landed else "target"
             out.append(pytest.param(case, path, marks=marks, id=f"{case['name']}-{path}-{kind}"))
     return out

@@ -2,13 +2,13 @@
 
 Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has since moved to `5749a89`, tests only). This is Phase 2 item 1 of the v1 plan, in two gated steps under one protocol bump: the typed columns and the probe split first (sections 1 to 3), the scalar-only record second (section 4). The pinned-memory flush, `grads=N`, K2, K3, the catalog and compaction are not in it.
 
-- **Shared cases:** `sdk/tests/fixtures/wave_al/cases.json`, written by `experiments/protocol-v5/build_cases.py`. Each case says what every path must report, and what the base reports today. `sdk/tests/test_wave_al_contract.py` reads them.
-- **Measurements:** `experiments/protocol-v5/` (`prototype.py`, `captures.py`, `live.py`, `measure.py`, `rust-reader/`), results in `results/`. Every one ran on this Mac's CPU against the protocol 4 release binary built from this tree, with no product code changed. A "v5" figure is the prototype's layout, sent to and stored by the protocol 4 server.
+- **Shared cases:** `sdk/tests/fixtures/wave_al/cases.json`, written by `experiments/protocol-v5/build_cases.py`. Each case says what every path must report, and what the base reports today. The builder runs on the base and on step 1's joined tree alike: it sends protocol 4's rows (`flight_v4.py`, frozen) to the tree's binary, which reads them as the base's did, and on `92e471a`'s tree it reproduced the file all but its `base` field. `sdk/tests/test_wave_al_contract.py` reads them.
+- **Measurements:** `experiments/protocol-v5/` (`prototype.py`, `captures.py`, `live.py`, `measure.py`, `rust-reader/`), results in `results/`. The results up to `eab810a` ran on this Mac's CPU against the base's protocol 4 release binary, with no product code changed; a "v5" figure there is the prototype's layout, sent to and stored by the protocol 4 server. Since step 1 merged (`92e471a`), `captures.py` and `measure.py` run the SDK's own `flight` against the tree's own server (`experiments/protocol-v5/README.md`).
 - **Read by:** the coordinating session that cuts the lanes, and the lanes of section 9.
 
 ## Where each decision stands
 
-**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided all nine on Nov 24 (the next section), and the same day brought one fault left open by wave AK into this wave (row L1, section 4.8).
+**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided all nine on Nov 24 (the next section), and the same day brought one fault left open by wave AK into this wave (row L1, section 4.8). Also on Nov 24, after a second session read step 1's three diffs against this contract, the owner answered the lanes' decisions (rows S1 to S8). Each amendment they make below is marked with its date and whose word it is; the seam lane AL-S1 builds the code side, and the names here are its names.
 
 | # | Decision | Stands | Evidence |
 |---|---|---|---|
@@ -35,6 +35,14 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch; `trial/ai-wave` has sinc
 | Q7 | The mirror ignores a tracker's own `step=` (Q7 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q8 | `compare` reads scalar-only records as series points (Q8 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q9 | A downgrade is documented as unsupported (Q9 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
+| S1 | A record of a version no reader takes keeps its number as its row version (99 stays 99); records of versions 0 and 1 get row version 2. The limit: it fails when an unknown record version equals a stored row version. A version 2 record gets row version 2 and is stored, though step 1's package does not read version 2; step 2 closes that in the same push (section 3). | **Owner, accepted Nov 24** | lane AL-1's decision 1; AL-S1 pins the version 2 case with a test and runs `load_records` on a part holding such a row |
+| S2 | An explicit `schema_version: 0` reads back as 0 (section 3). | **Owner, accepted Nov 24** | lane AL-1's decision 2 |
+| S3 | The projection is inside storage, not at replay's call sites, and the names are swapped at the seam: `Storage::read_part` returns every column, and `Storage::read_part_for_detect` is the projected read the detectors use (section 2.4). | **Owner, accepted with a change, Nov 24** | lane AL-2's decision 2 made `read_part` the projected read; the swap keeps Phase 4's read API from losing the probe arrays by default |
+| S4 | Protocol 4 rows are read as before in this wave, with one follow-up in step 2: for `layers_entry_not_object` only, Rust reads `layers_json` entry by entry (lane AL-3′), so Python and Rust read the same old row. `layers_name_arrow_cannot_encode` on protocol 4 rows is not fixed: a known difference (sections 1.5, 9). | **Owner, accepted Nov 24** | the cases' `rust_raw_v4` path; AL-S1 pins the known difference on each side |
+| S5 | A row whose only layers are null structs holds no layer, in both engines. Rust follows section 1.5 already; Python matches in lane AL-4′ (sections 1.5, 7, 9). | **Owner, accepted, and approved as a change of detector behaviour in Python, Nov 24** | case `layers_only_entries_not_object` |
+| S6 | `seq` is not in the schema until step 2 (section 9). | **Owner, accepted on a condition, Nov 24**: steps 1 and 2 ship in one push | lane AL-1's decision 3 |
+| S7 | A name Arrow cannot encode makes that row's whole `extra_json` unreadable in Rust (section 1.5). | **Owner, accepted as a known limit, Nov 24** | lane AL-3's pin `a_name_arrow_cannot_encode_is_not_read_by_non_finite` |
+| S8 | The refusal's wording: a protocol 5 server says "schema_version N is not supported; this server reads versions 1 and 2"; the sender's recogniser takes that and a protocol 4 server's "this server reads version 1" (sections 3, 5). | **The owner's seam note, Nov 24** | one fixture, `sdk/tests/fixtures/wave_al/refusal.json` (AL-S1), read by both engines' tests |
 | L1 | A value logged late inside a compiled function reaches its step's own record when a frozen parameter becomes trainable before the next step ends (step 2, lane AL-5). The stop of capture stays a stated limit (section 4.8). | **Owner, decided Nov 24** | "this will be fixed in AL", relayed by the coordinator; the place and the limit are this contract's recommendation |
 
 ## The owner's decisions
@@ -179,6 +187,7 @@ A value pending at `close()` with no step at all (a session that never trained) 
 - **`non_finite` is the exception: it reads every field of a layer, the refused ones included.** An unknown field `"p99": "nan"` names the layer in both engines.
   - Today Python reads every value, and Rust's visitor ORs every key.
   - Rust then parses `extra_json` on a row whose text names `"layers"`, as `refused_gradients` does for `grad_norms`.
+  - **A known limit (the owner, Nov 24, S7):** a name Arrow cannot encode makes that row's whole `extra_json` unreadable in Rust, so `non_finite` does not read that row's refused fields. Lane AL-3's test `a_name_arrow_cannot_encode_is_not_read_by_non_finite` pins it. No capture writes such a name.
 **Three cases are targets; today they differ from what the clean records give** (`cases.json`, `today`):
 - **`layers_entry_not_object`:**
   - Python raises `AttributeError: 'int' object has no attribute 'get'`.
@@ -190,6 +199,12 @@ A value pending at `close()` with no step at all (a session that never trained) 
 - Python (lane AL-4′, in step 2 with the other Python readers) skips an entry that is not an object, and a `layers` value that is not an object, as absent.
 - Rust (lane AL-3, with AL-1's layout) reads the rest of the map.
 
+**A row whose only layers are null structs holds no layer (the owner, Nov 24, S5).** Every entry not an object, each a null struct in its place: Rust reads the row as one with `layers {}` already, since a null struct is absent. Python counts a non-empty `layers` object as holding layers (`evidence.py` near line 1013, `layers_not_read_not_checked`, and near line 3354, the input counts). Lane AL-4′ makes it count only entries that are objects, so both engines read such a row as one with no layer. The owner approved this as a change of detector behaviour in Python (section 7). Case `layers_only_entries_not_object`: its `python` path is AL-4′'s target; its Rust paths are pins.
+
+**Protocol 4's rows (the owner, Nov 24, S4).** A protocol 5 binary reads a protocol 4 row as the base did: each case's `rust_raw_v4` path (`detect` given the rows `flight_v4.py` writes, as an older SDK sends them) is pinned at today's report, but for two:
+- **`layers_entry_not_object`: step 2's fix.** Lane AL-3′ (`detect.rs`) reads `layers_json` entry by entry, so an entry that is not an object is absent and the rest of the map is read, as section 1.5 reads the null struct. Python reads a protocol 4 row through `row_to_record` into the same record, so AL-4′'s `python` target is its side, and Python and Rust read the same old row. Target: `layers_entry_not_object-rust_raw_v4-target`.
+- **`layers_name_arrow_cannot_encode`: not fixed, a known difference.** On a protocol 4 row the whole `layers` map travels in `extra_json`, so Rust reads no layer, while Python reads the record's layers. The case's `known_difference` says so, its `rust_raw_v4` expectation is today's report, and lane AL-S1 pins it on each side.
+
 **Every other case gives today's results in both engines,** and the tests pin them (`-pin` in their IDs). That includes `moe_stats_diversity_refused`:
 - Python reads `float(true)` as a diversity of 1.0, where Rust takes it from the counts. Both still report the same `moe_imbalance`.
 - The difference shows only in the per-step `samples` (`build_evidence` against `detect --samples`). Lane AL-4′ makes Python fall back to the counts there as Rust does, and adds that comparison as its test.
@@ -200,7 +215,7 @@ A value pending at `close()` with no step at all (a session that never trained) 
 
 ### 1.7 The cases
 
-`layers_model_order`, `layers_empty_map`, `layers_non_finite_strings`, `layers_field_bool`, `layers_field_other_string`, `layers_field_missing`, `layers_field_extra`, `layers_field_null`, `layers_entry_not_object`, `layers_name_arrow_cannot_encode`, `layers_int_in_float_field`, `layers_value_not_object`, `moe_stats_real_fields`, `moe_stats_float_in_int_field`, `moe_stats_diversity_refused`, `moe_stats_int_past_int64`, `moe_stats_token_entropy_by_name`.
+`layers_model_order`, `layers_empty_map`, `layers_non_finite_strings`, `layers_field_bool`, `layers_field_other_string`, `layers_field_missing`, `layers_field_extra`, `layers_field_null`, `layers_entry_not_object`, `layers_name_arrow_cannot_encode`, `layers_int_in_float_field`, `layers_value_not_object`, `layers_only_entries_not_object` (the owner, Nov 24, S5), `moe_stats_real_fields`, `moe_stats_float_in_int_field`, `moe_stats_diversity_refused`, `moe_stats_int_past_int64`, `moe_stats_token_entropy_by_name`.
 
 ## 2. The heavy probe arrays (lanes AL-1, AL-2, AL-3)
 
@@ -264,7 +279,7 @@ In the dense capture a probe record is 1.7 MB of JSON. 98% of it is the 32 maps 
 - **`probe_histograms: Map<Utf8, Struct<lo: Float64, hi: Float64, counts: List<Int64>, nonfinite: Int64>>`**, all or none: one entry it cannot hold keeps every histogram of that probe in `probe_json`, so the map's order is never split (case `probe_histogram_irregular`).
 - **`row_to_record`** puts `histograms` first, as the capture writes it, and each map back on its module's entry.
 - **No detector reads `probe_maps` or `probe_histograms`.**
-  - A replay must not decode them: `Storage::read_part`'s callers in `detect::replay` read with a projection that leaves them out (`ProjectionMask::roots`, arrow-rs `parquet/src/arrow/mod.rs`).
+  - A replay must not decode them. **Amended Nov 24 (the owner, accepted with a change, S3):** the projection is inside storage, not at replay's call sites. `Storage::read_part` returns every column, and `Storage::read_part_for_detect` is the projected read the detectors use: it leaves out `probe_maps` and `probe_histograms` (`ProjectionMask::roots` over the part's top-level fields, by name, arrow-rs `parquet/src/arrow/mod.rs`) and reads a part without them whole. Its three call sites are the two in `detect::replay` and `examples/detect_store.rs`. So Phase 4's read API does not lose the probe arrays by default. (Lane AL-2 had made `read_part` itself the projected read and named the full one `read_part_whole`; the seam swaps the names.)
   - On the live path the batch is already decoded from Flight, so nothing changes there.
 - **The `.jsonl` file holds the whole probe, as today.** The Rerun export of a local run, every golden file and Gate 1 are unchanged.
 
@@ -291,10 +306,15 @@ There are four, not three.
 | Number | Where | Today | Protocol 5 | What it gates |
 |---|---|---|---|---|
 | `PROTOCOL` | `server_detect.py`, `main.rs` | 4 | **5** | Whether the SDK runs a binary's `detect` and `detect --follow`: exact equality, else "speaks protocol N and this tensorquill needs protocol M", and `auto` falls back to Python. Not checked by the live sender |
-| Batch metadata `schema_version` | `flight.py` `SCHEMA_VERSION`, `ingest.rs` `SCHEMA_VERSION`, the Flight `app_metadata` | 1 | **2** for protocol 5's layout. A protocol 5 server takes 1 and 2 | The live stream: a server refuses another with `INVALID_ARGUMENT`, "schema_version N is not supported; this server reads version 1", and acknowledges nothing (D6) |
-| Row `schema_version` | the Arrow column; today equal to the record's | 0, 1 | **2** for a row of protocol 5's layout, with the record's own in `record_version` (Q1 a). A protocol 5 server stores 0, 1 and 2 | RS10: a server drops and counts a row of another version, and acknowledges it. Today's readers refuse a part holding one (D7) |
+| Batch metadata `schema_version` | `flight.py` `SCHEMA_VERSION`, `ingest.rs` `SCHEMA_VERSIONS` (1 and 2 since lane AL-2), the Flight `app_metadata` | 1 | **2** for protocol 5's layout. A protocol 5 server takes 1 and 2 | The live stream: a server refuses another with `INVALID_ARGUMENT` and acknowledges nothing (D6). **Amended Nov 24 (the owner's seam note, S8):** a protocol 5 server says "schema_version N is not supported; this server reads versions 1 and 2"; a protocol 4 server says "… this server reads version 1". The sender's recogniser takes both; `sdk/tests/fixtures/wave_al/refusal.json` pins both for both engines' tests |
+| Row `schema_version` | the Arrow column; today equal to the record's | 0, 1 | **2** for a row of protocol 5's layout, with the record's own in `record_version` (Q1 a). **Amended Nov 24 (the owner, accepted, S1):** records of versions 0 and 1 get row version 2; a record of a version no reader takes keeps its number (99 stays 99). A protocol 5 server stores 0, 1 and 2 | RS10: a server drops and counts a row of another version, and acknowledges it. Today's readers refuse a part holding one (D7) |
 | Record `schema_version` | the `.jsonl`; `identity.SCHEMA_VERSIONS` | 0, 1 | step records stay 1; **2** is a scalar-only record (Q1 a) | Every offline reader: a record of another version refuses the whole input, naming it |
 
+- **The row version of a record no reader takes (the owner, Nov 24, accepted, S1).** It keeps its number, so a server still drops and counts it under `unsupported_schema_version` (RS10), as for every version but 2.
+  - **The limit:** the rule fails when an unknown record version equals a stored row version. Today a version 2 record gets row version 2 and is stored, although step 1's package does not read version 2; `load_records` then refuses the part holding it, naming it.
+  - Step 2 closes it in the same push: version 2 becomes the scalar-only record (section 4), `identity.SCHEMA_VERSIONS` takes it, and nothing here changes.
+  - Lane AL-S1 pins the version 2 case with a test and confirms, by running it, that `load_records` refuses a part holding such a row.
+- **`record_version` (the owner, Nov 24, accepted, S2)** is the record's own version, null when the record has no key. An explicit `schema_version: 0` reads back as 0, where protocol 4's reader dropped it; a record with no key reads back with none.
 - **The Arrow schema carries no number.** A layout is told by its columns: `layers` against `layers_json`. Every Rust reader looks columns up by name already (`Columns::new`), so it reads a batch of either layout, per batch.
 - **A part has one schema.** `accept_attempt` writes the buffered part when a batch's schema differs. So a rank whose protocol 4 backlog and protocol 5 rows meet has parts of both layouts, never a part of two.
 - **Unchanged:** the evidence's own `schema_version` (1), the offset file's `OFFSET_VERSION` (2), `store.json` and `attempts.json`.
@@ -446,8 +466,9 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
 
 | Writer or store | Reader | Result |
 |---|---|---|
-| Protocol 4 sender (metadata 1, rows 0/1, JSON columns) | Protocol 5 server | **Works.** Stored as received, in its own parts. `detect.rs` reads `layers_json` where there is no `layers`. No conversion |
-| Protocol 5 sender (metadata 2) | Protocol 4 server | **Refused.** `INVALID_ARGUMENT` "schema_version 2 is not supported; this server reads version 1"; nothing acknowledged; the lines stay in the sender's file (measured). The sender says once, on stderr and in `last_error`: "the server at … speaks an older protocol: upgrade tensorquill-server" (lane AL-1) |
+| Protocol 4 sender (metadata 1, rows 0/1, JSON columns) | Protocol 5 server | **Works.** Stored as received, in its own parts. `detect.rs` reads `layers_json` where there is no `layers`, as the base did (the cases' `rust_raw_v4`; the owner, Nov 24, S4: AL-3′'s one fix in step 2, one known difference). No conversion |
+| Protocol 5 sender (metadata 2) | Protocol 4 server | **Refused.** `INVALID_ARGUMENT` "schema_version 2 is not supported; this server reads version 1", a protocol 4 server's singular form; nothing acknowledged; the lines stay in the sender's file (measured). The sender says once, on stderr and in `last_error`: "the server at … speaks an older protocol: upgrade tensorquill-server" (lane AL-1) |
+| A sender of another metadata version (3) | Protocol 5 server | **Refused.** `INVALID_ARGUMENT` "schema_version 3 is not supported; this server reads versions 1 and 2", the plural form; nothing acknowledged (lane AL-2, run by hand). **Amended Nov 24 (the owner's seam note, S8):** the sender's recogniser takes this form and the protocol 4 server's singular one alike, both pinned by `sdk/tests/fixtures/wave_al/refusal.json` |
 | Protocol 5 server, restarting | A store of protocol 4 parts | **Works.** Replay reads each part by its columns. The step watermark is from names and footers, as today. No `scalars-*`, so no `seq` watermark |
 | Protocol 4 server, restarting | A store with protocol 5 parts | **Silent:** no layers, no MoE statistics, no maps; `scalars-*` not listed (Q9) |
 | Protocol 5 SDK | A protocol 4 binary, or the reverse | **Refused by `PROTOCOL`**: "speaks protocol 4 and this tensorquill needs protocol 5". `detectors="auto"` falls back to Python with that reason; `"rust"` raises. The watcher (`detect --follow`) does the same |
@@ -492,6 +513,7 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
   - Q1 (b) changes every captured record's version byte. No golden file is expected to change, since the evidence does not carry the records' version, but the lane must show it.
   - Q4 (b) changes an incident's `scalars` only for a run with scalar-only records. No golden file has one.
   - Q2 (b) changes nothing local.
+- **One approved change of detector behaviour (the owner, Nov 24, S5).** Python counts a row whose only `layers` entries are not objects as holding no layer, as Rust does (section 1.5, lane AL-4′). Otherwise detector behaviour does not move. No capture writes such a row, so the golden files and Gate 1's shown files are not expected to change by it; AL-4′'s gate shows it.
 - **A change to a golden file is the owner's amendment, not a lane's.**
 
 ## 8. Corrections to the architecture page and the plan
@@ -520,6 +542,7 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 
 **Two gated steps, one protocol bump, one push.**
 - Step 1 is sections 1 to 3; step 2 is section 4. The Python readers change only in step 2, as the plan has it.
+- **One push (the owner, Nov 24, accepted on a condition, S6).** `seq` is not in the schema until step 2 (lane AL-1′), on the condition that steps 1 and 2 ship in one push, so no user ever holds a part of step 1's schema without it.
 - Lanes are split by file, and two lanes never own one file.
 - **`PROTOCOL` stays 4 in every lane's own tree.** The coordinator raises it to 5 in both `server_detect.py` and `main.rs` in step 1's seam commit. So each lane's tree keeps its `rust_raw` pins passing with a binary built from it.
 - **Targets that need two lanes are judged on the joined tree,** with `--runxfail`, as wave AJ did. A `rust_raw` target needs AL-1's layout and AL-3's reader.
@@ -542,11 +565,11 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 | Lane | Owns | Does | Cases it must make pass |
 |---|---|---|---|
 | AL-1 | `flight.py`, `server_detect.py` | Protocol 5's row layout: `flight_schema`, `record_to_row`, `row_to_record`, `rows_batch` for sections 1, 2 and 3 (`load_records` reads a store of either layout through it). Metadata version 2. The older-server message | every section 1 and 2 case's `row` path (`test_flight_gives_the_row`); `moved` for `moe_stats_int_past_int64` |
-| AL-2 | `ingest.rs`, `storage.rs`, `main.rs` (but `PROTOCOL`), `watchdog.rs`, `server/examples/` | Metadata versions 1 and 2; row versions 0, 1 and 2. A read of a part that projects away `probe_maps` and `probe_histograms`, for replay. `live_streams` sends metadata version 2 for a source in protocol 5's layout (it writes 1 today, `live_streams.rs` line 264), so section 6's runs can be made | the matrix's server rows; `layers_model_order` on a live server across a restart |
+| AL-2 | `ingest.rs`, `storage.rs`, `main.rs` (but `PROTOCOL`), `watchdog.rs`, `server/examples/` | Metadata versions 1 and 2; row versions 0, 1 and 2. A read of a part that projects away `probe_maps` and `probe_histograms`, for replay (since the seam `Storage::read_part_for_detect`, with `read_part` reading every column: the owner, Nov 24, S3). `live_streams` sends metadata version 2 for a source in protocol 5's layout (it writes 1 today, `live_streams.rs` line 264), so section 6's runs can be made | the matrix's server rows; `layers_model_order` on a live server across a restart |
 | AL-3 | `detect.rs`, `detect/` | Reads `layers` and `moe_stats` from the typed columns where a batch has them, and the JSON columns where it does not. `non_finite` also reads the refused fields in `extra_json`. Never reads `probe_maps` or `probe_histograms`. `check_keys` takes row version 2 (it exits on anything but 0 or 1 today) | every section 1 and 2 case's `rust_raw` and `rust_sdk` paths, live server included (joined with AL-1) |
 
 - **AL-1 first.** AL-2 and AL-3 can start beside it: AL-2's projection and AL-3's dual reader need only the column names of sections 1.2 and 2.4.
-- **What step 1 leaves standing:** Python still raises on `layers_entry_not_object` and `layers_value_not_object`, as it does today, while Rust reads them. Their `python` targets are step 2's (AL-4′).
+- **What step 1 leaves standing:** Python still raises on `layers_entry_not_object`, `layers_value_not_object` and `layers_only_entries_not_object`, as it does today, while Rust reads them. Their `python` targets are step 2's (AL-4′). Rust reads protocol 4's row of `layers_entry_not_object` as the base did; its `rust_raw_v4` target is step 2's (AL-3′).
 - **The step's gate:**
   - the whole SDK suite and `cargo test` with this tree's binary;
   - the golden and Gate 1 comparisons;
@@ -560,9 +583,10 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 | AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `huggingface.py` (`on_evaluate`'s explicit step), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases, the two `scalar_hf_*` cases; wave AK's tests of the old warning text change with it. Section 4.8's drain before the flush of a newly trainable parameter: `scalar_compiled_late_before_unfreeze` (`test_a_value_logged_late_inside_a_compiled_function_reaches_its_step`), keeping `scalar_eager_late_before_unfreeze` and `scalar_compiled_late_at_a_stop` |
 | AL-1′ | `flight.py`, `server_detect.py` | The record's row (`seq`, `record_version`). Scalar-only records set apart before `_stream`, `FollowedDetect` and `stream_order` | `scalar_record_keys` (row) |
 | AL-2′ | `ingest.rs`, `storage.rs`, `watchdog.rs` (`scalars_not_newer`) | Section 4.5 | `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart` |
-| AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6, and section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step`; the `python` targets of `layers_entry_not_object` and `layers_value_not_object`; the samples comparison of `moe_stats_diversity_refused` |
+| AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6, and section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts. **Added Nov 24 (the owner, S5):** a row whose only `layers` entries are not objects holds no layer, where `evidence.py` counts a non-empty `layers` object as holding layers (near lines 1013 and 3354). The owner approved this as a change of detector behaviour (section 7) | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step`; the `python` targets of `layers_entry_not_object`, `layers_value_not_object` and `layers_only_entries_not_object`; the samples comparison of `moe_stats_diversity_refused` |
+| AL-3′ | `detect.rs`, `detect/` | **Added Nov 24 (the owner, S4).** Protocol 4's `layers_json` read entry by entry: an entry that is not an object is absent to every detector and the rest of the map is read, as section 1.5 reads protocol 5's null struct, so Python and Rust read the same old row. Nothing else of protocol 4's reading moves: `layers_name_arrow_cannot_encode`'s known difference stays | `layers_entry_not_object`'s `rust_raw_v4` target (`test_each_engine_reports_what_the_clean_records_give[layers_entry_not_object-rust_raw_v4-target]`); every other `rust_raw_v4` pin keeps passing |
 
-`detect.rs` has nothing to do in step 2 under Q4 (a). Under Q4 (b) it gains a lane, and the cases gain context expectations.
+Under Q4 (a), `detect.rs`'s only step 2 work is AL-3′'s. Under Q4 (b) it would gain context expectations too.
 
 ## 10. What the sibling clones do
 
