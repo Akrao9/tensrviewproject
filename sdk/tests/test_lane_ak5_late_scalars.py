@@ -213,8 +213,10 @@ def test_values_left_out_never_raise_under_python_w_error(tmp_path):
         """
     )
     env = {**os.environ, "PYTHONPATH": str(SDK / "src")}
-    done = subprocess.run([sys.executable, "-W", "error", "-c", script], capture_output=True, text=True, env=env,
-                          timeout=120)
+    # Without NumPy, importing PyTorch itself warns ("Failed to initialize NumPy"), which `-W error` would turn
+    # into a failed import before TensorQuill runs. Only that message is let through; every other warning is an error.
+    done = subprocess.run([sys.executable, "-W", "error", "-W", "ignore:Failed to initialize NumPy", "-c", script],
+                          capture_output=True, text=True, env=env, timeout=120)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "ok"
     assert done.stderr.count(LEFT_OUT) == 1  # said once per session, on the tensorquill logger

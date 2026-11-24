@@ -30,7 +30,6 @@ import warnings
 from collections.abc import Mapping
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -382,18 +381,14 @@ def test_values_mirrored_and_values_refused(wandb_):
         "int": 3,
         "float": 0.5,
         "nan": float("nan"),
-        "np_float32": np.float32(0.25),
-        "np_int64": np.int64(7),
         "cpu_0d": torch.tensor(1.5),
         "cpu_0d_grad": torch.tensor(2.5, requires_grad=True) * 1,
         "cpu_0d_int": torch.tensor(4),
         # refused:
         "bool": True,
-        "np_bool": np.bool_(True),
         "cpu_0d_bool": torch.tensor(True),
         "cpu_0d_complex": torch.tensor(1 + 2j),
         "cpu_1elem_1d": torch.tensor([1.0]),
-        "np_0d_array": np.array(1.0),
         "complex": 1 + 2j,
         "str": "0.5",
         "list": [1, 2],
@@ -406,12 +401,50 @@ def test_values_mirrored_and_values_refused(wandb_):
     _step(model, opt)
     session.close()
     (scalars,) = _scalars(sink)
-    assert set(scalars) == {"int", "float", "nan", "np_float32", "np_int64", "cpu_0d", "cpu_0d_grad", "cpu_0d_int"}
-    assert scalars["int"] == 3 and scalars["np_int64"] == 7 and scalars["cpu_0d_int"] == 4
-    assert scalars["float"] == 0.5 and scalars["np_float32"] == 0.25
+    assert set(scalars) == {"int", "float", "nan", "cpu_0d", "cpu_0d_grad", "cpu_0d_int"}
+    assert scalars["int"] == 3 and scalars["cpu_0d_int"] == 4
+    assert scalars["float"] == 0.5
     assert scalars["cpu_0d"] == 1.5 and scalars["cpu_0d_grad"] == 2.5
     assert scalars["nan"] == "nan" or scalars["nan"] != scalars["nan"]
     assert wandb_.calls[0][0] is data  # the tracker got the caller's own dict
+
+
+def test_numpy_scalars_are_mirrored_and_a_numpy_bool_or_0d_array_is_refused(wandb_):
+    # NumPy is no dependency of the SDK (the plain CI jobs have none), so only this test needs it.
+    np = pytest.importorskip("numpy")
+    wandb_.module.init()
+    model = _model()
+    session, sink, opt = _open(model)
+    wandb_.module.log({
+        "np_float32": np.float32(0.25),
+        "np_int64": np.int64(7),
+        # refused:
+        "np_bool": np.bool_(True),
+        "np_0d_array": np.array(1.0),
+    })
+    _step(model, opt)
+    session.close()
+    (scalars,) = _scalars(sink)
+    assert set(scalars) == {"np_float32", "np_int64"}
+    assert scalars["np_int64"] == 7 and scalars["np_float32"] == 0.25
+
+
+def test_the_mirror_records_without_numpy_loaded_and_does_not_import_it(wandb_, monkeypatch):
+    """The mirror looks NumPy up in `sys.modules` and never imports it: in a process that has not
+    loaded NumPy (here it is taken out of `sys.modules`, as on a machine without it) plain numbers
+    and CPU tensors are still recorded, and NumPy is still not loaded afterwards."""
+    for name in [n for n in sys.modules if n == "numpy" or n.startswith("numpy.")]:
+        monkeypatch.delitem(sys.modules, name)
+    wandb_.module.init()
+    model = _model()
+    session, sink, opt = _open(model)
+    wandb_.module.log({"loss": 0.5, "count": 3, "cpu_0d": torch.tensor(1.5), "bool": True})
+    wandb_.module.log({"other": 2.0}, commit=False)
+    _step(model, opt)
+    session.close()
+    (scalars,) = _scalars(sink)
+    assert scalars == {"loss": 0.5, "count": 3, "cpu_0d": 1.5, "other": 2.0}
+    assert "numpy" not in sys.modules
 
 
 def _non_cpu_scalar() -> torch.Tensor:

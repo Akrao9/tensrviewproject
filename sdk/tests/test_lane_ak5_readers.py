@@ -65,6 +65,7 @@ def test_the_python_evidence_reads_the_late_values_on_the_incidents_step(tmp_pat
 
 @pytest.mark.skipif(built_server_binary() is None, reason="tensorquill-server is not built in this worktree")
 def test_the_rust_report_reads_the_late_values_on_the_incidents_step(tmp_path):
+    pytest.importorskip("pyarrow.flight")  # the Rust detectors are given Arrow: the `flight` extra
     binary = built_server_binary()
     assert Path(__file__).resolve().parents[2] in binary.parents  # this worktree's own build
     path = tmp_path / "run.jsonl"

@@ -6,14 +6,15 @@ lane that made it untrue or incomplete (bug list, section 20).
 - Lane AK-3 put Rerun's analytics opt-out in the README; `RUN_ON_YOUR_JOB.md` introduces the
   `rerun` extra and suggests the web viewer, which the opt-out does not reach, and said neither.
 
-Documents and a docstring only: no behaviour is tested here.
+Documents and a docstring only: no behaviour is tested here. The docstring is read from the
+adapter's source, not by importing it: the module imports `accelerate`, which the plain CI jobs do
+not install, and a page test should run there too.
 """
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
-
-from tensorquill.accelerator import watch_accelerator
 
 SDK = Path(__file__).resolve().parents[1]
 GUIDE = (SDK / "RUN_ON_YOUR_JOB.md").read_text()
@@ -31,8 +32,16 @@ def line_with(text: str, start: str) -> str:
     return found[0]
 
 
+def docstring_of(source: Path, function: str) -> str:
+    """A top-level function's docstring, read from the file without importing it."""
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.FunctionDef) and node.name == function:
+            return ast.get_docstring(node) or ""
+    raise AssertionError(f"{function} is not a top-level function of {source.name}")
+
+
 def test_the_accelerate_adapter_says_a_folder_load_reads_the_safetensors_headers():
-    said = flat(watch_accelerator.__doc__)
+    said = flat(docstring_of(SDK / "src" / "tensorquill" / "accelerator.py", "watch_accelerator"))
     assert "recorded from its file names (`session.checkpoint_files`)" in said
     # At a load the model's weights are compared too, from headers alone (lane AK-2).
     assert "at a load the model's tensors are also compared, from the folder's `.safetensors` headers alone" in said
