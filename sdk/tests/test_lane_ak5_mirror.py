@@ -123,6 +123,22 @@ def test_a_mirrored_key_after_an_evaluation_still_counts_as_mirrored_on_the_next
     assert scalars[0]["eval/loss"] == 2.0 and scalars[1]["lr"] == 0.2
 
 
+@pytest.mark.parametrize("every", [4, 2])
+def test_a_key_mirrored_into_a_step_and_mirrored_again_after_it_keeps_the_last_value(wandb_, every):
+    """A Hugging Face W&B logger logs `train/global_step` after every logged step: one into the step in
+    progress, the next under the evaluation's phase onto that same step once it ended. Both are the
+    mirror's own, so the last wins, as for a key mirrored twice in a step."""
+    session, model, opt = _open(every)
+    _step(session, model, opt, 0.0)
+    wandb_.module.log({"lr": 0.1})  # step 1's, in "train"
+    session.log({"tokens": 8})  # the caller's own: kept
+    _step(session, model, opt, 1.0)
+    with session.phase("eval"):
+        wandb_.module.log({"lr": 0.2, "tokens": 99})
+    session.close()
+    assert _scalars(session)[1]["lr"] == 0.2 and _scalars(session)[1]["tokens"] == 8
+
+
 def test_the_mirror_never_trips_the_step_refusal(wandb_, mlflow_):
     session, model, opt = _open(4)
     _step(session, model, opt, 0.0)
