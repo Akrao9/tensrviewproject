@@ -76,7 +76,7 @@ fn both(batches: &[RecordBatch]) -> (Result<serde_json::Value, String>, Result<s
     )
 }
 
-/// Section 1: a negative `rank`, `attempt` or `step`, and a `schema_version` that is not 0 or 1,
+/// Section 1: a negative `rank`, `attempt` or `step`, and a `schema_version` that is not 0, 1 or 2,
 /// refuse the input in both modes with one line that names the column, the value and the row
 /// (counted across the batches given). Fails on the base (`1ca26d4`): each was judged, a report of
 /// one step (and for the rank, `rank: -3`).
@@ -88,7 +88,7 @@ fn a_negative_identity_value_or_an_unsupported_version_refuses_the_input_naming_
         ((Some(0), Some(0), Some(-3), Some(1)), "step", "-3"),
         ((Some(0), Some(0), Some(1), Some(99)), "schema_version", "99"),
         ((Some(0), Some(0), Some(1), Some(-3)), "schema_version", "-3"),
-        ((Some(0), Some(0), Some(1), Some(2)), "schema_version", "2"),
+        ((Some(0), Some(0), Some(1), Some(3)), "schema_version", "3"),
     ] {
         // One record alone, as the case of `cases.json` gives it.
         let (one, run) = both(&[batch(&[row])]);
@@ -100,7 +100,8 @@ fn a_negative_identity_value_or_an_unsupported_version_refuses_the_input_naming_
             );
             assert!(!error.contains('\n'), "one line: {error}");
             if name == "schema_version" {
-                assert!(error.contains("versions 0 and 1"), "{error}");
+                // Protocol 5's row version 2 is read since wave AL (lane AL-3).
+                assert!(error.contains("versions 0, 1 and 2"), "{error}");
             }
         }
     }
