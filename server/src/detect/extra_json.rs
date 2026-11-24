@@ -1,7 +1,8 @@
 //! The one reader of a row's `extra_json` text, shared by every detector that reads a key there
 //! (`detect.rs`: `step_skipped_by` and `step_skipped_part`, `clip_calls`, refused `grad_norms`,
 //! `moe_refused`, `update_not_read`, the stalled-weight onset's notes, `grads_not_read`,
-//! `layers_not_read` and `moe_source`; `replica.rs`: the observation, its scope and the spread's
+//! `layers_not_read`, `moe_source` and, in protocol 5's layout, a layer's refused fields for
+//! `non_finite`; `replica.rs`: the observation, its scope and the spread's
 //! fallback).
 //!
 //! A number no `f64` can hold, such as the `10**400` a refused map entry carries (the sender keeps
