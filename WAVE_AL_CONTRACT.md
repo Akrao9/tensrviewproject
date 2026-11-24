@@ -233,17 +233,18 @@ In the dense capture a probe record is 1.7 MB of JSON. 98% of it is the 32 maps 
 ### 2.3 The two options, measured
 
 **What the probe costs.**
-- On one rank (`results/ack.json`; 7 rounds, load 9.3 to 11):
-  - Today, a 50-step batch holding one of the dense capture's probes is acknowledged in 14.6 ms (median; 12.3 to 20.5). The same batch without the probe takes 5.6 ms.
-  - Its part is 743 KB, against 151 KB without the probe, and the server's Parquet write alone takes 5.5 ms (5.2 to 8.1), against 1.8 ms.
+- On one rank (`results/ack.json`; 7 rounds, load 2.3 to 2.6):
+  - Today, a 50-step batch holding one of the dense capture's probes is acknowledged in 14.1 ms (median; 11.2 to 39.8, one outlier above 23). The same batch without the probe takes 5.3 ms.
+  - Its part is 743 KB, against 151 KB without the probe, and the server's Parquet write alone takes 5.2 ms (5.1 to 6.4), against 1.7 ms.
 - Under 64 streams at the capture's 65 ms a step (`results/live64.json`):
-  - Today: p99 197 ms and worst 206 ms (medians of 5 rounds), against 85 and 89 ms with no probe. One round reached 379 ms, with 42 acknowledgements over 250 ms.
-  - The prototype: p99 117 ms and worst 122 ms, none over 250 ms.
-  - This is the plan's "acknowledgement spike", reproduced at a third of the size the plan states (section 8).
+  - Today: p99 170 ms and worst 185 ms (medians of 7 rounds, load 2.2 to 8.2), against 82 and 92 ms with no probe. One round reached 283 ms, its only acknowledgement over 250 ms.
+  - The prototype: p99 111 ms and worst 115 ms, none over 250 ms.
+  - An earlier run of 5 rounds (load 2.8 to 9.2) had one round reach 379 ms, with 42 acknowledgements over 250 ms. That round itself began at load 2.8, and nothing like it recurred in these 7 rounds.
+  - This is the plan's "acknowledgement spike", reproduced at under a third of the size the plan states (section 8).
 
 **Prototype columns (Q2 a), measured.**
-- The same batch, with maps and histograms in typed columns, is acknowledged in 9.1 ms (8.0 to 12.9).
-- Its part is 539 KB (−27%), and its write takes 4.9 ms.
+- The same batch, with maps and histograms in typed columns, is acknowledged in 9.1 ms (7.8 to 12.8).
+- Its part is 539 KB (−27%), and its write takes 4.8 ms.
 - The Arrow batch the sender builds is 1.42 MB, against 2.66 MB.
 - `probe_json` falls to about 60 KB a probe. The detectors still parse that text, which no longer holds a map.
 
@@ -405,17 +406,17 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 - That flatters its acknowledgements only after the part is written: the detectors run after the acknowledgement. They show through the next batch's wait, and the `after_probe` batches in `ack` are no slower in either arm.
 - The acceptance figures are ratios against a no-probe arm in the same layout, measured by the lane with protocol 5's own server, where the detectors read both arms alike.
 
-**Where they were measured.** This Mac: 8 cores, Apple M1 Pro, Python 3.12.3, pyarrow 26.0.1, the release binary of this tree. Each run records the one-minute load average before it: 4 to 11 throughout, from other sessions on the machine. Medians are given with the lowest and highest values. The plan's figures are corrected in section 8.
+**Where they were measured.** This Mac: 8 cores, Apple M1 Pro, Python 3.12.3, pyarrow 26.0.1, the release binary of this tree. Each run records the one-minute load average before each round. The figures below were re-measured on Nov 24 after the gate ended, at load 2.2 to 8.2 (each row gives its own); the first measurements, at load 4 to 11, are in the branch's history. The one-minute average also counts the previous round of the measurement itself, most of all in `live64`. Medians are given with the lowest and highest values. The plan's figures are corrected in section 8.
 
 | What | Today (protocol 4) | Prototype (protocol 5 layout, protocol 4 server) | Acceptance figure for the wave, and how it is measured |
 |---|---|---|---|
-| One rank: a probe batch, sent to acknowledged (`measure.py ack`, 7 rounds, 4 probe batches each) | 14.6 ms (12.3 to 20.5) | 9.1 ms (8.0 to 12.9) | At most 1.7 times a plain batch's acknowledgement on the same run, against 2.4 today (plain: 6.2 and 5.6 ms). `measure.py ack`, 5 or more rounds |
-| Its Parquet part | 743 KB; write alone 5.5 ms | 539 KB; 4.9 ms | At most 75% of today's bytes on the dense capture's probe parts. `measure.py ack` |
-| 64 ranks at 65 ms a step, every other part a probe (`measure.py live64`: the server's own `live_streams` example, 8 source ranks replayed as 64, `--flush-steps 50`, 5 rounds, load 2.8 to 9.2). Sent to acknowledged, median of the rounds' values (lowest to highest round) | median 76.6 ms (66.9 to 115.2), p99 197 (179 to 368), worst 206 (187 to 379); one round of five had 42 of 448 acknowledgements over 250 ms. Without any probe: median 50.3, p99 85.3 (85 to 97), worst 88.9 | median 52.6 (49.4 to 69.4), p99 117 (116 to 173), worst 122 (119 to 194); none over 250 ms | p99 at most 1.5 times the p99 of a no-probe arm in protocol 5's layout, on the same server and run (here: today 2.3, prototype 1.4, against the protocol 4 no-probe arm), and no acknowledgement over 250 ms in any of 5 rounds. `measure.py live64` |
-| Decoding what the detectors read of the layer and router statistics: 1,000 Granite-shaped rows (24 blocks, 32 experts), with `detect.rs`' own visitors against the typed maps (`measure.py decode`, `rust-reader bench`, 5 rounds, load 4.6 to 5.3) | `layers_json` 4.88 ms (4.86 to 4.92), `moe_stats_json` 4.27 ms (4.26 to 4.29) | `layers` 0.18 ms (0.18 to 0.19), `moe_stats` 0.069 ms (0.068 to 0.071) | Both under 0.5 ms per 1,000 rows. `rust-reader bench` on the lane's parts |
-| The detectors' whole time per flush of 64 ranks of 50 steps, one thread (`detect_store --bench`, the server's own example, 64 ranks × 1,000 steps, 5 runs) | 72.7 ms (72.6 to 72.8); of which the JSON decoding measured apart, 34.7 ms (34.65 to 34.86), 48% | Not measurable without product code. Expected about 39 ms: today's time without the decoding, plus the typed decode at 1 ms per 3,200 rows | At most 50 ms on the same store in protocol 5's layout, with `detect_store --bench` on the same machine. Today's 72.7 is to be re-measured beside it, and the figure is then at most 0.7 times today's |
-| Its parts | 4.86 MB for 1,000 rows | 4.37 MB (−10%); `read_part` 19.8 ms against 18.3 ms (nested columns decode a little slower) | No figure: the replay is not on the live path |
-| `load_records` on that store (Python) | 342 ms (276 to 400) | 304 ms (239 to 317) | No slower than today, beyond the spread |
+| One rank: a probe batch, sent to acknowledged (`measure.py ack`, 7 rounds, 4 probe batches each, load 2.3 to 2.6) | 14.1 ms (11.2 to 39.8) | 9.1 ms (7.8 to 12.8) | At most 1.7 times a plain batch's acknowledgement on the same run, against 2.2 today (plain: 6.4 ms in today's arm, 6.2 in the prototype's, 5.3 with no probe at all). `measure.py ack`, 5 or more rounds |
+| Its Parquet part | 743 KB; write alone 5.2 ms | 539 KB; 4.8 ms | At most 75% of today's bytes on the dense capture's probe parts. `measure.py ack` |
+| 64 ranks at 65 ms a step, every other part a probe (`measure.py live64`: the server's own `live_streams` example, 8 source ranks replayed as 64, `--flush-steps 50`, 7 rounds, load 2.2 to 8.2). Sent to acknowledged, median of the rounds' values (lowest to highest round) | median 71.1 ms (67.2 to 75.1), p99 170 (155 to 226), worst 185 (165 to 283); one round of seven had 1 of 448 acknowledgements over 250 ms (an earlier, loaded run: one round of five had 42, worst 379). Without any probe: median 48.7, p99 81.8 (79 to 99), worst 91.5 | median 51.0 (49.2 to 54.6), p99 111 (106 to 120), worst 115 (108 to 124); none over 250 ms | p99 at most 1.5 times the p99 of a no-probe arm in protocol 5's layout, on the same server and run (here: today 2.1, prototype 1.35, against the protocol 4 no-probe arm), and no acknowledgement over 250 ms in any of 5 or more rounds. `measure.py live64` |
+| Decoding what the detectors read of the layer and router statistics: 1,000 Granite-shaped rows (24 blocks, 32 experts), with `detect.rs`' own visitors against the typed maps (`measure.py decode`, `rust-reader bench`, 7 rounds, load 2.3 to 2.4) | `layers_json` 4.89 ms (4.78 to 5.61), `moe_stats_json` 4.24 ms (4.16 to 4.63) | `layers` 0.18 ms (0.17 to 0.19), `moe_stats` 0.069 ms (0.066 to 0.085) | Both under 0.5 ms per 1,000 rows. `rust-reader bench` on the lane's parts |
+| The detectors' whole time per flush of 64 ranks of 50 steps, one thread (`detect_store --bench`, the server's own example, 64 ranks × 1,000 steps, 7 runs, load 2.3 to 5.0) | 70.9 ms (70.6 to 71.4); of which the JSON decoding measured apart, 34.0 ms (33.8 to 34.4), 48% | Not measurable without product code. Expected about 38 ms: today's time without the decoding, plus the typed decode at 1 ms per 3,200 rows | At most 50 ms on the same store in protocol 5's layout, with `detect_store --bench` on the same machine. Today's 70.9 is to be re-measured beside it, and the figure is then at most 0.7 times today's |
+| Its parts | 4.86 MB for 1,000 rows | 4.37 MB (−10%); `read_part` 20.1 ms (18.2 to 22.8) against 19.5 ms (17.2 to 28.2), within the spread | No figure: the replay is not on the live path |
+| `load_records` on that store (Python) | 336 ms (264 to 494) | 298 ms (243 to 333) | No slower than today, beyond the spread |
 
 ## 7. The wave's invariant
 
@@ -446,12 +447,12 @@ The server reads protocol 4 parts forever (D9). A conversion could come only wit
 8. **The plan, Phase 2: "the `620` to `744 ms` ack spike".**
    - The README records one acknowledgement of 620 ms in one of four filled runs under 64 live streams, unattributed. "A probe flush under load is likeliest" is its words, not a measurement.
    - No source for 744 ms was found in the repository or the ledger.
-   - On one rank a probe batch costs 14.6 ms against 5.6 ms (section 6).
-9. **The plan, Phase 2: "`155 ms` → `350 ms` Parquet flush penalty".** That is writing all 64 ranks' parts on a probe flush (README, "Re-measured with 25 kinds"), not one part. One probe part's write is 5.5 ms here.
+   - On one rank a probe batch costs 14.1 ms against 5.3 ms (section 6).
+9. **The plan, Phase 2: "`155 ms` → `350 ms` Parquet flush penalty".** That is writing all 64 ranks' parts on a probe flush (README, "Re-measured with 25 kinds"), not one part. One probe part's write is 5.2 ms here.
 10. **The plan, Phase 2: "`layers_json` / `moe_stats_json` cost `33 ms` of `54 ms`".**
     - The README's 54 ms is the first six kinds; twelve took 56 ms.
     - The 33 ms is "measured apart" by `detect_store`'s own decode timing.
-    - Measured here on 64 ranks × 1,000 steps with the same example: 34.7 ms of 72.7 ms (48%), with today's per-rank kinds. "Two thirds" was the share with twelve kinds.
+    - Measured here on 64 ranks × 1,000 steps with the same example: 34.0 ms of 70.9 ms (48%), with today's per-rank kinds. "Two thirds" was the share with twelve kinds.
 11. **Section 4.3: old parts "expire via bucket lifecycle policies".** Already withdrawn by the owner on Nov 24 (ledger section 20). Repeated here because a sidecar (Q2 b) would be a second family that rule could not tell apart either.
 
 ## 9. The lanes

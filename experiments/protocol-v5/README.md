@@ -26,8 +26,8 @@ $PY experiments/protocol-v5/captures.py --out experiments/protocol-v5/results/ca
 $PY experiments/protocol-v5/captures.py --fixtures experiments/protocol-v5/results/fixtures.json
 $PY experiments/protocol-v5/live.py --out experiments/protocol-v5/results/live.json
 $PY experiments/protocol-v5/measure.py ack --rounds 7 --out experiments/protocol-v5/results/ack.json
-$PY experiments/protocol-v5/measure.py live64 --rounds 5 --out experiments/protocol-v5/results/live64.json
-$PY experiments/protocol-v5/measure.py decode --rounds 5 --out experiments/protocol-v5/results/decode.json
+$PY experiments/protocol-v5/measure.py live64 --rounds 7 --out experiments/protocol-v5/results/live64.json
+$PY experiments/protocol-v5/measure.py decode --rounds 7 --out experiments/protocol-v5/results/decode.json
 $PY experiments/protocol-v5/build_cases.py
 ```
 
