@@ -1036,7 +1036,9 @@ def layers_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[st
     first: dict[str, tuple[int, str]] = {}
     read = False
     for record in records:
-        read = read or (isinstance(record.get("layers"), Mapping) and bool(record["layers"]))
+        # A record holds a layer only through an entry that is an object (row S5, the owner's
+        # approved change, Nov 24): one whose only entries are not objects read no layer, as Rust reads it.
+        read = read or bool(layer_entries(record))
         said = record.get("layers_not_read")
         if not isinstance(said, Mapping):
             continue
@@ -3483,7 +3485,8 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
 
     "Carries" means the field holds something a rule reads: an empty `layers` or
     `grad_norms` does not count, an empty `weights_unchanged` does (a weight check that
-    found every parameter changed), and a probe that failed carries no attention.
+    found every parameter changed), and a probe that failed carries no attention. A `layers`
+    whose only entries are not objects carries no layer (`layer_entries`, row S5).
     """
     counts = dict.fromkeys(INPUT_NEEDS, 0)
     for record in records:
@@ -3493,8 +3496,10 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
                 (total := _router_total(value)) is not None and total > 0 for value in moe.values()):
             counts["moe"] += 1
         total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
-        # A `layers` value that is not an object holds no layer (section 1.5).
-        norms, layers = bool(record.get("grad_norms")), isinstance(record.get("layers"), Mapping) and bool(record["layers"])
+        # A record holds a layer only through an entry that is an object (section 1.5; row S5, the
+        # owner's approved change, Nov 24): a value that is not an object, or one whose only entries
+        # are not objects, holds none, as Rust reads it.
+        norms, layers = bool(record.get("grad_norms")), bool(layer_entries(record))
         counts["grad_total"] += total
         # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
         counts["update"] += (
