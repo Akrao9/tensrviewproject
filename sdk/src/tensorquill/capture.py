@@ -2829,7 +2829,7 @@ class Session:
         if self._closed_call("log()"):
             return
         if step is not _NO_STEP:
-            self._log_at(_explicit_step(step), dict(values or {}, **named))
+            self._log_at(step, dict(values or {}, **named))
             return
         converted = self._scalar_values(dict(values or {}, **named))
         # The phase as the hooks read it (`_Evaluating`): a compiled step that logs guards on that
@@ -2839,9 +2839,16 @@ class Session:
         else:
             self._pending_scalars.update(converted)
 
-    def _log_at(self, step: int, values: Mapping[str, Any]) -> None:
+    @torch.compiler.disable
+    def _log_at(self, step: Any, values: Mapping[str, Any]) -> None:
         """`log(values, step=step)`: one scalar-only record, its `seq` and `ts` taken at the call, after
-        every check. A call with no values writes nothing and takes no `seq`."""
+        every check. A call with no values writes nothing and takes no `seq`.
+
+        Always run eagerly: inside a compiled function it is one graph break, and neither the step, nor
+        `seq`, nor the pending list is a guard, so a new step on every call compiles nothing again
+        (without it each call recompiled, until Dynamo's limit). Under `fullgraph=True` it cannot be
+        traced, a stated limit: the clock and the counter are read on the host."""
+        step = _explicit_step(step)
         converted = self._scalar_values(values)
         if not converted:
             return
