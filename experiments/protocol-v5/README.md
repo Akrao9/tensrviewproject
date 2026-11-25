@@ -14,7 +14,7 @@ What `WAVE_AL_CONTRACT.md` cites. Nothing here is product code, and nothing here
 | `measure.py ack` → `results/ack.json`, `results/ack-run2.json` | One rank: a probe batch's acknowledgement, its part's bytes and its Parquet write. Arms: `v4` (protocol 4's rows, metadata 1), `v5` (the SDK's protocol 5 rows, metadata 2), `none` (no probe, protocol 5's layout) |
 | `measure.py live64` → `results/live64.json`, `results/live64-run2.json` | 64 ranks at 65 ms a step through the server's own `live_streams` example, for the same three arms |
 | `measure.py decode` → `results/decode.json` | The detectors' JSON decoding against the typed columns (`rust-reader bench`); `detect_store --bench` on 64 ranks × 1,000 steps in protocol 5's layout and in protocol 4's, interleaved; Python's `load_records` on both layouts |
-| `cross_version.py` → `results/cross_version.json` | Section 5's matrix across a real protocol 4 build (below) |
+| `cross_version.py` → `results/cross_version.json` | Section 5's matrix across a real protocol 4 build (below), with step 2's scalar-only records |
 | `build_cases.py` → `sdk/tests/fixtures/wave_al/cases.json` | The shared cases: `row` from the prototype, `expect` and `today` from the base's engines. Its Rust reports are made from protocol 4's rows (`flight_v4.py`) through the tree's binary, which reads them as the base's did, so it gives the same file on the base and on step 1's joined tree, all but the `base` field (the commit it ran on). Step 2 changes the Python readers (AL-4′) and protocol 4's `layers_json` read (AL-3′); from then on `today` is the file's, and the builder refuses a tree whose readers take record version 2 |
 | `rust-reader/` | Reads a part whole with `Storage::read_part_whole` (`keys`), times reading with `Storage::read_part` (since lane AL-2, the projected read replay makes) and decoding (`bench`), and times a whole part's Parquet write with the server's writer settings (`write`) |
 
@@ -44,9 +44,18 @@ Run the timings with nothing else heavy on the machine, and compare a lane's fig
 - An old `runs` does not refuse a store of protocol 5 parts. It lists the run with the evidence the protocol 5 server wrote (`incidents.json`, `watchdog.json`), as the new `runs` does.
 - The old `load_records` and the old one read refuse it, naming the part and the row.
 
+That claim was corrected on the page. Run again on Nov 25 against `4e31e2b` (step 2 joined), with rows 6 to 11 for the scalar-only records, 50 of the 51 claims held. The one that did not is row 9 b: a protocol 4 sender given a file holding scalar-only records sends each as a training step. With a scalar-only record at step 500, the protocol 5 server keeps it as the rank's last step and drops the training steps after it in the file. The owner decided it on Nov 25: under metadata 1 a version 2 row is dropped and counted (`unsupported_schema_version`), and the rest of the batch is stored. Lane AL-2′ built it (merged at `1c4440d`).
+
+Run again on Nov 25 with the new side at `0abb905` (its release server, recorded by name, commit and sha256 in the results), 57 of 57 claims held. Row 9 b now checks the owner's figures: all 30 training steps stored, last step 29, one row counted, and the value kept in the local file. Rows 9 c and 9 d measure, without judging, the protocol 5 `send_file` on the same file:
+- with the protocol 4 sender's offset file left in place, it sends nothing;
+- from byte 0, the offset file removed, it stores the scalar-only record in a `scalars-*` object and drops the 30 training rows as not newer.
+
 ```bash
 git clone <this repository> <old> && git -C <old> checkout 85a477a
 cargo build --release --manifest-path <old>/server/Cargo.toml --bin tensorquill-server
 $PY experiments/protocol-v5/cross_version.py --old-checkout <old> --old-binary <old>/server/target/release/tensorquill-server \
-    --new-binary server/target/release/tensorquill-server --out experiments/protocol-v5/results/cross_version.json
+    --new-binary server/target/release/tensorquill-server --new-binary-commit $(git rev-parse HEAD) \
+    --out experiments/protocol-v5/results/cross_version.json
 ```
+
+The results record the new side's server by its file name, the commit it was built at (as given) and its sha256.
