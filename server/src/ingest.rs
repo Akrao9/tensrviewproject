@@ -6,7 +6,11 @@
 //! where `end_byte_offset` is the position in the sender's local file just after the batch. The
 //! metadata's `schema_version` is 1 from a protocol 4 sender and 2 from one of protocol 5's layout
 //! (`WAVE_AL_CONTRACT.md` section 3, from Nov 24, 2026); the server takes both, and refuses any other
-//! with `INVALID_ARGUMENT`, acknowledging nothing. A layout is told by its columns (`layers` against
+//! with `INVALID_ARGUMENT`, acknowledging nothing. The metadata version also says which row versions
+//! the batch may hold (`ROW_VERSIONS`, the owner's decision of Nov 25, 2026): 0 and 1 under metadata
+//! 1, and 0, 1 and 2 under metadata 2; a row of another version is dropped and counted (below), so a
+//! protocol 4 sender that sends a protocol 5 capture's scalar-only record (row version 2, no `seq`)
+//! never has it stored as a training step. A layout is told by its columns (`layers` against
 //! `layers_json`), never by a version: each batch is stored as received, with no conversion, and a
 //! part has one schema, so a rank whose protocol 4 backlog meets protocol 5 rows has parts of both.
 //!
@@ -38,7 +42,9 @@
 //! is handled as before.
 //!
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
-//! 0, 1 or 2 (`SUPPORTED_ROW_VERSIONS`), cannot be stored: it is dropped and counted, with a line on
+//! one its batch's metadata version allows (`ROW_VERSIONS`: 0 and 1 under metadata 1, a protocol 4
+//! sender's; 0, 1 and 2 under metadata 2, from the owner's decision of Nov 25, 2026), cannot be
+//! stored: it is dropped and counted under `unsupported_schema_version`, with a line on
 //! stderr and in the rank's entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`),
 //! and the rest of its
 //! batch is kept and acknowledged (RS10). A batch whose key column is missing or of another type
@@ -89,7 +95,29 @@ use crate::watchdog::{RankReport, Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INT
 
 /// The batch metadata versions this server takes: 1, a protocol 4 sender's, and 2, protocol 5's
 /// layout (`WAVE_AL_CONTRACT.md` section 3, D6). Any other refuses the stream.
-pub const SCHEMA_VERSIONS: [i64; 2] = [1, 2];
+pub const SCHEMA_VERSIONS: [i64; 2] = [ROW_VERSIONS[0].0, ROW_VERSIONS[1].0];
+
+/// The one place that says which row versions a batch of each metadata version may hold (the
+/// owner's decision of Nov 25, 2026): under metadata 1, a protocol 4 sender's, rows of versions 0 and
+/// 1; under metadata 2, protocol 5's layout, rows of versions 0, 1 and 2 (`SUPPORTED_ROW_VERSIONS`).
+/// A row of another version than its batch's metadata allows is dropped and counted under
+/// `unsupported_schema_version` (RS10). Until then every version in `SUPPORTED_ROW_VERSIONS` was
+/// stored whatever the metadata: a protocol 4 sender sending a protocol 5 capture's scalar-only
+/// record (row version 2, no `seq` column) had it stored as a training step, and the step watermark
+/// it raised dropped the training steps after it.
+pub const ROW_VERSIONS: [(i64, &[i32]); 2] = [(1, &PROTOCOL_4_ROW_VERSIONS), (2, &SUPPORTED_ROW_VERSIONS)];
+
+/// The row versions a protocol 4 sender writes: 0 for a record that named none, and 1.
+const PROTOCOL_4_ROW_VERSIONS: [i32; 2] = [0, 1];
+
+/// The row versions a batch of metadata version `metadata` may hold, per `ROW_VERSIONS`; none for a
+/// metadata version this server does not read (its stream is refused before any row is looked at).
+pub fn row_versions(metadata: i64) -> &'static [i32] {
+    ROW_VERSIONS
+        .iter()
+        .find(|(version, _)| *version == metadata)
+        .map_or(&[], |(_, rows)| *rows)
+}
 pub const DEFAULT_QUOTA_BYTES: usize = 128 * 1024 * 1024;
 pub const DEFAULT_FLUSH_STEPS: usize = 500;
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
@@ -951,7 +979,7 @@ impl Ingest {
             // and a batch none of whose rows can be read is refused and counted (RS10). Then the
             // scalar-only rows, those whose `seq` is not null, are taken out before the step
             // watermark is looked at (`WAVE_AL_CONTRACT.md` section 4.5).
-            let (batch, dropped, scalars) = match readable_rows(batch) {
+            let (batch, dropped, scalars) = match readable_rows(batch, row_versions(metadata.schema_version)) {
                 Ok(kept) => kept,
                 Err(refused) => {
                     if let Some(column) = refused.column {
@@ -2341,7 +2369,9 @@ const KEY_COLUMNS: [(&str, DataType); 5] = [
 /// that named none), and 2, a row of protocol 5's layout (`WAVE_AL_CONTRACT.md` section 3, D7, from
 /// Nov 24, 2026). Live, a row of any other version is dropped and counted under
 /// `unsupported_schema_version` (RS10, decided by the author on Nov 20, 2026); offline, it refuses
-/// the input. One list for both, so a row the server stores is always one `detect` reads.
+/// the input. One list for both, so a row the server stores is always one `detect` reads. Live, a
+/// batch of metadata version 1 may hold only 0 and 1 of them (`ROW_VERSIONS`); the offline modes
+/// read Arrow streams that carry no batch metadata, so they take this whole list.
 pub const SUPPORTED_ROW_VERSIONS: [i32; 3] = [0, 1, 2];
 
 /// The key under which rows of a version this server does not read are counted.
@@ -2356,7 +2386,8 @@ struct Refused {
 
 /// Drops the rows that cannot be stored and says how many, by key (RS10): first the rows whose run,
 /// rank, step, attempt or schema version is null, by the first null key of each row in that order;
-/// then, of the rest, the rows whose `schema_version` is not one of `SUPPORTED_ROW_VERSIONS`. The
+/// then, of the rest, the rows whose `schema_version` is not one of `readable`, the versions the
+/// batch's metadata version allows (`row_versions`: 0 and 1 under metadata 1, 0, 1 and 2 under 2). The
 /// rest of the batch is kept: until Nov 19, 2026 one null key refused the whole batch, which ended
 /// the stream, and its sender, which sends from its offset again, stored nothing more for the rank;
 /// until Nov 20, 2026 a row's version was not looked at. The batch is checked whole before any of
@@ -2365,7 +2396,7 @@ struct Refused {
 /// A key column that is missing or of another type refuses the batch, naming the column: no row of
 /// it can be read then. The same keys as the offline modes check (`detect::check_keys`, lane V7),
 /// which refuse their whole input instead, since nothing sends it again.
-fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Refused> {
+fn drop_unstorable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordBatch, Dropped), Refused> {
     let mut keep = vec![true; batch.num_rows()];
     let mut dropped = Vec::new();
     for (name, wanted) in &KEY_COLUMNS {
@@ -2407,7 +2438,7 @@ fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Re
         .expect("checked above");
     let mut rows = 0;
     for (row, kept) in keep.iter_mut().enumerate() {
-        if *kept && !SUPPORTED_ROW_VERSIONS.contains(&versions.value(row)) {
+        if *kept && !readable.contains(&versions.value(row)) {
             *kept = false;
             rows += 1;
         }
@@ -2432,8 +2463,8 @@ pub const SEQ_COLUMN: &str = "seq";
 /// The rows of a batch that can be stored (`drop_unstorable_rows`), and the rows dropped, with the
 /// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, and the
 /// scalar-only rows if there are any.
-fn readable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped, Option<RecordBatch>), Refused> {
-    let (batch, dropped) = drop_unstorable_rows(batch)?;
+fn readable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordBatch, Dropped, Option<RecordBatch>), Refused> {
+    let (batch, dropped) = drop_unstorable_rows(batch, readable)?;
     let (batch, scalars) = split_scalar_rows(batch)?;
     Ok((batch, dropped, scalars))
 }
@@ -2842,6 +2873,20 @@ mod tests {
             .collect();
         assert_eq!(waits, [10, 20, 40, 640, 640, 640]);
         assert_eq!(replay_wait(Duration::MAX, 5), Duration::MAX);
+    }
+
+    /// The owner's decision of Nov 25, 2026: one table says which row versions go with which batch
+    /// metadata version, and the metadata versions taken are its keys.
+    #[test]
+    fn each_metadata_version_reads_its_own_row_versions_from_one_table() {
+        assert_eq!(row_versions(1), [0, 1]);
+        assert_eq!(row_versions(2), SUPPORTED_ROW_VERSIONS);
+        assert!(row_versions(3).is_empty() && row_versions(0).is_empty());
+        let keys: Vec<i64> = ROW_VERSIONS.iter().map(|(metadata, _)| *metadata).collect();
+        assert_eq!(keys, SCHEMA_VERSIONS);
+        for (_, rows) in ROW_VERSIONS {
+            assert!(rows.iter().all(|row| SUPPORTED_ROW_VERSIONS.contains(row)), "{rows:?}");
+        }
     }
 
     #[test]
