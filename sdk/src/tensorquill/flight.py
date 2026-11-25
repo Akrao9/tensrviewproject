@@ -173,6 +173,8 @@ _KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # Capture always writes these two, as null when there is no value, so a null column reads
 # back as a present `None`. Every other null column reads back as an absent key.
 _ALWAYS = ("ts", "grad_norm")
+# A scalar-only record's keys that its row holds in the `seq` column alone (section 4.4).
+_SCALAR_KEYS = ("record", "seq")
 _COLUMNS = (*_KEY_COLUMNS, *(column for column, _ in _FIELDS.values()), "probe_maps", "probe_histograms",
             "seq", "record_version", "extra_json")
 
@@ -256,9 +258,34 @@ def record_to_row(
     (`rows_to_send`) makes its rows without this check, as before: a line the server refuses and
     counts stays the server's to refuse and count (live ingest is unchanged, RS10).
 
+    A scalar-only record (`scalar_only`) whose `seq` the column cannot hold raises the same error,
+    naming `seq` (section 4.4).
+
     The rest is `_row`'s."""
     check(record, where)
+    if scalar_only(record):
+        _seq(record, where)
     return _row(record, schema, moved)
+
+
+def scalar_only(record: Mapping[str, Any]) -> bool:
+    """Whether `record` is a scalar-only record (`WAVE_AL_CONTRACT.md` section 4.2): its `record` key is
+    `"scalars"`. Its row carries `seq` and no `record` (section 4.4); the Rust detectors are never sent
+    one (section 4.6, `server_detect`)."""
+    return isinstance(record, Mapping) and record.get("record") == "scalars"
+
+
+def _seq(record: Mapping[str, Any], where: str | None = None) -> int:
+    """A scalar-only record's `seq`, which its row's `seq` column holds: an integer from 0 that Int64
+    holds. Else `MalformedRecordError` naming `seq`: such a row would carry a null `seq`, which a server
+    stores as a training row in a part, moving the step watermark (D8), so the line is refused instead,
+    and on the sender's path skipped and counted like a line whose key column cannot be stored."""
+    value = record.get("seq", MalformedRecordError.ABSENT)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _INT64[1]:
+        raise MalformedRecordError("seq", value, where,
+                                   'a scalar-only record ("record": "scalars") needs a seq, an integer of 0 or more '
+                                   "that Int64 holds")
+    return value
 
 
 def _row(
@@ -284,14 +311,25 @@ def _row(
     is `ROW_VERSION` and the record's own version is in `record_version` (section 3, Q1 a): null when
     the record has no `schema_version` key. A record of a version this package does not read keeps
     that version as its row's too, so a server drops and counts it as before (RS10) and never stores
-    it as a row it reads."""
+    it as a row it reads.
+
+    A scalar-only record (`scalar_only`, section 4.4) converts like any line, with its `seq` in the
+    `seq` column (null on every other row) and its `record` key in no column: `row_to_record` restores
+    it from the non-null `seq`. Its `scalars` follow wave W3's rule, as a step record's. A null travels
+    in its row's columns only as an absent key: an explicit `null`, even for `ts` or `grad_norm`
+    (`_ALWAYS`, which a step row reads back as present), travels in `extra_json`, so its row gives the
+    record back exactly. A `seq` the column cannot hold raises `MalformedRecordError` (`_seq`)."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
     extra: dict[str, Any] = {}
+    scalar = scalar_only(record)
+    if scalar:
+        row["seq"] = _seq(record)
+    always = () if scalar else _ALWAYS
     for key, value in record.items():
-        if key in _KEY_COLUMNS:
+        if key in _KEY_COLUMNS or (scalar and key in _SCALAR_KEYS):
             continue
         spec = _FIELDS.get(key)
-        if spec is None or (value is None and key not in _ALWAYS):
+        if spec is None or (value is None and key not in always):
             extra[key] = value
             continue
         if key in _STRUCT_MAPS:
@@ -604,17 +642,26 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
     protocol 5's (`record_version`, `layers` and `moe_stats` as maps, `probe_maps`, `probe_histograms`)
     or protocol 4's (`layers_json`, `moe_stats_json`, the whole probe in `probe_json`). So `load_records`
     reads a store of either layout, or a rank with parts of both. A struct's null field reads back
-    absent, and the fields it could not hold come back from `extra_json` (section 1.4)."""
+    absent, and the fields it could not hold come back from `extra_json` (section 1.4).
+
+    A row with a non-null `seq` is a scalar-only record's (section 4.4): `record: "scalars"` comes back
+    from it, with the keys in the capture's order, and a null column reads back absent. A row with no
+    `seq` column (step 1's schema, protocol 4's) or a null one is a step row, read as before."""
     record: dict[str, Any] = {}
+    seq = row.get("seq")
     if "record_version" in row:  # protocol 5's layout: the record's own version, null for none
         if row["record_version"] is not None:
             record["schema_version"] = row["record_version"]
     elif row["schema_version"]:
         record["schema_version"] = row["schema_version"]
+    if seq is not None:
+        record["record"] = "scalars"
     record.update(run_id=row["run_id"], rank=row["rank"])
     if row.get("attempt"):
         record["attempt"] = row["attempt"]
     record["step"] = row["step"]
+    if seq is not None:
+        record["seq"] = seq
     extra = json.loads(row["extra_json"]) if row.get("extra_json") else {}
     for key, (column, convert) in _FIELDS.items():
         if key in _STRUCT_MAPS:
@@ -631,7 +678,7 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
             continue
         value = row.get(column)
         if value is None:
-            if key in _ALWAYS:
+            if key in _ALWAYS and seq is None:
                 record[key] = None
         elif convert in (_json, _ordered_json):
             record[key] = json.loads(value)
@@ -869,6 +916,11 @@ def _unheld_key(record: Mapping[str, Any], schema: Any) -> tuple[str, Any]:
                 return key, value
         elif isinstance(value, bool) or not isinstance(value, int) or not _fits(value, schema.field(key).type):
             return key, value
+    if scalar_only(record):
+        try:
+            _seq(record)
+        except MalformedRecordError as error:
+            return error.field, error.value
     return "a key column", None
 
 
