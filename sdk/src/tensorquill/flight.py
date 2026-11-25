@@ -731,63 +731,6 @@ _MAP_COLUMNS = frozenset(
 )
 
 
-# --- A store's scalar-only records: its `scalars-*` objects ---------------------------------
-#
-# A server stores the rows whose `seq` is not null apart from its parts, as
-# `rank=<r>/attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet` (`WAVE_AL_CONTRACT.md` section 4.5),
-# never as `part-*`, so the readers that list parts never list them. These are read beside the parts.
-_SCALARS_NAME = re.compile(r"scalars-([0-9]+)-([0-9]+)\.parquet")
-_RANK_FOLDER = re.compile(r"rank=([0-9]+)")
-_ATTEMPT_FOLDER = re.compile(r"attempt=(-?[0-9]+)")
-
-
-def scalar_objects(directory: str | Path, rank: int | None = None) -> list[Path]:
-    """The `scalars-*` objects under `directory` (a run's `runs/<run_id>` folder, a `rank=<r>` folder or an
-    `attempt=<a>` folder), ordered by the rank and attempt numbers of their folders and the first `seq` of
-    their names. An object whose name does not parse by section 4.5's naming comes after the named ones of
-    its rank and attempt, by name (a server reads the footer for such a name; its rows read as any
-    object's). With `rank`, another rank's `rank=<n>` folder is not entered. A path that is
-    not a folder holds none. The stored attempt order (`attempts.json`) is not applied here: each path
-    names its rank and attempt, and the caller reorders by its own rule."""
-    directory = Path(directory)
-    if not directory.is_dir():
-        return []
-
-    def order(path: Path) -> tuple[int, int, int, str]:
-        rank_of, attempt = 0, 0
-        for folder in path.relative_to(directory.parent).parts[:-1]:
-            if found := _RANK_FOLDER.fullmatch(folder):
-                rank_of = int(found.group(1))
-            elif found := _ATTEMPT_FOLDER.fullmatch(folder):
-                attempt = int(found.group(1))
-        named = _SCALARS_NAME.fullmatch(path.name)
-        return rank_of, attempt, int(named.group(1)) if named else 2**63, path.name
-
-    def other_rank(path: Path) -> bool:
-        return rank is not None and any(
-            (found := _RANK_FOLDER.fullmatch(folder)) and int(found.group(1)) != rank
-            for folder in path.relative_to(directory.parent).parts[:-1])
-
-    found: list[Path] = []
-    for top, folders, files in os.walk(directory):
-        if rank is not None:  # another rank's folder is never entered, as `evidence._parquet_parts` does for parts
-            folders[:] = [f for f in folders if not ((m := _RANK_FOLDER.fullmatch(f)) and int(m.group(1)) != rank)]
-        found.extend(Path(top) / name for name in files if name.startswith("scalars-") and name.endswith(".parquet"))
-    return sorted((p for p in found if not other_rank(p)), key=order)
-
-
-def read_scalar_object(path: str | Path) -> list[dict[str, Any]]:
-    """The scalar-only records of one `scalars-*` object, its rows through `row_to_record` in their order.
-    Nothing is checked: the caller checks each record's identity and names the object and row
-    (`identity.check` with `identity.in_part(path, row)`), as for a part. Needs `pyarrow`."""
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as error:
-        raise ImportError("reading Parquet parts needs pyarrow: pip install pyarrow") from error
-    # `partitioning=None`: the object's own columns only, not `rank=` and `attempt=` from its folders.
-    return [row_to_record(row) for row in pq.read_table(path, partitioning=None).to_pylist()]
-
-
 # --- The local file and its offset ----------------------------------------------------
 
 

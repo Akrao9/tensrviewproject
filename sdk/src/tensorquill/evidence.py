@@ -2941,8 +2941,9 @@ def _parquet_parts(directory: Path, rank: int | None = None, *, scalars: bool = 
     """The server's part files under `directory`, ordered by rank, attempt and first step.
 
     With `scalars`, also the attempts' `scalars-<first_seq>-<last_seq>.parquet` objects
-    (WAVE_AL_CONTRACT.md section 4.5), each after its attempt's parts, by first `seq`. Without it
-    they are never listed, as before them: only a reader of series reads them.
+    (WAVE_AL_CONTRACT.md section 4.5), each after its attempt's parts, by first `seq`, and one whose name
+    does not parse after the named ones, by name. Without it they are never listed, as before them: only a
+    reader of series reads them. This is the one listing of them in the package.
 
     Attempts go in the rank's stored order (`attempts.json`, contract 1), or by number in a
     store written before that file. With `rank`, the `rank=<n>` folders of other ranks directly under `directory` are not
@@ -2971,7 +2972,10 @@ def _parquet_parts(directory: Path, rank: int | None = None, *, scalars: bool = 
         family = 1 if path.name.startswith("scalars-") else 0
         match = (_SCALARS_NAME if family else _PART_NAME).search(path.name)
         place = _attempt_place(orders[rank_folder], numbers["attempt"])
-        return numbers["rank"], place, family, int(match.group(1)) if match else 0, path.name
+        # A scalars object whose name does not parse (a server reads its footer instead) comes after the named
+        # ones of its attempt; a part's keeps its place as before.
+        first = int(match.group(1)) if match else (2**63 if family else 0)
+        return numbers["rank"], place, family, first, path.name
 
     patterns = ("part-*.parquet", "scalars-*.parquet") if scalars else ("part-*.parquet",)
     found: list[Path] = []
