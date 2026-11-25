@@ -179,7 +179,7 @@ A value pending at `close()` with no step at all (a session that never trained) 
 
 The seam lane put the README's sentence in (`d562417`, merged at `4ff9c4e`).
 
-**Measured on `0abb905`** (section 5, rows 9 b to 9 d): the owner's figures hold. The run also measured the README's last clause, which sends the file again with a protocol 5 SDK. Rows 9 c and 9 d state what that does.
+**Measured on `0abb905`** (section 5, rows 9 b to 9 d): the owner's figures hold. The run also measured the last clause the README's sentence had then, which said to send the file again with a protocol 5 SDK. Rows 9 c and 9 d state what that does. **The clause was cut at the join on row 9 c (the coordinator, Nov 25):** as the older sender leaves the file, that send owes nothing and sends no row. The README keeps the owner's sentence, and whether it names the send from byte 0 of row 9 d is the owner's to decide.
 
 ## 1. `layers` and `moe_stats` as typed columns (lanes AL-1, AL-3)
 
