@@ -864,9 +864,15 @@ struct FaultServer {
 
 /// A server in this process over `store`, as `lane_aa3_support::start` makes one.
 async fn start_over(store: Arc<FaultStore>) -> FaultServer {
+    start_with(store, 1, Duration::from_secs(3600)).await
+}
+
+/// A server in this process over `store` that writes a rank's buffer once it holds `flush_steps`
+/// steps or its oldest row has waited `flush_interval`.
+async fn start_with(store: Arc<FaultStore>, flush_steps: usize, flush_interval: Duration) -> FaultServer {
     let config = IngestConfig {
-        flush_steps: 1,
-        flush_interval: Duration::from_secs(3600),
+        flush_steps,
+        flush_interval,
         ..IngestConfig::default()
     };
     let ingest = Ingest::new(Storage::new(store, "".into()), config);
@@ -1009,5 +1015,110 @@ async fn scalars_not_newer_is_absent_until_a_row_is_dropped() {
         .map(|key| (key.to_string(), entry[*key].clone()))
         .collect();
     assert_eq!(counted["rows_not_newer"], 1, "{entry}");
+    server.ingest.shutdown().await.unwrap();
+}
+
+/// Section 4.5 with a `PUT` that stored the scalars object and then reported failure: until the object
+/// is stored, the rank takes no new scalar row, so the write is tried again under the same name and
+/// no second object over the same `seq` is made. Here the sender sends `seq` 0 and 1 again with a new
+/// `seq` 2: the first object is met and taken as stored, and `seq` 2 gets one of its own.
+#[tokio::test]
+async fn after_a_failed_scalars_write_no_new_scalar_row_is_taken_until_it_is_stored() {
+    let run = "al2b_sealed";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = FaultStore::new(root);
+    let server = start_over(store.clone()).await;
+    store.store_then_fail.store(true, Ordering::SeqCst);
+    let first: Vec<Value> = (0..2).map(|seq| scalar_record(run, 3, seq)).collect();
+    send_one(&server.address, run, batch(&first), 2)
+        .await
+        .expect_err("the put reported failure");
+    let again: Vec<Value> = (0..3).map(|seq| scalar_record(run, 3, seq)).collect();
+    assert_eq!(send_one(&server.address, run, batch(&again), 3).await.unwrap(), 3);
+    assert_eq!(
+        files(root, run, "scalars-"),
+        ["scalars-00000000-00000001.parquet", "scalars-00000002-00000002.parquet"]
+    );
+    assert_eq!(stored_seqs(root, run), [0, 1, 2], "no seq is stored twice");
+    server.ingest.shutdown().await.unwrap();
+}
+
+/// Section 4.5: an object holds one attempt, under that attempt's folder. A batch whose scalar rows
+/// are of two attempts (the end of one session's file and the start of the next) gives each its own
+/// object, each with its own `seq` watermark.
+#[tokio::test]
+async fn the_scalar_rows_of_two_attempts_are_stored_apart() {
+    let run = "al2b_attempts";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let server = start(root).await;
+    let mut later = scalar_record(run, 0, 0);
+    later["attempt"] = json!(2);
+    let sent = batch(&[scalar_record(run, 4, 0), scalar_record(run, 4, 1), later]);
+    assert_eq!(send_one(&server.address, run, sent, 3).await.unwrap(), 3);
+    assert_eq!(stored_seqs(root, run), [0, 1]);
+    let second = root.join("runs").join(run).join("rank=0").join("attempt=2");
+    let names: Vec<String> = std::fs::read_dir(&second)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["scalars-00000000-00000000.parquet"]);
+    server.ingest.shutdown().await.unwrap();
+}
+
+/// Section 4.5: an object has one schema. Scalar rows buffered beside step rows, then a batch of
+/// scalar rows only in another layout (a column more): the buffered rows are stored first, as a part
+/// is when its schema changes, then the new ones, and the offset is acknowledged.
+#[tokio::test]
+async fn scalar_rows_of_another_schema_begin_an_object_of_their_own() {
+    let run = "al2b_schemas";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = FaultStore::new(root);
+    let server = start_with(store, 100, Duration::from_secs(3600)).await;
+    let mut put = open(&server.address, run, schema()).await;
+    put.send(batch(&[step_record(run, 0), scalar_record(run, 0, 0)]), 2, 2)
+        .await;
+    let mut fields: Vec<Field> = schema().fields().iter().map(|field| field.as_ref().clone()).collect();
+    fields.push(Field::new("lr", DataType::Float64, true));
+    let wider = Arc::new(Schema::new(fields));
+    let mut row = row(&scalar_record(run, 0, 1));
+    row["lr"] = json!(0.1);
+    let mut wide = open(&server.address, run, wider.clone()).await;
+    wide.send(decode(wider, &[row]), 2, 3).await;
+    assert_eq!(wide.reply().await.unwrap(), 3);
+    assert_eq!(
+        files(root, run, "scalars-"),
+        ["scalars-00000000-00000000.parquet", "scalars-00000001-00000001.parquet"]
+    );
+    assert_eq!(stored_steps(root, run), [0]);
+    wide.finish().await;
+    put.finish().await;
+    server.ingest.shutdown().await.unwrap();
+}
+
+/// Section 4.5: scalar rows whose object could not be written are tried again by the timed flush, as
+/// a part is, with no new batch from the sender.
+#[tokio::test]
+async fn the_timed_flush_tries_a_failed_scalars_write_again() {
+    let run = "al2b_timed";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = FaultStore::new(root);
+    let server = start_with(store.clone(), 1, Duration::from_millis(100)).await;
+    store.fail_scalars.store(true, Ordering::SeqCst);
+    send_one(&server.address, run, batch(&[scalar_record(run, 0, 0)]), 1)
+        .await
+        .expect_err("not stored");
+    store.fail_scalars.store(false, Ordering::SeqCst);
+    for _ in 0..200 {
+        if !files(root, run, "scalars-").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(files(root, run, "scalars-"), ["scalars-00000000-00000000.parquet"]);
+    assert_eq!(server.ingest.buffered_bytes(), 0, "nothing is held once it is stored");
     server.ingest.shutdown().await.unwrap();
 }
