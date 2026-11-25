@@ -23,6 +23,20 @@
 //! address that reaches the store, and new for a store wiped and made again; an older sender reads
 //! `end_byte_offset` alone, as before). Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
+//!
+//! A row whose `seq` is not null is a scalar-only row (`WAVE_AL_CONTRACT.md` section 4.5, from
+//! Nov 24, 2026): a value logged with an explicit step, which is the x of a series and not a training
+//! step. Such rows are taken out of their batch before the step watermark is looked at, so they never
+//! raise it (D8) and are never progress: not the rank's `last_step`, not the step the watchdog is
+//! given, and never a row the detectors read, live or in a replay (Q4 a). They are deduplicated by
+//! `(run_id, rank, attempt, seq)` against the attempt's own `seq` watermark; a row at or below it is
+//! dropped and counted as `scalars_not_newer` on the rank's entry. They are stored as
+//! `attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet`, created only if no object has that
+//! name, beside the parts and never one of them; a restarted server reads the watermark from those
+//! names. A flush stores the step part, then the scalars object, and only then acknowledges the
+//! offset. A batch without a `seq` column, or whose `seq` is null on every row, is all step rows and
+//! is handled as before.
+//!
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
 //! 0, 1 or 2 (`SUPPORTED_ROW_VERSIONS`), cannot be stored: it is dropped and counted, with a line on
 //! stderr and in the rank's entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`),
@@ -423,6 +437,27 @@ struct RankBuffer {
     /// not stored (L30), counted in `late_steps_confirmed` when the part is stored. At most one per
     /// row received while the part is open.
     late_steps: std::collections::BTreeSet<i64>,
+    /// Per attempt, the highest `seq` kept so far, buffered or stored (`WAVE_AL_CONTRACT.md` section
+    /// 4.5): the scalar-only rows' own watermark, apart from the steps'.
+    seq_watermarks: HashMap<i64, Option<i64>>,
+    /// The scalar-only rows waiting to be stored, apart from the step rows (section 4.5).
+    scalars: ScalarBuffer,
+}
+
+/// A rank's buffered scalar-only rows: the rows whose `seq` is not null, of one attempt.
+#[derive(Default)]
+struct ScalarBuffer {
+    attempt: i64,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    /// The first and last `seq` buffered: the `seq` rises from one row to the next.
+    first_seq: i64,
+    last_seq: i64,
+    /// Arrow bytes held, counted in the server's quota as step rows are.
+    bytes: usize,
+    /// Set when writing these rows failed: a `PUT` that reports failure may have stored the object,
+    /// so no row is added until a write of them succeeds (as `RankBuffer::sealed` for a part).
+    sealed: bool,
 }
 
 impl RankBuffer {
@@ -909,12 +944,14 @@ impl Ingest {
         // too, counted as a refused batch though it held no row, and the refusal named no bytes of
         // the sender's, so the sender kept its offset and its rows never left (RS10).
         let question = batch.num_rows() == 0 && end_byte_offset == 0;
-        let (pieces, dropped) = if question {
-            (Vec::new(), Dropped::new())
+        let (pieces, scalar_pieces, dropped) = if question {
+            (Vec::new(), Vec::new(), Dropped::new())
         } else {
             // Rows that cannot be stored are dropped before anything of the batch is placed or kept,
-            // and a batch none of whose rows can be read is refused and counted (RS10).
-            let (batch, dropped) = match drop_unstorable_rows(batch) {
+            // and a batch none of whose rows can be read is refused and counted (RS10). Then the
+            // scalar-only rows, those whose `seq` is not null, are taken out before the step
+            // watermark is looked at (`WAVE_AL_CONTRACT.md` section 4.5).
+            let (batch, dropped, scalars) = match readable_rows(batch) {
                 Ok(kept) => kept,
                 Err(refused) => {
                     if let Some(column) = refused.column {
@@ -926,11 +963,31 @@ impl Ingest {
                 }
             };
             refuse_negative_steps(&batch)?;
-            (split_by_attempt(batch)?, dropped)
+            let scalar_pieces = match scalars {
+                Some(scalars) => {
+                    refuse_negative_steps(&scalars)?;
+                    refuse_negative_seqs(&scalars)?;
+                    split_by_attempt(scalars)?
+                }
+                None => Vec::new(),
+            };
+            // A batch that held scalar rows only has no step rows left to look at. A batch without
+            // them is split as before, whatever it holds.
+            let pieces = if !scalar_pieces.is_empty() && batch.num_rows() == 0 {
+                Vec::new()
+            } else {
+                split_by_attempt(batch)?
+            };
+            (pieces, scalar_pieces, dropped)
         };
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
-        let attempts: Vec<i64> = pieces.iter().map(|(attempt, _)| *attempt).collect();
+        // A scalar row's attempt is placed as a step row's is.
+        let attempts: Vec<i64> = pieces
+            .iter()
+            .chain(&scalar_pieces)
+            .map(|(attempt, _)| *attempt)
+            .collect();
         self.place(key, sender, &attempts).await?;
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
@@ -955,6 +1012,12 @@ impl Ingest {
                 }
             }
         }
+        // The scalar-only rows never meet the step watermark and are never progress: not the rank's
+        // `last_step`, not the step given to the watchdog below, never a step the detectors read.
+        let mut scalars_not_newer = 0;
+        for (attempt, batch) in scalar_pieces {
+            scalars_not_newer += self.accept_scalars(key, attempt, batch, &mut buffer).await?;
+        }
         // Counted once the rest of the batch is taken: a batch refused before (the store could not
         // be read) is sent again, and its rows would be counted twice.
         if !dropped.is_empty() {
@@ -966,6 +1029,8 @@ impl Ingest {
         // L30: every row not stored for a step that was not newer, on arrival. A row sent again is
         // counted again; which of them arrived late is counted apart, when their part is stored.
         self.watchdog.not_newer(key, not_newer, now);
+        // Section 4.5: every scalar row not stored for a `seq` that was not newer, on arrival.
+        self.watchdog.scalars_not_newer(key, scalars_not_newer, now);
         self.watchdog.batch(
             key,
             progressed.map_or(owner.unwrap_or(buffer.attempt), |(attempt, _)| attempt),
@@ -1090,6 +1155,77 @@ impl Ingest {
         Ok((None, not_newer))
     }
 
+    /// Buffers the new scalar-only rows of a batch whose rows all belong to one attempt
+    /// (`WAVE_AL_CONTRACT.md` section 4.5), and returns how many were not kept because their `seq` was
+    /// not newer. They are kept apart from the step rows, so they never raise the step watermark (D8)
+    /// and are never progress. A row is deduplicated by `(run_id, rank, attempt, seq)`: one at or
+    /// below the attempt's `seq` watermark, or not above the rows before it, is dropped, so a replay
+    /// stores nothing twice.
+    async fn accept_scalars(
+        &self,
+        key: &Key,
+        attempt: i64,
+        batch: RecordBatch,
+        buffer: &mut RankBuffer,
+    ) -> Result<u64, Status> {
+        let watermark = match buffer.seq_watermarks.get(&attempt) {
+            Some(watermark) => *watermark,
+            None => {
+                // The attempt's first scalar rows since this server took the rank up: its watermark
+                // is read from the names of its `scalars-*` objects (footers only for a name that
+                // does not parse), so a replay after a restart stores nothing twice.
+                let stored = self
+                    .storage
+                    .max_seq(&key.0, key.1, attempt)
+                    .await
+                    .map_err(|error| Status::unavailable(format!("cannot read the store: {error}")))?;
+                buffer.seq_watermarks.insert(attempt, stored);
+                stored
+            }
+        };
+        let (batch, first, last, discarded) = keep_new_seqs(key, batch, watermark)?;
+        if batch.num_rows() == 0 {
+            return Ok(discarded);
+        }
+        // A write of the buffered rows that failed may have stored their object (a timeout after the
+        // store committed it): no row is added until it is stored, so the retry is the same object
+        // under the same name, which meets the stored one, and no second object over the same `seq`
+        // is made.
+        if buffer.scalars.sealed {
+            self.flush(key, buffer).await?;
+        }
+        // An object holds one attempt and has one schema.
+        if buffer
+            .scalars
+            .batches
+            .first()
+            .is_some_and(|held| held.schema() != batch.schema() || buffer.scalars.attempt != attempt)
+        {
+            self.flush(key, buffer).await?;
+        }
+        let bytes = batch_bytes(&batch)?;
+        if !self.reserve(bytes) {
+            // Writing this rank's own buffer may make the room; otherwise refuse.
+            self.flush(key, buffer).await?;
+            if !self.reserve(bytes) {
+                return Err(Status::resource_exhausted("ingest buffer full"));
+            }
+        }
+        buffer.seq_watermarks.insert(attempt, Some(last));
+        if buffer.scalars.batches.is_empty() {
+            buffer.scalars.first_seq = first;
+            // The timed flush writes the rank once its oldest row has waited, of either kind.
+            buffer.since.get_or_insert_with(Instant::now);
+        }
+        let scalars = &mut buffer.scalars;
+        scalars.attempt = attempt;
+        scalars.last_seq = last;
+        scalars.rows += batch.num_rows();
+        scalars.bytes += bytes;
+        scalars.batches.push(batch);
+        Ok(discarded)
+    }
+
     /// Stores what the buffer holds as one part, then acknowledges the offset it covers.
     /// On a store error the rows stay buffered and a later flush tries again.
     async fn flush(&self, key: &Key, buffer: &mut RankBuffer) -> Result<(), Status> {
@@ -1139,6 +1275,18 @@ impl Ingest {
             buffer.rows = 0;
             buffer.bytes = 0;
             buffer.since = None;
+        }
+        // Then the scalar-only rows, in an object of their own (`WAVE_AL_CONTRACT.md` section 4.5),
+        // and only then the acknowledgement: an offset is acknowledged once every row before it is
+        // stored, of both kinds. A part stored before a scalars write that failed is still judged
+        // below; the offset waits for the next flush that stores the scalar rows.
+        let scalars_stored = self.flush_scalars(key, buffer).await;
+        if scalars_stored.is_err() {
+            if self.config.detect && !stored.is_empty() {
+                self.take_replicas(key, &stored).await;
+                self.detect(key, buffer, &stored).await;
+            }
+            return scalars_stored;
         }
         if let (Some(offset), Some(ack)) = (buffer.pending_offset.take(), &buffer.ack) {
             // `{"end_byte_offset": N, "store_id": "..."}` (L3). The ID is known: `accept` read it
@@ -1405,6 +1553,44 @@ impl Ingest {
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
         self.flush(key, &mut buffer).await
+    }
+
+    /// Stores the rank's buffered scalar-only rows as one `scalars-*` object (section 4.5), after its
+    /// step part. On a store error the rows stay buffered and the buffer takes no new scalar row
+    /// until a write of them succeeds (`ScalarBuffer::sealed`); the timed flush tries again after
+    /// `flush_interval`.
+    async fn flush_scalars(&self, key: &Key, buffer: &mut RankBuffer) -> Result<(), Status> {
+        if buffer.scalars.batches.is_empty() {
+            return Ok(());
+        }
+        let scalars = &buffer.scalars;
+        let written = self
+            .storage
+            .write_scalars(
+                &key.0,
+                key.1,
+                scalars.attempt,
+                &scalars.batches,
+                scalars.first_seq,
+                scalars.last_seq,
+            )
+            .await;
+        if let Err(error) = written {
+            buffer.scalars.sealed = true;
+            buffer.since.get_or_insert_with(Instant::now);
+            let message = format!("cannot write the scalar rows to the store: {error}");
+            eprintln!("tensorquill-server: {} rank {}: {message}", key.0, key.1);
+            return Err(Status::unavailable(message));
+        }
+        self.used.fetch_sub(buffer.scalars.bytes, Ordering::SeqCst);
+        let attempt = buffer.scalars.attempt;
+        buffer.scalars = ScalarBuffer {
+            attempt,
+            ..ScalarBuffer::default()
+        };
+        // The step part, if any, was stored before: nothing of either kind waits now.
+        buffer.since = None;
+        Ok(())
     }
 
     /// Writes every buffer whose oldest row has waited `flush_interval`. Ranks are written
@@ -1954,7 +2140,13 @@ impl Ingest {
             let Ok(held) = buffer.try_lock() else {
                 return false;
             };
-            if !held.batches.is_empty() || held.pending_offset.is_some() || held.ack.is_some() || held.sealed {
+            // Scalar-only rows still buffered (section 4.5) keep the run as step rows do.
+            if !held.batches.is_empty()
+                || !held.scalars.batches.is_empty()
+                || held.pending_offset.is_some()
+                || held.ack.is_some()
+                || held.sealed
+            {
                 return false;
             }
         }
@@ -2041,7 +2233,7 @@ impl Ingest {
                 "replica": replica_version,
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone(), (r["refused_batch_keys"].clone(), r["rows_not_newer"].clone(), r["late_steps_confirmed"].clone()))).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone(), (r["refused_batch_keys"].clone(), r["rows_not_newer"].clone(), r["late_steps_confirmed"].clone(), r["scalars_not_newer"].clone()))).collect::<Vec<_>>()
                 }),
             })
             .to_string();
@@ -2233,6 +2425,69 @@ fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Re
     Ok((batch, dropped))
 }
 
+/// The column whose non-null value marks a scalar-only row (`WAVE_AL_CONTRACT.md` sections 4.2 to
+/// 4.5): a record's `seq`, counted per session from 0. Null on a step row.
+pub const SEQ_COLUMN: &str = "seq";
+
+/// The rows of a batch that can be stored (`drop_unstorable_rows`), and the rows dropped, with the
+/// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, and the
+/// scalar-only rows if there are any.
+fn readable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped, Option<RecordBatch>), Refused> {
+    let (batch, dropped) = drop_unstorable_rows(batch)?;
+    let (batch, scalars) = split_scalar_rows(batch)?;
+    Ok((batch, dropped, scalars))
+}
+
+/// Takes the scalar-only rows, those whose `seq` is not null, out of a batch (section 4.5): the step
+/// rows and, when there are any, the scalar-only rows, each in the batch's own order and schema. A
+/// batch without a `seq` column (step 1's sender, a protocol 4 sender), or whose `seq` is null on
+/// every row, is all step rows and is returned as it came. A `seq` column of another type than Int64
+/// has no row that can be read as either kind: the batch is refused, naming the column, as for a key
+/// column (RS10).
+fn split_scalar_rows(batch: RecordBatch) -> Result<(RecordBatch, Option<RecordBatch>), Refused> {
+    let Some(column) = batch.column_by_name(SEQ_COLUMN) else {
+        return Ok((batch, None));
+    };
+    if column.data_type() != &DataType::Int64 {
+        return Err(Refused {
+            column: Some(SEQ_COLUMN),
+            status: Status::invalid_argument(format!(
+                "column `{SEQ_COLUMN}` is {}, not {}; the batch is refused",
+                column.data_type(),
+                DataType::Int64
+            )),
+        });
+    }
+    if column.null_count() == column.len() {
+        return Ok((batch, None));
+    }
+    let internal = |error: arrow::error::ArrowError| Refused {
+        column: None,
+        status: Status::internal(error.to_string()),
+    };
+    let scalar = arrow::compute::is_not_null(column).map_err(internal)?;
+    let step = arrow::compute::not(&scalar).map_err(internal)?;
+    let scalars = filter_record_batch(&batch, &scalar).map_err(internal)?;
+    let steps = filter_record_batch(&batch, &step).map_err(internal)?;
+    Ok((steps, Some(scalars)))
+}
+
+/// Refuses a batch whose scalar-only rows hold a negative `seq`, whole, as `refuse_negative_steps`
+/// refuses a negative step: `seq` counts from 0 (section 4.2), so such a row was never written by a
+/// session and nothing of the batch is stored, acknowledged or counted.
+fn refuse_negative_seqs(scalars: &RecordBatch) -> Result<(), Status> {
+    let seqs = scalars
+        .column_by_name(SEQ_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| Status::invalid_argument("column `seq` is missing or of the wrong type"))?;
+    match seqs.iter().flatten().find(|seq| *seq < 0) {
+        Some(seq) => Err(Status::invalid_argument(format!(
+            "column `seq` holds a negative value ({seq}); the batch is refused"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Refuses a batch that holds a negative `step`, whole, with `invalid_argument`, as `split_by_attempt`
 /// refuses one that holds a negative `attempt` (wave AG, section 10 of `WAVE_AF_CONTRACT.md`): nothing
 /// of it is stored, acknowledged or counted, and its stream ends. Until then such rows were stored and
@@ -2310,6 +2565,55 @@ fn keep_new_rows(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Resul
             first.get_or_insert(*step);
         } else {
             discarded.push(*step);
+        }
+        keep.append_value(new);
+    }
+    let keep = keep.finish();
+    let batch = if keep.true_count() == batch.num_rows() {
+        batch
+    } else {
+        filter_record_batch(&batch, &keep).map_err(|error| Status::internal(error.to_string()))?
+    };
+    Ok((batch, first.unwrap_or(0), mark.unwrap_or(0), discarded))
+}
+
+/// The kept scalar-only rows of a batch, their first and last `seq`, and how many were not kept.
+type NewSeqs = (RecordBatch, i64, i64, u64);
+
+/// Drops scalar-only rows whose `seq` is not above `watermark` or above the rows before them
+/// (`WAVE_AL_CONTRACT.md` section 4.5), as `keep_new_rows` drops step rows by their step. Returns the
+/// kept rows with their first and last `seq`, and how many were dropped. The rows' run and rank must
+/// be the descriptor's, as for step rows.
+fn keep_new_seqs(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Result<NewSeqs, Status> {
+    let run_ids = batch
+        .column_by_name("run_id")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| Status::invalid_argument("column `run_id` is missing or of the wrong type"))?;
+    let ranks = batch
+        .column_by_name("rank")
+        .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+        .ok_or_else(|| Status::invalid_argument("column `rank` is missing or of the wrong type"))?;
+    if run_ids.iter().any(|run_id| run_id != Some(key.0.as_str())) || ranks.values().iter().any(|rank| *rank != key.1) {
+        return Err(Status::invalid_argument(
+            "a row belongs to another run or rank than the descriptor",
+        ));
+    }
+    let seqs = batch
+        .column_by_name(SEQ_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .filter(|seqs| seqs.null_count() == 0)
+        .ok_or_else(|| Status::invalid_argument("column `seq` is missing, null or of the wrong type"))?;
+    let mut mark = watermark;
+    let mut first = None;
+    let mut discarded = 0;
+    let mut keep = BooleanBuilder::with_capacity(seqs.len());
+    for seq in seqs.values() {
+        let new = mark.is_none_or(|mark| *seq > mark);
+        if new {
+            mark = Some(*seq);
+            first.get_or_insert(*seq);
+        } else {
+            discarded += 1;
         }
         keep.append_value(new);
     }
