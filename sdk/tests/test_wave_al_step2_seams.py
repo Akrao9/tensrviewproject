@@ -59,10 +59,15 @@ def test_the_scalars_bullet_gives_the_explicit_step_as_the_capture_has_it():
     for words in ("**An explicit step (Nov 24, 2026, protocol 5).**",
                   "`session.log({...}, step=N)` records the values at step `N` as a scalar-only record "
                   '(schema version 2, `"record": "scalars"`), never a training step',
-                  "a bool, a float, `None` or anything else raises `TypeError`, and a negative step `ValueError`, "
-                  "before anything is recorded",
+                  # The owner's turns of lane AL-5's decisions 1, 4 and 9 (Nov 24), each beside `step=`.
+                  "`step=None` is the same as leaving `step=` out",
+                  "a bool, a float, a string or a negative integer raises (`TypeError`, or `ValueError` for a negative "
+                  "step) before anything is recorded",
                   "numbered `seq` 0, 1, 2… per session, in call order",
-                  "the call is one graph break; under `fullgraph=True` Dynamo raises",
+                  "at an explicit `flush()` (also with no step in memory)",
+                  "inside a function compiled with `torch.compile(fullgraph=True)`, `step=` raises Dynamo's `Unsupported`",
+                  "Call `session.log(..., step=N)` outside the compiled function",
+                  "or compile without `fullgraph`, which costs one graph break",
                   "[Scalar-only records](#scalar-only-records)",
                   'A key `"step"` in the dictionary'):
         assert words in SCALARS, words
