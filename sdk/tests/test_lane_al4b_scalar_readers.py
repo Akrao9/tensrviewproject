@@ -337,10 +337,10 @@ def test_mcp_list_runs_lists_the_last_training_step(tmp_path):
 def _pair_of_runs() -> tuple[list[dict], list[dict]]:
     def run(run_id: str, leaves: bool) -> list[dict]:
         out = []
-        for step in range(12):
+        for step in range(50):  # first_divergence needs 33 common steps
             out.append({"schema_version": 1, "run_id": run_id, "rank": 0, "attempt": 1, "step": step, "ts": float(step),
-                        "grad_norm": 1.0, "scalars": {"train/loss": 2.0 - 0.1 * step}})
-            eval_loss = 3.0 - 0.1 * step + (5.0 if leaves and step >= 8 else 0.0)
+                        "grad_norm": 1.0, "scalars": {"train/loss": 2.0 - 0.01 * step}})
+            eval_loss = 3.0 - 0.01 * step + (5.0 if leaves and step >= 40 else 0.0)
             out.append({"schema_version": 2, "record": "scalars", "run_id": run_id, "rank": 0, "attempt": 1, "step": step,
                         "seq": step, "ts": 100.0 + step, "scalars": {"eval/loss": eval_loss}})
         return out
@@ -353,9 +353,9 @@ def test_first_divergence_reads_scalar_records_as_series_points():
     a, b = _pair_of_runs()
     found = first_divergence(a, b)
     assert found["answer"] == "diverged", found["reason"]
-    assert (found["divergence"]["kind"], found["divergence"]["name"], found["divergence"]["step"]) == ("scalars", "eval/loss", 8)
-    assert found["runs"]["a"]["records"] == found["runs"]["b"]["records"] == 12  # never a record of their own
-    assert found["runs"]["b"]["last_step"] == 11
+    assert (found["divergence"]["kind"], found["divergence"]["name"], found["divergence"]["step"]) == ("scalars", "eval/loss", 40)
+    assert found["runs"]["a"]["records"] == found["runs"]["b"]["records"] == 50  # never a record of their own
+    assert found["runs"]["b"]["last_step"] == 49
     found = first_divergence(_training(a), _training(b))
     assert found["answer"] == "no_divergence"
 
@@ -368,7 +368,7 @@ def test_compare_runs_reads_scalar_records_as_series_points(tmp_path):
     _write(tmp_path / "b.rank0.jsonl", b)
     found = compare_runs("a", "b", source=tmp_path)["divergence"]
     assert found["state"] == "diverged", found
-    assert (found["divergence"]["name"], found["divergence"]["step"]) == ("eval/loss", 8)
+    assert (found["divergence"]["name"], found["divergence"]["step"]) == ("eval/loss", 40)
     error, said = _tool(mcp_server.Source(tmp_path / "a.rank0.jsonl", runs=tmp_path), "compare_runs", {"runs": ["a", "b"]})
     assert not error, said
     assert said["divergence"]["state"] == "diverged"
