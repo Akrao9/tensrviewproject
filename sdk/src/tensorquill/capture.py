@@ -2831,7 +2831,7 @@ class Session:
         section 4.2), never a training step, whatever the phase and whether or not a step is in
         memory. `N` is an integer of 0 or more; a bool, a float or anything else raises
         `TypeError`, a negative integer `ValueError`, before anything is recorded. The record is
-        written with the next block of step records, or at `close()`; a tensor is copied on its
+        written with the next block of step records, at an explicit `flush()`, or at `close()`; a tensor is copied on its
         device and read with that block, so the call adds no sync. Records of one session are
         numbered `seq` 0, 1, 2... in the order of these calls, and a reader takes the highest
         `seq` where two meet at a step. A key `"step"` in the dictionary is an ordinary scalar.
@@ -3711,11 +3711,21 @@ class Session:
                 torch._foreach_zero_(buffers)
 
     def flush(self) -> None:
-        """Move the ring to the CPU and queue it for the sink."""
+        """Move the ring to the CPU and queue it for the sink, with the scalar-only records logged
+        since the last block (`log(..., step=N)`). With no step in the ring they are queued alone,
+        so an explicit `flush()` hands every pending record to the writer, as `close()` does. The
+        writer thread writes them as it writes step records: `flush()` does not wait for the file."""
         if self._closed_call("flush()"):
             return
         self._take_traced_late()
         self._flush(hold_newest=False)
+        self._put_scalar_records()
+
+    def _put_scalar_records(self) -> None:
+        """Queue the scalar-only records no block of steps took, in a block with no steps (`_decode`).
+        Nothing when none is pending: one test of a list."""
+        if self._scalar_records and not self._stopped:
+            self._put(([],))
 
     def _clear_ring_lists(self) -> None:
         self._steps = []
@@ -4344,10 +4354,9 @@ class Session:
             self._take_traced_late()
             self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
-            if self._scalar_records and not self._stopped:
-                # No block of step records was left to carry them (no step since the last flush, or
-                # none at all): a block with no steps does (`_decode`).
-                self._put(([],))
+            # No block of step records was left to carry them (no step since the last flush, or
+            # none at all): a block with no steps does (`_decode`).
+            self._put_scalar_records()
         if not self._stopped:
             try:
                 self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))
