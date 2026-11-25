@@ -422,7 +422,7 @@ A layout is told by its columns, not by a number: `load_records` and the server'
 
 **An older server or an older SDK.** A sender older than protocol 5 streams to a protocol 5 server as before: its batches are stored as sent, in parts of their own. A `tensorquill-server` older than protocol 5 refuses this SDK's stream with `schema_version 2 is not supported; this server reads version 1` and stores nothing. The sender then says once, on stderr and in `session._sink.sender.last_error`: `the server at <endpoint> speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server)`, and keeps trying. Training is not affected, the local file keeps every line, and the lines are sent once the server is upgraded.
 
-**A downgrade is not supported.** A protocol 4 server started again on a store that holds protocol 5 parts reads them without a word: their steps have no layers, no MoE statistics and no attention maps to it, so it judges no layer and no router statistic there. An SDK older than protocol 5 refuses a store that holds protocol 5 parts, naming the part and the row. Once a store holds protocol 5 parts, keep the server and the SDK at protocol 5 or later.
+**A downgrade is not supported.** A protocol 4 server started again on a store that holds protocol 5 parts reads them without a word: their steps have no layers, no MoE statistics and no attention maps to it, so it judges no layer and no router statistic there. In an SDK older than protocol 5, `load_records` and a read of the run (`python -m tensorquill <store>/runs/<run_id>`) refuse a store that holds protocol 5 parts, naming the part and the row; its `runs` lists the run from the server's own reports (`incidents.json` and `watchdog.json`, which the protocol 5 server wrote), as this SDK does. Once a store holds protocol 5 parts, keep the server and the SDK at protocol 5 or later.
 
 ## Detector benchmark on 64 ranks
 
@@ -465,7 +465,7 @@ Timed with `cargo run --release --example detect_store -- <store> <run_id> --ben
 | Per flush of 64 ranks | Rust, twelve kinds | Python, all kinds |
 | --- | ---: | ---: |
 | Detectors | 56 ms (68) | 2,220 ms, projected with state kept |
-| of which decoding `layers_json` and `moe_stats_json` | about 33 ms, measured apart | |
+| of which decoding `layers_json` and `moe_stats_json` | about 33 ms, measured apart (protocol 4; 0.02 ms with protocol 5's typed columns, below) | |
 | Writing the 64 Parquet parts (already on the live path) | 138 to 145 ms | |
 | Writing 64 `incidents.json` files | 13 ms (14) | |
 | Reading the parts back | not needed live | 830 ms |
@@ -474,7 +474,7 @@ The first six kinds took 54 ms; the six added on Nov 15, 2026 cost about 2 ms mo
 
 What these numbers do not show:
 - The store is healthy, and most of the speed comes from skipping a median when a window's lowest or highest value already rules a hit out, which is exact. Before those shortcuts the first six kinds took 136 ms per flush; take that as the cost when every check has to work its median out, as on a run that is failing everywhere.
-- Two thirds of the detector time is decoding the two JSON columns. Typed columns for the per-layer statistics would remove most of it; that is a schema change and is not made.
+- Two thirds of the detector time was decoding the two JSON columns. Since protocol 5 (Nov 24, 2026) `layers` and `moe_stats` are typed columns, and the detectors read them with no JSON. On the same machine, `detect_store --bench` on a store of the same shape (64 ranks, 1,000 steps) takes 41.5 ms per flush (41.2 to 41.7, seven runs) against 70.0 ms (69.8 to 70.7) for the same records in protocol 4's layout, interleaved with it; decoding, measured apart, falls from 33.8 ms to 0.02 ms. A server still reads `layers_json` and `moe_stats_json` from protocol 4 parts, at the old cost.
 - The store has a weight check and a replica check once in 50 steps and no loss scaler. A run that checks weights on every step pays for 219 name comparisons on each; that was not timed.
 - The detectors' state is outside the server's memory quota and is kept until the server exits: 1.5 to 2 MB per rank at Granite's shape, measured under live streams below. A replay also holds every step number and learning rate of the rank while it runs (under 100 bytes a step, by its layout).
 - A real model's values, a GPU job, and S3 or GCS are not measured.
