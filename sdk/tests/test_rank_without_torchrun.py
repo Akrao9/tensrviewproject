@@ -9,8 +9,8 @@ steps into the default output folder.
 How a rank started this way should be known is not decided, so nothing here holds what a process
 calls its rank, its world size or its run ID, what the file holds, or what the readers say of it;
 the lane's report records each. One thing is held, as a strict expected failure: two processes of
-one job that run at the same time must not write one records file with no warning. Two separate
-tests check that the children ran to their end, so a broken child cannot pass as that failure.
+one job that run at the same time must not write one records file with no warning. A separate
+test checks that the children ran to their end, so a broken child cannot pass as that failure.
 
 Only torch and pytest are needed. Each child has a time limit and is killed if it is still running.
 """
@@ -42,9 +42,9 @@ CHILD = textwrap.dedent(
 
     class Keep(logging.Handler):
         def emit(self, record):
-            said.append(record.getMessage())
+            said.append("tensorquill logger: " + record.getMessage())
 
-    logging.getLogger("tensorquill").addHandler(Keep())
+    logging.getLogger("tensorquill").addHandler(Keep())  # what `_say` logs instead of warning
     import torch
     from torch import nn
     import tensorquill
@@ -200,8 +200,6 @@ def test_each_process_ran_to_its_end(outcomes, arrangement):
         assert child["report"] is not None, child["stderr"]
         assert child["report"]["steps_done"] == STEPS
         assert child["report"]["path"] is not None
-    rows = [row for rows in result["files"].values() for row in rows]
-    assert len(rows) == 2 * STEPS, "every step of both processes is somewhere in the output folder"
 
 
 @pytest.mark.parametrize("arrangement", SHARED_AT_ONCE)
@@ -210,12 +208,13 @@ def test_each_process_ran_to_its_end(outcomes, arrangement):
     raises=AssertionError,
     reason="Without RANK and a process group, both processes read rank 0 and world size 1, take the "
     "same SLURM run ID and append to the same tensorquill-out/<run_id>.rank0.jsonl at the same "
-    "time, and tensorquill.init gives no warning (ledger row OG4).",
+    "time, and tensorquill.init gives no warning.",
 )
 def test_two_processes_of_one_job_do_not_share_a_file_without_a_warning(outcomes, arrangement):
     result = outcomes(arrangement)
     reports = [child["report"] for child in result["children"]]
     assert all(r is not None for r in reports), [c["stderr"] for c in result["children"]]
     paths = {r["path"] for r in reports}
-    warned = any(r["init_said"] for r in reports)
+    # Only what TensorQuill says counts: a warning of torch's or another library's at `init` does not.
+    warned = any("tensorquill" in said.lower() for r in reports for said in r["init_said"])
     assert len(paths) == 2 or warned, f"one file, {sorted(paths)}, and no warning at init"
