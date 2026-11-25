@@ -2497,6 +2497,67 @@ def load_records(
     return records if all_attempts else resolve_attempts(records)
 
 
+def scalar_points_in_order(scalar_only: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Scalar-only records in the order their points stand at one step, the last standing: by
+    attempt, in the order the attempts first appear, then by `seq` (Q6 a: the highest `seq` wins).
+    `seq` counts per session, so it orders the records of one attempt only; a later attempt's
+    point stands over an earlier one's at the same step, as its training records do."""
+    listed = list(scalar_only)
+    place: dict[tuple[str, Any, Any], int] = {}
+    for record in listed:
+        place.setdefault((run_of(record), record.get("rank", 0), record.get("attempt", 0)), len(place))
+    return sorted(listed, key=lambda r: (place[(run_of(r), r.get("rank", 0), r.get("attempt", 0))], int(r["seq"])))
+
+
+def merged_scalar_points(
+    training: Iterable[Mapping[str, Any]], scalar_only: Iterable[Mapping[str, Any]]
+) -> dict[str, dict[int, Any]]:
+    """Each logged scalar's points, `{name: {step: value}}`, the steps ascending: the training
+    records' `scalars` values and the scalar-only records' points, by step (WAVE_AL_CONTRACT.md
+    section 4.6). At one step a scalar-only record's value stands over the training records' and,
+    among scalar-only records, the highest `seq` (`scalar_points_in_order`; Q6 a). Of training
+    records of one step, the later stands. A step no training record has is a point of its own; no
+    record, step or sample is made. Values are as recorded (a non-finite one as the sink's string);
+    `None` is no value. Names come in the order they first appear, the training records' first."""
+    points: dict[str, dict[int, Any]] = {}
+    for record in sorted(training, key=lambda r: int(r["step"])):
+        logged = record.get("scalars")
+        if isinstance(logged, Mapping):
+            for name, value in logged.items():
+                if value is not None:
+                    points.setdefault(str(name), {})[int(record["step"])] = value
+    for record in scalar_points_in_order(scalar_only):
+        logged = record.get("scalars")
+        if isinstance(logged, Mapping):
+            for name, value in logged.items():
+                if value is not None:
+                    points.setdefault(str(name), {})[int(record["step"])] = value
+    return {name: dict(sorted(at.items())) for name, at in points.items()}
+
+
+def scalar_series(
+    source: str | Path | Iterable[Mapping[str, Any]],
+    *,
+    rank: int | None = None,
+    all_attempts: bool = False,
+) -> dict[str, list[list[Any]]]:
+    """Each logged scalar's series of one rank, `{name: [[step, value], ...]}` in step order: the
+    training records' values and the scalar-only records' points, merged by step
+    (`merged_scalar_points`). `source` is what `load_records` reads, and the attempts are resolved
+    as it resolves them (with the training records' cutoffs), or not with `all_attempts`.
+
+    Records of several ranks with no `rank` given raise `ValueError`, as `build_evidence` refuses
+    them, and so do records of several run IDs (`check_one_run`)."""
+    records = load_records(source, rank=rank, all_attempts=all_attempts, scalars=True)
+    ranks = sorted({int(r.get("rank", 0)) for r in records})
+    if len(ranks) > 1:
+        raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
+    check_one_run(records)
+    training, scalar_only = set_apart_scalars(records)
+    return {name: [[step, value] for step, value in at.items()]
+            for name, at in merged_scalar_points(training, scalar_only).items()}
+
+
 def set_apart_scalars(records: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """The training records and the scalar-only records of `records` (`identity.is_scalar_record`),
     each in the order given (WAVE_AL_CONTRACT.md section 4.6). No engine is given a scalar-only
@@ -9249,7 +9310,15 @@ def export_rerun(
         probe_invalid = [False]
         if records is not None:
             # Scalar-only records are set apart: none is a training step (WAVE_AL_CONTRACT.md section 4.6).
+            # Each of their points is logged under `/logged/<name>` at its step, after the training
+            # records', and stands over a training record's value at that step (Q6 a).
             records, scalar_only = set_apart_scalars(records)
+            standing: dict[str, dict[int, Any]] = {}
+            for point in scalar_points_in_order(scalar_only):
+                for name, val in (point.get("scalars") or {}).items() if isinstance(point.get("scalars"), Mapping) else ():
+                    if val is not None:
+                        standing.setdefault(str(name), {})[int(point["step"])] = val
+            overridden = {name: set(at) for name, at in standing.items()}
             for record in records:
                 rr.set_time("training_step", sequence=int(record["step"]))
                 grad_norm = record.get("grad_norm")
@@ -9275,6 +9344,8 @@ def export_rerun(
                     rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
                     training_paths["/training/step_skipped"] = "Update skipped (by the loss scaler or the caller)"
                 for name, val in (record.get("scalars") or {}).items():
+                    if int(record["step"]) in overridden.get(name, ()):
+                        continue  # a scalar-only record's point stands at this step (Q6 a)
                     value = _finite(val)
                     if value is not None:
                         parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
@@ -9291,6 +9362,15 @@ def export_rerun(
                                       f"/{rr.escape_entity_path_part(str(key))}")
                             rr.log(entity, rr.Scalars(float(val)))
                             activation_paths.setdefault(key, set()).add(entity)
+            for name, at in standing.items():
+                parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
+                entity = f"/logged/{parts}"
+                for step, val in sorted(at.items()):
+                    value = _finite(val)
+                    if value is not None:
+                        rr.set_time("training_step", sequence=step)
+                        rr.log(entity, rr.Scalars(value))
+                        logged_paths[entity] = name
 
         if activation_paths:
             labels = {

@@ -154,9 +154,12 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     above a later one look exactly like those rows, so they are still read unresolved here.
     """
     from .evidence import resolve_attempts, run_of
+    from .identity import is_scalar_record
 
     ranges: dict[str, dict[Any, list[int]]] = {}
     for row in rows:
+        if is_scalar_record(row):  # resolved with the training rows' cutoffs, never one (section 4.6)
+            continue
         step = int(row["step"])
         span = ranges.setdefault(run_of(row), {}).setdefault(row.get("attempt", 0), [step, step])
         span[0], span[1] = min(span[0], step), max(span[1], step)
@@ -177,7 +180,7 @@ class _Run:
 
     def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False,
                  label: str = "A") -> None:
-        from .evidence import run_of
+        from .evidence import run_of, scalar_points_in_order, set_apart_scalars
         from .identity import check, in_list, is_scalar_record
 
         self.series: dict[str, dict[int, float]] = {}
@@ -195,9 +198,6 @@ class _Run:
         # row is resolved away (WAVE_AE_CONTRACT.md, section 5): "" for a row that names none.
         self.every_run_id: set[str] = set()
         own: list[Mapping[str, Any]] = []
-        # The rank's scalar-only records, set apart after the check (WAVE_AL_CONTRACT.md section
-        # 4.6): never a record or a step of the run.
-        self.scalar_records: list[Mapping[str, Any]] = []
         for index, record in enumerate(records):
             # Every record, whatever its rank, before any is read (WAVE_AF_CONTRACT.md, section 1): one
             # that cannot be placed in a rank, an attempt and a step refuses the input.
@@ -206,18 +206,28 @@ class _Run:
             self.ranks_seen.add(record_rank)
             if record_rank != rank or record.get("step") is None:
                 continue
-            if is_scalar_record(record):
-                self.scalar_records.append(record)
-                continue
             own.append(record)
             self.every_run_id.add(run_of(record))
+        # The rank's scalar-only records are resolved with its training records' cutoffs and then
+        # set apart (WAVE_AL_CONTRACT.md section 4.6): never a record or a step of the run, they are
+        # read as series points after the training records (Q8 a), and stand over a training
+        # record's value at their step, the highest `seq` last (Q6 a).
         kept = own if resolved else _resolved(own)
-        self.replaced = len(own) - len(kept)
+        trained = [record for record in own if not is_scalar_record(record)]
+        kept, scalar_only = set_apart_scalars(kept)
+        self.replaced = len(trained) - len(kept)
         for record in kept:
             self.records += 1
             if record.get("run_id") not in self.run_ids:
                 self.run_ids.append(record.get("run_id"))
             self._read(record, int(record["step"]))
+        for record in scalar_points_in_order(scalar_only):
+            logged = record.get("scalars")
+            for name, scalar in logged.items() if isinstance(logged, Mapping) else ():
+                if _is_wall_clock(str(name)):
+                    self.wall_clock.add(f"scalars/{name}")
+                elif scalar is not None:
+                    self._put("scalars", str(name), None, int(record["step"]), scalar)
 
     def _put(self, kind: str, name: str | None, stat: str | None, step: int, value: Any) -> None:
         number = _number(value)
