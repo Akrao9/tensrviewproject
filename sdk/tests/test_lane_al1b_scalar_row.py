@@ -326,3 +326,22 @@ def test_a_rank_s_listing_never_enters_another_rank_s_folder(tmp_path, monkeypat
     assert [p.name for p in flight.scalar_objects(run, rank=0)] == ["scalars-00000000-00000000.parquet",
                                                                    "scalars-00000001-00000002.parquet"]
     assert opened and not [p for p in opened if "rank=1" in Path(p).parts], opened
+
+
+@pytest.mark.parametrize("seq", [-1, None, "absent"], ids=repr)
+def test_the_sender_says_which_scalar_only_line_it_left_out_for_its_seq(seq, capsys):
+    """What `rows_to_send` gives the sender for such a line is what the sender says, once (wave AG's message)."""
+    pytest.importorskip("pyarrow")
+    good, step = _scalar_record(), next(r for r in KEYS["records"] if not _is_scalar(r))
+    bad = {k: v for k, v in good.items() if k != "seq"} if seq == "absent" else {**good, "seq": seq}
+    records = [step, bad]
+    lines = [json.dumps(r).encode() for r in records]
+    refused: list = []
+    flight.rows_to_send(records, flight.flight_schema(), refused=refused)
+    sender = flight.FlightSender.__new__(flight.FlightSender)
+    sender._said_skipped, sender.path, sender.endpoint = False, "run.rank0.jsonl", "grpc://server"
+    sender._say_skipped(0, lines, [0, 1], refused, [r.get("step") for r in records])
+    found = "absent" if seq == "absent" else identity._shown(seq)
+    assert capsys.readouterr().err.startswith(
+        f"tensorquill: the line at byte {len(lines[0]) + 1} of run.rank0.jsonl (step 500) is not sent to grpc://server: "
+        f"its seq is {found}, and its column in the stream cannot hold it.")
