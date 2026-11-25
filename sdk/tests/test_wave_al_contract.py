@@ -12,20 +12,27 @@ What runs here, on the base and on every lane's tree:
 - The `rust_sdk` path (`build_evidence(detectors="rust")`) of every case that names it, against the
   case's `rust_raw` expectation: ordinary tests since the joined tree (92e471a).
 - The `rust_raw_v4` path (the owner, Nov 24): `detect` given protocol 4's rows, as an older SDK sends
-  them, reads them as the base did. `layers_entry_not_object`'s is lane AL-3′'s target (step 2);
-  `layers_name_arrow_cannot_encode`'s is a known difference, pinned at today's report.
+  them, reads them as the base did. `layers_entry_not_object`'s was lane AL-3′'s target (step 2, landed
+  at 0826958); `layers_name_arrow_cannot_encode`'s is a known difference, pinned at today's report.
 - Pins: where the base already reports on `records` what the contract asks (`expect`), the engine
   paths are ordinary tests, so no lane can move them.
 - Targets: where the base does not (a refused entry today, the scalar-only record; the row layout
   until lane AL-1 landed), the test is a strict expected failure (`xfail(strict=True)`, as the repository marks work a lane
   has not landed). The lane named in its reason turns it into an ordinary test by removing the mark
   when its change makes it pass; a target that passes before that fails the run (strict).
+- Section 4 (step 2, merged at 0826958): the readers take a file with scalar-only records, which are
+  never a training step, on the Python path, both Rust paths, and a live server fed by `send_file`
+  (the cases that name it but no lane's server test reads: `scalar_record_keys`,
+  `scalar_not_a_training_step`).
 - Section 4.8, on `tensorquill.init` and `Session.log` themselves: a value logged late inside a compiled
-  function before the flush for a newly trainable parameter (a target), and its eager twin (a pin).
+  function before the flush for a newly trainable parameter, and its eager twin.
+
+Since step 2 landed no test here is an expected failure: every target of the wave passes on the joined
+tree (0826958) and is an ordinary test.
 
 The Rust paths need the server binary (`TENSORQUILL_SERVER_BIN`, or one beside the interpreter) and
 are skipped without it; anything that needs pyarrow is skipped without it (CI's plain jobs have none).
-The live server, `runs` and MCP paths are the lanes' own tests (contract section 9).
+The other live-server cases, `runs` and MCP paths are the lanes' own tests (contract section 9).
 """
 
 from __future__ import annotations
@@ -53,12 +60,15 @@ LANE_PY_NO_LAYER = ("lane AL-4' (evidence.py, step 2): an entry that is not an o
                     "layers are such entries holds no layer (the owner's approved change, Nov 24), contract sections 1.5 and 7")
 LANE_RUST_V4 = ("lane AL-3' (detect.rs, step 2): protocol 4's layers_json read entry by entry, so an entry that is not "
                 "an object is absent and the rest are read (the owner, Nov 24), contract sections 1.5 and 9")
-LANE_SCALAR = "step 2 of the wave (contract section 4): the scalar-only record"
 # Targets whose lanes have landed: they pass on the joined tree and are ordinary tests now. A case's
 # `today` stays the base's (f71d8e0), so the mark is decided here, not by `today == expect`.
 LANDED = {
     ("layers_entry_not_object", "rust_raw"),  # lanes AL-1 and AL-3, merged at 92e471a
     ("layers_name_arrow_cannot_encode", "rust_raw"),  # lanes AL-1 and AL-3, merged at 92e471a
+    ("layers_entry_not_object", "python"),  # lane AL-4', merged at 0826958 (step 2)
+    ("layers_value_not_object", "python"),  # lane AL-4', merged at 0826958 (step 2)
+    ("layers_only_entries_not_object", "python"),  # lane AL-4', merged at 0826958 (step 2; row S5)
+    ("layers_entry_not_object", "rust_raw_v4"),  # lane AL-3', merged at 0826958 (step 2; row S4)
 }
 
 
@@ -291,12 +301,12 @@ def test_each_engine_reports_what_the_clean_records_give(case, path):
         assert got["run_state"] == want["run_state"]
 
 
-@pytest.mark.xfail(strict=True, reason=LANE_SCALAR)
 @pytest.mark.parametrize("case", [c for c in SCALAR if "python" in c["paths"]],
                          ids=[c["name"] for c in SCALAR if "python" in c["paths"]])
 def test_a_scalar_record_is_read_and_never_a_training_step(case):
     """The readers take a file with scalar-only records (section 4): never a step judged, never
-    `repeated_steps`; the evidence equals the evidence of the training records alone."""
+    `repeated_steps`; the evidence equals the evidence of the training records alone. Step 2's target,
+    an ordinary test since it landed (lane AL-4', 0826958)."""
     records = copy.deepcopy(case["records"])
     training = [r for r in records if r.get("schema_version") != 2]
     built = evidence.build_evidence(records, detectors="python")
@@ -306,8 +316,6 @@ def test_a_scalar_record_is_read_and_never_a_training_step(case):
     assert "repeated_steps" not in [i["kind"] for i in built["incidents"]]
 
 
-LANE_LATE = ("lane AL-5 (capture.py, step 2): a value logged late inside a compiled function is drained before the "
-             "flush for a newly trainable parameter, contract section 4.8")
 LEFT_OUT = "left out the scalar"
 UNFROZEN = "frozen when the session started"
 
@@ -384,20 +392,129 @@ def test_the_same_value_logged_eagerly_reaches_its_step(every):
     assert not [m for m in messages if LEFT_OUT in m]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=LANE_LATE)
 @pytest.mark.parametrize("every", [1, 4])
 def test_a_value_logged_late_inside_a_compiled_function_reaches_its_step(every):
-    """Case `scalar_compiled_late_before_unfreeze`, the target: on step 1's own record, as eagerly, and no
-    left-out warning. Today the flush for the unfrozen layer writes step 1 without draining
-    `_late_traced`, and the value is left out with a warning that names the wrong cause."""
+    """Case `scalar_compiled_late_before_unfreeze`: on step 1's own record, as eagerly, and no left-out
+    warning. Lane AL-5's target (landed at 0826958): at the base the flush for the unfrozen layer wrote
+    step 1 without draining `_late_traced`, and the value was left out with a warning that named the
+    wrong cause."""
     step_1, logged, messages = _late_before_unfreeze(True, every)
     assert not [m for m in messages if LEFT_OUT in m]
     assert step_1.get("eval/x") == pytest.approx(logged)
 
 
-def test_a_scalar_record_is_refused_by_the_base_readers():
-    """Pinned as the base does it, for section 5's matrix: today's `load_records` refuses a file with a
-    scalar-only record, naming its version. Kept only until step 2 of the wave lands (its lane removes
-    this test with the target above)."""
-    case = next(c for c in SCALAR if c["name"] == "scalar_old_reader")
-    assert case["today"]["python"].startswith("MalformedRecordError: schema_version is 2")
+# --- Section 4 on the Rust paths and a live server (step 2, merged at 0826958) -------------------------
+
+
+def _needs_rust():
+    pytest.importorskip("pyarrow")
+    from tensorquill.server_detect import find_binary
+
+    binary = find_binary()
+    if binary is None:
+        pytest.skip("tensorquill-server is not built")
+    return binary
+
+
+def _training(records: list[dict]) -> list[dict]:
+    return [r for r in records if r.get("record") != "scalars"]
+
+
+SCALAR_RUST = [(c, p) for c in SCALAR for p in ("rust_raw", "rust_sdk") if p in c["paths"]]
+
+
+@pytest.mark.parametrize(("case", "path"), SCALAR_RUST, ids=[f"{c['name']}-{p}" for c, p in SCALAR_RUST])
+def test_a_scalar_record_is_never_a_training_step_to_the_rust_detectors(case, path):
+    """The case's Rust paths: `server_report` (lane AL-1' sets scalar-only records apart before the
+    stream) and `build_evidence(detectors="rust")` report on `records` what they report on the training
+    records alone, with no `repeated_steps`."""
+    _needs_rust()
+    records = copy.deepcopy(case["records"])
+    if path == "rust_raw":
+        from tensorquill.server_detect import server_report
+
+        got, want = server_report(copy.deepcopy(records)), server_report(_training(records))
+        assert got["last_step"] == want["last_step"] == case["expect"].get("last_training_step", want["last_step"])
+    else:
+        got = evidence.build_evidence(copy.deepcopy(records), detectors="rust")
+        want = evidence.build_evidence(_training(records), detectors="rust")
+        assert got["detectors"] == "rust"
+    assert [_brief(i) for i in got["incidents"]] == [_brief(i) for i in want["incidents"]]
+    assert got["kind_checks"] == want["kind_checks"]
+    assert "repeated_steps" not in [i["kind"] for i in got["incidents"]]
+
+
+class _Server:
+    def __init__(self, binary, store: Path) -> None:
+        import subprocess
+
+        self.process = subprocess.Popen(
+            [str(binary), "--listen", "127.0.0.1:0", "--store", str(store), "--watchdog-seconds", "0.5",
+             "--flush-seconds", "0.3"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        line = self.process.stdout.readline()
+        self.endpoint = f"grpc://127.0.0.1:{int(line.rsplit(':', 1)[1])}"
+
+    def close(self) -> None:
+        import signal
+
+        self.process.send_signal(signal.SIGTERM)
+        self.process.wait(30)
+        self.process.stdout.close()
+        self.process.stderr.close()
+
+
+# The cases that name the live server and that no lane's server test reads (AL-2' reads the three of
+# section 4.5 in its own files).
+SCALAR_LIVE = [c for c in SCALAR if "live_server" in c["paths"]
+               and c["name"] in ("scalar_record_keys", "scalar_not_a_training_step")]
+
+
+@pytest.mark.parametrize("case", SCALAR_LIVE, ids=[c["name"] for c in SCALAR_LIVE])
+def test_a_scalar_record_on_a_live_server_is_stored_apart_and_never_judged(case, tmp_path):
+    """The case's `live_server` path: the records as one rank's `.jsonl`, sent by `flight.send_file` to a
+    protocol 5 release server. Every line is acknowledged; the training rows are in `part-*` files and
+    the scalar-only rows only in `scalars-*` objects, read back as the records; `incidents.json` is
+    the report of the training records alone, through their last step."""
+    import time
+
+    binary = _needs_rust()  # before any pyarrow import: CI's plain jobs have none, and skip here
+    import pyarrow.parquet as pq
+
+    from tensorquill import flight
+    from tensorquill.server_detect import server_report
+
+    records = copy.deepcopy(case["records"])
+    training, scalars = _training(records), [r for r in records if r.get("record") == "scalars"]
+    run_id = records[0]["run_id"]
+    path = tmp_path / f"{run_id}.rank0.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    store = tmp_path / "store"
+    server = _Server(binary, store)
+    try:
+        assert flight.send_file(path, server.endpoint, run_id, 0, timeout=30) is True
+        last = max(r["step"] for r in training)
+        report_path = store / "runs" / run_id / "rank=0" / "incidents.json"
+        deadline, report = time.monotonic() + 30, None
+        while time.monotonic() < deadline:
+            try:
+                report = json.loads(report_path.read_text())
+            except (OSError, ValueError):
+                report = None
+            if report and report.get("last_step") == last:
+                break
+            time.sleep(0.05)
+    finally:
+        server.close()
+    assert report is not None and report["last_step"] == last
+    assert last == case["expect"].get("last_training_step", last)
+    want = server_report(training)
+    assert [_brief(i) for i in report["incidents"]] == [_brief(i) for i in want["incidents"]]
+    assert {k: v.get("value") for k, v in report["kind_checks"].items()} == \
+        {k: v.get("value") for k, v in want["kind_checks"].items()}
+    parts = sorted((store / "runs" / run_id).rglob("part-*.parquet"))
+    stored_steps = sorted(s for p in parts for s in pq.read_table(p, columns=["step"]).column(0).to_pylist())
+    assert stored_steps == sorted(r["step"] for r in training)
+    objects = flight.scalar_objects(store / "runs" / run_id)
+    assert objects, "no scalars-* object stored"
+    assert [r for o in objects for r in flight.read_scalar_object(o)] == scalars
+

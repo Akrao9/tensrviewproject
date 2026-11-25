@@ -20,7 +20,7 @@ base's did, while the Python readers are the base's until step 2. So it runs on 
 1's joined tree alike, and gives the same file: run on `92e471a`'s descendants with this tree's
 binary, it reproduced the file written at the base, all but `base`, which records the commit it ran
 on. Step 2 changes the Python readers (AL-4') and protocol 4's `layers_json` read (AL-3'); from then on
-`today` is the file's, not a rerun's.
+`today` is the file's, not a rerun's, and the builder refuses a tree whose readers take record version 2.
 """
 
 from __future__ import annotations
@@ -443,6 +443,12 @@ def section_4() -> list[dict]:
 
 
 def main() -> None:
+    from tensorquill import identity
+
+    if 2 in identity.SCHEMA_VERSIONS:
+        raise SystemExit("this tree's readers take the scalar-only record (step 2, 0826958): today would be step 2's, "
+                         "not the base's. cases.json is the file's from here on; change a case in it by hand, or run "
+                         "this on a tree before step 2 (up to a6c1e2c)")
     rust = find_binary() is not None
     if not rust:
         raise SystemExit("tensorquill-server is not built: the Rust reports need it (TENSORQUILL_SERVER_BIN)")
