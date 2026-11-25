@@ -20,7 +20,7 @@ base's did, while the Python readers are the base's until step 2. So it runs on 
 1's joined tree alike, and gives the same file: run on `92e471a`'s descendants with this tree's
 binary, it reproduced the file written at the base, all but `base`, which records the commit it ran
 on. Step 2 changes the Python readers (AL-4') and protocol 4's `layers_json` read (AL-3'); from then on
-`today` is the file's, not a rerun's.
+`today` is the file's, not a rerun's, and the builder refuses a tree whose readers take record version 2.
 """
 
 from __future__ import annotations
@@ -390,7 +390,8 @@ def section_4() -> list[dict]:
         {"today_raises": "MalformedRecordError"}, ("today",))
     add("scalar_log_refusals", "session.log(..., step=s) refuses, before anything is recorded: a bool, a float, a "
         "negative integer or text as s (TypeError or ValueError, as log refuses a bad value); with no step= the rules "
-        "of wave AK hold (a value with no step in memory: the scalar_no_step_* cases, Q5)",
+        "of wave AK hold (a value with no step in memory: the scalar_no_step_* cases, Q5). step=None is no step=, "
+        "not a refusal (the owner, Nov 24: scalar_log_step_none_is_no_step)",
         [], {"refused_steps": [True, 1.5, -1, "3"], "written": 0}, ("capture",))
     # Q5, decided Nov 24: no step in memory and no step=. Left out with one warning per session, which
     # shows the explicit call. Written by hand from the contract's section Q5; lane AL-5's to run.
@@ -439,10 +440,74 @@ def section_4() -> list[dict]:
          "records_with_step_1": 0, "left_out_warnings": 0, "stop_warnings": 1,
          "warning_contains": ["the steps already handed to the writer are written, no later step is"]}, ("capture",),
         today={"capture": "the same as expect (read in capture.py at f71d8e0; lane AL-5's own test)"})
+    cases.extend(owner_after_step_2())
+    return cases
+
+
+def owner_after_step_2():
+    """The owner's decisions on lane AL-5's step 2 (Nov 24; contract rows S9 and S10). Written by hand
+    from the owner's words and capture.py at 0826958, where `today` is read: after step 2 this builder
+    refuses the tree, so these two were put in cases.json by hand from this function."""
+    cases = []
+
+    def add(name, about, records, expect, paths, **more):
+        cases.append({"name": name, "section": 4, "about": about, "paths": list(paths), "records": records,
+                      "expect": expect, **more})
+
+    add("scalar_log_step_none_is_no_step",
+        "session.log(values, step=None) is no step, the same as leaving step= out (the owner, Nov 24; row S10): "
+        "outside \"eval\" before the first step the value is pending and lands on step 0's own record; under "
+        "\"eval\" with a step in memory it lands on the newest step; under \"eval\" before the first step it is "
+        "left out with section Q5's one warning. It writes no scalar-only record and takes no seq, so a later "
+        "log(..., step=7) is seq 0. A bool, a float, a negative integer and anything else not an integer still "
+        "raise, before anything is recorded (scalar_log_refusals)", [],
+        {"scenarios": ["before_the_first_step", "eval_with_a_step_in_memory", "eval_before_the_first_step"],
+         "same_as_no_step": True, "scalar_only_records": [[7, 0]]}, ("capture",),
+        today={"capture": "TypeError: step=None is refused, as anything not an integer (lane AL-5's decision 1, "
+                          "read in capture.py at 0826958; the strict target "
+                          "test_step_none_is_the_same_as_leaving_step_out shows it)"})
+    setups = {"steps_in_memory": {"steps_before": 2, "flush_before": False, "step": 1},
+              "no_step_ever": {"steps_before": 0, "flush_before": False, "step": 0},
+              "no_step_since_a_flush": {"steps_before": 3, "flush_before": True, "step": 2}}
+    add("scalar_flush_writes_pending_records",
+        "session.log({\"eval/x\": 1.5}, step=N), then flush(), at every=4: the scalar-only record reaches the sink "
+        "before close(), and is written once, whether steps are in memory (it goes with their block) or none, no "
+        "step ever or none since the last flush (the owner, Nov 24; row S9). Section Q5's values with no step= are "
+        "not moved: after flush() with no step since they are still left out", [],
+        {"setups": setups, "written_before_close": 1, "written": 1}, ("capture",),
+        today={"capture": {"steps_in_memory": "written, with the block of steps 0 and 1 (read in capture.py at "
+                                              "0826958; pinned by test_flush_writes_the_pending_scalar_only_records)",
+                           "no_step_ever": "pending until the next block or close() (lane AL-5's decision 4, at "
+                                           "0826958; the strict target shows it)",
+                           "no_step_since_a_flush": "pending until the next block or close() (lane AL-5's decision 4, "
+                                                    "at 0826958; the strict target shows it)"}})
+    # The owner, Nov 24, on lane AL-1′'s decision 6 (row S13): a batch's min_step and max_step are its
+    # training rows' range; a batch of scalar-only rows alone carries what a batch with no steps does.
+    first = [rec("al_meta", s, grad_norm=1.0) for s in range(4)] + [scalar("al_meta", 500, 0, {"eval/loss": 1.0})]
+    then = [scalar("al_meta", 501, 1, {"eval/loss": 0.9}), scalar("al_meta", 502, 2, {"eval/loss": 0.8})]
+    add("scalar_batch_metadata_counts_training_rows",
+        "flight.FlightSender sends records, then the records appended after it closed, from its saved offset. The "
+        "first batch holds training steps 0 to 3 and a scalar-only record at step 500: its min_step and max_step are "
+        "the training rows' range, 0 and 3. The resumed stream opens with its batch that asks for the store, with no "
+        "steps; its next batch holds scalar-only rows alone, and carries the same min_step and max_step as that batch "
+        "with no steps (the owner, Nov 24; row S13)", first + then,
+        {"sent_first": len(first), "appended": len(then),
+         "batches": [{"rows": 5, "min_step": 0, "max_step": 3},
+                     {"rows": 0, "asks_for_the_store": True},
+                     {"rows": 2, "steps_as_the_batch_with_no_steps": True}]}, ("sender",),
+        today={"sender": "the scalar rows' steps are counted (lane AL-1′'s decision 6, read at 0826958): the first "
+                         "batch carries min_step 0 and max_step 500, the scalar-only batch 501 and 502; the strict "
+                         "target test_a_batch_s_min_and_max_step_count_its_training_rows_only shows it"})
     return cases
 
 
 def main() -> None:
+    from tensorquill import identity
+
+    if 2 in identity.SCHEMA_VERSIONS:
+        raise SystemExit("this tree's readers take the scalar-only record (step 2, 0826958): today would be step 2's, "
+                         "not the base's. cases.json is the file's from here on; change a case in it by hand, or run "
+                         "this on a tree before step 2 (up to a6c1e2c)")
     rust = find_binary() is not None
     if not rust:
         raise SystemExit("tensorquill-server is not built: the Rust reports need it (TENSORQUILL_SERVER_BIN)")
@@ -489,7 +554,8 @@ def main() -> None:
             "rust_raw = server_detect.server_report; rust_raw_v4 = tensorquill-server detect given protocol 4's rows "
             "(experiments/protocol-v5/flight_v4.py), as an older SDK sends them; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release "
             "server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; "
-            "mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
+            "mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; sender = flight.FlightSender's "
+            "batch metadata, as the repository's stand-in server (sdk/tests/flight_fake_server.py) records it; today = the base's readers.",
             "Sections 1 and 2: row is what record_to_row must give at row.step (typed columns as [name, value] pairs in stored order, "
             "non-finite floats as the sink's strings, null for a null column or a null struct; probe_json as text; extra as extra_json "
             "parsed, null for none), and row_to_record(record_to_row(r)) == r with the map's order kept. expect is today's engines on "
