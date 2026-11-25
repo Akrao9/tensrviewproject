@@ -24,6 +24,8 @@ from tensorquill import server_detect as sd
 CASES = json.loads((Path(__file__).parent / "fixtures" / "wave_al" / "cases.json").read_text(encoding="utf-8"))["cases"]
 SECTION_4 = {c["name"]: c for c in CASES if c["section"] == 4}
 WITH_SCALARS = [name for name, c in SECTION_4.items() if any(r.get("record") == "scalars" for r in c["records"])]
+# And training records too: a case of scalar-only records alone has nothing to judge (tested apart).
+MIXED = [name for name in WITH_SCALARS if any(r.get("record") != "scalars" for r in SECTION_4[name]["records"])]
 
 
 def _records(name: str = "scalar_record_keys") -> list[dict]:
@@ -153,10 +155,11 @@ def test_the_cross_rank_comparison_never_sends_a_scalar_only_record(monkeypatch)
 
 
 def test_a_report_of_only_scalar_only_records_has_nothing_to_judge(reads_version_2):
-    only = [r for r in _records() if r.get("record") == "scalars"]
-    for report in (sd.server_report, sd.server_run_report):
-        with pytest.raises(ValueError, match="no records to judge"):
-            report(only, binary="/nonexistent/tensorquill-server")
+    assert "scalar_seq_watermark_across_restart" not in MIXED
+    for only in ([r for r in _records() if r.get("record") == "scalars"], _records("scalar_seq_watermark_across_restart")):
+        for report in (sd.server_report, sd.server_run_report):
+            with pytest.raises(ValueError, match="no records to judge: every record given is a scalar-only record"):
+                report(only, binary="/nonexistent/tensorquill-server")
 
 
 # --- With the server binary: what the detectors report ------------------------------------------
@@ -173,7 +176,7 @@ needs_binary = pytest.mark.skipif(_binary() is None, reason="tensorquill-server 
 
 
 @needs_binary
-@pytest.mark.parametrize("name", WITH_SCALARS)
+@pytest.mark.parametrize("name", MIXED)
 def test_the_rust_detectors_report_what_the_training_records_alone_give(name, reads_version_2):
     pytest.importorskip("pyarrow")
     records = _records(name)
