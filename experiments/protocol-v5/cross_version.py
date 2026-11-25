@@ -25,6 +25,22 @@ Rows (each records what happened, with the exact messages, and what section 5 an
 4. The old `load_records` and `runs` on a store of protocol 5 parts.
 5. The old server restarted on a store that holds protocol 5 parts (the downgrade, Q9 a).
 
+Step 2's scalar-only records (section 4), added for the run on the joined tree:
+6. The new sender, with scalar-only records in its file, to the old server; then the new server in its
+   place: where the rows with a `seq` go, the offset, and the new `load_records` with and without
+   `scalars=True`.
+7. The old readers on that store, which holds `scalars-*` objects beside protocol 5 parts.
+8. The old `runs` on that store; 8b, the old `runs` and `load_records` on a new `.jsonl` holding a
+   scalar-only record (section 5's "such a file").
+9. The old sender to the new server, and the new `load_records` with and without `scalars=True` on what
+   it stored: a file of training records, and a file that also holds scalar-only records.
+10. A batch whose `min_step` and `max_step` are null: the new sender resumed with only scalar-only
+   lines left to send, to the old server, then to the new; and the old sender's own batch with no steps
+   (its resumed stream's first) to the old server, as the control.
+11. The downgrade with `scalars-*` objects: the old server restarted on row 6's store, given later training
+   steps of that rank by the old sender. If it read the object holding step 500 as a part, it would drop
+   them as not newer.
+
 The records: one rank, layers in a model's order, an `activation_spike` at step 35 and one at 85. The
 detectors give one incident whose `affected_steps` counts the spikes they read, so it says which
 parts' layers a server read: the old sender writes steps 0 to 59, the new one 60 to 119.
@@ -68,6 +84,21 @@ def records(run_id: str, steps: range) -> list[dict]:
     return out
 
 
+def scalar(run_id: str, step: int, seq: int, value: float) -> dict:
+    return {"schema_version": 2, "record": "scalars", "run_id": run_id, "rank": 0, "attempt": 1, "step": step,
+            "seq": seq, "ts": 1000.0 + seq, "scalars": {"eval/loss": value}}
+
+
+def with_scalars(run_id: str, steps: range, at: dict[int, list[tuple[int, int, float]]]) -> list[dict]:
+    """`records(run_id, steps)` with scalar-only records after the training record of each step in
+    `at`: `{after_step: [(step, seq, value), ...]}`."""
+    out = []
+    for record in records(run_id, steps):
+        out.append(record)
+        out.extend(scalar(run_id, s, q, v) for s, q, v in at.get(record["step"], []))
+    return out
+
+
 def append(path: Path, rows: list[dict]) -> None:
     with path.open("a") as handle:
         for row in rows:
@@ -106,13 +137,30 @@ def child(task: str, sdk: str, args: dict) -> None:
         out["offset"] = flight.read_offset(flight.offset_path(args["path"]))
     elif task == "load_records":
         try:
-            got = evidence.load_records(args["source"])
+            options = {k: args[k] for k in ("scalars", "all_attempts") if k in args}  # the old SDK has no scalars=
+            got = evidence.load_records(args["source"], **options)
             want = [json.loads(line) for line in Path(args["file"]).read_text().splitlines()] if args.get("file") else None
+            training = [r for r in got if r.get("record") != "scalars"]
             out["records"] = len(got)
-            out["steps_in_order"] = [r["step"] for r in got] == sorted(r["step"] for r in got)
+            out["scalar_only"] = len(got) - len(training)
+            out["steps_in_order"] = [r["step"] for r in training] == sorted(r["step"] for r in training)
             out["equal_to_file"] = None if want is None else got == want
+            if want is not None:
+                kept = [r for r in want if r.get("record") != "scalars"]
+                out["training_equal_to_file_s"] = training == kept
+                out["scalar_only_equal_to_file_s"] = (sorted((r for r in got if r.get("record") == "scalars"), key=lambda r: r["seq"])
+                                                      == sorted((r for r in want if r.get("record") == "scalars"), key=lambda r: r["seq"]))
         except Exception as error:  # noqa: BLE001
             out["raised"] = f"{type(error).__name__}: {error}"
+    elif task == "send_count":
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sender = flight.FlightSender(args["path"], args["endpoint"], args["run_id"], 0)
+            out["confirmed"] = sender.close(timeout=args["timeout"])
+        out["skipped_lines"] = getattr(sender, "skipped_lines", None)
+        out["last_error"] = None if sender.last_error is None else f"{type(sender.last_error).__name__}: {sender.last_error}"
+        out["offset"] = flight.read_offset(flight.offset_path(args["path"]))
+        out["warnings"] = [f"{w.category.__name__}: {w.message}" for w in caught]
     elif task == "evidence":
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -138,7 +186,8 @@ class Context:
         self.new_binary = str(args.new_binary.resolve())
         self.tmp = tmp
         self.hide = [(str(tmp), "<tmp>"), (str(tmp.resolve()), "<tmp>"), (str(args.old_checkout.resolve()), "<old>"),
-                     (str(ROOT), "<new>"), (str(Path.home()), "~")]
+                     (str(ROOT), "<new>"), (self.new_binary, "<new-binary>"), (self.old_binary, "<old-binary>"),
+                     (str(Path.home()), "~")]
 
     def clean(self, value):
         """Every path in a message, as a name: no local path is written to the results."""
@@ -220,8 +269,68 @@ def parts(store: Path, run_id: str) -> list[dict]:
         steps = pq.read_table(path, columns=["step"]).column(0).to_pylist()
         rows = pq.read_table(path, columns=["schema_version"]).column(0).to_pylist()
         out.append({"part": path.name, "layout": "protocol 5" if "layers" in names else "protocol 4",
-                    "steps": [min(steps), max(steps)], "row_versions": sorted(set(rows))})
+                    "steps": [min(steps), max(steps)], "row_versions": sorted(set(rows)), "rows": len(steps),
+                    **({"step_list": steps} if len(steps) <= 64 else {})})
     return out
+
+
+def scalar_objects(store: Path, run_id: str) -> list[dict]:
+    import pyarrow.parquet as pq
+
+    out = []
+    for path in sorted((store / "runs" / run_id).rglob("scalars-*.parquet")):
+        seq = pq.read_table(path, columns=["seq"]).column(0).to_pylist()
+        steps = pq.read_table(path, columns=["step"]).column(0).to_pylist()
+        out.append({"object": str(path.relative_to(store / "runs" / run_id)), "rows": len(seq), "seq": [min(seq), max(seq)],
+                    "steps": steps})
+    return out
+
+
+def runs_json(ctx: "Context", sdk: str, target: Path) -> dict:
+    done = subprocess.run([ctx.python, "-m", "tensorquill", "runs", str(target), "--json"], capture_output=True, text=True,
+                          timeout=120, env=ctx.env(sdk), cwd=ctx.tmp)
+    try:
+        listed = json.loads(done.stdout)
+    except ValueError:
+        listed = done.stdout[-1500:]
+    return {"exit": done.returncode, "listed": listed, "stderr": [line for line in done.stderr.splitlines() if line.strip()]}
+
+
+def swap(ctx: "Context", run_id: str, path: Path, store: Path, port: int, last_step: int) -> dict:
+    """The new sender started against the old server on `store`, refused; then the new server in its
+    place on the same store and port, and the same sender finishes (row 1's method)."""
+    entry: dict = {}
+    lines_before = path.read_text().count("\n")
+    parts_before = parts(store, run_id)
+    old = Server(ctx.old_binary, store, port)
+    go = ctx.tmp / f"go-{run_id}"
+    proc = subprocess.Popen([ctx.python, __file__, "--child", "sender_swap", "--sdk", ctx.new_sdk, "--args",
+                             json.dumps({"path": str(path), "endpoint": old.endpoint, "run_id": run_id,
+                                         "backoff_cap": 2.0, "go": str(go), "timeout": 90})],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ctx.env(ctx.new_sdk), cwd=ctx.tmp)
+    refused = json.loads(proc.stdout.readline())
+    entry["old_server"] = {"ready": old.ready, "sender": refused, "parts_before": parts_before,
+                           "parts_after": parts(store, run_id), "scalar_objects_after": scalar_objects(store, run_id),
+                           "lines_in_file": path.read_text().count("\n"), "lines_before": lines_before}
+    entry["old_server"]["stderr"] = old.close()
+    new = Server(ctx.new_binary, store, port)
+    go.write_text("go")
+    stdout, stderr = proc.communicate(timeout=180)
+    entry["new_server"] = {"ready": new.ready, "sender": json.loads(stdout.strip().splitlines()[-1])}
+    stderr_lines = [line for line in stderr.splitlines() if line.strip()]
+    entry["sender_stderr"] = stderr_lines
+    entry["older_message_said"] = says(stderr_lines, "speaks an older protocol")
+    entry["new_server"]["report"] = report_through(store, run_id, last_step)
+    entry["new_server"]["stderr"] = new.close()
+    entry["new_server"]["parts"] = parts(store, run_id)
+    entry["new_server"]["scalar_objects"] = scalar_objects(store, run_id)
+    try:
+        entry["new_server"]["watchdog_rank0"] = next(
+            (r for r in json.loads((store / "runs" / run_id / "watchdog.json").read_text()).get("ranks", [])
+             if r.get("rank") == 0), None)
+    except (OSError, ValueError) as error:
+        entry["new_server"]["watchdog_rank0"] = f"unreadable: {error}"
+    return entry
 
 
 def report_through(store: Path, run_id: str, last_step: int, seconds: float = 30) -> dict | None:
@@ -387,6 +496,121 @@ def row_5(ctx: Context) -> dict:
     return out
 
 
+def row_6(ctx: Context) -> dict:
+    """The new sender with scalar-only records to the old server, then the new server in its place."""
+    run_id, store, port = "xv-scal", ctx.tmp / "store-6", free_port()
+    path = ctx.tmp / f"{run_id}.rank0.jsonl"
+    append(path, with_scalars(run_id, range(0, 40), {9: [(500, 0, 1.5)], 19: [(19, 1, 1.4)], 39: [(39, 2, 1.3)]}))
+    out = swap(ctx, run_id, path, store, port, 39)
+    source = str(store / "runs" / run_id)
+    out["new_load_records"] = ctx.child("load_records", ctx.new_sdk, source=source, file=str(path))
+    out["new_load_records_scalars"] = ctx.child("load_records", ctx.new_sdk, source=source, file=str(path), scalars=True)
+    return out
+
+
+def row_7(ctx: Context) -> dict:
+    """The old readers on row 6's store: `scalars-*` objects beside protocol 5 parts."""
+    store, run_id = ctx.tmp / "store-6", "xv-scal"
+    objects = sorted((store / "runs" / run_id).rglob("scalars-*.parquet"))
+    out = {"parts": parts(store, run_id), "scalar_objects": scalar_objects(store, run_id),
+           "old_load_records": ctx.child("load_records", ctx.old_sdk, source=str(store / "runs" / run_id)),
+           "old_load_records_of_a_scalars_object": (ctx.child("load_records", ctx.old_sdk, source=str(objects[0]))
+                                                    if objects else "no scalars-* object")}
+    cwd = ctx.tmp / "cli-old-one-read-6"
+    cwd.mkdir()
+    out["old_one_read"] = ctx.cli(ctx.old_sdk, ctx.old_binary, [str(store / "runs" / run_id), "--detectors", "python"], cwd)
+    return out
+
+
+def row_8(ctx: Context) -> dict:
+    """The old `runs` on row 6's store (with the new `runs` as the control); 8b, on a folder holding
+    row 6's `.jsonl` (with scalar-only records), and the old `load_records` on that file."""
+    store = ctx.tmp / "store-6"
+    out = {"old_runs": runs_json(ctx, ctx.old_sdk, store), "new_runs_control": runs_json(ctx, ctx.new_sdk, store)}
+    folder = ctx.tmp / "folder-8b"
+    folder.mkdir()
+    (folder / "xv-scal.rank0.jsonl").write_text((ctx.tmp / "xv-scal.rank0.jsonl").read_text())
+    out["8b"] = {"old_runs": runs_json(ctx, ctx.old_sdk, folder), "new_runs_control": runs_json(ctx, ctx.new_sdk, folder),
+                 "old_load_records": ctx.child("load_records", ctx.old_sdk, source=str(folder / "xv-scal.rank0.jsonl")),
+                 "new_load_records": ctx.child("load_records", ctx.new_sdk, source=str(folder / "xv-scal.rank0.jsonl"),
+                                               file=str(folder / "xv-scal.rank0.jsonl"))}
+    return out
+
+
+def row_9(ctx: Context) -> dict:
+    """The old sender to the new server; the new `load_records` with and without `scalars=True` on the
+    store. (a) a file of training records; (b) one that also holds scalar-only records."""
+    out = {}
+    for case, rows in (("a_training_only", records("xv-old-a", range(0, 30))),
+                       ("b_with_scalar_only", with_scalars("xv-old-b", range(0, 30), {9: [(500, 0, 1.5)], 29: [(29, 1, 1.3)]}))):
+        run_id = rows[0]["run_id"]
+        store, port = ctx.tmp / f"store-9-{case}", free_port()
+        path = ctx.tmp / f"{run_id}.rank0.jsonl"
+        append(path, rows)
+        server = Server(ctx.new_binary, store, port)
+        entry = {"lines": len(rows), "old_sender": ctx.child("send_count", ctx.old_sdk, path=str(path),
+                                                            endpoint=server.endpoint, run_id=run_id, timeout=30)}
+        entry["report"] = report_through(store, run_id, 500 if case.startswith("b") else 29, seconds=10)
+        entry["server_stderr"] = server.close()
+        entry["parts"] = parts(store, run_id)
+        entry["scalar_objects"] = scalar_objects(store, run_id)
+        source = str(store / "runs" / run_id)
+        entry["new_load_records"] = ctx.child("load_records", ctx.new_sdk, source=source, file=str(path))
+        entry["new_load_records_scalars"] = ctx.child("load_records", ctx.new_sdk, source=source, file=str(path), scalars=True)
+        out[case] = entry
+    return out
+
+
+def row_10(ctx: Context) -> dict:
+    """A batch whose `min_step` and `max_step` are null. (a) The new sender's saved offset is bound to a
+    new server's store holding steps 0 to 19; only scalar-only lines are appended, so its resumed stream
+    is the batch with no steps that asks for the store, then a batch of scalar-only rows alone: to the old
+    server, then the new in its place. (b) The control: the old sender resumed against the old server,
+    whose stream opens with its own batch with no steps (metadata 1)."""
+    run_id, store, port = "xv-null", ctx.tmp / "store-10", free_port()
+    path = ctx.tmp / f"{run_id}.rank0.jsonl"
+    append(path, records(run_id, range(0, 20)))
+    server = Server(ctx.new_binary, store, port)
+    out: dict = {"a": {"before": ctx.child("send_file", ctx.new_sdk, path=str(path), endpoint=server.endpoint,
+                                           run_id=run_id, timeout=30)}}
+    out["a"]["before"]["report"] = report_through(store, run_id, 19)
+    server.close()
+    append(path, [scalar(run_id, 19, 0, 1.4), scalar(run_id, 500, 1, 1.5)])
+    out["a"].update(swap(ctx, run_id, path, store, port, 19))
+    run_id, store, port = "xv-null-old", ctx.tmp / "store-10-old", free_port()
+    path = ctx.tmp / f"{run_id}.rank0.jsonl"
+    append(path, records(run_id, range(0, 20)))
+    server = Server(ctx.old_binary, store, port)
+    out["b"] = {"first": ctx.child("send_count", ctx.old_sdk, path=str(path), endpoint=server.endpoint, run_id=run_id, timeout=30)}
+    append(path, records(run_id, range(20, 40)))
+    out["b"]["resumed"] = ctx.child("send_count", ctx.old_sdk, path=str(path), endpoint=server.endpoint, run_id=run_id, timeout=30)
+    out["b"]["report"] = report_through(store, run_id, 39)
+    out["b"]["server_stderr"] = server.close()
+    out["b"]["parts"] = parts(store, run_id)
+    out["b"]["file_bytes"] = path.stat().st_size
+    return out
+
+
+def row_11(ctx: Context) -> dict:
+    """The old server restarted on row 6's store (a protocol 5 part of steps 0 to 39 and a scalars-*
+    object holding steps 500, 19 and 39); the old sender sends steps 40 to 59 of the same rank from a file
+    of its own."""
+    run_id, store, port = "xv-scal", ctx.tmp / "store-6", free_port()
+    folder = ctx.tmp / "folder-11"
+    folder.mkdir()
+    path = folder / f"{run_id}.rank0.jsonl"
+    append(path, records(run_id, range(40, 60)))
+    out: dict = {"parts_before": parts(store, run_id), "scalar_objects_before": scalar_objects(store, run_id)}
+    server = Server(ctx.old_binary, store, port)
+    out["ready"] = server.ready
+    out["old_sender"] = ctx.child("send_count", ctx.old_sdk, path=str(path), endpoint=server.endpoint, run_id=run_id, timeout=30)
+    out["report"] = report_through(store, run_id, 59)
+    out["server_stderr"] = server.close()
+    out["parts_after"] = parts(store, run_id)
+    out["scalar_objects_after"] = scalar_objects(store, run_id)
+    return out
+
+
 # --- checks against section 5 and the README -------------------------------------------------------
 
 
@@ -460,8 +684,9 @@ def checks(r: dict) -> list[dict]:
           "part-" in raised and "row" in raised, raised or "did not raise")
     listed = [row for row in (e["old_runs"] if isinstance(e["old_runs"], list) else []) if isinstance(row, dict)]
     run = next((row for row in listed if row.get("run_id") == "xv-fresh"), None)
-    claim("4", "the old runs lists it as a run with no evidence",
-          run is not None and not run.get("incidents") and run.get("run_state") is None, json.dumps(listed)[:900])
+    claim("4", "the old runs lists the run with the protocol 5 server's own report (corrected Nov 24)",
+          run is not None and run.get("run_state") == "unhealthy" and run.get("last_step") == 39
+          and (run.get("first_incident") or {}).get("kind") == "activation_spike", json.dumps(listed)[:900])
     read = e["old_one_read"]
     claim("4", "the old one read of the store's run refuses it, naming the part and the row",
           read["exit"] not in (0, None) and any("part-" in line and "row" in line for line in read["stderr"]), str(read))
@@ -471,6 +696,114 @@ def checks(r: dict) -> list[dict]:
     claim("5", "their steps have no layers to it: the spike in a protocol 5 part is not judged, the one in a protocol 4 part is",
           bool(e["report"]) and ("activation_spike", 35, 1) in [tuple(i) for i in e["report"]["incidents"]],
           str(e["report"]))
+    out.extend(checks_step_2(r))
+    return out
+
+
+def checks_step_2(r: dict) -> list[dict]:
+    out = []
+
+    def claim(row: str, text: str, holds: bool, seen: str) -> None:
+        out.append({"row": row, "claim": text, "holds": bool(holds), "seen": seen})
+
+    def listed(entry: dict, run_id: str) -> dict | None:
+        rows = entry["listed"] if isinstance(entry["listed"], list) else []
+        return next((x for x in rows if isinstance(x, dict) and x.get("run_id") == run_id), None)
+
+    e = r["row_6"]
+    o, n = e["old_server"], e["new_server"]
+    claim("6", "the old server refuses the new sender's stream on its metadata version, before any row: nothing stored",
+          not o["parts_after"] and not o["scalar_objects_after"]
+          and any("schema_version 2 is not supported" in line for line in o["stderr"]), " | ".join(o["stderr"]))
+    claim("6", "nothing acknowledged, the lines kept, OlderServer said once",
+          o["sender"]["offset_file"] == 0 and o["lines_in_file"] == o["lines_before"] == 43
+          and o["sender"]["last_error_type"] == "OlderServer" and e["older_message_said"] == 1,
+          f"offset {o['sender']['offset_file']}; {o['lines_in_file']} lines; {o['sender']['last_error_type']}; "
+          f"said {e['older_message_said']} time(s)")
+    claim("6", "with the new server in its place: confirmed; the training rows alone in part-* files (steps 0 to 39)",
+          n["sender"].get("confirmed") is True and n["parts"] and all(p["layout"] == "protocol 5" for p in n["parts"])
+          and min(p["steps"][0] for p in n["parts"]) == 0 and max(p["steps"][1] for p in n["parts"]) == 39,
+          f"confirmed {n['sender'].get('confirmed')}; parts {n['parts']}")
+    claim("6", "the rows with a seq only in scalars-* objects, each once (seq 0 to 2)",
+          sum(x["rows"] for x in n["scalar_objects"]) == 3
+          and sorted(q for x in n["scalar_objects"] for q in range(x["seq"][0], x["seq"][1] + 1)) == [0, 1, 2],
+          str(n["scalar_objects"]))
+    claim("6", "a scalar-only row never moves the rank's last step (the report's last step is 39, not 500)",
+          bool(n["report"]) and n["report"]["last_step"] == 39, str(n["report"]))
+    d, s_ = e["new_load_records"], e["new_load_records_scalars"]
+    claim("6", "the new load_records gives the training records alone by default",
+          d.get("scalar_only") == 0 and d.get("training_equal_to_file_s") is True, str({k: v for k, v in d.items() if k != "stderr"}))
+    claim("6", "with scalars=True it also reads the scalars-* objects: every scalar-only record of the file",
+          s_.get("scalar_only") == 3 and s_.get("training_equal_to_file_s") is True and s_.get("scalar_only_equal_to_file_s") is True,
+          str({k: v for k, v in s_.items() if k != "stderr"}))
+    e = r["row_7"]
+    raised = e["old_load_records"].get("raised") or ""
+    claim("7", "the old load_records refuses the store, naming the part and the row (protocol 5 parts)",
+          "part-" in raised and "row" in raised, raised or "did not raise")
+    read = e["old_one_read"]
+    claim("7", "the old one read of the run refuses it, naming the part and the row",
+          read["exit"] not in (0, None) and any("part-" in line and "row" in line for line in read["stderr"]), str(read))
+    e = r["row_8"]
+    old, new = listed(e["old_runs"], "xv-scal"), listed(e["new_runs_control"], "xv-scal")
+    keys = ("run_state", "last_step", "incidents", "first_incident")
+    claim("8", "the old runs lists the store's run from the protocol 5 server's report, as the new runs does (last step 39)",
+          old is not None and new is not None and all(old.get(k) == new.get(k) for k in keys) and old.get("last_step") == 39,
+          f"old {json.dumps({k: (old or {}).get(k) for k in keys})}; new {json.dumps({k: (new or {}).get(k) for k in keys})}")
+    b = e["8b"]
+    raised = b["old_load_records"].get("raised") or ""
+    claim("8b", "the old load_records refuses a new .jsonl holding a scalar-only record, naming the line",
+          "schema_version" in raised and "line" in raised, raised or "did not raise")
+    old = listed(b["old_runs"], "xv-scal")
+    claim("8b", "the old runs lists such a file as a run with no evidence",
+          old is not None and not old.get("incidents") and old.get("run_state") is None, json.dumps(old)[:900])
+    for case in ("a_training_only", "b_with_scalar_only"):
+        e = r["row_9"][case]
+        d, s_ = e["new_load_records"], e["new_load_records_scalars"]
+        if case == "a_training_only":
+            claim("9 a", "the old sender's store: confirmed, protocol 4 parts, no scalars-* object",
+                  e["old_sender"].get("confirmed") is True and {p["layout"] for p in e["parts"]} == {"protocol 4"}
+                  and not e["scalar_objects"], f"{e['old_sender']}; {e['parts']}; {e['scalar_objects']}")
+            claim("9 a", "the new load_records reads it as the file, with and without scalars=True",
+                  d.get("equal_to_file") is True and s_.get("equal_to_file") is True,
+                  f"default {d.get('equal_to_file')}, scalars=True {s_.get('equal_to_file')}")
+        else:
+            claim("9 b", "the new load_records reads what the old sender stored from a file with scalar-only records, "
+                  "with and without scalars=True, without raising (protocol 5 readers take protocol 4 parts)",
+                  "raised" not in d and "raised" not in s_ and d.get("training_equal_to_file_s") is True,
+                  f"old sender {json.dumps({k: v for k, v in e['old_sender'].items() if k != 'stderr'})}; parts {e['parts']}; "
+                  f"objects {e['scalar_objects']}; default {json.dumps({k: v for k, v in d.items() if k != 'stderr'})}; "
+                  f"scalars=True {json.dumps({k: v for k, v in s_.items() if k != 'stderr'})}")
+    e = r["row_10"]["a"]
+    o, n = e["old_server"], e["new_server"]
+    claim("10 a", "the old server refuses the resumed stream's first batch, the one with no steps (null min_step and "
+          "max_step), on its metadata version: nothing acknowledged",
+          any("received 1 batches, 0 rows" in line and "schema_version 2 is not supported" in line for line in o["stderr"])
+          and o["sender"]["offset_file"] == e["before"]["offset"] and o["parts_after"] == o["parts_before"]
+          and not o["scalar_objects_after"], f"{' | '.join(o['stderr'])}; offset {o['sender']['offset_file']}")
+    claim("10 a", "the new server in its place takes the batch of scalar-only rows alone: confirmed, one scalars-* object "
+          "of 2 rows, no new part, the last step still 19",
+          n["sender"].get("confirmed") is True and sum(x["rows"] for x in n["scalar_objects"]) == 2
+          and n["parts"] == o["parts_before"] and bool(n["report"]) and n["report"]["last_step"] == 19
+          and isinstance(n["watchdog_rank0"], dict) and n["watchdog_rank0"].get("last_step") != 500,
+          f"confirmed {n['sender'].get('confirmed')}; objects {n['scalar_objects']}; parts {n['parts']}; report {n['report']}; "
+          f"watchdog.json rank 0 {n['watchdog_rank0']}")
+    b = r["row_10"]["b"]
+    claim("10 b", "the old server takes the old sender's batch with no steps (metadata 1, null min_step and max_step): "
+          "the resumed stream is confirmed and every byte acknowledged",
+          b["resumed"].get("confirmed") is True and b["resumed"].get("offset") == b["file_bytes"]
+          and bool(b["report"]) and b["report"]["last_step"] == 39,
+          f"{json.dumps({k: v for k, v in b['resumed'].items() if k != 'stderr'})}; file {b['file_bytes']} bytes; report {b['report']}")
+    e = r["row_11"]
+    claim("11", "the old server restarted on a store with scalars-* objects does not list them: the rank's later "
+          "training steps (40 to 59) are stored and judged, not dropped as below step 500",
+          e["old_sender"].get("confirmed") is True and bool(e["report"]) and e["report"]["last_step"] == 59
+          and any(p["steps"] == [40, 59] for p in e["parts_after"]),
+          f"sender {json.dumps({k: v for k, v in e['old_sender'].items() if k != 'stderr'})}; report {e['report']}; "
+          f"parts {e['parts_after']}")
+    claim("11", "it says nothing about them, and leaves them as they were",
+          not any("scalars" in line or "seq" in line for line in e["server_stderr"])
+          and e["scalar_objects_after"] == e["scalar_objects_before"],
+          f"{e['server_stderr']}; objects {e['scalar_objects_after']}")
     return out
 
 
@@ -498,7 +831,9 @@ def main() -> None:
         ctx = Context(args, Path(tmp))
         result: dict = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "old_commit": commit, "new_commit": new_commit,
                         "old_protocol": 4, "new_protocol": 5}
-        for name, row in (("row_1", row_1), ("row_2", row_2), ("row_3", row_3), ("row_4", row_4), ("row_5", row_5)):
+        for name, row in (("row_1", row_1), ("row_2", row_2), ("row_3", row_3), ("row_4", row_4), ("row_5", row_5),
+                          ("row_6", row_6), ("row_7", row_7), ("row_8", row_8), ("row_9", row_9), ("row_10", row_10),
+                          ("row_11", row_11)):
             started = time.monotonic()
             result[name] = row(ctx)
             print(f"{name} done in {time.monotonic() - started:.0f} s", file=sys.stderr, flush=True)
