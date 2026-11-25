@@ -2857,7 +2857,7 @@ class Session:
         Always run eagerly: inside a compiled function it is one graph break, and neither the step, nor
         `seq`, nor the pending list is a guard, so a new step on every call compiles nothing again
         (without it each call recompiled, until Dynamo's limit). Under `fullgraph=True` it cannot be
-        traced, a stated limit: the clock and the counter are read on the host."""
+        traced, a stated limit: Dynamo raises its `Unsupported` there, before anything is recorded."""
         step = _explicit_step(step)
         converted = self._scalar_values(values)
         if not converted:
