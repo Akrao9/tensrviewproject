@@ -253,7 +253,7 @@ def test_the_store_s_scalar_only_records_read_back_exactly(tmp_path):
     assert _read(flight.scalar_objects(run)) == [*made["rank0"], *made["rank1"]]
 
 
-def test_a_scalars_object_s_rows_come_back_as_row_to_record_gives_them_and_the_check_is_the_caller_s(tmp_path):
+def test_a_scalars_object_s_rows_come_back_as_row_to_record_gives_them_and_the_check_is_the_caller_s(tmp_path, reads_version_2):
     """`read_scalar_object` is rows through `row_to_record` only: a row whose identity is not valid comes back
     as it is, for the caller to check and name (`identity.check` with `in_part`), as for a part."""
     run, _ = _store(tmp_path)
