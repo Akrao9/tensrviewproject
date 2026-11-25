@@ -142,7 +142,8 @@ def test_every_section_4_record_comes_back_through_record_to_row(case, reads_ver
 def test_a_step_row_has_a_null_seq_and_a_stray_seq_or_record_key_travels_in_extra_json():
     step = next(r for r in KEYS["records"] if not _is_scalar(r))
     assert flight._row(copy.deepcopy(step))["seq"] is None
-    for stray in ({"seq": 3}, {"record": "other", "seq": 3}, {"seq": 3, "schema_version": 2}):
+    for stray in ({"seq": 3}, {"record": "other", "seq": 3}, {"seq": 3, "schema_version": 2}, {"record": "scalars"},
+                  {"record": "scalars", "seq": 3}):
         record = {**step, **stray}
         row = flight._row(copy.deepcopy(record))
         assert row["seq"] is None, stray
@@ -174,8 +175,25 @@ def test_a_scalar_only_record_whose_seq_the_column_cannot_hold_is_not_made_a_ste
     missing = {k: v for k, v in _scalar_record().items() if k != "seq"}
     with pytest.raises(identity.MalformedRecordError):
         flight._row(missing)
-    with pytest.raises(identity.MalformedRecordError):  # the record's mark, whatever its version
-        flight._row({**missing, "schema_version": 1})
+
+
+@pytest.mark.parametrize("extra", [{}, {"seq": 3}, {"seq": -1}], ids=repr)
+def test_a_version_1_record_marked_scalars_is_a_step_record_whose_record_key_travels_as_any_unknown_key(extra):
+    """One rule for what a scalar-only record is: `identity.is_scalar_record` (`schema_version` the integer 2
+    and `"record": "scalars"`), which `identity.check`, every reader and `flight` ask. A version 1 record that
+    carries the mark is an ordinary step record: its `record` (and any `seq`) travel in `extra_json`, its
+    `seq` column is null, and the Rust paths are sent it as a training record."""
+    from tensorquill import server_detect
+
+    step = next(r for r in KEYS["records"] if not _is_scalar(r))
+    record = {**copy.deepcopy(step), "record": "scalars", **extra}
+    assert not identity.is_scalar_record(record)
+    row = flight.record_to_row(copy.deepcopy(record))  # identity.check takes a version 1 record
+    assert row["seq"] is None and (row["schema_version"], row["record_version"]) == (2, 1)
+    assert json.loads(row["extra_json"]) == {"record": "scalars", **extra}
+    assert flight.row_to_record(row) == record
+    assert server_detect.stream_order([record]) == [record]
+    assert not hasattr(flight, "scalar_only")  # the rule is identity's, asked by name
 
 
 def test_the_sender_skips_and_names_a_scalar_only_line_whose_seq_cannot_be_stored():
