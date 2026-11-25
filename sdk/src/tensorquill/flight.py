@@ -737,6 +737,65 @@ _MAP_COLUMNS = frozenset(
 )
 
 
+# --- A store's scalar-only records: its `scalars-*` objects ---------------------------------
+#
+# A server stores the rows whose `seq` is not null apart from its parts, as
+# `rank=<r>/attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet` (`WAVE_AL_CONTRACT.md` section 4.5),
+# never as `part-*`, so the readers that list parts never list them. These are read beside the parts.
+_SCALARS_NAME = re.compile(r"scalars-([0-9]+)-([0-9]+)\.parquet")
+_RANK_FOLDER = re.compile(r"rank=([0-9]+)")
+_ATTEMPT_FOLDER = re.compile(r"attempt=(-?[0-9]+)")
+
+
+def scalar_objects(directory: str | Path, rank: int | None = None) -> list[Path]:
+    """The `scalars-*` objects under `directory` (a run's `runs/<run_id>` folder, a `rank=<r>` folder or an
+    `attempt=<a>` folder), ordered by rank, attempt number and first `seq`, then by name for a name that
+    does not parse. With `rank`, the objects in another rank's `rank=<n>` folder are left out. A path that
+    is not a folder holds none."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+
+    def order(path: Path) -> tuple[int, int, int, str]:
+        rank_of, attempt = 0, 0
+        for folder in path.relative_to(directory.parent).parts[:-1]:
+            if found := _RANK_FOLDER.fullmatch(folder):
+                rank_of = int(found.group(1))
+            elif found := _ATTEMPT_FOLDER.fullmatch(folder):
+                attempt = int(found.group(1))
+        named = _SCALARS_NAME.fullmatch(path.name)
+        return rank_of, attempt, int(named.group(1)) if named else 2**63, path.name
+
+    def other_rank(path: Path) -> bool:
+        return rank is not None and any(
+            (found := _RANK_FOLDER.fullmatch(folder)) and int(found.group(1)) != rank
+            for folder in path.relative_to(directory.parent).parts[:-1])
+
+    return sorted((p for p in directory.rglob("scalars-*.parquet") if p.is_file() and not other_rank(p)), key=order)
+
+
+def load_scalar_records(directory: str | Path, rank: int | None = None) -> list[dict[str, Any]]:
+    """The scalar-only records a store holds under `directory`, read from its `scalars-*` objects
+    (`scalar_objects`) through `row_to_record`, in their order, each row's identity checked
+    (`identity.check`, naming the object and its row). With `rank`, that rank's records only. Needs
+    `pyarrow`. `evidence.load_records` reads these beside the store's parts."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise ImportError("reading Parquet parts needs pyarrow: pip install pyarrow") from error
+    from .identity import in_part
+
+    records: list[dict[str, Any]] = []
+    for path in scalar_objects(directory, rank):
+        # `partitioning=None`: the object's own columns only, not `rank=` and `attempt=` from its folders.
+        for number, row in enumerate(pq.read_table(path, partitioning=None).to_pylist()):
+            record = row_to_record(row)
+            check(record, in_part(path, number))
+            if rank is None or record.get("rank", 0) == rank:
+                records.append(record)
+    return records
+
+
 # --- The local file and its offset ----------------------------------------------------
 
 
