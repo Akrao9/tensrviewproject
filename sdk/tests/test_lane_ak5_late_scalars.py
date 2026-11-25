@@ -254,17 +254,14 @@ def test_step_as_a_keyword_writes_a_scalar_only_record_and_a_step_key_is_a_scala
 def test_the_package_passes_step_to_session_log_only_where_wave_al_put_it():
     """Searched when `step=` was refused (wave AK): no example, test or page passed it to `session.log`.
     Since wave AL two places in the package name the call: the Hugging Face callback's own, with no
-    step in memory, and the left-out warning's text, which shows it. No example or page passes it."""
+    step in memory, and the left-out warning's text, which shows it. No example passes it. The pages
+    (`README.md` and the guides) are not searched now: since wave AL they are meant to show the call."""
     import re
 
     # A call with a value for `step` (the refusal's own words, `step=...)`, are not a call).
     call = re.compile(r"session\.log\([^)]*\bstep\s*=\s*(?!\.\.\.)")
     found = []
-    for path in list((SDK / "examples").rglob("*.py")) + list((SDK / "src").rglob("*.py")) + [
-        SDK / "README.md", SDK / "RUN_ON_YOUR_JOB.md", SDK / "AGENT_INSTRUCTIONS.md",
-    ]:
-        if not path.exists():
-            continue
+    for path in list((SDK / "examples").rglob("*.py")) + list((SDK / "src").rglob("*.py")):
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if call.search(line):
                 found.append((path.name, line.strip()))

@@ -520,3 +520,27 @@ def test_step_inside_a_compiled_function_is_one_graph_break_that_never_recompile
     assert [(r["step"], r["seq"]) for r in records] == [(100 + i, i) for i in range(12)]
     assert [r["scalars"]["eval/x"] for r in records] == pytest.approx(expected)
     assert frames == settled <= 3  # eight more calls, eight more steps: nothing compiled again
+
+
+def test_step_inside_a_fullgraph_compiled_function_is_refused_by_dynamo_and_records_nothing():
+    """The stated limit: under `torch.compile(fullgraph=True)` the eager record cannot be traced, and
+    Dynamo raises its own `Unsupported` (on torch 2.6 and 2.15 alike) before anything is recorded.
+    The session is unharmed: the same call made eagerly afterwards is recorded with `seq` 0."""
+    torch._dynamo.reset()
+    model = nn.Linear(4, 1)
+    sink = MemorySink()
+    session = tensorquill.init(model, sink=sink, every=4, run_id="al5_fullgraph", heartbeat_seconds=None,
+                               stack_seconds=None)
+
+    def evaluate(x):
+        value = model(x).pow(2).mean()
+        session.log({"eval/x": value}, step=7)
+        return value
+
+    with pytest.raises(torch._dynamo.exc.Unsupported):
+        torch.compile(evaluate, backend="eager", fullgraph=True)(torch.randn(2, 4))
+    assert session._scalar_records == []
+    evaluate(torch.randn(2, 4))
+    session.close()
+    torch._dynamo.reset()
+    assert [(r["step"], r["seq"]) for r in sink.records if r.get("record") == "scalars"] == [(7, 0)]
