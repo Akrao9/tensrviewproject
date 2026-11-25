@@ -28,8 +28,8 @@ SECTION_4 = [c for c in CASES if c["section"] == 4]
 KEYS = next(c for c in SECTION_4 if c["name"] == "scalar_record_keys")
 JOINED = ("the joined tree: identity.check takes record version 2 with lane AL-4''s change to identity.py "
           "(contract section 4.6), not in this lane's tree")
-JOINED_LOADER = ("the joined tree: evidence.load_records (lane AL-4''s file) reads a store's scalars-* objects "
-                 "through flight.load_scalar_records")
+JOINED_LOADER = ("the merge: the coordinator adds to evidence.load_records the one call that reads a store's "
+                 "scalars-* objects (flight.scalar_objects) beside its parts")
 
 
 def _scalar_record() -> dict:
@@ -242,21 +242,53 @@ def test_the_store_s_scalars_objects_are_listed_by_rank_attempt_and_first_seq(tm
     assert flight.scalar_objects(run / "rank=0" / "attempt=1" / "part-00000000-00000005.parquet") == []
 
 
-def test_the_store_s_scalar_only_records_read_back_exactly(tmp_path, reads_version_2):
+def _read(objects: list[Path]) -> list[dict]:
+    return [record for path in objects for record in flight.read_scalar_object(path)]
+
+
+def test_the_store_s_scalar_only_records_read_back_exactly(tmp_path):
     run, made = _store(tmp_path)
-    assert flight.load_scalar_records(run, rank=0) == made["rank0"]
-    assert flight.load_scalar_records(run, rank=1) == made["rank1"]
-    assert flight.load_scalar_records(run) == [*made["rank0"], *made["rank1"]]
+    assert _read(flight.scalar_objects(run, rank=0)) == made["rank0"]
+    assert _read(flight.scalar_objects(run, rank=1)) == made["rank1"]
+    assert _read(flight.scalar_objects(run)) == [*made["rank0"], *made["rank1"]]
 
 
-def test_a_scalars_object_is_read_with_its_rows_checked(tmp_path, reads_version_2):
+def test_a_scalars_object_s_rows_come_back_as_row_to_record_gives_them_and_the_check_is_the_caller_s(tmp_path):
+    """`read_scalar_object` is rows through `row_to_record` only: a row whose identity is not valid comes back
+    as it is, for the caller to check and name (`identity.check` with `in_part`), as for a part."""
     run, _ = _store(tmp_path)
     [path] = flight.scalar_objects(run, rank=1)
-    _write(path, [{**_scalar_record(), "rank": 1, "attempt": -4}])
+    bad = {**_scalar_record(), "rank": 1, "attempt": -4}
+    _write(path, [bad])
+    assert flight.read_scalar_object(path) == [bad]
     with pytest.raises(identity.MalformedRecordError) as raised:
-        flight.load_scalar_records(run, rank=1)
+        identity.check(bad, identity.in_part(path, 0))
     assert str(raised.value) == (f"attempt is -4 at {identity.in_part(path, 0)}: "
                                  "tensorquill reads an integer of 0 or more")
+
+
+def test_a_scalars_name_that_does_not_parse_is_listed_last_in_its_folder(tmp_path):
+    """Section 4.5's names give the object's first and last `seq`; a server reads the footer for a name
+    that does not parse. The listing keeps such an object, after the named ones of its rank and attempt, by
+    name, and its rows read as any object's."""
+    run, made = _store(tmp_path)
+    odd = run / "rank=0" / "attempt=1" / "scalars-recovered.parquet"
+    extra = {**_scalar_record(), "seq": 3, "step": 950}
+    _write(odd, [extra])
+    names = [p.relative_to(run).as_posix() for p in flight.scalar_objects(run)]
+    assert names == ["rank=0/attempt=1/scalars-00000000-00000000.parquet",
+                     "rank=0/attempt=1/scalars-00000001-00000002.parquet",
+                     "rank=0/attempt=1/scalars-recovered.parquet",
+                     "rank=1/attempt=1/scalars-00000000-00000000.parquet"]
+    assert _read(flight.scalar_objects(run, rank=0)) == [*made["rank0"], extra]
+    assert not hasattr(flight, "load_scalar_records")
+
+
+def test_flight_takes_nothing_from_evidence():
+    """The merge's one call is `evidence`'s; `flight` never imports it (the stored attempt order, which a
+    caller applies, is `evidence`'s rule)."""
+    source = Path(flight.__file__).read_text(encoding="utf-8")
+    assert "from .evidence" not in source and "import evidence" not in source and "tensorquill.evidence" not in source
 
 
 def test_load_records_reads_one_scalars_object_as_its_records(tmp_path, reads_version_2):
