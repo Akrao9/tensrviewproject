@@ -955,14 +955,15 @@ impl<'a> Columns<'a> {
 
 impl<'a> Columns<'a> {
     /// A row's layers in stored order, each with the statistics the detectors read, from whichever
-    /// layout the batch has. An entry that is not an object is absent: protocol 4's reader then
-    /// reads no layer of the row, as it always has; protocol 5's reads the rest (contract 1.5).
+    /// layout the batch has. An entry that is not an object is absent and the rest of the map is
+    /// read, in both layouts: protocol 5's null struct (contract 1.5) and, since lane AL-3′ (the
+    /// owner, Nov 24, S4), protocol 4's JSON entry ([`JsonLayers`]).
     fn layers(&self, row: usize) -> Vec<(Cow<'a, str>, LayerStats)> {
         match &self.layers {
             None => Vec::new(),
             Some(StructMap::Json(layers)) => text(Some(*layers), row)
-                .and_then(|layers| serde_json::from_str::<Members<LayerStats>>(layers).ok())
-                .map_or_else(Vec::new, |Members(layers)| layers),
+                .and_then(|layers| serde_json::from_str::<JsonLayers>(layers).ok())
+                .map_or_else(Vec::new, |JsonLayers(layers)| layers),
             Some(StructMap::Typed(layers)) => layers.row(row, text(self.extra, row)),
         }
     }
@@ -1176,22 +1177,103 @@ impl<'de> Deserialize<'de> for LayerStats {
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("an object")
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<LayerStats, A::Error> {
-                let mut stats = LayerStats::default();
-                while let Some(Key(key)) = map.next_key()? {
-                    let stat: Stat = map.next_value()?;
-                    match key.as_ref() {
-                        "std" => stats.std = stat.number,
-                        "abs_max" => stats.abs_max = stat.number,
-                        "zero_frac" => stats.zero_frac = stat.number,
-                        _ => {}
-                    }
-                    stats.non_finite |= stat.non_finite;
-                }
-                Ok(stats)
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<LayerStats, A::Error> {
+                LayerStats::from_map(map)
             }
         }
         deserializer.deserialize_map(LayerVisitor)
+    }
+}
+
+impl LayerStats {
+    /// One layer's object, read field by field as the parser gives it.
+    fn from_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let mut stats = LayerStats::default();
+        while let Some(Key(key)) = map.next_key()? {
+            let stat: Stat = map.next_value()?;
+            match key.as_ref() {
+                "std" => stats.std = stat.number,
+                "abs_max" => stats.abs_max = stat.number,
+                "zero_frac" => stats.zero_frac = stat.number,
+                _ => {}
+            }
+            stats.non_finite |= stat.non_finite;
+        }
+        Ok(stats)
+    }
+}
+
+/// Protocol 4's `layers_json` read entry by entry (the owner, Nov 24, S4): its layers in document
+/// order, an entry that is not an object left out, so that it is absent to every detector and the
+/// rest of the map is read, as `LayersColumn::row` reads protocol 5's null struct (contract 1.5).
+/// The text is read once, in one pass: each entry's value is told apart by the parser's own
+/// callback (`deserialize_any`), an object read as `LayerStats` and any other value skipped where
+/// it stands. A text that is not JSON still reads as nothing, as before; so does one whose name
+/// serde_json refuses (a lone surrogate's escape, the known difference of case
+/// `layers_name_arrow_cannot_encode`). `moe_stats_json` is not read this way: it is still read
+/// whole (`Members<RouterStats>`).
+struct JsonLayers<'a>(Vec<(Cow<'a, str>, LayerStats)>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for JsonLayers<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// One entry's value: its statistics when it is an object, else nothing.
+        struct Entry(Option<LayerStats>);
+
+        impl<'de> Deserialize<'de> for Entry {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct EntryVisitor;
+                impl<'de> Visitor<'de> for EntryVisitor {
+                    type Value = Entry;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("any value")
+                    }
+                    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Entry, A::Error> {
+                        LayerStats::from_map(map).map(|stats| Entry(Some(stats)))
+                    }
+                    fn visit_f64<E>(self, _: f64) -> Result<Entry, E> {
+                        Ok(Entry(None))
+                    }
+                    fn visit_i64<E>(self, _: i64) -> Result<Entry, E> {
+                        Ok(Entry(None))
+                    }
+                    fn visit_u64<E>(self, _: u64) -> Result<Entry, E> {
+                        Ok(Entry(None))
+                    }
+                    fn visit_bool<E>(self, _: bool) -> Result<Entry, E> {
+                        Ok(Entry(None))
+                    }
+                    fn visit_str<E>(self, _: &str) -> Result<Entry, E> {
+                        Ok(Entry(None))
+                    }
+                    fn visit_unit<E>(self) -> Result<Entry, E> {
+                        Ok(Entry(None))
+                    }
+                    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Entry, A::Error> {
+                        while seq.next_element::<IgnoredAny>()?.is_some() {}
+                        Ok(Entry(None))
+                    }
+                }
+                deserializer.deserialize_any(EntryVisitor)
+            }
+        }
+
+        struct LayersVisitor<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for LayersVisitor<'a> {
+            type Value = JsonLayers<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut layers = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(Key(key)) = map.next_key()? {
+                    if let Entry(Some(stats)) = map.next_value()? {
+                        layers.push((key, stats));
+                    }
+                }
+                Ok(JsonLayers(layers))
+            }
+        }
+        deserializer.deserialize_map(LayersVisitor(PhantomData))
     }
 }
 
