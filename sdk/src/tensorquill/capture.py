@@ -75,6 +75,9 @@ _LOW_PRECISION = (torch.float16, torch.bfloat16)
 WEIGHT_EVERY = 50
 # Version of the step-record format; readers treat records without it as version 0.
 SCHEMA_VERSION = 1
+# Version of the scalar-only record `Session.log(..., step=N)` writes (`WAVE_AL_CONTRACT.md` section
+# 4.2, Q1 a): only what changed is version 2, so a step record stays version 1.
+SCALARS_SCHEMA_VERSION = 2
 # Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
 PROBE_EVERY = 1000
 # How far the writer thread may fall behind before capture stops for the session (`Session._put`),
@@ -501,8 +504,21 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
-# `Session.log`'s `step=` when not given: any value given, None included, is refused.
+# `Session.log`'s `step=` when not given. A value given is a step of its own: a scalar-only record.
 _NO_STEP: Any = object()
+
+
+def _explicit_step(step: Any) -> int:
+    """`Session.log`'s `step=` as an `int`, or the refusal of contract section 4.2: a bool, a float and
+    anything not an integer raise `TypeError` (`None` too: no step is no `step=`), a negative integer
+    `ValueError`. Any `numbers.Integral` but a bool is an integer, as `identity.check` takes a step."""
+    if isinstance(step, bool) or not isinstance(step, numbers.Integral):
+        raise TypeError(f"session.log(..., step=...): step must be an integer of 0 or more, not "
+                        f"{type(step).__name__} {step!r}")
+    value = int(step)
+    if value < 0:
+        raise ValueError(f"session.log(..., step=...): step must be an integer of 0 or more, not {value}")
+    return value
 
 
 def _warn(message: str, stacklevel: int = 2) -> None:
@@ -1721,6 +1737,10 @@ class Session:
         self._pending_scalars: dict[str, Any] = {}
         self._late_said = False  # a scalar left out for want of a step in memory was said (`_no_step_for`)
         self._late_traced: dict[str, Any] = {}  # logged late inside a compiled function (`_log_late`)
+        # Scalar-only records (`log(..., step=N)`) not yet handed to the writer, their values as
+        # logged (a tensor still on its device), and the next one's `seq`, counted from 0 per session.
+        self._scalar_records: list[dict[str, Any]] = []
+        self._scalar_seq = 0
         self._ring_probe: list[dict[str, Any] | None] = []
         self._probe_off_written = False
         # Data progress (`data`): None until the first batch is noted, then every step has one.
@@ -2790,20 +2810,23 @@ class Session:
         kept back when the ring last filled, until the next step ends, a `flush()` or `close()`.
         A value still pending at `close()` goes there too, unless that step already holds its
         name. With no step in memory (before the first step, or after `flush()` with no step
-        since) it is left out, said once per session in a warning (`_no_step_for`). A record
-        already written is never changed.
+        since) it is left out, said once per session in a warning that shows the call below
+        (`_no_step_for`). A record already written is never changed.
 
-        `step=` raises `TypeError`: an explicit step comes with protocol 5's scalar-only record.
-        A key `"step"` in the dictionary is an ordinary scalar.
+        `step=N` records the values at step `N` of their own: a scalar-only record (contract
+        section 4.2), never a training step, whatever the phase and whether or not a step is in
+        memory. `N` is an integer of 0 or more; a bool, a float or anything else raises
+        `TypeError`, a negative integer `ValueError`, before anything is recorded. The record is
+        written with the next block of step records, or at `close()`; a tensor is copied on its
+        device and read with that block, so the call adds no sync. Records of one session are
+        numbered `seq` 0, 1, 2... in the order of these calls, and a reader takes the highest
+        `seq` where two meet at a step. A key `"step"` in the dictionary is an ordinary scalar.
         """
         if self._closed_call("log()"):
             return
         if step is not _NO_STEP:
-            raise TypeError(
-                "session.log(..., step=...): an explicit step is not supported yet; it comes with protocol 5's "
-                "scalar-only record. A value logged inside session.phase(\"eval\") is recorded on the newest step, "
-                "and a key \"step\" in the dictionary is an ordinary scalar."
-            )
+            self._log_at(_explicit_step(step), dict(values or {}, **named))
+            return
         converted = self._scalar_values(dict(values or {}, **named))
         # The phase as the hooks read it (`_Evaluating`): a compiled step that logs guards on that
         # one flag, which its hooks already read, and not on the phase's name.
@@ -2811,6 +2834,25 @@ class Session:
             self._log_late(converted)
         else:
             self._pending_scalars.update(converted)
+
+    def _log_at(self, step: int, values: Mapping[str, Any]) -> None:
+        """`log(values, step=step)`: one scalar-only record, its `seq` and `ts` taken at the call, after
+        every check. A call with no values writes nothing and takes no `seq`."""
+        converted = self._scalar_values(values)
+        if not converted:
+            return
+        seq, self._scalar_seq = self._scalar_seq, self._scalar_seq + 1
+        self._scalar_records.append({
+            "schema_version": SCALARS_SCHEMA_VERSION,
+            "record": "scalars",
+            "run_id": self.run.run_id,
+            "rank": self.run.rank,
+            "attempt": self.attempt,
+            "step": step,
+            "seq": seq,
+            "ts": time.time(),
+            "scalars": converted,
+        })
 
     @staticmethod
     def _scalar_values(items: Mapping[Any, Any]) -> dict[str, Any]:
@@ -3973,9 +4015,21 @@ class Session:
     def _put(self, block: tuple[Any, ...]) -> None:
         """Hand a block to the writer thread, never waiting for it. A writer a full queue behind
         stops capture for the session (`_stop`) and this block is dropped: the steps already
-        queued are still written, so the records stay one unbroken run of steps."""
+        queued are still written, so the records stay one unbroken run of steps.
+
+        The scalar-only records logged since the last block (`log(..., step=N)`) go with this one,
+        written after its step records (contract section 4.2): their tensors are moved to the CPU
+        here, with the block, in one transfer per device, and only when one holds a tensor. A block
+        dropped here drops them too, as a stop drops what is pending."""
         if self._stopped:
             return
+        if self._scalar_records:
+            pending, self._scalar_records = self._scalar_records, []
+            rows = [record["scalars"] for record in pending]
+            if any(isinstance(value, torch.Tensor) for row in rows for value in row.values()):
+                rows = _scalars_to_cpu(rows)
+            ready = [{**record, "scalars": row} for record, row in zip(pending, rows)]
+            block = tuple(block) + (None,) * (len(_BLOCK_FIELDS) - len(block)) + (ready,)
         try:
             if self._close_by is None:
                 self._queue.put_nowait(block)
@@ -4032,6 +4086,7 @@ class Session:
         self._clear_ring_lists()
         self._held = None
         self._probe_owed = False
+        self._scalar_records = []  # lost with the steps not yet handed to the writer (contract section 4.2)
         try:  # an idle writer ends now; a busy one ends once the queue is empty (`_drain`)
             self._queue.put_nowait(None)
         except queue.Full:
@@ -4229,6 +4284,10 @@ class Session:
             self._take_traced_late()
             self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
+            if self._scalar_records and not self._stopped:
+                # No block of step records was left to carry them (no step since the last flush, or
+                # none at all): a block with no steps does (`_decode`).
+                self._put(([],))
         if not self._stopped:
             try:
                 self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))
@@ -4341,7 +4400,12 @@ class Session:
         param_names: Sequence[str] | None = None,
         moe_source: Mapping[str, Mapping[str, str]] | None = None,
         layers_not_read: Mapping[str, str] | None = None,
+        scalar_records: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
+        """The block's records: its steps' records, then the scalar-only records `_put` gave it, already
+        on the CPU (`log(..., step=N)`), as they are. A block with no steps carries only those."""
+        if not steps:
+            return list(scalar_records or ())
         # The parameters the block was made with: `_take_unfrozen` may add some after it was queued.
         names = self.param_names if param_names is None else param_names
         n, n_layers, n_params = len(steps), len(self.layer_names), len(names)
@@ -4536,6 +4600,8 @@ class Session:
             records[0]["grads_not_read"] = dict(grad_why)
         if system and records:
             records[-1]["system"] = system
+        if scalar_records:
+            records.extend(scalar_records)  # after every key said once for the block, so none lands on one
         return records
 
 
