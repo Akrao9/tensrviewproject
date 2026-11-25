@@ -216,7 +216,7 @@ def test_the_compare_command_exits_2_with_one_line(tmp_path):
     assert done.returncode == 2 and "Traceback" not in done.stderr
     said = done.stderr.strip().splitlines()
     assert said == [f"tensorquill: error: schema_version is 99 at {bad}, line 11: "
-                    "this tensorquill reads schema versions 0 and 1"]
+                    "this tensorquill reads schema versions 0, 1 and 2"]
     assert not (tmp_path / "c.json").exists()
 
 

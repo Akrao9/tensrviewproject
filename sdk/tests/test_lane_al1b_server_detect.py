@@ -6,9 +6,8 @@ Scalar-only records are set apart, after `identity.check` and before any engine,
 `stream_order`, and before `server_duplicate_batches` slims its records. The detectors read exactly what the
 training records alone give.
 
-`identity.check` takes record version 2 only with lane AL-4''s change (`identity.py`, not this lane's): the
-`reads_version_2` fixture widens `identity.SCHEMA_VERSIONS` for a test until it does, and does nothing after.
-Tests that need pyarrow or the server binary skip one by one without them; none needs git history."""
+What a scalar-only record is, is `identity.is_scalar_record`'s one rule. Tests that need pyarrow or the server
+binary skip one by one without them; none needs git history."""
 
 from __future__ import annotations
 
@@ -36,14 +35,6 @@ def _training(records: list[dict]) -> list[dict]:
     return [r for r in records if r.get("record") != "scalars"]
 
 
-@pytest.fixture
-def reads_version_2(monkeypatch):
-    """`identity.check` taking record version 2, as lane AL-4' makes it (section 4.6). A no-op on a tree
-    where it already does."""
-    if 2 not in identity.SCHEMA_VERSIONS:
-        monkeypatch.setattr(identity, "SCHEMA_VERSIONS", (*identity.SCHEMA_VERSIONS, 2))
-
-
 def test_the_cases_hold_scalar_only_records_among_training_records():
     assert "scalar_record_keys" in WITH_SCALARS and len(WITH_SCALARS) >= 5
     records = _records()
@@ -57,7 +48,7 @@ def test_stream_order_never_holds_a_scalar_only_record(name):
 
 
 @pytest.mark.parametrize("name", WITH_SCALARS)
-def test_the_stream_the_binary_reads_is_the_training_records_alone(name, reads_version_2):
+def test_the_stream_the_binary_reads_is_the_training_records_alone(name):
     pytest.importorskip("pyarrow")
     records = _records(name)
     alone = sd.records_stream(_training(records))
@@ -70,7 +61,7 @@ def test_the_stream_the_binary_reads_is_the_training_records_alone(name, reads_v
     assert table.column("step").to_pylist() == [r["step"] for r in sd.stream_order(_training(records))]
 
 
-def test_every_record_is_checked_before_the_scalar_only_ones_are_set_apart(reads_version_2):
+def test_every_record_is_checked_before_the_scalar_only_ones_are_set_apart():
     pytest.importorskip("pyarrow")
     records = _records()
     place = next(i for i, r in enumerate(records) if r.get("record") == "scalars")
@@ -79,15 +70,6 @@ def test_every_record_is_checked_before_the_scalar_only_ones_are_set_apart(reads
         sd.records_stream(records)
     assert str(raised.value) == (f"rank is -1 at record {place} of the records passed: "
                                  "tensorquill reads an integer of 0 or more")
-
-
-def test_a_scalar_only_record_is_refused_until_version_2_is_read():
-    """In this lane's tree `identity.check` still refuses version 2 (lane AL-4' widens it): the stream
-    names the record, as for any record of a version not read, and nothing is judged."""
-    if 2 in identity.SCHEMA_VERSIONS:
-        pytest.skip("identity.check takes version 2 on this tree")
-    with pytest.raises(identity.MalformedRecordError, match="schema_version is 2 at record 4"):
-        sd.records_stream(_records())
 
 
 class _Child:
@@ -111,7 +93,7 @@ class _Child:
         monkeypatch.setattr(sd.FollowedDetect, "close", lambda detect: setattr(detect, "_process", None))
 
 
-def test_a_watcher_never_sends_a_scalar_only_record_and_an_append_stays_an_append(monkeypatch, reads_version_2):
+def test_a_watcher_never_sends_a_scalar_only_record_and_an_append_stays_an_append(monkeypatch):
     pytest.importorskip("pyarrow")
     child = _Child(monkeypatch)
     records = _records()
@@ -131,7 +113,7 @@ def test_a_watcher_never_sends_a_scalar_only_record_and_an_append_stays_an_appen
     assert [s["step"] for s in detect.samples] == [*[r["step"] for r in training], 6]
 
 
-def test_a_watcher_given_only_scalar_only_records_has_nothing_to_judge(monkeypatch, reads_version_2):
+def test_a_watcher_given_only_scalar_only_records_has_nothing_to_judge(monkeypatch):
     _Child(monkeypatch)
     only = [r for r in _records() if r.get("record") == "scalars"]
     with pytest.raises(ValueError, match="no records to judge"):
@@ -154,7 +136,7 @@ def test_the_cross_rank_comparison_never_sends_a_scalar_only_record(monkeypatch)
     assert sent == []
 
 
-def test_a_report_of_only_scalar_only_records_has_nothing_to_judge(reads_version_2):
+def test_a_report_of_only_scalar_only_records_has_nothing_to_judge():
     assert "scalar_seq_watermark_across_restart" not in MIXED
     for only in ([r for r in _records() if r.get("record") == "scalars"], _records("scalar_seq_watermark_across_restart")):
         for report in (sd.server_report, sd.server_run_report):
@@ -177,7 +159,7 @@ needs_binary = pytest.mark.skipif(_binary() is None, reason="tensorquill-server 
 
 @needs_binary
 @pytest.mark.parametrize("name", MIXED)
-def test_the_rust_detectors_report_what_the_training_records_alone_give(name, reads_version_2):
+def test_the_rust_detectors_report_what_the_training_records_alone_give(name):
     pytest.importorskip("pyarrow")
     records = _records(name)
     with_scalars = sd.server_report(records, samples=True)

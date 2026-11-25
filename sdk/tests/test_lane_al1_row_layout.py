@@ -238,7 +238,9 @@ def test_the_schema_is_protocol_5s():
     for name in ("layers", "moe_stats", "probe_maps", "probe_histograms"):
         assert schema.field(name).type.keys_sorted is False, name
     assert names.index("probe_json") < names.index("probe_maps") < names.index("probe_histograms")
-    assert "seq" not in names  # the scalar-only record's column is step 2's (section 4)
+    # The scalar-only record's column (step 2, section 4.4): a nullable Int64, just before `record_version`.
+    assert schema.field("seq").type == i64 and schema.field("seq").nullable
+    assert names.index("seq") + 1 == names.index("record_version")
 
 
 def test_every_case_record_round_trips_through_an_arrow_batch_with_order_kept():

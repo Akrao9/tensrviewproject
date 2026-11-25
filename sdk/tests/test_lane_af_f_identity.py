@@ -44,7 +44,7 @@ def test_the_error_says_the_field_what_was_found_what_is_read_and_where():
     with pytest.raises(MalformedRecordError) as raised:
         check({**GOOD, "schema_version": 99}, identity.in_part("part-0-9.parquet", 4))
     assert str(raised.value) == ("schema_version is 99 at part-0-9.parquet, row 4: "
-                                 "this tensorquill reads schema versions 0 and 1")
+                                 "this tensorquill reads schema versions 0, 1 and 2")
     without_step = dict(GOOD)
     del without_step["step"]
     with pytest.raises(MalformedRecordError) as raised:
@@ -79,7 +79,7 @@ def test_the_version_numbers_are_kept_apart():
     from tensorquill import flight
 
     assert (flight.SCHEMA_VERSION, flight.ROW_VERSION) == (2, 2)
-    assert identity.SCHEMA_VERSIONS == (0, 1)
+    assert identity.SCHEMA_VERSIONS == (0, 1, 2)
     assert flight.SCHEMA_VERSIONS is identity.SCHEMA_VERSIONS  # what the sender checks a record against
 
 
@@ -186,8 +186,10 @@ VALID = [
 # own is in `record_version` (null with no key); `layers`, `moe_stats`, `probe_maps` and `probe_histograms`
 # replace `layers_json` and `moe_stats_json`; and the fourth record's layer field `x`, which no struct
 # field names, is refused into `extra_json` with the map's entries kept in its order. `moved` is the same.
-PROTOCOL_5_ROWS = "381b15a4bf060020f9500153b7c80a889ab4bd1619f2c4f816439b6114b0b4f7"
-PROTOCOL_5_ROWS_SCHEMA = "15d845e6196a9e8cddcffe1c7d9f8e0d9652064cca55a6e9b1a65d9d19b25259"
+# Step 2 adds `seq`, null on every one of these rows: with it dropped, each row is step 1's, byte for byte
+# (the digests were 381b15a4bf06… and 15d845e6196a… before it).
+PROTOCOL_5_ROWS = "84742141cf771148d6d621cf5ab63d6c46968dfdbf7c4e330de6e856c20f03cc"
+PROTOCOL_5_ROWS_SCHEMA = "b7db61c828534be814840694cef57c34250336a4dbdb9b6790c39cc7065c64c7"
 
 
 def _rows_digest(schema) -> str:

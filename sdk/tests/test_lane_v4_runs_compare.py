@@ -111,17 +111,19 @@ def store_rank(root: Path, run_id: str, ranks: tuple[int, ...]) -> Path:
 
 
 def fake_parts(monkeypatch, by_folder_rank: dict[tuple[str, int], list[dict] | Exception]) -> None:
-    """`load_records` on a store's run folder gives these records (every attempt), or raises."""
+    """`load_records` on a store's run folder gives these records (every attempt), or raises. `scalars`
+    is taken and passed on as `load_records` takes it: without it, scalar-only records are set apart."""
     real = ev.load_records
 
-    def load(source, *, rank=None, all_attempts=False):
+    def load(source, *, rank=None, all_attempts=False, scalars=False):
         path = Path(source) if isinstance(source, (str, Path)) else None
         if path is None or not path.is_dir():
-            return real(source, rank=rank, all_attempts=all_attempts)
+            return real(source, rank=rank, all_attempts=all_attempts, scalars=scalars)
         found = by_folder_rank[(path.name, rank)]
         if isinstance(found, Exception):
             raise found
-        return list(found) if all_attempts else ev.resolve_attempts(list(found))
+        found = list(found) if scalars else ev.set_apart_scalars(found)[0]
+        return found if all_attempts else ev.resolve_attempts(found)
 
     monkeypatch.setattr(ev, "load_records", load)
 
@@ -264,10 +266,10 @@ def test_cli08_a_rank_that_fails_only_when_part_4_reads_it_does_not_end_part_4_f
     })
     real = ev.load_records
 
-    def flaky(source, *, rank=None, all_attempts=False):
+    def flaky(source, *, rank=None, all_attempts=False, scalars=False):
         if not all_attempts and rank == 1 and Path(source).name == "after":
             raise OSError("the part went away")
-        return real(source, rank=rank, all_attempts=all_attempts)
+        return real(source, rank=rank, all_attempts=all_attempts, scalars=scalars)
 
     monkeypatch.setattr(ev, "load_records", flaky)
     part = tensorquill.compare_runs("base", "after", source=root)["divergence"]

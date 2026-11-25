@@ -306,7 +306,7 @@ def test_load_records_refuses_a_part_holding_a_record_version_it_does_not_take_u
     part, row_versions, records, entry = _stored(store, run_id)
     assert (row_versions, records) == ([2] * 5, [1, 1, 1, 99, 1])
     assert "dropped_row_keys" not in entry, entry
-    assert _refusal(store, run_id) == f"schema_version is 99 at {part}, row 3: this tensorquill reads schema versions 0 and 1"
+    assert _refusal(store, run_id) == f"schema_version is 99 at {part}, row 3: this tensorquill reads schema versions 0, 1 and 2"
 
 
 @needs_server
