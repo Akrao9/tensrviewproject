@@ -166,4 +166,7 @@ def test_a_mirrored_value_with_no_step_in_memory_is_left_out_and_the_tracker_sti
         session.close()
     assert wandb_.values() == [{"eval/baseline": 2.5}]
     assert "eval/baseline" not in _scalars(session)[0]
-    assert len([w for w in caught if "protocol 5" in str(w.message)]) == 1
+    # Wave AL (section Q5): the warning shows the explicit call, and says the mirror cannot pass a step.
+    said = [str(w.message) for w in caught if "left out the scalar" in str(w.message)]
+    assert len(said) == 1
+    assert "(a baseline evaluation)" in said[0] and "through mirror_scalars, which cannot pass a step" in said[0]

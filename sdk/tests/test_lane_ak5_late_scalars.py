@@ -1,12 +1,15 @@
-"""Lane AK-5: where a scalar logged outside a step is recorded, and `step=` refused.
+"""Lane AK-5: where a scalar logged outside a step is recorded; `step=` since wave AL.
 
 The owner's decision of Nov 24 (planning/OPEN_BUGS.md, section 20): a scalar logged while the
 session's phase is `"eval"`, or still pending when `close()` runs, is recorded on the newest step,
 if that step is still in memory (the ring's last row, or the step kept back when the ring last
 filled). A record already handed to the writer is never changed. With no step in memory the value
-is left out, said once per session through the warning that never raises, until protocol 5's
-scalar-only record gives it a place. `session.log(..., step=...)` raises `TypeError`; a dictionary
-key `"step"` stays an ordinary scalar.
+is left out, said once per session through the warning that never raises.
+
+Moved by wave AL's lane AL-5 (`WAVE_AL_CONTRACT.md` sections 4.2 and Q5): the warning now shows the
+call that records such a value, `session.log({...}, step=N)`, and that call writes protocol 5's
+scalar-only record instead of raising `TypeError`; a dictionary key `"step"` stays an ordinary
+scalar. The pins of the old text and of the refusal moved with it.
 
 The two reproduction scripts of section 20 (`planning/repro/eval_scalar_step_repro.py` and
 `eval_scalar_edge_cases.py`) are the first tests here, row by row, with the new results.
@@ -34,7 +37,7 @@ from tensorquill.sink import JsonlSink, MemorySink
 SDK = Path(__file__).resolve().parents[1]
 REPO = SDK.parent
 BASE = "e9b159888975a99c767b0c648279ec72eeef5fd7"  # the lane's base: lane AK-1's mirror, before AK-5
-LEFT_OUT = "protocol 5"  # the warning names the scalar-only record that will give such a value a place
+LEFT_OUT = "left out the scalar"  # the warning's words (wave AL, section Q5); it shows the explicit step= call
 
 
 # ---- helpers ---------------------------------------------------------------------------------
@@ -63,7 +66,8 @@ def _step(session, model, opt, value=None) -> float:
 
 
 def _by_step(records) -> dict[int, dict]:
-    return {r["step"]: r.get("scalars", {}) for r in records}
+    """The step records' scalars by step; a scalar-only record (wave AL, `step=`) is not a step."""
+    return {r["step"]: r.get("scalars", {}) for r in records if r.get("record") != "scalars"}
 
 
 def _on_disk(path: Path) -> list[int]:
@@ -97,8 +101,7 @@ def test_the_first_reproduction_script_row_by_row():
             with session.phase("eval"):
                 session.log({"eval/loss": 1.8})  # an evaluation after step 2
     session.log({"eval/final": 0.9})  # after the last step, before close()
-    with pytest.raises(TypeError, match="protocol 5"):
-        session.log({"x": 1.0}, step=500)
+    session.log({"x": 1.0}, step=500)  # wave AL: a scalar-only record at step 500, never a training step
     session.close()
     scalars = _by_step(sink.records)
     assert sorted(scalars) == [0, 1, 2, 3, 4]
@@ -106,6 +109,8 @@ def test_the_first_reproduction_script_row_by_row():
     assert scalars[2]["eval/loss"] == 1.8 and "eval/loss" not in scalars[3]  # was step 3
     assert scalars[4]["eval/final"] == 0.9  # was in no record
     assert all("x" not in s and "step" not in s for s in scalars.values())
+    assert [(r["step"], r["seq"], r["scalars"]) for r in sink.records if r.get("record") == "scalars"] == [
+        (500, 0, {"x": 1.0})]
 
 
 # ---- section 20's second table (eval_scalar_edge_cases.py) -------------------------------------
@@ -163,7 +168,10 @@ def test_flush_then_an_evaluation_is_left_out_with_one_warning(tmp_path):
         with session.phase("eval"):
             session.log({"eval/loss": 1.8})  # step 2 is already written: no step in memory
             session.log({"eval/acc": 0.5})
-    assert len(_left_out_warnings(caught)) == 1
+    said = _left_out_warnings(caught)
+    assert len(said) == 1
+    assert "(an evaluation after flush())" in said[0]
+    assert "session.log({'eval/loss': value}, step=2), the last step training finished" in said[0]
     _step(session, model, opt)
     session.close()
     scalars = _by_step(json.loads(line) for line in path.read_text().splitlines())
@@ -185,6 +193,8 @@ def test_a_baseline_evaluation_before_the_first_step_is_left_out(steps):
         session.close()
     said = _left_out_warnings(caught)
     assert len(said) == 1 and "eval/baseline" in said[0]
+    assert "(a baseline evaluation)" in said[0]
+    assert "session.log({'eval/baseline': value}, step=0), the step training starts at" in said[0]
     scalars = _by_step(sink.records)
     assert sorted(scalars) == list(range(steps))
     assert all("eval/baseline" not in s for s in scalars.values())  # was on step 0
@@ -222,37 +232,43 @@ def test_values_left_out_never_raise_under_python_w_error(tmp_path):
     assert done.stderr.count(LEFT_OUT) == 1  # said once per session, on the tensorquill logger
 
 
-def test_step_as_a_keyword_is_refused_and_a_step_key_is_a_scalar():
+def test_step_as_a_keyword_writes_a_scalar_only_record_and_a_step_key_is_a_scalar():
+    """Wave AL (section 4.2): `step=` writes a scalar-only record; `step=None` is refused, as anything
+    not an integer is. A key `"step"` in the dictionary stays an ordinary scalar of the step."""
     model = _model()
     session, sink, opt = _open(model, every=50)
-    for call in (lambda: session.log(eval_loss=1.8, step=500), lambda: session.log({"a": 1.0}, step=None),
-                 lambda: session.log({"a": 1.0}, step=3)):
-        with pytest.raises(TypeError, match="explicit step") as raised:
-            call()
-        assert "protocol 5" in str(raised.value)
+    session.log(eval_loss=1.8, step=500)
+    with pytest.raises(TypeError, match="step must be an integer"):
+        session.log({"a": 1.0}, step=None)
+    session.log({"a": 1.0}, step=3)
     session.log({"step": 5})  # W&B users log a metric named step as a custom x-axis
     _step(session, model, opt)
     session.close()
-    assert sink.records[0]["scalars"]["step"] == 5
-    assert "eval_loss" not in sink.records[0]["scalars"] and "a" not in sink.records[0]["scalars"]
+    steps = [r for r in sink.records if r.get("record") != "scalars"]
+    assert steps[0]["scalars"]["step"] == 5
+    assert "eval_loss" not in steps[0]["scalars"] and "a" not in steps[0]["scalars"]
+    assert [(r["step"], r["seq"], r["scalars"]) for r in sink.records if r.get("record") == "scalars"] == [
+        (500, 0, {"eval_loss": 1.8}), (3, 1, {"a": 1.0})]
 
 
-def test_the_repository_passes_no_step_keyword_to_session_log():
-    """Searched before refusing `step=`: no example, test or page passes it to `session.log`."""
+def test_the_package_passes_step_to_session_log_only_where_wave_al_put_it():
+    """Searched when `step=` was refused (wave AK): no example, test or page passed it to `session.log`.
+    Since wave AL two places in the package name the call: the Hugging Face callback's own, with no
+    step in memory, and the left-out warning's text, which shows it. No example passes it. The pages
+    (`README.md` and the guides) are not searched now: since wave AL they are meant to show the call."""
     import re
 
     # A call with a value for `step` (the refusal's own words, `step=...)`, are not a call).
     call = re.compile(r"session\.log\([^)]*\bstep\s*=\s*(?!\.\.\.)")
     found = []
-    for path in list((SDK / "examples").rglob("*.py")) + list((SDK / "src").rglob("*.py")) + [
-        SDK / "README.md", SDK / "RUN_ON_YOUR_JOB.md", SDK / "AGENT_INSTRUCTIONS.md",
-    ]:
-        if not path.exists():
-            continue
+    for path in list((SDK / "examples").rglob("*.py")) + list((SDK / "src").rglob("*.py")):
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if call.search(line):
-                found.append(f"{path.name}:{number}")
-    assert found == []
+                found.append((path.name, line.strip()))
+    assert sorted(name for name, _ in found) == ["capture.py", "huggingface.py"]
+    assert all("value}}, step={self._suggested_step()}" in line for name, line in found if name == "capture.py")
+    assert all(line == "self.session.log(values, step=self.session._suggested_step())"
+               for name, line in found if name == "huggingface.py")
 
 
 # ---- what else the rule covers ----------------------------------------------------------------

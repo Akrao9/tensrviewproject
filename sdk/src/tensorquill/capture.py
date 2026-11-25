@@ -75,6 +75,9 @@ _LOW_PRECISION = (torch.float16, torch.bfloat16)
 WEIGHT_EVERY = 50
 # Version of the step-record format; readers treat records without it as version 0.
 SCHEMA_VERSION = 1
+# Version of the scalar-only record `Session.log(..., step=N)` writes (`WAVE_AL_CONTRACT.md` section
+# 4.2, Q1 a): only what changed is version 2, so a step record stays version 1.
+SCALARS_SCHEMA_VERSION = 2
 # Probe passes are rare, like wandb.watch's histograms (every 1,000 batches by default).
 PROBE_EVERY = 1000
 # How far the writer thread may fall behind before capture stops for the session (`Session._put`),
@@ -501,8 +504,31 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
-# `Session.log`'s `step=` when not given: any value given, None included, is refused.
-_NO_STEP: Any = object()
+class _NoStep:
+    """The type of `Session.log`'s `step=` when not given. A value given is a step of its own: a
+    scalar-only record. Told by its type (`type(step) is not _NoStep`), which Dynamo traces on every
+    PyTorch the SDK supports; `step is not <an object()>` with an integer step fails to trace on 2.6."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<no step>"
+
+
+_NO_STEP: Any = _NoStep()
+
+
+def _explicit_step(step: Any) -> int:
+    """`Session.log`'s `step=` as an `int`, or the refusal of contract section 4.2: a bool, a float and
+    anything not an integer raise `TypeError` (`None` too: no step is no `step=`), a negative integer
+    `ValueError`. Any `numbers.Integral` but a bool is an integer, as `identity.check` takes a step."""
+    if isinstance(step, bool) or not isinstance(step, numbers.Integral):
+        raise TypeError(f"session.log(..., step=...): step must be an integer of 0 or more, not "
+                        f"{type(step).__name__} {step!r}")
+    value = int(step)
+    if value < 0:
+        raise ValueError(f"session.log(..., step=...): step must be an integer of 0 or more, not {value}")
+    return value
 
 
 def _warn(message: str, stacklevel: int = 2) -> None:
@@ -1720,7 +1746,15 @@ class Session:
         self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
         self._late_said = False  # a scalar left out for want of a step in memory was said (`_no_step_for`)
+        # The mirror's mark (`mirror._log_into`, section Q5): set while it logs a value it brought, and
+        # the names it left pending, with the count of steps ended when it did.
+        self._mirroring = False
+        self._mirrored_pending: tuple[int, set[str]] = (0, set())
         self._late_traced: dict[str, Any] = {}  # logged late inside a compiled function (`_log_late`)
+        # Scalar-only records (`log(..., step=N)`) not yet handed to the writer, their values as
+        # logged (a tensor still on its device), and the next one's `seq`, counted from 0 per session.
+        self._scalar_records: list[dict[str, Any]] = []
+        self._scalar_seq = 0
         self._ring_probe: list[dict[str, Any] | None] = []
         self._probe_off_written = False
         # Data progress (`data`): None until the first batch is noted, then every step has one.
@@ -2790,20 +2824,23 @@ class Session:
         kept back when the ring last filled, until the next step ends, a `flush()` or `close()`.
         A value still pending at `close()` goes there too, unless that step already holds its
         name. With no step in memory (before the first step, or after `flush()` with no step
-        since) it is left out, said once per session in a warning (`_no_step_for`). A record
-        already written is never changed.
+        since) it is left out, said once per session in a warning that shows the call below
+        (`_no_step_for`). A record already written is never changed.
 
-        `step=` raises `TypeError`: an explicit step comes with protocol 5's scalar-only record.
-        A key `"step"` in the dictionary is an ordinary scalar.
+        `step=N` records the values at step `N` of their own: a scalar-only record (contract
+        section 4.2), never a training step, whatever the phase and whether or not a step is in
+        memory. `N` is an integer of 0 or more; a bool, a float or anything else raises
+        `TypeError`, a negative integer `ValueError`, before anything is recorded. The record is
+        written with the next block of step records, or at `close()`; a tensor is copied on its
+        device and read with that block, so the call adds no sync. Records of one session are
+        numbered `seq` 0, 1, 2... in the order of these calls, and a reader takes the highest
+        `seq` where two meet at a step. A key `"step"` in the dictionary is an ordinary scalar.
         """
         if self._closed_call("log()"):
             return
-        if step is not _NO_STEP:
-            raise TypeError(
-                "session.log(..., step=...): an explicit step is not supported yet; it comes with protocol 5's "
-                "scalar-only record. A value logged inside session.phase(\"eval\") is recorded on the newest step, "
-                "and a key \"step\" in the dictionary is an ordinary scalar."
-            )
+        if type(step) is not _NoStep:
+            self._log_at(step, dict(values or {}, **named))
+            return
         converted = self._scalar_values(dict(values or {}, **named))
         # The phase as the hooks read it (`_Evaluating`): a compiled step that logs guards on that
         # one flag, which its hooks already read, and not on the phase's name.
@@ -2811,6 +2848,32 @@ class Session:
             self._log_late(converted)
         else:
             self._pending_scalars.update(converted)
+
+    @torch.compiler.disable
+    def _log_at(self, step: Any, values: Mapping[str, Any]) -> None:
+        """`log(values, step=step)`: one scalar-only record, its `seq` and `ts` taken at the call, after
+        every check. A call with no values writes nothing and takes no `seq`.
+
+        Always run eagerly: inside a compiled function it is one graph break, and neither the step, nor
+        `seq`, nor the pending list is a guard, so a new step on every call compiles nothing again
+        (without it each call recompiled, until Dynamo's limit). Under `fullgraph=True` it cannot be
+        traced, a stated limit: Dynamo raises its `Unsupported` there, before anything is recorded."""
+        step = _explicit_step(step)
+        converted = self._scalar_values(values)
+        if not converted:
+            return
+        seq, self._scalar_seq = self._scalar_seq, self._scalar_seq + 1
+        self._scalar_records.append({
+            "schema_version": SCALARS_SCHEMA_VERSION,
+            "record": "scalars",
+            "run_id": self.run.run_id,
+            "rank": self.run.rank,
+            "attempt": self.attempt,
+            "step": step,
+            "seq": seq,
+            "ts": time.time(),
+            "scalars": converted,
+        })
 
     @staticmethod
     def _scalar_values(items: Mapping[Any, Any]) -> dict[str, Any]:
@@ -2865,8 +2928,7 @@ class Session:
         self._take_traced_late()
         row = self._newest_scalars()
         if row is None:
-            self._no_step_for(values, "logged inside session.phase(\"eval\") with no step in memory (before the "
-                                      "first step, or after flush() with no step since)")
+            self._no_step_for(values, "log")
             return
         self._ring_scalars[-1] = {**row, **values}
         self._mark_held("scalars")
@@ -2890,31 +2952,71 @@ class Session:
             return
         row = self._newest_scalars()
         if row is None:
-            self._no_step_for(pending, "pending at close() with no step in memory (no step ended, or none since "
-                                       "flush())")
+            self._no_step_for(pending, "close")
             return
         added = {name: value for name, value in pending.items() if name not in row}
         if added:
             self._ring_scalars[-1] = {**row, **added}
             self._mark_held("scalars")
 
-    def _no_step_for(self, values: Mapping[str, Any], why: str) -> None:
-        """A scalar with no step in memory to be recorded on: left out, and said once per session.
+    def _log_mirrored(self, values: dict[str, Any]) -> None:
+        """`log(values)` for a value the mirror brought from a tracker's call (`mirror._log_into`): the
+        mark `_no_step_for` reads, so its warning says the mirror cannot pass a step (section Q5, Q7).
+        Through `self.log` itself, so what replaces `log` on the session sees the mirror's call too."""
+        self._mirroring = True
+        try:
+            self.log(values)
+        finally:
+            self._mirroring = False
+        if not self._evaluating.on:  # pending: left out at `close()` if no step takes it
+            committed, names = self._mirrored_pending
+            if committed != self._steps_committed:
+                names = set()
+            self._mirrored_pending = (self._steps_committed, names | set(values))
 
-        The coordinator's reading of the owner's decision of Nov 24 (OPEN_BUGS, section 20), which
-        the owner may overrule: a record already written is never changed, and the value is not put
-        on a later step, as it was before (a baseline evaluation on step 0, a value after `flush()`
-        on the next step). Protocol 5's scalar-only record is to give it a place. This is the one
+    def _suggested_step(self) -> int:
+        """The step a value with no step in memory is shown to be logged at (section Q5's table): the
+        step training starts at (`start_step`, unless a step was committed), else the last step training
+        finished. Host integers the session keeps, the ones `_record_manifest` uses: no device read."""
+        return self._next_step if self._steps_committed == 0 else self._next_step - 1
+
+    def _no_step_for(self, values: Mapping[str, Any], at: str) -> None:
+        """A scalar with no step in memory to be recorded on, and no `step=`: left out, said once per
+        session (`WAVE_AL_CONTRACT.md` section Q5, the owner's decision of Nov 24).
+
+        A record already written is never changed, and the value is not put on a later step. The
+        warning names the case and shows the explicit call that records it, `log({...}, step=N)`,
+        which writes a scalar-only record, with `N` from `_suggested_step`. `at` is "log" for a value
+        logged under "eval", "close" for one pending at `close()`. A value the mirror brought (its
+        mark, `_log_mirrored`) gets one more sentence: the mirror passes no step (Q7). The text is
+        the case of the first value left out; later ones are left out silently. This is the one
         place that decides it."""
         if self._late_said:
             return
         self._late_said = True
         names = sorted(values)
         shown = ", ".join(repr(n) for n in names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+        if self._steps_committed == 0:
+            # No step committed: a baseline evaluation, or a value pending at close() in a session that
+            # never trained, which section Q5 counts as the same case.
+            case = "it was logged before the first training step (a baseline evaluation)"
+            which = "the step training starts at"
+        elif at == "close":
+            case = "it was still pending at close() after flush() with no training step since"
+            which = "the last step training finished"
+        else:
+            case = "it was logged after flush() with no training step since (an evaluation after flush())"
+            which = "the last step training finished"
+        committed, pending = self._mirrored_pending
+        mirrored = self._mirroring or (at == "close" and committed == self._steps_committed
+                                       and any(name in pending for name in names))
+        mirror = (" It came from your tracker's log call through mirror_scalars, which cannot pass a step (the "
+                  "tracker's own step is ignored): call session.log(..., step=...) yourself for it.") if mirrored else ""
         _warn(
-            f"TensorQuill left out the scalar{'s' if len(names) != 1 else ''} {shown}: {why}. A step already "
-            "written is never changed, and the value is not put on a later step; a scalar with a step of its own "
-            "comes with protocol 5's scalar-only record. Said once per session.",
+            f"TensorQuill left out the scalar{'s' if len(names) != 1 else ''} {shown}: {case}, when no step is in "
+            "memory. To record it, log it with an explicit step, which writes a scalar-only record: "
+            f"session.log({{{names[0]!r}: value}}, step={self._suggested_step()}), {which}.{mirror} Said once per "
+            "session.",
             stacklevel=4,
         )
 
@@ -3638,11 +3740,19 @@ class Session:
         """Move the ring to the CPU and queue it (`_flush_ring`). An exception part way would leave
         the ring's lists longer than the ring and every later step raising (lane U5 saw an
         `IndexError` at each step after one raise here), so it stops capture instead (`_stop`),
-        which clears the ring: nothing raises into training from here."""
+        which clears the ring: nothing raises into training from here.
+
+        What a compiled function logged late (`_late_traced`) is put on the newest step first, so
+        every path that hands the newest step to the writer drains it (`WAVE_AL_CONTRACT.md` section
+        4.8): `_commit`, `flush()`, `close()`, and `_take_unfrozen`, which writes the ring from the
+        optimizer's pre-step hook before the next step ends. So a value in that buffer always belongs
+        to a step not yet handed to the writer. Eager code only: nothing a traced function reads
+        changes. After a stop nothing is drained: the value is lost with its step (a stated limit)."""
         if self._error is not None and not self._stopped:
             self._stop(self._error)
         if self._stopped:
             return
+        self._take_traced_late()
         self._say_new_trainable()
         try:
             self._flush_ring(hold_newest=hold_newest)
@@ -3965,9 +4075,21 @@ class Session:
     def _put(self, block: tuple[Any, ...]) -> None:
         """Hand a block to the writer thread, never waiting for it. A writer a full queue behind
         stops capture for the session (`_stop`) and this block is dropped: the steps already
-        queued are still written, so the records stay one unbroken run of steps."""
+        queued are still written, so the records stay one unbroken run of steps.
+
+        The scalar-only records logged since the last block (`log(..., step=N)`) go with this one,
+        written after its step records (contract section 4.2): their tensors are moved to the CPU
+        here, with the block, in one transfer per device, and only when one holds a tensor. A block
+        dropped here drops them too, as a stop drops what is pending."""
         if self._stopped:
             return
+        if self._scalar_records:
+            pending, self._scalar_records = self._scalar_records, []
+            rows = [record["scalars"] for record in pending]
+            if any(isinstance(value, torch.Tensor) for row in rows for value in row.values()):
+                rows = _scalars_to_cpu(rows)
+            ready = [{**record, "scalars": row} for record, row in zip(pending, rows)]
+            block = tuple(block) + (None,) * (len(_BLOCK_FIELDS) - len(block)) + (ready,)
         try:
             if self._close_by is None:
                 self._queue.put_nowait(block)
@@ -4024,6 +4146,7 @@ class Session:
         self._clear_ring_lists()
         self._held = None
         self._probe_owed = False
+        self._scalar_records = []  # lost with the steps not yet handed to the writer (contract section 4.2)
         try:  # an idle writer ends now; a busy one ends once the queue is empty (`_drain`)
             self._queue.put_nowait(None)
         except queue.Full:
@@ -4221,6 +4344,10 @@ class Session:
             self._take_traced_late()
             self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
+            if self._scalar_records and not self._stopped:
+                # No block of step records was left to carry them (no step since the last flush, or
+                # none at all): a block with no steps does (`_decode`).
+                self._put(([],))
         if not self._stopped:
             try:
                 self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))
@@ -4333,7 +4460,12 @@ class Session:
         param_names: Sequence[str] | None = None,
         moe_source: Mapping[str, Mapping[str, str]] | None = None,
         layers_not_read: Mapping[str, str] | None = None,
+        scalar_records: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
+        """The block's records: its steps' records, then the scalar-only records `_put` gave it, already
+        on the CPU (`log(..., step=N)`), as they are. A block with no steps carries only those."""
+        if not steps:
+            return list(scalar_records or ())
         # The parameters the block was made with: `_take_unfrozen` may add some after it was queued.
         names = self.param_names if param_names is None else param_names
         n, n_layers, n_params = len(steps), len(self.layer_names), len(names)
@@ -4528,6 +4660,8 @@ class Session:
             records[0]["grads_not_read"] = dict(grad_why)
         if system and records:
             records[-1]["system"] = system
+        if scalar_records:
+            records.extend(scalar_records)  # after every key said once for the block, so none lands on one
         return records
 
 

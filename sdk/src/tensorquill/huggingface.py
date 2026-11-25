@@ -141,12 +141,23 @@ class TensorQuillCallback(TrainerCallback):
         # watches also sees; recorded here, explicitly, they win over the mirrored copy. Under the
         # "eval" phase, so on the step the evaluation followed; set here too, since with several
         # evaluation datasets each one ends with its own `on_evaluate`.
+        #
+        # With no step in memory (`eval_on_start`'s baseline, or an evaluation after a `flush()` with
+        # no step since) the value would be left out (`Session._no_step_for`): logged with an explicit
+        # step instead, a scalar-only record (`WAVE_AL_CONTRACT.md` section Q5). The step is the
+        # session's own number, `_suggested_step`: the step training starts at, which is
+        # `state.global_step` for a baseline (`start_step` is `global_step` at `on_train_begin`, also
+        # on a resume), else the last step that ended, `state.global_step - 1`, since both count
+        # optimizer steps. `state` itself is not read.
         try:
             values = _evaluation_scalars(metrics)
             if values:
                 if self.session._phase != "eval":
                     self.session.set_phase("eval")
-                self.session.log(values)
+                if self.session._newest_scalars() is None:
+                    self.session.log(values, step=self.session._suggested_step())
+                else:
+                    self.session.log(values)
         except Exception:  # noqa: BLE001  nothing here may stop the Trainer
             pass
         self.session.set_phase("checkpoint" if getattr(control, "should_save", False) else "train")
