@@ -30,7 +30,7 @@ from typing import Any, Iterable, Mapping
 from . import manifest as _manifest
 # A record's identity fields (WAVE_AF_CONTRACT.md, section 1): checked where records are loaded,
 # before either engine is chosen, by lane F's one check (`identity.check`).
-from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part
+from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part, is_scalar_record
 from .sink import read_end_marker
 from .data_checks import (
     CHANGES_LISTED,
@@ -2442,6 +2442,7 @@ def load_records(
     *,
     rank: int | None = None,
     all_attempts: bool = False,
+    scalars: bool = False,
 ) -> list[dict[str, Any]]:
     """Read captured step records.
 
@@ -2459,13 +2460,20 @@ def load_records(
     `schema_version`, `rank`, `attempt` or `step` is not valid raises `MalformedRecordError`,
     which names the field, the value, and the file and line, the part and row, or the place in
     the list (WAVE_AF_CONTRACT.md, section 1). Nothing is judged from such an input.
+
+    Scalar-only records (`identity.is_scalar_record`, `session.log(..., step=N)`: WAVE_AL_CONTRACT.md
+    section 4) are set apart here, after that check: by default they are left out, so the records
+    returned are the training records alone, as before them. `scalars=True` keeps them, in their
+    place among the training records, for a reader of series (`scalar_series`); a store's
+    `scalars-*` objects are then read beside its parts. Either way the attempts are resolved with
+    the training records' cutoffs (`resolve_attempts`).
     """
     if isinstance(source, (str, Path)):
         path = Path(source)
         if path.is_dir():
             # One rank at a time: a run of many ranks never has to fit in memory at once.
             records = [
-                r for part in _parquet_parts(path, rank) for r in _checked_part(part)
+                r for part in _parquet_parts(path, rank, scalars=scalars) for r in _checked_part(part)
                 if rank is None or r.get("rank", 0) == rank
             ]
         elif path.suffix == ".parquet":
@@ -2484,7 +2492,20 @@ def load_records(
             records.append(dict(item))
     if rank is not None:
         records = [r for r in records if r.get("rank", 0) == rank]
+    if not scalars:
+        records = [r for r in records if not is_scalar_record(r)]
     return records if all_attempts else resolve_attempts(records)
+
+
+def set_apart_scalars(records: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The training records and the scalar-only records of `records` (`identity.is_scalar_record`),
+    each in the order given (WAVE_AL_CONTRACT.md section 4.6). No engine is given a scalar-only
+    record: none of the kinds judges one (D12), and none is a step."""
+    training: list[dict[str, Any]] = []
+    scalar_only: list[dict[str, Any]] = []
+    for record in records:
+        (scalar_only if is_scalar_record(record) else training).append(record)  # type: ignore[arg-type]
+    return training, scalar_only
 
 
 def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
@@ -2513,9 +2534,10 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
     return records, left_out
 
 
-def _load_counted(source: Any, rank: int | None, *, checked: bool = False) -> tuple[list[dict[str, Any]], int]:
-    """`load_records(source, rank=rank, all_attempts=True)`, with a `.jsonl` file read by
-    `read_jsonl`: its records and the lines left out (0 for any other source).
+def _load_counted(source: Any, rank: int | None, *, checked: bool = False,
+                  scalars: bool = False) -> tuple[list[dict[str, Any]], int]:
+    """`load_records(source, rank=rank, all_attempts=True, scalars=scalars)`, with a `.jsonl` file
+    read by `read_jsonl`: its records and the lines left out (0 for any other source).
 
     Records whose identity was checked already are copied and not checked again: `read_jsonl`'s,
     checked with their file and line, and with `checked` the records handed in, which a watcher's
@@ -2523,15 +2545,17 @@ def _load_counted(source: Any, rank: int | None, *, checked: bool = False) -> tu
     about 40 ms of a 0.5 s update, wave AF-W)."""
     if isinstance(source, (str, Path)) and not Path(source).is_dir() and Path(source).suffix not in (".parquet",):
         records, left_out = read_jsonl(source)
-        return _copies(records, rank), left_out
+        return _copies(records, rank, scalars=scalars), left_out
     if checked and not isinstance(source, (str, Path)):
-        return _copies(source, rank), 0
-    return load_records(source, rank=rank, all_attempts=True), 0
+        return _copies(source, rank, scalars=scalars), 0
+    return load_records(source, rank=rank, all_attempts=True, scalars=scalars), 0
 
 
-def _copies(records: Iterable[Mapping[str, Any]], rank: int | None) -> list[dict[str, Any]]:
-    """What `load_records(records, rank=rank, all_attempts=True)` gives for records already checked."""
-    return [dict(item) for item in records if rank is None or item.get("rank", 0) == rank]
+def _copies(records: Iterable[Mapping[str, Any]], rank: int | None, *, scalars: bool = False) -> list[dict[str, Any]]:
+    """What `load_records(records, rank=rank, all_attempts=True, scalars=scalars)` gives for records
+    already checked."""
+    return [dict(item) for item in records
+            if (rank is None or item.get("rank", 0) == rank) and (scalars or not is_scalar_record(item))]
 
 
 def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
@@ -2758,6 +2782,8 @@ _run_of = run_of
 
 
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
+# A scalars object's name, its first and last `seq` (WAVE_AL_CONTRACT.md section 4.5).
+_SCALARS_NAME = re.compile(r"scalars-(-?\d+)-(-?\d+)\.parquet$")
 _WHOLE = re.compile(r"-?[0-9]+")  # ASCII digits only: `int("²")` raises (lane V3's note)
 ATTEMPT_ORDER_FILE = "attempts.json"
 
@@ -2811,8 +2837,12 @@ def _other_rank_folder(entry: os.DirEntry[str], rank: int) -> bool:
     return number is not None and number != rank
 
 
-def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
+def _parquet_parts(directory: Path, rank: int | None = None, *, scalars: bool = False) -> list[Path]:
     """The server's part files under `directory`, ordered by rank, attempt and first step.
+
+    With `scalars`, also the attempts' `scalars-<first_seq>-<last_seq>.parquet` objects
+    (WAVE_AL_CONTRACT.md section 4.5), each after its attempt's parts, by first `seq`. Without it
+    they are never listed, as before them: only a reader of series reads them.
 
     Attempts go in the rank's stored order (`attempts.json`, contract 1), or by number in a
     store written before that file. With `rank`, the `rank=<n>` folders of other ranks directly under `directory` are not
@@ -2823,7 +2853,7 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
 
     orders: dict[Path, list[int] | None] = {}
 
-    def order(path: Path) -> tuple[int, tuple[int, int], int, str]:
+    def order(path: Path) -> tuple[int, tuple[int, int], int, int, str]:
         numbers = {"rank": 0, "attempt": 0}
         rank_folder: Path | None = None
         relative = path.relative_to(directory.parent).parts[:-1]
@@ -2838,18 +2868,22 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
             rank_folder = path.parent.parent if path.parent.name.startswith("attempt=") else path.parent
         if rank_folder not in orders:
             orders[rank_folder] = stored_attempt_order(rank_folder)[0]
-        match = _PART_NAME.search(path.name)
+        family = 1 if path.name.startswith("scalars-") else 0
+        match = (_SCALARS_NAME if family else _PART_NAME).search(path.name)
         place = _attempt_place(orders[rank_folder], numbers["attempt"])
-        return numbers["rank"], place, int(match.group(1)) if match else 0, path.name
+        return numbers["rank"], place, family, int(match.group(1)) if match else 0, path.name
 
-    if rank is None:
-        found = list(directory.rglob("part-*.parquet"))
-    else:
-        found = list(directory.glob("part-*.parquet"))
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if entry.is_dir(follow_symlinks=False) and not _other_rank_folder(entry, rank):
-                    found.extend((directory / entry.name).rglob("part-*.parquet"))
+    patterns = ("part-*.parquet", "scalars-*.parquet") if scalars else ("part-*.parquet",)
+    found: list[Path] = []
+    for pattern in patterns:
+        if rank is None:
+            found.extend(directory.rglob(pattern))
+        else:
+            found.extend(directory.glob(pattern))
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False) and not _other_rank_folder(entry, rank):
+                        found.extend((directory / entry.name).rglob(pattern))
     return sorted(found, key=order)
 
 
@@ -2975,7 +3009,11 @@ class _Tail:
     first and last CHECKED_BYTES (4 KiB) of what was read, and the same modification time (or one
     that also grows the file) is not detected, and the watcher goes on reading from its offset. A
     file cut to empty is read again but holds no record, so the watcher still writes nothing for it
-    and the last evidence file stays as it was."""
+    and the last evidence file stays as it was.
+
+    `records` holds the training records read; the scalar-only records are set apart as they are
+    read, into `scalars` (WAVE_AL_CONTRACT.md section 4.6), so the watcher judges the training
+    records alone. A store's `scalars-*` objects are not listed here."""
 
     CHECKED_BYTES = 4096  # at the start of a `.jsonl` file, and before the end of what was read
 
@@ -2983,6 +3021,7 @@ class _Tail:
         self.source = source
         self.rank = rank
         self.records: list[dict[str, Any]] = []
+        self.scalars: list[dict[str, Any]] = []  # the scalar-only records read, in their order
         self._offset = 0
         self._seen: set[Path] = set()
         self._stats: dict[Path, tuple[int, int, int]] = {}  # each part read: its size, time and file
@@ -2997,6 +3036,7 @@ class _Tail:
 
     def _restart(self) -> None:
         self.records = []
+        self.scalars = []
         self._offset = 0
         self._seen = set()
         self._stats = {}
@@ -3092,7 +3132,11 @@ class _Tail:
                 self._last = (self._last + data[max(0, end - self.CHECKED_BYTES):end])[-self.CHECKED_BYTES:]
         if self.rank is not None:
             new = [r for r in new if r.get("rank", 0) == self.rank]
+        new, scalar_only = set_apart_scalars(new)
         self.records.extend(new)
+        self.scalars.extend(scalar_only)
+        # A scalar-only line changes no evidence (the watcher judges the training records), so it
+        # alone is not news to the watcher.
         return bool(new) or restarted
 
 
@@ -7645,6 +7689,9 @@ def _build_evidence(
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
     held_ranks: list[int] | None = None
+    # The training records alone (`_load_counted` sets the scalar-only records apart, after the
+    # identity check): no engine judges a scalar-only record, and none is a step, so the evidence is
+    # the training records' (WAVE_AL_CONTRACT.md section 4.6, Q4 a).
     if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
         # A file or list is read whole either way: the ranks it holds are kept, so the evidence
         # can say it judged one of several (L21). A store's rank folder holds one rank.
@@ -9190,6 +9237,8 @@ def export_rerun(
         probe_series = False
         probe_invalid = [False]
         if records is not None:
+            # Scalar-only records are set apart: none is a training step (WAVE_AL_CONTRACT.md section 4.6).
+            records, scalar_only = set_apart_scalars(records)
             for record in records:
                 rr.set_time("training_step", sequence=int(record["step"]))
                 grad_norm = record.get("grad_norm")
@@ -9588,7 +9637,9 @@ def _main() -> None:
     # A file is read whole and its rank picked by `build_evidence`, which then says which ranks the
     # file held (L21); a directory is read a rank at a time, as before.
     whole_file = not args.input.is_dir()
-    records, left_out = _load_counted(args.input, None if whole_file else rank)
+    every, left_out = _load_counted(args.input, None if whole_file else rank, scalars=args.rerun is not None)
+    # The scalar-only records are read only for the Rerun export's series (section 4.6).
+    records, _ = set_apart_scalars(every)
     held = sorted({int(r.get("rank", 0)) for r in records})
     if whole_file and rank is None and len(held) > 1:
         parser.error(f"{args.input} holds ranks {_rank_ranges(held, 8)}: choose one with --rank N (the evidence is one "
@@ -9618,7 +9669,8 @@ def _main() -> None:
     print(run_state_line(evidence))
     print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
-        export_rerun(evidence, args.rerun, records=resolve_attempts(own))
+        export_rerun(evidence, args.rerun, records=resolve_attempts(
+            every if rank is None else [r for r in every if r.get("rank", 0) == rank]))
         print(f"wrote Rerun recording -> {args.rerun}")
 
 

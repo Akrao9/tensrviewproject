@@ -178,7 +178,7 @@ class _Run:
     def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False,
                  label: str = "A") -> None:
         from .evidence import run_of
-        from .identity import check, in_list
+        from .identity import check, in_list, is_scalar_record
 
         self.series: dict[str, dict[int, float]] = {}
         self.about: dict[str, dict[str, Any]] = {}
@@ -195,6 +195,9 @@ class _Run:
         # row is resolved away (WAVE_AE_CONTRACT.md, section 5): "" for a row that names none.
         self.every_run_id: set[str] = set()
         own: list[Mapping[str, Any]] = []
+        # The rank's scalar-only records, set apart after the check (WAVE_AL_CONTRACT.md section
+        # 4.6): never a record or a step of the run.
+        self.scalar_records: list[Mapping[str, Any]] = []
         for index, record in enumerate(records):
             # Every record, whatever its rank, before any is read (WAVE_AF_CONTRACT.md, section 1): one
             # that cannot be placed in a rank, an attempt and a step refuses the input.
@@ -202,6 +205,9 @@ class _Run:
             record_rank = record.get("rank", 0)
             self.ranks_seen.add(record_rank)
             if record_rank != rank or record.get("step") is None:
+                continue
+            if is_scalar_record(record):
+                self.scalar_records.append(record)
                 continue
             own.append(record)
             self.every_run_id.add(run_of(record))
