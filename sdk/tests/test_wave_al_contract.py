@@ -619,12 +619,13 @@ def _flushed_scalar_records(sink, seconds: float = 5.0) -> list[tuple]:
 
 
 FLUSH_SETUPS = CASE["scalar_flush_writes_pending_records"]["expect"]["setups"]
+# The setups lane AL-5's turn of decision 4 must make pass (row S9). Decided here, not by `today`; at
+# the join this set is emptied.
+FLUSH_WAITING = {"no_step_ever", "no_step_since_a_flush"}
 
 
 def _flush_param(name: str):
-    today = CASE["scalar_flush_writes_pending_records"]["today"]["capture"][name]
-    marks = [] if today.startswith("written") else [
-        pytest.mark.xfail(strict=True, raises=AssertionError, reason=LANE_FLUSH)]
+    marks = [pytest.mark.xfail(strict=True, raises=AssertionError, reason=LANE_FLUSH)] if name in FLUSH_WAITING else []
     return pytest.param(name, id=name, marks=marks)
 
 
