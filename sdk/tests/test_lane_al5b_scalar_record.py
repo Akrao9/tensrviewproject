@@ -149,11 +149,12 @@ def test_a_non_finite_value_is_written_as_the_sinks_string(tmp_path):
 # ---- scalar_log_refusals ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", _case("scalar_log_refusals")["expect"]["refused_steps"] + [None, 2.0, [3]],
+@pytest.mark.parametrize("bad", _case("scalar_log_refusals")["expect"]["refused_steps"] + [False, 2.0, 1.0, [3]],
                          ids=repr)
 def test_step_refuses_before_anything_is_recorded(tmp_path, bad):
     """`scalar_log_refusals`: a bool, a float, a negative integer and anything not an integer, as
-    `TypeError`, or `ValueError` for a negative. Nothing is recorded and no `seq` is taken."""
+    `TypeError`, or `ValueError` for a negative. Nothing is recorded and no `seq` is taken. `None` is
+    not refused: the owner's decision, it is no step (`test_step_none_is_the_same_as_no_step`)."""
     path = tmp_path / "refused.jsonl"
     model = _model()
     session, opt = _open(model, path)
@@ -666,3 +667,109 @@ def test_a_second_flush_writes_nothing_twice_and_a_run_without_it_is_unchanged(t
     once, twice, never = (run(tmp_path / f"{n}.jsonl", n) for n in (1, 3, 0))
     assert shape(once) == shape(twice) == shape(never)
     assert [r.get("seq") for r in never] == [None, None, None, 0, 1, 2]
+
+
+# ---- step=None is no step (the owner, on decision 1) ---------------------------------------------
+
+
+def test_a_numpy_float_step_is_refused(tmp_path):
+    np = pytest.importorskip("numpy")
+    path = tmp_path / "npfloat.jsonl"
+    session, opt = _open(_model(), path)
+    with pytest.raises(TypeError, match="step"):
+        session.log({"a": 1.0}, step=np.float64(3.0))
+    assert session._scalar_records == []
+    session.close()
+    assert _lines(path) == []
+
+
+def _freeze(monkeypatch) -> None:
+    clock = type("Clock", (), {k: staticmethod(getattr(time, k)) for k in ("monotonic", "perf_counter", "sleep")})
+    clock.time = staticmethod(lambda: 1_790_000_000.0)
+    monkeypatch.setattr(capture, "time", clock)
+    monkeypatch.setattr(capture, "_next_attempt", lambda: 1_790_000_000_000)
+
+
+def _none_scenario(path: Path, kw: dict, case: str) -> list[str]:
+    """One situation a call without `step=` covers, with `kw` added to every such call: {} or
+    {"step": None}. Returns the left-out warnings; the file is the other result."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=JsonlSink(path), run_id="al5_none", heartbeat_seconds=None,
+                                   stack_seconds=None, every=3, data_wait=False)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        def step(i):
+            loss = model(torch.full((2, 4), float(i))).pow(2).mean()
+            loss.backward()
+            if case == "in_memory":
+                session.log({"loss": loss.detach(), "i": i}, **kw)  # the step in progress takes it
+            opt.step()
+            opt.zero_grad()
+
+        if case == "no_step":
+            with session.phase("eval"):
+                session.log({"eval/baseline": 2.5}, **kw)  # left out, with section Q5's warning
+        for i in range(5):
+            step(i)
+            if case == "eval" and i in (1, 2, 4):
+                with session.phase("eval"):
+                    session.log({"eval/loss": torch.tensor(float(i))}, **kw)  # on the newest step
+        if case == "after_flush":
+            session.flush()
+            with session.phase("eval"):
+                session.log({"eval/after": 1.0}, **kw)  # left out, suggesting the last step
+        if case == "close":
+            session.log({"eval/final": 0.5}, **kw)  # pending at close(): on the newest step
+        session.close()
+    return [str(w.message) for w in caught if "left out the scalar" in str(w.message)]
+
+
+@pytest.mark.parametrize("case", ["in_memory", "eval", "close", "no_step", "after_flush"])
+def test_step_none_is_the_same_as_no_step(tmp_path, monkeypatch, case):
+    """`log(values, step=None)` is `log(values)`: the same bytes in the file, the same warning with the
+    same suggested number, and no scalar-only record, in each situation a call without `step=` covers."""
+    _freeze(monkeypatch)
+    plain, none = tmp_path / "plain.jsonl", tmp_path / "none.jsonl"
+    said_plain = _none_scenario(plain, {}, case)
+    said_none = _none_scenario(none, {"step": None}, case)
+    assert none.read_bytes() == plain.read_bytes()
+    assert b'"record"' not in none.read_bytes()
+    assert said_none == said_plain
+    assert len(said_none) == (1 if case in ("no_step", "after_flush") else 0)
+
+
+def test_step_none_inside_a_fullgraph_compiled_function_is_traced_as_no_step():
+    """Inside `torch.compile(fullgraph=True)`, `step=None` takes the traced path of a call without
+    `step=` (`_log_late`): no graph break, compiled once, on the step each evaluation followed."""
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    model = nn.Linear(4, 1)
+    sink = MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2, run_id="al5_none_compiled", heartbeat_seconds=None,
+                               stack_seconds=None)
+    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    counter = CompileCounter()
+
+    @torch.compile(backend=counter, fullgraph=True)
+    def evaluate(x):
+        with torch.no_grad():
+            value = model(x).pow(2).mean()
+        session.log({"eval/x": value}, step=None)
+        return value
+
+    expected = {}
+    for i in range(4):
+        model(torch.randn(8, 4)).pow(2).mean().backward()
+        opt.step()
+        opt.zero_grad()
+        with session.phase("eval"):
+            expected[i] = evaluate(torch.full((8, 4), float(i))).item()
+    session.close()
+    torch._dynamo.reset()
+    assert counter.frame_count == 1
+    assert [r for r in sink.records if r.get("record") == "scalars"] == []
+    assert [r["scalars"]["eval/x"] for r in sink.records] == pytest.approx([expected[i] for i in range(4)])
