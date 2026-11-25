@@ -941,7 +941,7 @@ def rows_to_send(
     The rows are `_row`'s, so a valid record's row is what `record_to_row` makes of it. The steps returned,
     the batch's `min_step` and `max_step`, are the training rows' alone: a scalar-only row (`seq` set) is in
     the batch but never one of its steps, so a batch of scalar-only rows alone has none and sends null for
-    both, as a batch with no steps does (the owner, Nov 24, on lane AL-1''s decision 6)."""
+    both, as a batch with no steps does (the owner, Nov 24, on lane AL-1's decision 6)."""
     import pyarrow as pa
 
     def strict(record: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]] | None:

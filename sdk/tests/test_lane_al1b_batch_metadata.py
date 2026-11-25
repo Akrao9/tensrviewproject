@@ -1,4 +1,4 @@
-"""Wave AL step 2, the owner's turn of lane AL-1''s decision 6 (Nov 24): a batch's `min_step` and `max_step`
+"""Wave AL step 2, the owner's turn of lane AL-1's decision 6 (Nov 24): a batch's `min_step` and `max_step`
 count training rows only.
 
 A batch holding training rows and scalar-only rows gives the training rows' `min_step` and `max_step` alone,
