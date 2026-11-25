@@ -423,6 +423,17 @@ struct RankBuffer {
     /// not stored (L30), counted in `late_steps_confirmed` when the part is stored. At most one per
     /// row received while the part is open.
     late_steps: std::collections::BTreeSet<i64>,
+    /// The scalar-only rows waiting to be stored, apart from the step rows (`WAVE_AL_CONTRACT.md`
+    /// section 4.5).
+    scalars: ScalarBuffer,
+}
+
+/// A rank's buffered scalar-only rows: the rows whose `seq` is not null, of one attempt.
+#[derive(Default)]
+struct ScalarBuffer {
+    attempt: i64,
+    batches: Vec<RecordBatch>,
+    rows: usize,
 }
 
 impl RankBuffer {
@@ -909,12 +920,14 @@ impl Ingest {
         // too, counted as a refused batch though it held no row, and the refusal named no bytes of
         // the sender's, so the sender kept its offset and its rows never left (RS10).
         let question = batch.num_rows() == 0 && end_byte_offset == 0;
-        let (pieces, dropped) = if question {
-            (Vec::new(), Dropped::new())
+        let (pieces, scalar_pieces, dropped) = if question {
+            (Vec::new(), Vec::new(), Dropped::new())
         } else {
             // Rows that cannot be stored are dropped before anything of the batch is placed or kept,
-            // and a batch none of whose rows can be read is refused and counted (RS10).
-            let (batch, dropped) = match drop_unstorable_rows(batch) {
+            // and a batch none of whose rows can be read is refused and counted (RS10). Then the
+            // scalar-only rows, those whose `seq` is not null, are taken out before the step
+            // watermark is looked at (`WAVE_AL_CONTRACT.md` section 4.5).
+            let (batch, dropped, scalars) = match readable_rows(batch) {
                 Ok(kept) => kept,
                 Err(refused) => {
                     if let Some(column) = refused.column {
@@ -926,11 +939,31 @@ impl Ingest {
                 }
             };
             refuse_negative_steps(&batch)?;
-            (split_by_attempt(batch)?, dropped)
+            let scalar_pieces = match scalars {
+                Some(scalars) => {
+                    refuse_negative_steps(&scalars)?;
+                    refuse_negative_seqs(&scalars)?;
+                    split_by_attempt(scalars)?
+                }
+                None => Vec::new(),
+            };
+            // A batch that held scalar rows only has no step rows left to look at. A batch without
+            // them is split as before, whatever it holds.
+            let pieces = if !scalar_pieces.is_empty() && batch.num_rows() == 0 {
+                Vec::new()
+            } else {
+                split_by_attempt(batch)?
+            };
+            (pieces, scalar_pieces, dropped)
         };
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
-        let attempts: Vec<i64> = pieces.iter().map(|(attempt, _)| *attempt).collect();
+        // A scalar row's attempt is placed as a step row's is.
+        let attempts: Vec<i64> = pieces
+            .iter()
+            .chain(&scalar_pieces)
+            .map(|(attempt, _)| *attempt)
+            .collect();
         self.place(key, sender, &attempts).await?;
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
@@ -954,6 +987,11 @@ impl Ingest {
                     superseded += rows as u64;
                 }
             }
+        }
+        // The scalar-only rows never meet the step watermark and are never progress: not the rank's
+        // `last_step`, not the step given to the watchdog below, never a step the detectors read.
+        for (attempt, batch) in scalar_pieces {
+            self.accept_scalars(key, attempt, batch, &mut buffer).await?;
         }
         // Counted once the rest of the batch is taken: a batch refused before (the store could not
         // be read) is sent again, and its rows would be counted twice.
@@ -1088,6 +1126,27 @@ impl Ingest {
         // No row kept: a step is confirmed late only behind a row of the open part (`open`).
         buffer.late_steps.append(&mut late);
         Ok((None, not_newer))
+    }
+
+    /// Buffers the scalar-only rows of a batch whose rows all belong to one attempt
+    /// (`WAVE_AL_CONTRACT.md` section 4.5). They are kept apart from the step rows, so they never
+    /// raise the step watermark (D8) and are never progress.
+    async fn accept_scalars(
+        &self,
+        key: &Key,
+        attempt: i64,
+        batch: RecordBatch,
+        buffer: &mut RankBuffer,
+    ) -> Result<(), Status> {
+        let _ = key;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let scalars = &mut buffer.scalars;
+        scalars.attempt = attempt;
+        scalars.rows += batch.num_rows();
+        scalars.batches.push(batch);
+        Ok(())
     }
 
     /// Stores what the buffer holds as one part, then acknowledges the offset it covers.
@@ -2231,6 +2290,69 @@ fn drop_unstorable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped), Re
         status: Status::internal(error.to_string()),
     })?;
     Ok((batch, dropped))
+}
+
+/// The column whose non-null value marks a scalar-only row (`WAVE_AL_CONTRACT.md` sections 4.2 to
+/// 4.5): a record's `seq`, counted per session from 0. Null on a step row.
+pub const SEQ_COLUMN: &str = "seq";
+
+/// The rows of a batch that can be stored (`drop_unstorable_rows`), and the rows dropped, with the
+/// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, and the
+/// scalar-only rows if there are any.
+fn readable_rows(batch: RecordBatch) -> Result<(RecordBatch, Dropped, Option<RecordBatch>), Refused> {
+    let (batch, dropped) = drop_unstorable_rows(batch)?;
+    let (batch, scalars) = split_scalar_rows(batch)?;
+    Ok((batch, dropped, scalars))
+}
+
+/// Takes the scalar-only rows, those whose `seq` is not null, out of a batch (section 4.5): the step
+/// rows and, when there are any, the scalar-only rows, each in the batch's own order and schema. A
+/// batch without a `seq` column (step 1's sender, a protocol 4 sender), or whose `seq` is null on
+/// every row, is all step rows and is returned as it came. A `seq` column of another type than Int64
+/// has no row that can be read as either kind: the batch is refused, naming the column, as for a key
+/// column (RS10).
+fn split_scalar_rows(batch: RecordBatch) -> Result<(RecordBatch, Option<RecordBatch>), Refused> {
+    let Some(column) = batch.column_by_name(SEQ_COLUMN) else {
+        return Ok((batch, None));
+    };
+    if column.data_type() != &DataType::Int64 {
+        return Err(Refused {
+            column: Some(SEQ_COLUMN),
+            status: Status::invalid_argument(format!(
+                "column `{SEQ_COLUMN}` is {}, not {}; the batch is refused",
+                column.data_type(),
+                DataType::Int64
+            )),
+        });
+    }
+    if column.null_count() == column.len() {
+        return Ok((batch, None));
+    }
+    let internal = |error: arrow::error::ArrowError| Refused {
+        column: None,
+        status: Status::internal(error.to_string()),
+    };
+    let scalar = arrow::compute::is_not_null(column).map_err(internal)?;
+    let step = arrow::compute::not(&scalar).map_err(internal)?;
+    let scalars = filter_record_batch(&batch, &scalar).map_err(internal)?;
+    let steps = filter_record_batch(&batch, &step).map_err(internal)?;
+    Ok((steps, Some(scalars)))
+}
+
+/// Refuses a batch whose scalar-only rows hold a negative `seq`, whole, as `refuse_negative_steps`
+/// refuses a negative step: `seq` counts from 0 (section 4.2), so such a row was never written by a
+/// session and nothing of the batch is stored, acknowledged or counted.
+fn refuse_negative_seqs(scalars: &RecordBatch) -> Result<(), Status> {
+    let seqs = scalars
+        .column_by_name(SEQ_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| Status::invalid_argument("column `seq` is missing or of the wrong type"))?;
+    match seqs.iter().flatten().find(|seq| *seq < 0) {
+        Some(seq) => Err(Status::invalid_argument(format!(
+            "column `seq` holds a negative value ({seq}); the batch is refused"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Refuses a batch that holds a negative `step`, whole, with `invalid_argument`, as `split_by_attempt`
