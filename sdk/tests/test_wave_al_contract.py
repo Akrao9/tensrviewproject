@@ -28,12 +28,12 @@ What runs here, on the base and on every lane's tree:
   function before the flush for a newly trainable parameter, and its eager twin.
 
 Since step 2 landed every target of the wave's two steps passes on the joined tree (0826958) and is an
-ordinary test. The owner's two turns of lane AL-5's decisions (Nov 24; contract rows S9 and S10) add
-expected failures, strict, until AL-5's change is joined:
-`test_step_none_is_the_same_as_leaving_step_out` (all three) and
-`test_flush_writes_the_pending_scalar_only_records[no_step_ever]` and `[no_step_since_a_flush]`. The
-owner's turn of lane AL-1′'s decision 6 (row S13) adds one more, until AL-1′'s change is joined:
-`test_a_batch_s_min_and_max_step_count_its_training_rows_only`.
+ordinary test. The owner's two turns of lane AL-5's decisions (Nov 24; contract rows S9 and S10) and
+the turn of lane AL-1′'s decision 6 (row S13) were targets too, strict expected failures until those
+changes were joined: `test_step_none_is_the_same_as_leaving_step_out`,
+`test_flush_writes_the_pending_scalar_only_records` and
+`test_a_batch_s_min_and_max_step_count_its_training_rows_only`. They are ordinary tests since the
+join, and no test in this file is an expected failure.
 
 The Rust paths need the server binary (`TENSORQUILL_SERVER_BIN`, or one beside the interpreter) and
 are skipped without it; anything that needs pyarrow is skipped without it (CI's plain jobs have none).
@@ -519,9 +519,10 @@ def test_a_scalar_record_on_a_live_server_is_stored_apart_and_never_judged(case,
     parts = sorted((store / "runs" / run_id).rglob("part-*.parquet"))
     stored_steps = sorted(s for p in parts for s in pq.read_table(p, columns=["step"]).column(0).to_pylist())
     assert stored_steps == sorted(r["step"] for r in training)
-    objects = flight.scalar_objects(store / "runs" / run_id)
-    assert objects, "no scalars-* object stored"
-    assert [r for o in objects for r in flight.read_scalar_object(o)] == scalars
+    # Read back as every reader reads a store (the seam left one listing, `evidence`'s; `flight` has none).
+    assert sorted((store / "runs" / run_id).rglob("scalars-*.parquet")), "no scalars-* object stored"
+    stored = evidence.load_records(store / "runs" / run_id, scalars=True, all_attempts=True)
+    assert evidence.set_apart_scalars(stored)[1] == scalars
 
 
 
@@ -591,7 +592,6 @@ def _no_step_run(scenario: str, step_none: bool):
 NO_STEP_SCENARIOS = CASE["scalar_log_step_none_is_no_step"]["expect"]["scenarios"]
 
 
-@pytest.mark.xfail(strict=True, raises=TypeError, reason=LANE_STEP_NONE)
 @pytest.mark.parametrize("scenario", NO_STEP_SCENARIOS)
 def test_step_none_is_the_same_as_leaving_step_out(scenario):
     """Case `scalar_log_step_none_is_no_step`: `log(values, step=None)` records exactly what
@@ -621,9 +621,9 @@ def _flushed_scalar_records(sink, seconds: float = 5.0) -> list[tuple]:
 
 
 FLUSH_SETUPS = CASE["scalar_flush_writes_pending_records"]["expect"]["setups"]
-# The setups lane AL-5's turn of decision 4 must make pass (row S9). Decided here, not by `today`; at
-# the join this set is emptied.
-FLUSH_WAITING = {"no_step_ever", "no_step_since_a_flush"}
+# The setups lane AL-5's turn of decision 4 had to make pass (row S9). Decided here, not by `today`;
+# emptied at the join, where its change landed.
+FLUSH_WAITING: set[str] = set()
 
 
 def _flush_param(name: str):
@@ -691,7 +691,6 @@ def _sent_batches(tmp_path: Path, first: list[dict], then: list[dict]) -> list[d
     return [json.loads(line) for line in (store / "batches.jsonl").read_text().splitlines()]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=LANE_METADATA)
 def test_a_batch_s_min_and_max_step_count_its_training_rows_only(tmp_path):
     """Case `scalar_batch_metadata_counts_training_rows`: a batch holding training rows and a
     scalar-only row carries the training rows' range; a batch of scalar-only rows alone carries the
