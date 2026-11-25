@@ -76,7 +76,7 @@ class Client:
         client = flight.FlightClient(self.endpoint)
         descriptor = flight.FlightDescriptor.for_path("runs", RUN, "rank=0")
         writer, reader = client.do_put(descriptor, batch.schema, flight.FlightCallOptions(timeout=30.0))
-        metadata = {"schema_version": 1, "run_id": RUN, "rank": 0, "end_byte_offset": end,
+        metadata = {"schema_version": 2, "run_id": RUN, "rank": 0, "end_byte_offset": end,
                     "min_step": min(steps) if steps else None, "max_step": max(steps) if steps else None,
                     "sender_attempt": 1}
         answers, status = [], None

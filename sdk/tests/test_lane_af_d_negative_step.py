@@ -37,7 +37,7 @@ def _put(endpoint: str, steps: list[int], end: int) -> dict:
     out: dict = {"acks": []}
     try:
         writer, reader = client.do_put(fl.FlightDescriptor.for_path("runs", RUN, "rank=0"), batch.schema)
-        metadata = {"schema_version": 1, "run_id": RUN, "rank": 0, "min_step": min(steps), "max_step": max(steps),
+        metadata = {"schema_version": 2, "run_id": RUN, "rank": 0, "min_step": min(steps), "max_step": max(steps),
                     "end_byte_offset": end}
         writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
         writer.done_writing()

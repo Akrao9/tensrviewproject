@@ -53,7 +53,7 @@ def _live(tmp_path: Path, records) -> tuple[dict, dict]:
         client = fl.FlightClient(server.endpoint)
         batch = records_to_batch(records)
         writer, reader = client.do_put(fl.FlightDescriptor.for_path("runs", run, "rank=0"), batch.schema)
-        metadata = {"schema_version": 1, "run_id": run, "rank": 0, "min_step": records[0]["step"], "max_step": last,
+        metadata = {"schema_version": 2, "run_id": run, "rank": 0, "min_step": records[0]["step"], "max_step": last,
                     "end_byte_offset": 100, "world_size": 1}
         writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
         assert json.loads(reader.read().to_pybytes())["end_byte_offset"] == 100

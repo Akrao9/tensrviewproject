@@ -229,7 +229,7 @@ def _put(endpoint: str, run_id: str, batches: list[list[dict]]) -> None:
         for records in batches:
             steps = [r["step"] for r in records]
             start, end = end, end + 100 * len(records)
-            metadata = {"schema_version": 1, "run_id": run_id, "rank": 0, "start_byte_offset": start,
+            metadata = {"schema_version": 2, "run_id": run_id, "rank": 0, "start_byte_offset": start,
                         "end_byte_offset": end, "min_step": min(steps), "max_step": max(steps), "sender_attempt": 1}
             writer.write_with_metadata(records_to_batch(records).cast(first.schema) if records is not batches[0] else first,
                                        pa.py_buffer(json.dumps(metadata).encode()))

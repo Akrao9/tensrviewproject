@@ -4,7 +4,8 @@ owner's answers to the lanes' decisions (Nov 24, 2026).
 1. Protocol 5: `server_detect.PROTOCOL` and `PROTOCOL` in `server/src/main.rs` are both 5 (D13), each
    with a line saying what 5 changed, and this tree's binary prints it. The pages give the same number.
 2. One row-version list in the server: `ingest::SUPPORTED_ROW_VERSIONS` is what ingest stores and
-   what `detect` reads (0, 1 and 2).
+   what `detect` reads (0, 1 and 2); live, a batch of metadata version 1 may hold 0 and 1 of them only
+   (`ingest::ROW_VERSIONS`, the owner's decision of Nov 25, 2026).
 3. One wording of the server's refusal of a batch metadata version, read by both sides from
    `fixtures/wave_al/refusal.json`: the sender recognises a protocol 4 server's and this server's.
 4. The known differences on a name Arrow cannot encode, the Python side (the Rust side is in
@@ -106,7 +107,11 @@ def test_the_server_keeps_one_row_version_list_read_by_ingest_and_detect():
     assert "pub const SUPPORTED_ROW_VERSIONS: [i32; 3] = [0, 1, 2];" in ingest
     assert "STORED_ROW_VERSIONS" not in ingest and "STORED_ROW_VERSIONS" not in detect
     assert not re.search(r"\bconst ROW_VERSIONS\b", detect)
-    assert "!SUPPORTED_ROW_VERSIONS.contains(" in ingest  # what ingest stores (RS10)
+    # What ingest stores (RS10): the versions its batch's metadata version allows, from the one table
+    # (the owner's decision of Nov 25, 2026: 0 and 1 under metadata 1, the whole list under 2).
+    assert "pub const ROW_VERSIONS: [(i64, &[i32]); 2]" in ingest
+    assert "(SCHEMA_VERSIONS[1], &SUPPORTED_ROW_VERSIONS)," in ingest
+    assert "!readable.contains(" in ingest
     assert "!crate::ingest::SUPPORTED_ROW_VERSIONS.contains(" in detect  # what `check_keys` reads
 
 

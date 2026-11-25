@@ -159,7 +159,7 @@ for line in sys.stdin:
     records = [{"schema_version": 1, "run_id": run, "rank": rank, "attempt": attempt, "step": step,
                 "ts": float(step), "grad_norm": 1.0, "lr": [0.1]} for step in range(first, end)]
     offset += 100 * len(records)
-    metadata = {"schema_version": 1, "run_id": run, "rank": rank, "world_size": 2, "sender_attempt": attempt,
+    metadata = {"schema_version": 2, "run_id": run, "rank": rank, "world_size": 2, "sender_attempt": attempt,
                 "min_step": first, "max_step": end - 1, "end_byte_offset": offset}
     writer.write_with_metadata(records_to_batch(records), pa.py_buffer(json.dumps(metadata).encode()))
     reader.read()

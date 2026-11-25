@@ -105,7 +105,7 @@ def _send(endpoint: str, records: list[dict]) -> None:
         writer, reader = client.do_put(flight.FlightDescriptor.for_path("runs", RUN, "rank=0"), batch.schema,
                                        flight.FlightCallOptions(timeout=60.0))
         steps = [r["step"] for r in records]
-        metadata = {"schema_version": 1, "run_id": RUN, "rank": 0, "end_byte_offset": 100 * len(records),
+        metadata = {"schema_version": 2, "run_id": RUN, "rank": 0, "end_byte_offset": 100 * len(records),
                     "min_step": min(steps), "max_step": max(steps), "sender_attempt": 1}
         writer.write_with_metadata(batch, pa.py_buffer(json.dumps(metadata).encode()))
         writer.done_writing()

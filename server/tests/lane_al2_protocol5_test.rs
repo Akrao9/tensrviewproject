@@ -432,8 +432,8 @@ async fn batch_metadata_versions_1_and_2_are_taken_and_any_other_is_refused_nami
     );
 }
 
-/// Section 3, RS10: rows of `schema_version` 0, 1 and 2 are stored and acknowledged; a row of any
-/// other version is dropped and counted under `unsupported_schema_version`, and the rest of its batch
+/// Section 3, RS10: under batch metadata 2, rows of `schema_version` 0, 1 and 2 are stored and
+/// acknowledged; a row of any other version is dropped and counted under `unsupported_schema_version`, and the rest of its batch
 /// is kept. Fails on the base: a row of version 2 is dropped and counted (D6, `old_server_row_v2`).
 #[tokio::test]
 async fn rows_of_versions_0_1_and_2_are_stored_and_any_other_is_dropped_and_counted() {
@@ -444,8 +444,10 @@ async fn rows_of_versions_0_1_and_2_are_stored_and_any_other_is_dropped_and_coun
     let mut columns = rows.columns().to_vec();
     columns[0] = Arc::new(versions);
     rows = RecordBatch::try_new(rows.schema(), columns).unwrap();
-    // Under metadata 1, as a sender may send its backlog: the row's version is checked apart.
-    assert_eq!(send_one(&server, rows, 1, 100).await.unwrap(), 100);
+    // Under metadata 2, protocol 5's: the versions its batch may hold are 0, 1 and 2. Under metadata 1
+    // a row of version 2 is dropped too (the owner's decision of Nov 25, 2026, tested in
+    // `lane_al2b_v2_under_v1_test.rs`).
+    assert_eq!(send_one(&server, rows, 2, 100).await.unwrap(), 100);
     let stored: Vec<i64> = parts(dir.path())
         .iter()
         .flat_map(|part| steps_of(&read_whole(part)))

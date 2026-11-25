@@ -126,7 +126,7 @@ class Stream:
 
         self.offset += 100 * len(records)
         metadata: dict[str, Any] = {
-            "schema_version": 1, "run_id": self.run_id, "rank": 0,
+            "schema_version": 2, "run_id": self.run_id, "rank": 0,
             "min_step": min(r["step"] for r in records), "max_step": max(r["step"] for r in records),
             "end_byte_offset": self.offset,
         }
