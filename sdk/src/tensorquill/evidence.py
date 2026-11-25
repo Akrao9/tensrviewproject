@@ -166,6 +166,32 @@ _WIRE_NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}  # as J
 _UNCARRIED = object()
 
 
+def layer_entries(record: Mapping[str, Any]) -> list[tuple[Any, Mapping[str, Any]]]:
+    """The layers a record holds, `(name, stats)` in stored order: the entries of its `layers`
+    that are objects (WAVE_AL_CONTRACT.md section 1.5). An entry that is not an object (`5`, a
+    null struct in protocol 5's column) and a `layers` value that is not an object (`[1, 2]`,
+    `null`) are absent to every detector, as Rust reads them, and are never raised on."""
+    layers = record.get("layers")
+    if not isinstance(layers, Mapping):
+        return []
+    return [(name, stats) for name, stats in layers.items() if isinstance(stats, Mapping)]
+
+
+def _recorded_diversity(stats: Any) -> float | None:
+    """A router's recorded `diversity` when it is a finite number, else None, so the rule takes it
+    from the counts (WAVE_AL_CONTRACT.md section 1.5): as Rust's `Number` reads it, a bool, a
+    string (the sink's `"nan"` among them), `null`, a list, an object and a value that is not
+    finite are absent, and so is the whole entry when it is not an object."""
+    value = stats.get("diversity") if isinstance(stats, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:  # an integer past a float's range reads as infinite in Rust: not finite
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _router_counts(value: Any) -> list[int] | None:
     """A router's counts as the `moe_counts` column carries them, a list of signed 64-bit integers
     (a bool is not one), else None: that router is then absent from the record, as Rust sees it."""
@@ -1986,7 +2012,7 @@ class _ActivationAnomalies:
         for record in sorted(records, key=lambda r: r["step"]):
             step = int(record["step"])
             spikes, drifts, dead = [], [], []
-            for name, stats in record.get("layers", {}).items():
+            for name, stats in layer_entries(record):  # an entry that is not an object is absent (section 1.5)
                 std, amax, zfrac = (_finite(stats.get(k)) for k in ("std", "abs_max", "zero_frac"))
                 if std is None or amax is None or zfrac is None:
                     continue
@@ -3467,7 +3493,8 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
                 (total := _router_total(value)) is not None and total > 0 for value in moe.values()):
             counts["moe"] += 1
         total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
-        norms, layers = bool(record.get("grad_norms")), bool(record.get("layers"))
+        # A `layers` value that is not an object holds no layer (section 1.5).
+        norms, layers = bool(record.get("grad_norms")), isinstance(record.get("layers"), Mapping) and bool(record["layers"])
         counts["grad_total"] += total
         # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
         counts["update"] += (
@@ -6703,7 +6730,7 @@ class _NonFinite:
         for record in records:
             bad_layers = [
                 name
-                for name, stats in record.get("layers", {}).items()
+                for name, stats in layer_entries(record)  # every field of each layer that is an object
                 if any(_is_non_finite(v) for v in stats.values())
             ]
             bad_grads = [] if record.get("step_skipped") else _non_finite_gradients(record)
@@ -7435,7 +7462,9 @@ class _MoeSamples:
             moe = record.get("moe")
             if not isinstance(moe, Mapping):
                 moe = {}
-            moe_stats = record.get("moe_stats", {})
+            moe_stats = record.get("moe_stats")
+            if not isinstance(moe_stats, Mapping):  # a value that is not an object holds no statistics (section 1.5)
+                moe_stats = {}
             for layer_idx, router_name in enumerate(routers, 1):
                 expected_experts = router_sizes[router_name]
                 # An entry the column cannot carry is no entry (wave AJ, A5: before, `int(c)` raised
@@ -7457,11 +7486,10 @@ class _MoeSamples:
                     dead: list[int] = []
                 else:
                     shares = [c / tokens for c in counts]
-                    diversity = (
-                        float(moe_stats[router_name]["diversity"])
-                        if router_name in moe_stats and "diversity" in moe_stats[router_name]
-                        else _diversity_from_counts(counts, n_experts)
-                    )
+                    # The recorded diversity when it is a finite number, else the counts' (section
+                    # 1.5): a bool was read as 1.0 here and as absent by Rust.
+                    recorded = _recorded_diversity(moe_stats.get(router_name))
+                    diversity = recorded if recorded is not None else _diversity_from_counts(counts, n_experts)
                     k = router_top_k.get(router_name, 1)
                     window = history[router_name]
                     if k >= 3:
@@ -9355,7 +9383,7 @@ def export_rerun(
                 probe = record.get("probe")
                 if probe:
                     probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
-                for layer_name, stats in record.get("layers", {}).items():
+                for layer_name, stats in layer_entries(record):
                     for key, val in stats.items():
                         if isinstance(val, (int, float)) and math.isfinite(val):
                             entity = (f"/layers/{rr.escape_entity_path_part(str(layer_name))}"

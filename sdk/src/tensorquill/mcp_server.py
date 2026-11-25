@@ -1482,7 +1482,8 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
     for record in records:
         step = int(record["step"])
         if kind == "layer":
-            stats = (record.get("layers") or {}).get(name)
+            layers = record.get("layers")
+            stats = layers.get(name) if isinstance(layers, Mapping) else None  # section 1.5: no object, no point
             point = _columns(stats) if isinstance(stats, Mapping) else None
         elif kind == "parameter":
             point = {
@@ -1491,7 +1492,8 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
                 if isinstance(record.get(field), Mapping) and name in record[field]
             } or None
         elif kind == "router":
-            stats = (record.get("moe_stats") or {}).get(name)
+            moe_stats = record.get("moe_stats")
+            stats = moe_stats.get(name) if isinstance(moe_stats, Mapping) else None
             diversity = stats.get("diversity") if isinstance(stats, Mapping) else None
             point = _router_point((record.get("moe") or {}).get(name), diversity, expert)
         elif kind in PROBE_KINDS:
