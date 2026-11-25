@@ -504,8 +504,18 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
-# `Session.log`'s `step=` when not given. A value given is a step of its own: a scalar-only record.
-_NO_STEP: Any = object()
+class _NoStep:
+    """The type of `Session.log`'s `step=` when not given. A value given is a step of its own: a
+    scalar-only record. Told by its type (`type(step) is not _NoStep`), which Dynamo traces on every
+    PyTorch the SDK supports; `step is not <an object()>` with an integer step fails to trace on 2.6."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<no step>"
+
+
+_NO_STEP: Any = _NoStep()
 
 
 def _explicit_step(step: Any) -> int:
@@ -2828,7 +2838,7 @@ class Session:
         """
         if self._closed_call("log()"):
             return
-        if step is not _NO_STEP:
+        if type(step) is not _NoStep:
             self._log_at(step, dict(values or {}, **named))
             return
         converted = self._scalar_values(dict(values or {}, **named))
