@@ -2591,24 +2591,35 @@ def resolve_attempts(
 
     An attempt is of one run: a later attempt of another run ID never rolls back this one's
     records (lane U7, Nov 19, 2026). A record with no `run_id` is of no named run (`_run_of`).
+
+    Scalar-only records (`identity.is_scalar_record`) are resolved with the training records'
+    cutoffs (WAVE_AL_CONTRACT.md section 4.6): one is left out where a later attempt's first
+    training step is at or below its step, as a training record of its attempt there would be.
+    Their own steps cut nothing, so an attempt whose first line is a baseline at step 0 rolls back
+    only from its first training step, and an attempt holding scalar-only records alone rolls
+    back nothing. Such an attempt still takes its place in the order of first appearance.
     """
     first_step: dict[tuple[str, Any, int], int] = {}
+    appeared_keys: dict[tuple[str, Any, int], None] = {}  # every attempt, in the order it first appears
     for record in records:
         key = (_run_of(record), record.get("rank", 0), record.get("attempt", 0))
+        appeared_keys.setdefault(key)
+        if is_scalar_record(record):
+            continue
         step = int(record["step"])
         if key not in first_step or step < first_step[key]:
             first_step[key] = step
-    if len({(run, rank) for run, rank, _ in first_step}) == len(first_step):
+    if len({(run, rank) for run, rank, _ in appeared_keys}) == len(appeared_keys):
         return records  # one attempt per rank of each run: nothing was replaced
     cutoff: dict[tuple[str, Any, int], float] = {}
-    for run, rank in {(run, rank) for run, rank, _ in first_step}:
+    for run, rank in {(run, rank) for run, rank, _ in appeared_keys}:
         cut = math.inf
-        # `first_step` holds a rank's attempts in the order they first appear.
-        appeared = [a for n, r, a in first_step if (n, r) == (run, rank)]
+        # `appeared_keys` holds a rank's attempts in the order they first appear.
+        appeared = [a for n, r, a in appeared_keys if (n, r) == (run, rank)]
         given = [a for a in (order or {}).get((run, rank), ()) if a in appeared]
         for attempt in reversed(given + [a for a in appeared if a not in given]):
             cutoff[(run, rank, attempt)] = cut
-            cut = min(cut, first_step[(run, rank, attempt)])
+            cut = min(cut, first_step.get((run, rank, attempt), math.inf))
     return [
         record for record in records
         if int(record["step"]) < cutoff[(_run_of(record), record.get("rank", 0), record.get("attempt", 0))]
