@@ -174,7 +174,7 @@ _KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # back as a present `None`. Every other null column reads back as an absent key.
 _ALWAYS = ("ts", "grad_norm")
 _COLUMNS = (*_KEY_COLUMNS, *(column for column, _ in _FIELDS.values()), "probe_maps", "probe_histograms",
-            "record_version", "extra_json")
+            "seq", "record_version", "extra_json")
 
 # The struct maps of section 1.2: their fields in the capture's order (`capture.py` `STATS`,
 # `_router_stats`), and the fields that are Int64. Readers look a field up by name, so a field added
@@ -194,9 +194,9 @@ _INT64 = (-(2**63), 2**63 - 1)
 def flight_schema() -> Any:
     """The Arrow schema of one step per row, in protocol 5's layout (row `schema_version` 2,
     `WAVE_AL_CONTRACT.md` sections 1 to 3): `layers` and `moe_stats` as maps of structs,
-    the probe's maps and histograms in `probe_maps` and `probe_histograms` beside `probe_json`, and the
-    record's own version in `record_version`. No map is marked `keys_sorted`: entries keep the
-    record's order (D1)."""
+    the probe's maps and histograms in `probe_maps` and `probe_histograms` beside `probe_json`, the
+    scalar-only record's `seq` (null on a step row; section 4.4), and the record's own version in
+    `record_version`. No map is marked `keys_sorted`: entries keep the record's order (D1)."""
     import pyarrow as pa
 
     f64, f32, i64 = pa.float64(), pa.float32(), pa.int64()
@@ -237,6 +237,7 @@ def flight_schema() -> Any:
             pa.field("data_wait", f64),
             pa.field("step_time", f64),
             pa.field("system_json", pa.string()),
+            pa.field("seq", pa.int64()),  # a scalar-only record's; a server stores such rows apart (section 4.5)
             pa.field("record_version", pa.int32()),
             pa.field("extra_json", pa.string()),
         ]
