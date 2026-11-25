@@ -504,24 +504,11 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
-class _NoStep:
-    """The type of `Session.log`'s `step=` when not given. A value given is a step of its own: a
-    scalar-only record. Told by its type (`type(step) is not _NoStep`), which Dynamo traces on every
-    PyTorch the SDK supports; `step is not <an object()>` with an integer step fails to trace on 2.6."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "<no step>"
-
-
-_NO_STEP: Any = _NoStep()
-
-
 def _explicit_step(step: Any) -> int:
     """`Session.log`'s `step=` as an `int`, or the refusal of contract section 4.2: a bool, a float and
-    anything not an integer raise `TypeError` (`None` too: no step is no `step=`), a negative integer
-    `ValueError`. Any `numbers.Integral` but a bool is an integer, as `identity.check` takes a step."""
+    anything not an integer raise `TypeError`, a negative integer `ValueError`. Any `numbers.Integral`
+    but a bool is an integer, as `identity.check` takes a step. `None` never reaches here: it is no
+    step, the same as leaving `step=` out (the owner's decision, Nov 24)."""
     if isinstance(step, bool) or not isinstance(step, numbers.Integral):
         raise TypeError(f"session.log(..., step=...): step must be an integer of 0 or more, not "
                         f"{type(step).__name__} {step!r}")
@@ -2806,7 +2793,7 @@ class Session:
             # its record has no key, as the count is not known there.
             self._clip_step_calls += 1
 
-    def log(self, values: Mapping[str, Any] | None = None, *, step: Any = _NO_STEP, **named: Any) -> None:
+    def log(self, values: Mapping[str, Any] | None = None, *, step: Any = None, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
 
         `session.log({"train/loss": loss})` or `session.log(loss=loss)`. Values are
@@ -2829,16 +2816,25 @@ class Session:
 
         `step=N` records the values at step `N` of their own: a scalar-only record (contract
         section 4.2), never a training step, whatever the phase and whether or not a step is in
-        memory. `N` is an integer of 0 or more; a bool, a float or anything else raises
-        `TypeError`, a negative integer `ValueError`, before anything is recorded. The record is
-        written with the next block of step records, or at `close()`; a tensor is copied on its
-        device and read with that block, so the call adds no sync. Records of one session are
-        numbered `seq` 0, 1, 2... in the order of these calls, and a reader takes the highest
-        `seq` where two meet at a step. A key `"step"` in the dictionary is an ordinary scalar.
+        memory. `N` is an integer of 0 or more. `step=None` is the same as leaving `step=` out.
+        A bool (`True`, `False`), a float (`1.0` too), a string or anything else that is not an
+        integer raises `TypeError`, and a negative integer `ValueError`, before anything is
+        recorded. A tensor value is copied on its device and read with the block that writes the
+        record, so the call adds no sync. The record is written with the next block of step
+        records, at an explicit `flush()` (also with no step in memory), or at `close()`; the
+        writer thread writes it, as it writes step records. Records of one session are numbered
+        `seq` 0, 1, 2... in the order of these calls, and a reader takes the highest `seq` where
+        two meet at a step. A key `"step"` in the dictionary is an ordinary scalar.
+
+        The record is made eagerly. Inside a function compiled with `torch.compile(fullgraph=True)`,
+        `step=N` therefore raises Dynamo's `torch._dynamo.exc.Unsupported` before anything is
+        recorded. Call it outside the compiled function, which is where a value logged outside a
+        step belongs, or compile without `fullgraph`: the call is then one graph break, compiled
+        once. A call without `step=` (or with `step=None`) is traced as before.
         """
         if self._closed_call("log()"):
             return
-        if type(step) is not _NoStep:
+        if step is not None:  # `None` is no step (the owner, Nov 24); traced as a constant under compile
             self._log_at(step, dict(values or {}, **named))
             return
         converted = self._scalar_values(dict(values or {}, **named))
@@ -3711,11 +3707,21 @@ class Session:
                 torch._foreach_zero_(buffers)
 
     def flush(self) -> None:
-        """Move the ring to the CPU and queue it for the sink."""
+        """Move the ring to the CPU and queue it for the sink, with the scalar-only records logged
+        since the last block (`log(..., step=N)`). With no step in the ring they are queued alone,
+        so an explicit `flush()` hands every pending record to the writer, as `close()` does. The
+        writer thread writes them as it writes step records: `flush()` does not wait for the file."""
         if self._closed_call("flush()"):
             return
         self._take_traced_late()
         self._flush(hold_newest=False)
+        self._put_scalar_records()
+
+    def _put_scalar_records(self) -> None:
+        """Queue the scalar-only records no block of steps took, in a block with no steps (`_decode`).
+        Nothing when none is pending: one test of a list."""
+        if self._scalar_records and not self._stopped:
+            self._put(([],))
 
     def _clear_ring_lists(self) -> None:
         self._steps = []
@@ -4344,10 +4350,9 @@ class Session:
             self._take_traced_late()
             self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
-            if self._scalar_records and not self._stopped:
-                # No block of step records was left to carry them (no step since the last flush, or
-                # none at all): a block with no steps does (`_decode`).
-                self._put(([],))
+            # No block of step records was left to carry them (no step since the last flush, or
+            # none at all): a block with no steps does (`_decode`).
+            self._put_scalar_records()
         if not self._stopped:
             try:
                 self._queue.put(None, timeout=max(deadline - time.monotonic(), 0.0))

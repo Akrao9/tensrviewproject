@@ -252,3 +252,26 @@ def test_a_value_left_out_is_never_written_and_the_explicit_call_records_it(tmp_
     session.close()
     lines = [json.loads(line) for line in sink_path.read_text().splitlines()]
     assert [(r["record"], r["step"], r["seq"], r["scalars"]) for r in lines] == [("scalars", 0, 0, {"eval/loss": 2.5})]
+
+
+def test_step_none_through_the_mirror_is_the_callers_own_value_and_no_step(monkeypatch):
+    """The owner's decision: `step=None` is no step. A value the caller logs with it is the caller's
+    own, so a mirrored value of the same name in that step does not replace it; and a value the
+    mirror brings with no step in memory is left out with the mirror's sentence, as without it."""
+    wandb = wandb_stand_in(lambda name, module: monkeypatch.setitem(sys.modules, name, module))
+    wandb.module.init()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        session, sink, model, opt = _open(0)
+        with session.phase("eval"):
+            wandb.module.log({"eval/acc": 0.5})  # no step in memory: left out, the mirror's
+            session.log({"eval/own": 1.0}, step=None)  # left out silently: said once
+        session.log({"lr": 0.1}, step=None)  # the caller's own, in the step in progress
+        wandb.module.log({"lr": 0.2})  # mirrored: does not replace the caller's
+        _step(session, model, opt)
+        session.close()
+    (said,) = [str(w.message) for w in caught if LEFT_OUT in str(w.message)]
+    assert MIRROR_SENTENCE in said and "'eval/acc'" in said
+    assert [r.get("record") for r in sink.records] == [None]
+    assert sink.records[0]["scalars"]["lr"] == 0.1
+    assert "eval/own" not in sink.records[0]["scalars"]

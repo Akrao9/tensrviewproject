@@ -149,11 +149,12 @@ def test_a_non_finite_value_is_written_as_the_sinks_string(tmp_path):
 # ---- scalar_log_refusals ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", _case("scalar_log_refusals")["expect"]["refused_steps"] + [None, 2.0, [3]],
+@pytest.mark.parametrize("bad", _case("scalar_log_refusals")["expect"]["refused_steps"] + [False, 2.0, 1.0, [3]],
                          ids=repr)
 def test_step_refuses_before_anything_is_recorded(tmp_path, bad):
     """`scalar_log_refusals`: a bool, a float, a negative integer and anything not an integer, as
-    `TypeError`, or `ValueError` for a negative. Nothing is recorded and no `seq` is taken."""
+    `TypeError`, or `ValueError` for a negative. Nothing is recorded and no `seq` is taken. `None` is
+    not refused: the owner's decision, it is no step (`test_step_none_is_the_same_as_no_step`)."""
     path = tmp_path / "refused.jsonl"
     model = _model()
     session, opt = _open(model, path)
@@ -544,3 +545,231 @@ def test_step_inside_a_fullgraph_compiled_function_is_refused_by_dynamo_and_reco
     session.close()
     torch._dynamo.reset()
     assert [(r["step"], r["seq"]) for r in sink.records if r.get("record") == "scalars"] == [(7, 0)]
+
+
+# ---- flush() writes pending scalar-only records (the owner, on decision 4) ------------------------
+
+
+def _wait_for_records(path: Path, count: int, seconds: float = 10.0) -> list[dict]:
+    """The scalar-only records in the file once the writer thread has written `count` (or the deadline):
+    `flush()` hands them to the writer, as it hands step records, and does not wait for the write."""
+    deadline = time.monotonic() + seconds
+    while len(_scalar_records(path)) < count and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return _scalar_records(path)
+
+
+def test_flush_with_an_empty_ring_writes_a_pending_record_at_once(tmp_path):
+    """(a) Steps, a `flush()` that empties the ring, then `log(..., step=N)` and `flush()` again: the
+    record is in the file before any further step and before `close()`, and it reads back through
+    `load_records(..., scalars=True)`."""
+    from tensorquill.evidence import load_records
+
+    path = tmp_path / "flushed.jsonl"
+    model = _model()
+    session, opt = _open(model, path, every=50)
+    for _ in range(3):
+        _step(session, model, opt)
+    session.flush()
+    session.log({"eval/loss": 1.25}, step=2)
+    session.flush()
+    records = _wait_for_records(path, 1)
+    assert [(r["step"], r["seq"], r["scalars"]) for r in records] == [(2, 0, {"eval/loss": 1.25})]
+    assert [r["step"] for r in _step_records(path)] == [0, 1, 2]
+    read = load_records(path, scalars=True)
+    assert [r for r in read if r.get("record") == "scalars"] == records
+    session.close()
+    assert len(_scalar_records(path)) == 1  # not written again at close
+
+
+@pytest.mark.parametrize("before", ["no_step_at_all", "after_a_flush"])
+def test_flush_with_no_step_in_memory_writes_a_pending_record(tmp_path, before):
+    """(b) Before the first training step, and after a `flush()` that already emptied the ring."""
+    path = tmp_path / f"{before}.jsonl"
+    model = _model()
+    session, opt = _open(model, path, every=50)
+    if before == "after_a_flush":
+        _step(session, model, opt)
+        session.flush()
+    session.log({"eval/baseline": 2.5}, step=0)
+    session.flush()
+    records = _wait_for_records(path, 1)
+    assert [(r["step"], r["seq"], r["scalars"]) for r in records] == [(0, 0, {"eval/baseline": 2.5})]
+    session.close()
+    assert len(_scalar_records(path)) == 1
+
+
+def test_flush_with_steps_in_the_ring_writes_the_record_after_them(tmp_path):
+    path = tmp_path / "ring.jsonl"
+    model = _model()
+    session, opt = _open(model, path, every=50)
+    _step(session, model, opt)
+    session.log({"eval/loss": 1.0}, step=0)
+    _step(session, model, opt)
+    session.flush()
+    _wait_for_records(path, 1)
+    assert [r.get("record", r["step"]) for r in _lines(path)] == [0, 1, "scalars"]
+    session.close()
+
+
+_KILLED_AFTER_FLUSH = """
+import os, sys, time, torch, tensorquill
+model = torch.nn.Linear(4, 1)
+session = tensorquill.init(model, sink=tensorquill.JsonlSink(sys.argv[1]), every=50, run_id="al5_killed",
+                           heartbeat_seconds=None, stack_seconds=None)
+opt = torch.optim.SGD(model.parameters(), lr=0.1)
+model(torch.ones(2, 4)).sum().backward(); opt.step(); opt.zero_grad()
+session.flush()
+session.log({"eval/loss": 0.5}, step=0)
+session.flush()
+time.sleep(float(sys.argv[2]))  # the job goes on without a step for a while (a slow evaluation), then dies
+os._exit(0)  # no close(), no atexit, no end marker
+"""
+
+
+def test_a_process_that_dies_after_such_a_flush_has_the_record_on_disk(tmp_path):
+    """(c) A child that flushes, goes on with no step, and ends with `os._exit` (no `close()`): the
+    parent finds the record in the file. Before, it waited for a block of steps or `close()`, so it
+    was lost with the process."""
+    import os
+    import subprocess
+    import sys
+
+    path = tmp_path / "killed.jsonl"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    done = subprocess.run([sys.executable, "-W", "ignore", "-c", _KILLED_AFTER_FLUSH, str(path), "1.0"],
+                          capture_output=True, text=True, env=env, timeout=180)
+    assert done.returncode == 0, done.stderr
+    assert [r["step"] for r in _step_records(path)] == [0]
+    assert [(r["step"], r["seq"], r["scalars"]) for r in _scalar_records(path)] == [(0, 0, {"eval/loss": 0.5})]
+    assert not path.with_name("killed.end.json").exists()
+
+
+def test_a_second_flush_writes_nothing_twice_and_a_run_without_it_is_unchanged(tmp_path):
+    """(d) `seq` and the order of the lines are the same in a run that never flushes this way; a second
+    `flush()` with nothing pending writes nothing."""
+    def run(path: Path, flushes: int) -> list[dict]:
+        model = _model()
+        session, opt = _open(model, path, every=50)
+        for i in range(3):
+            _step(session, model, opt, value=float(i))
+            session.log({"eval/i": float(i)}, step=10 + i)
+        if flushes:
+            session.flush()
+            for _ in range(flushes - 1):
+                session.flush()
+        session.close()
+        return _lines(path)
+
+    def shape(lines: list[dict]) -> list[tuple]:
+        return [(r.get("record"), r["step"], r.get("seq"), r.get("scalars")) for r in lines]
+
+    once, twice, never = (run(tmp_path / f"{n}.jsonl", n) for n in (1, 3, 0))
+    assert shape(once) == shape(twice) == shape(never)
+    assert [r.get("seq") for r in never] == [None, None, None, 0, 1, 2]
+
+
+# ---- step=None is no step (the owner, on decision 1) ---------------------------------------------
+
+
+def test_a_numpy_float_step_is_refused(tmp_path):
+    np = pytest.importorskip("numpy")
+    path = tmp_path / "npfloat.jsonl"
+    session, opt = _open(_model(), path)
+    with pytest.raises(TypeError, match="step"):
+        session.log({"a": 1.0}, step=np.float64(3.0))
+    assert session._scalar_records == []
+    session.close()
+    assert _lines(path) == []
+
+
+def _freeze(monkeypatch) -> None:
+    clock = type("Clock", (), {k: staticmethod(getattr(time, k)) for k in ("monotonic", "perf_counter", "sleep")})
+    clock.time = staticmethod(lambda: 1_790_000_000.0)
+    monkeypatch.setattr(capture, "time", clock)
+    monkeypatch.setattr(capture, "_next_attempt", lambda: 1_790_000_000_000)
+
+
+def _none_scenario(path: Path, kw: dict, case: str) -> list[str]:
+    """One situation a call without `step=` covers, with `kw` added to every such call: {} or
+    {"step": None}. Returns the left-out warnings; the file is the other result."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=JsonlSink(path), run_id="al5_none", heartbeat_seconds=None,
+                                   stack_seconds=None, every=3, data_wait=False)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        def step(i):
+            loss = model(torch.full((2, 4), float(i))).pow(2).mean()
+            loss.backward()
+            if case == "in_memory":
+                session.log({"loss": loss.detach(), "i": i}, **kw)  # the step in progress takes it
+            opt.step()
+            opt.zero_grad()
+
+        if case == "no_step":
+            with session.phase("eval"):
+                session.log({"eval/baseline": 2.5}, **kw)  # left out, with section Q5's warning
+        for i in range(5):
+            step(i)
+            if case == "eval" and i in (1, 2, 4):
+                with session.phase("eval"):
+                    session.log({"eval/loss": torch.tensor(float(i))}, **kw)  # on the newest step
+        if case == "after_flush":
+            session.flush()
+            with session.phase("eval"):
+                session.log({"eval/after": 1.0}, **kw)  # left out, suggesting the last step
+        if case == "close":
+            session.log({"eval/final": 0.5}, **kw)  # pending at close(): on the newest step
+        session.close()
+    return [str(w.message) for w in caught if "left out the scalar" in str(w.message)]
+
+
+@pytest.mark.parametrize("case", ["in_memory", "eval", "close", "no_step", "after_flush"])
+def test_step_none_is_the_same_as_no_step(tmp_path, monkeypatch, case):
+    """`log(values, step=None)` is `log(values)`: the same bytes in the file, the same warning with the
+    same suggested number, and no scalar-only record, in each situation a call without `step=` covers."""
+    _freeze(monkeypatch)
+    plain, none = tmp_path / "plain.jsonl", tmp_path / "none.jsonl"
+    said_plain = _none_scenario(plain, {}, case)
+    said_none = _none_scenario(none, {"step": None}, case)
+    assert none.read_bytes() == plain.read_bytes()
+    assert b'"record"' not in none.read_bytes()
+    assert said_none == said_plain
+    assert len(said_none) == (1 if case in ("no_step", "after_flush") else 0)
+
+
+def test_step_none_inside_a_fullgraph_compiled_function_is_traced_as_no_step():
+    """Inside `torch.compile(fullgraph=True)`, `step=None` takes the traced path of a call without
+    `step=` (`_log_late`): no graph break, compiled once, on the step each evaluation followed."""
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    model = nn.Linear(4, 1)
+    sink = MemorySink()
+    session = tensorquill.init(model, sink=sink, every=2, run_id="al5_none_compiled", heartbeat_seconds=None,
+                               stack_seconds=None)
+    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    counter = CompileCounter()
+
+    @torch.compile(backend=counter, fullgraph=True)
+    def evaluate(x):
+        with torch.no_grad():
+            value = model(x).pow(2).mean()
+        session.log({"eval/x": value}, step=None)
+        return value
+
+    expected = {}
+    for i in range(4):
+        model(torch.randn(8, 4)).pow(2).mean().backward()
+        opt.step()
+        opt.zero_grad()
+        with session.phase("eval"):
+            expected[i] = evaluate(torch.full((8, 4), float(i))).item()
+    session.close()
+    torch._dynamo.reset()
+    assert counter.frame_count == 1
+    assert [r for r in sink.records if r.get("record") == "scalars"] == []
+    assert [r["scalars"]["eval/x"] for r in sink.records] == pytest.approx([expected[i] for i in range(4)])

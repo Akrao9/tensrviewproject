@@ -233,19 +233,19 @@ def test_values_left_out_never_raise_under_python_w_error(tmp_path):
 
 
 def test_step_as_a_keyword_writes_a_scalar_only_record_and_a_step_key_is_a_scalar():
-    """Wave AL (section 4.2): `step=` writes a scalar-only record; `step=None` is refused, as anything
-    not an integer is. A key `"step"` in the dictionary stays an ordinary scalar of the step."""
+    """Wave AL (section 4.2): `step=` writes a scalar-only record; `step=None` is no step, the same as
+    leaving `step=` out (the owner's decision, Nov 24), so its value is the step in progress's. A key
+    `"step"` in the dictionary stays an ordinary scalar of the step."""
     model = _model()
     session, sink, opt = _open(model, every=50)
     session.log(eval_loss=1.8, step=500)
-    with pytest.raises(TypeError, match="step must be an integer"):
-        session.log({"a": 1.0}, step=None)
+    session.log({"b": 2.0}, step=None)  # no step: the step in progress takes it
     session.log({"a": 1.0}, step=3)
     session.log({"step": 5})  # W&B users log a metric named step as a custom x-axis
     _step(session, model, opt)
     session.close()
     steps = [r for r in sink.records if r.get("record") != "scalars"]
-    assert steps[0]["scalars"]["step"] == 5
+    assert steps[0]["scalars"]["step"] == 5 and steps[0]["scalars"]["b"] == 2.0
     assert "eval_loss" not in steps[0]["scalars"] and "a" not in steps[0]["scalars"]
     assert [(r["step"], r["seq"], r["scalars"]) for r in sink.records if r.get("record") == "scalars"] == [
         (500, 0, {"eval_loss": 1.8}), (3, 1, {"a": 1.0})]
