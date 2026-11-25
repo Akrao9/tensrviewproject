@@ -7,8 +7,13 @@
 //! in protocol 5's (the typed maps, with what a column cannot hold in `extra_json` as section 1.4
 //! lays it out), and compares the reports. A record no capture writes (an entry that is not an
 //! object, a name Arrow cannot encode) is compared with its clean record instead: the typed row
-//! reads the rest of the map, where the JSON row today loses every layer. The same cases run
-//! through the binary from Python in `sdk/tests/test_lane_al3_typed_detect.py`.
+//! reads the rest of the map. The same cases run through the binary from Python in
+//! `sdk/tests/test_lane_al3_typed_detect.py`.
+//!
+//! Lane AL-3′'s tests (wave AL, step 2; the owner, Nov 24, row S4) follow: protocol 4's
+//! `layers_json` is read entry by entry, so an entry that is not an object is absent there too and
+//! the rest of the map is read, while a name serde_json refuses and `moe_stats_json` are read as
+//! before.
 
 use std::sync::Arc;
 
@@ -467,8 +472,9 @@ fn a_refused_field_is_absent_and_non_finite_reads_it_from_extra_json() {
 
 /// Section 1.5's first target, `layers_entry_not_object`: a null struct in its place, the entry in
 /// `extra_json`; the rest of the map is read, as on the clean records. As in the case, every record
-/// holds it, and today's JSON row then loses every layer of the run (unchanged here: protocol 4's
-/// reader is not this lane's to change).
+/// holds it. Protocol 4's JSON row of the same records is read the same way since lane AL-3′ (the
+/// owner, Nov 24, S4): the entry is absent and the rest of the map is read, where the base lost
+/// every layer of the run.
 #[test]
 fn an_entry_that_is_not_an_object_is_absent_and_the_rest_of_the_map_is_read() {
     let (mut dirty, mut clean) = (run(), run());
@@ -484,8 +490,163 @@ fn an_entry_that_is_not_an_object_is_absent_and_the_rest_of_the_map_is_read() {
         incident(&typed, "activation_spike")["modules"][0]["module"],
         "model.layers.10"
     );
-    let today = judged(&[batch(&dirty, Layout::Json)]);
-    assert_eq!(check(&today, "activation_spike"), "not_configured");
+    assert_eq!(judged(&[batch(&dirty, Layout::Json)]), typed);
+}
+
+// --- protocol 4's `layers_json`, entry by entry (lane AL-3′, the owner, Nov 24, S4) -------------
+
+/// `recs` with `entry` put under the name `model.odd` at `position` of every step's layers.
+fn with_entry_at(mut recs: Vec<Rec>, position: usize, entry: &Entry) -> Vec<Rec> {
+    for rec in &mut recs {
+        rec.layers
+            .as_mut()
+            .unwrap()
+            .insert(position, ("model.odd".to_owned(), entry.clone()));
+    }
+    recs
+}
+
+/// Row S4: protocol 4's `layers_json` is read entry by entry. An entry that is not an object, of
+/// any JSON kind and at any place in the map, is absent to every detector (`non_finite` included:
+/// a `"nan"` entry names no layer, as protocol 5's null struct does not), and the rest of the map is
+/// read: the JSON row is judged as its clean row, and as protocol 5's row of the same records.
+#[test]
+fn a_protocol_4_entry_that_is_not_an_object_is_absent_and_the_rest_of_the_map_is_read() {
+    let clean = judged(&[batch(&run(), Layout::Json)]);
+    assert_eq!(check(&clean, "activation_spike"), "checked");
+    let others = [
+        json!(5),
+        json!(-3),
+        json!(2.5),
+        json!(u64::MAX),
+        Value::Null,
+        json!(true),
+        json!("nan"),
+        json!("x"),
+        json!([]),
+        json!([{"std": 1.0, "abs_max": 60.0, "zero_frac": 0.0}, "inf", [1, {"a": null}]]),
+    ];
+    for other in others {
+        let entry = Entry::Other(other.clone());
+        for position in [0, 3, NAMES.len()] {
+            let recs = with_entry_at(run(), position, &entry);
+            let text = json_text(recs[0].layers.as_deref().unwrap());
+            let from_json = judged(&[batch(&recs, Layout::Json)]);
+            assert_eq!(from_json, clean, "{other} at {position}: {text}");
+            assert_eq!(from_json, judged(&[batch(&recs, TYPED)]), "{other} at {position}");
+        }
+    }
+}
+
+/// Row S4, with the rest of the reading unmoved: a row whose only entries are not objects holds no
+/// layer, as `{}` holds none (case `layers_only_entries_not_object`); and an object entry is read
+/// exactly as before, a non-finite statistic of it named by `non_finite` beside an entry that is not
+/// an object.
+#[test]
+fn a_protocol_4_row_of_entries_that_are_not_objects_holds_no_layer() {
+    let only = |entries: Vec<(String, Entry)>| -> Vec<Rec> {
+        (0..3)
+            .map(|step| Rec {
+                step,
+                layers: Some(entries.clone()),
+                ..Rec::default()
+            })
+            .collect()
+    };
+    let empty = judged(&[batch(&only(Vec::new()), Layout::Json)]);
+    let odd = only(vec![
+        ("a".to_owned(), Entry::Other(json!(5))),
+        ("b".to_owned(), Entry::Other(Value::Null)),
+    ]);
+    let report = judged(&[batch(&odd, Layout::Json)]);
+    assert_eq!(report, empty);
+    assert_eq!(report, judged(&[batch(&odd, TYPED)]));
+    assert_eq!(check(&report, "activation_spike"), "not_configured");
+
+    let mut fields = match layer(1.0, 3.0) {
+        Entry::Object(fields) => fields,
+        Entry::Other(_) => unreachable!(),
+    };
+    fields[0].1 = json!("nan");
+    let recs = with_entry_at(
+        changed(run(), 10, "model.layers.3", Some(Entry::Object(fields))),
+        1,
+        &Entry::Other(json!(5)),
+    );
+    let report = judged(&[batch(&recs, Layout::Json)]);
+    assert_eq!(report, judged(&[batch(&recs, TYPED)]));
+    let first = incident(&report, "non_finite");
+    assert_eq!(
+        (first["step"].clone(), first["layers"].clone()),
+        (json!(10), json!(["model.layers.3"])),
+        "{report}"
+    );
+}
+
+/// Row S4 moves nothing else of protocol 4's reading. A name Arrow cannot encode still makes the
+/// whole text unreadable, beside an entry that is not an object too (the known difference of case
+/// `layers_name_arrow_cannot_encode`); and `moe_stats_json` is still read whole, so a router entry
+/// that is not an object leaves the row with no recorded diversity, and every router's is taken
+/// from the counts, where protocol 5's row reads the other router's own.
+#[test]
+fn a_protocol_4_row_is_otherwise_read_as_before() {
+    let recs = with_entry_at(run(), 1, &Entry::Other(json!(5)));
+    let plain = batch(&recs, Layout::Json);
+    let at = plain.schema().index_of("layers_json").unwrap();
+    let texts = plain.column(at).as_any().downcast_ref::<StringArray>().unwrap();
+    let with_name: StringArray = texts
+        .iter()
+        .map(|text| {
+            text.map(|text| {
+                let open = &text[..text.len() - 1];
+                format!(r#"{open},"bad\ud800":{{"mean":0.0,"std":1.0,"abs_max":3.0,"zero_frac":0.0}}}}"#)
+            })
+        })
+        .collect();
+    let mut columns = plain.columns().to_vec();
+    columns[at] = Arc::new(with_name);
+    let report = judged(&[RecordBatch::try_new(plain.schema(), columns).unwrap()]);
+    for kind in ["activation_spike", "activation_drift", "dead_activations"] {
+        assert_eq!(check(&report, kind), "not_configured", "{kind}");
+    }
+    assert!(kinds(&report).is_empty(), "{report}");
+
+    let recs: Vec<Rec> = moe_run(|_| None)
+        .into_iter()
+        .map(|mut rec| {
+            rec.routers = Some(vec![
+                ("r".to_owned(), vec![25, 10, 3, 2]),
+                ("q".to_owned(), vec![10, 10, 10, 10]),
+            ]);
+            rec.moe_stats = Some(vec![
+                ("r".to_owned(), router(Some(json!(0.25)), None)),
+                ("q".to_owned(), Entry::Other(json!(5))),
+            ]);
+            rec
+        })
+        .collect();
+    let without_stats: Vec<Rec> = recs
+        .iter()
+        .cloned()
+        .map(|mut rec| {
+            rec.moe_stats = None;
+            rec
+        })
+        .collect();
+    let (r, q) = (
+        json!(super::diversity_from_counts(&[25, 10, 3, 2])),
+        json!(super::diversity_from_counts(&[10, 10, 10, 10])),
+    );
+    let from_json = diversities(&batch(&recs, Layout::Json));
+    assert_eq!(
+        from_json,
+        [r, q.clone()].iter().cycle().take(16).cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(from_json, diversities(&batch(&without_stats, Layout::Json)));
+    assert_eq!(
+        diversities(&batch(&recs, TYPED)),
+        [json!(0.25), q].iter().cycle().take(16).cloned().collect::<Vec<_>>()
+    );
 }
 
 /// A row whose every entry is a null struct holds no layer, as `{}` holds none.
