@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .identity import SCHEMA_VERSIONS, MalformedRecordError, _shown, check
+from .identity import SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 from .sink import _finite
 
@@ -258,21 +258,14 @@ def record_to_row(
     (`rows_to_send`) makes its rows without this check, as before: a line the server refuses and
     counts stays the server's to refuse and count (live ingest is unchanged, RS10).
 
-    A scalar-only record (`scalar_only`) whose `seq` the column cannot hold raises the same error,
+    A scalar-only record (`identity.is_scalar_record`) whose `seq` the column cannot hold raises the same error,
     naming `seq` (section 4.4).
 
     The rest is `_row`'s."""
     check(record, where)
-    if scalar_only(record):
+    if is_scalar_record(record):
         _seq(record, where)
     return _row(record, schema, moved)
-
-
-def scalar_only(record: Mapping[str, Any]) -> bool:
-    """Whether `record` is a scalar-only record (`WAVE_AL_CONTRACT.md` section 4.2): its `record` key is
-    `"scalars"`. Its row carries `seq` and no `record` (section 4.4); the Rust detectors are never sent
-    one (section 4.6, `server_detect`)."""
-    return isinstance(record, Mapping) and record.get("record") == "scalars"
 
 
 def _seq(record: Mapping[str, Any], where: str | None = None) -> int:
@@ -313,7 +306,8 @@ def _row(
     that version as its row's too, so a server drops and counts it as before (RS10) and never stores
     it as a row it reads.
 
-    A scalar-only record (`scalar_only`, section 4.4) converts like any line, with its `seq` in the
+    A scalar-only record (`identity.is_scalar_record`: version 2 and `"record": "scalars"`, the one rule
+    every reader asks; section 4.4) converts like any line, with its `seq` in the
     `seq` column (null on every other row) and its `record` key in no column: `row_to_record` restores
     it from the non-null `seq`. Its `scalars` follow wave W3's rule, as a step record's. A null travels
     in its row's columns only as an absent key: an explicit `null`, even for `ts` or `grad_norm`
@@ -321,7 +315,7 @@ def _row(
     record back exactly. A `seq` the column cannot hold raises `MalformedRecordError` (`_seq`)."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
     extra: dict[str, Any] = {}
-    scalar = scalar_only(record)
+    scalar = is_scalar_record(record)
     if scalar:
         row["seq"] = _seq(record)
     always = () if scalar else _ALWAYS
@@ -973,7 +967,7 @@ def _unheld_key(record: Mapping[str, Any], schema: Any) -> tuple[str, Any]:
                 return key, value
         elif isinstance(value, bool) or not isinstance(value, int) or not _fits(value, schema.field(key).type):
             return key, value
-    if scalar_only(record):
+    if is_scalar_record(record):
         try:
             _seq(record)
         except MalformedRecordError as error:
