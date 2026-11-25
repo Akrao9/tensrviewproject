@@ -2816,12 +2816,21 @@ class Session:
 
         `step=N` records the values at step `N` of their own: a scalar-only record (contract
         section 4.2), never a training step, whatever the phase and whether or not a step is in
-        memory. `N` is an integer of 0 or more; a bool, a float or anything else raises
-        `TypeError`, a negative integer `ValueError`, before anything is recorded. The record is
-        written with the next block of step records, at an explicit `flush()`, or at `close()`; a tensor is copied on its
-        device and read with that block, so the call adds no sync. Records of one session are
-        numbered `seq` 0, 1, 2... in the order of these calls, and a reader takes the highest
-        `seq` where two meet at a step. A key `"step"` in the dictionary is an ordinary scalar.
+        memory. `N` is an integer of 0 or more. `step=None` is the same as leaving `step=` out.
+        A bool (`True`, `False`), a float (`1.0` too), a string or anything else that is not an
+        integer raises `TypeError`, and a negative integer `ValueError`, before anything is
+        recorded. A tensor value is copied on its device and read with the block that writes the
+        record, so the call adds no sync. The record is written with the next block of step
+        records, at an explicit `flush()` (also with no step in memory), or at `close()`; the
+        writer thread writes it, as it writes step records. Records of one session are numbered
+        `seq` 0, 1, 2... in the order of these calls, and a reader takes the highest `seq` where
+        two meet at a step. A key `"step"` in the dictionary is an ordinary scalar.
+
+        The record is made eagerly. Inside a function compiled with `torch.compile(fullgraph=True)`,
+        `step=N` therefore raises Dynamo's `torch._dynamo.exc.Unsupported` before anything is
+        recorded. Call it outside the compiled function, which is where a value logged outside a
+        step belongs, or compile without `fullgraph`: the call is then one graph break, compiled
+        once. A call without `step=` (or with `step=None`) is traced as before.
         """
         if self._closed_call("log()"):
             return
