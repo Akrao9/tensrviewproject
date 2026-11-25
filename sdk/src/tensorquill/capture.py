@@ -3638,11 +3638,19 @@ class Session:
         """Move the ring to the CPU and queue it (`_flush_ring`). An exception part way would leave
         the ring's lists longer than the ring and every later step raising (lane U5 saw an
         `IndexError` at each step after one raise here), so it stops capture instead (`_stop`),
-        which clears the ring: nothing raises into training from here."""
+        which clears the ring: nothing raises into training from here.
+
+        What a compiled function logged late (`_late_traced`) is put on the newest step first, so
+        every path that hands the newest step to the writer drains it (`WAVE_AL_CONTRACT.md` section
+        4.8): `_commit`, `flush()`, `close()`, and `_take_unfrozen`, which writes the ring from the
+        optimizer's pre-step hook before the next step ends. So a value in that buffer always belongs
+        to a step not yet handed to the writer. Eager code only: nothing a traced function reads
+        changes. After a stop nothing is drained: the value is lost with its step (a stated limit)."""
         if self._error is not None and not self._stopped:
             self._stop(self._error)
         if self._stopped:
             return
+        self._take_traced_late()
         self._say_new_trainable()
         try:
             self._flush_ring(hold_newest=hold_newest)
