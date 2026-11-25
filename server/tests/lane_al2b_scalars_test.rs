@@ -1122,3 +1122,32 @@ async fn the_timed_flush_tries_a_failed_scalars_write_again() {
     assert_eq!(server.ingest.buffered_bytes(), 0, "nothing is held once it is stored");
     server.ingest.shutdown().await.unwrap();
 }
+
+/// Q4 (a), the replay side, read directly: `detect::replay`, the read a restart and a rebuild make,
+/// over a store that holds a part of training steps 0 to 2 and a `scalars-*` object whose row is of
+/// step 1000 with a `grad_norm` that is not finite. The report reads the part alone: three steps,
+/// through step 2, no incident. The object is the server's own, as the live path writes it.
+#[tokio::test]
+async fn the_replay_reads_the_parts_alone_and_never_a_scalars_object() {
+    let run = "al2b_replay_read";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = storage(root);
+    let training = batch(&(0..3).map(|step| step_record(run, step)).collect::<Vec<_>>());
+    store.write_part(run, 0, 1, &[training], 0, 2).await.unwrap();
+    let scalar = batch(&[scalar_record(run, 1000, 0)]);
+    let index = scalar.schema().index_of("grad_norm").unwrap();
+    let mut columns = scalar.columns().to_vec();
+    columns[index] = Arc::new(Float64Array::from(vec![f64::NAN]));
+    let scalar = RecordBatch::try_new(scalar.schema(), columns).unwrap();
+    store.write_scalars(run, 0, 1, &[scalar], 0, 0).await.unwrap();
+    assert_eq!(files(root, run, "scalars-"), ["scalars-00000000-00000000.parquet"]);
+    let thresholds = Arc::new(tensorquill_server::detect::Thresholds::default());
+    let detectors = tensorquill_server::detect::replay(&store, run, 0, &thresholds)
+        .await
+        .unwrap();
+    let report = tensorquill_server::detect::report(run, 0, &detectors, 1);
+    assert_eq!(report["steps"], 3, "{report}");
+    assert_eq!(report["last_step"], 2, "{report}");
+    assert_eq!(report["incidents"], json!([]), "{report}");
+}

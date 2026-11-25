@@ -23,6 +23,20 @@
 //! address that reaches the store, and new for a store wiped and made again; an older sender reads
 //! `end_byte_offset` alone, as before). Buffered Arrow bytes across all streams are capped; a batch
 //! that does not fit is refused with `RESOURCE_EXHAUSTED` and the sender retries later.
+//!
+//! A row whose `seq` is not null is a scalar-only row (`WAVE_AL_CONTRACT.md` section 4.5, from
+//! Nov 24, 2026): a value logged with an explicit step, which is the x of a series and not a training
+//! step. Such rows are taken out of their batch before the step watermark is looked at, so they never
+//! raise it (D8) and are never progress: not the rank's `last_step`, not the step the watchdog is
+//! given, and never a row the detectors read, live or in a replay (Q4 a). They are deduplicated by
+//! `(run_id, rank, attempt, seq)` against the attempt's own `seq` watermark; a row at or below it is
+//! dropped and counted as `scalars_not_newer` on the rank's entry. They are stored as
+//! `attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet`, created only if no object has that
+//! name, beside the parts and never one of them; a restarted server reads the watermark from those
+//! names. A flush stores the step part, then the scalars object, and only then acknowledges the
+//! offset. A batch without a `seq` column, or whose `seq` is null on every row, is all step rows and
+//! is handled as before.
+//!
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
 //! 0, 1 or 2 (`SUPPORTED_ROW_VERSIONS`), cannot be stored: it is dropped and counted, with a line on
 //! stderr and in the rank's entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`),
