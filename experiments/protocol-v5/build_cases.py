@@ -390,7 +390,8 @@ def section_4() -> list[dict]:
         {"today_raises": "MalformedRecordError"}, ("today",))
     add("scalar_log_refusals", "session.log(..., step=s) refuses, before anything is recorded: a bool, a float, a "
         "negative integer or text as s (TypeError or ValueError, as log refuses a bad value); with no step= the rules "
-        "of wave AK hold (a value with no step in memory: the scalar_no_step_* cases, Q5)",
+        "of wave AK hold (a value with no step in memory: the scalar_no_step_* cases, Q5). step=None is no step=, "
+        "not a refusal (the owner, Nov 24: scalar_log_step_none_is_no_step)",
         [], {"refused_steps": [True, 1.5, -1, "3"], "written": 0}, ("capture",))
     # Q5, decided Nov 24: no step in memory and no step=. Left out with one warning per session, which
     # shows the explicit call. Written by hand from the contract's section Q5; lane AL-5's to run.
@@ -439,6 +440,47 @@ def section_4() -> list[dict]:
          "records_with_step_1": 0, "left_out_warnings": 0, "stop_warnings": 1,
          "warning_contains": ["the steps already handed to the writer are written, no later step is"]}, ("capture",),
         today={"capture": "the same as expect (read in capture.py at f71d8e0; lane AL-5's own test)"})
+    cases.extend(owner_after_step_2())
+    return cases
+
+
+def owner_after_step_2():
+    """The owner's decisions on lane AL-5's step 2 (Nov 24; contract rows S9 and S10). Written by hand
+    from the owner's words and capture.py at 0826958, where `today` is read: after step 2 this builder
+    refuses the tree, so these two were put in cases.json by hand from this function."""
+    cases = []
+
+    def add(name, about, records, expect, paths, **more):
+        cases.append({"name": name, "section": 4, "about": about, "paths": list(paths), "records": records,
+                      "expect": expect, **more})
+
+    add("scalar_log_step_none_is_no_step",
+        "session.log(values, step=None) is no step, the same as leaving step= out (the owner, Nov 24; row S10): "
+        "outside \"eval\" before the first step the value is pending and lands on step 0's own record; under "
+        "\"eval\" with a step in memory it lands on the newest step; under \"eval\" before the first step it is "
+        "left out with section Q5's one warning. It writes no scalar-only record and takes no seq, so a later "
+        "log(..., step=7) is seq 0. A bool, a float, a negative integer and anything else not an integer still "
+        "raise, before anything is recorded (scalar_log_refusals)", [],
+        {"scenarios": ["before_the_first_step", "eval_with_a_step_in_memory", "eval_before_the_first_step"],
+         "same_as_no_step": True, "scalar_only_records": [[7, 0]]}, ("capture",),
+        today={"capture": "TypeError: step=None is refused, as anything not an integer (lane AL-5's decision 1, "
+                          "read in capture.py at 0826958; the strict target "
+                          "test_step_none_is_the_same_as_leaving_step_out shows it)"})
+    setups = {"steps_in_memory": {"steps_before": 2, "flush_before": False, "step": 1},
+              "no_step_ever": {"steps_before": 0, "flush_before": False, "step": 0},
+              "no_step_since_a_flush": {"steps_before": 3, "flush_before": True, "step": 2}}
+    add("scalar_flush_writes_pending_records",
+        "session.log({\"eval/x\": 1.5}, step=N), then flush(), at every=4: the scalar-only record reaches the sink "
+        "before close(), and is written once, whether steps are in memory (it goes with their block) or none, no "
+        "step ever or none since the last flush (the owner, Nov 24; row S9). Section Q5's values with no step= are "
+        "not moved: after flush() with no step since they are still left out", [],
+        {"setups": setups, "written_before_close": 1, "written": 1}, ("capture",),
+        today={"capture": {"steps_in_memory": "written, with the block of steps 0 and 1 (read in capture.py at "
+                                              "0826958; pinned by test_flush_writes_the_pending_scalar_only_records)",
+                           "no_step_ever": "pending until the next block or close() (lane AL-5's decision 4, at "
+                                           "0826958; the strict target shows it)",
+                           "no_step_since_a_flush": "pending until the next block or close() (lane AL-5's decision 4, "
+                                                    "at 0826958; the strict target shows it)"}})
     return cases
 
 

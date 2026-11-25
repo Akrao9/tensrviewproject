@@ -8,7 +8,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch). Step 1 merged into `tri
 
 ## Where each decision stands
 
-**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided all nine on Nov 24 (the next section), and the same day brought one fault left open by wave AK into this wave (row L1, section 4.8). Also on Nov 24, after a second session read step 1's three diffs against this contract, the owner answered the lanes' decisions (rows S1 to S8). Each amendment they make below is marked with its date and whose word it is; the seam lane AL-S1 builds the code side, and the names here are its names. Step 2 was merged on Nov 24 at `0826958` (the owner: "Yes, merge then"); what it built is marked below, and the decisions its lanes made beyond this page are listed in section 9.1 as proposed, not yet the owner's.
+**Decided** means the code or a measurement settles it; the evidence column says which. **Owner** means a product choice. The owner decided all nine on Nov 24 (the next section), and the same day brought one fault left open by wave AK into this wave (row L1, section 4.8). Also on Nov 24, after a second session read step 1's three diffs against this contract, the owner answered the lanes' decisions (rows S1 to S8). Each amendment they make below is marked with its date and whose word it is; the seam lane AL-S1 builds the code side, and the names here are its names. Step 2 was merged on Nov 24 at `0826958` (the owner: "Yes, merge then"); what it built is marked below, and the decisions its lanes made beyond this page are listed in section 9.1. The same day the owner decided four of them (rows S9 to S12, section "Step 2's lane decisions" below): two turn what lane AL-5 built, two accept what was built. The other 25 stay proposed, not yet the owner's.
 
 | # | Decision | Stands | Evidence |
 |---|---|---|---|
@@ -35,7 +35,7 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch). Step 1 merged into `tri
 | Q7 | The mirror ignores a tracker's own `step=` (Q7 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q8 | `compare` reads scalar-only records as series points (Q8 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
 | Q9 | A downgrade is documented as unsupported (Q9 a). | **Owner, decided Nov 24** | "Yes, all but Q5", relayed by the coordinator |
-| S1 | A record of a version no reader takes keeps its number as its row version (99 stays 99); records of versions 0 and 1 get row version 2. The limit: it fails when an unknown record version equals a stored row version. A version 2 record gets row version 2 and is stored, though step 1's package does not read version 2; step 2 closes that in the same push (section 3). | **Owner, accepted Nov 24** | lane AL-1's decision 1; AL-S1 pins the version 2 case with a test and runs `load_records` on a part holding such a row. Step 2 (merged at `0826958`) makes version 2 the scalar-only record, which the readers take; how a version 2 record that is not a whole scalar-only record is read is AL-4′'s proposed decision 1 (section 9.1) |
+| S1 | A record of a version no reader takes keeps its number as its row version (99 stays 99); records of versions 0 and 1 get row version 2. The limit: it fails when an unknown record version equals a stored row version. A version 2 record gets row version 2 and is stored, though step 1's package does not read version 2; step 2 closes that in the same push (section 3). | **Owner, accepted Nov 24** | lane AL-1's decision 1; AL-S1 pins the version 2 case with a test and runs `load_records` on a part holding such a row. Step 2 (merged at `0826958`) makes version 2 the scalar-only record, which the readers take; a version 2 record that is not a whole scalar-only record is refused by the readers (row S12, the owner, Nov 24) |
 | S2 | An explicit `schema_version: 0` reads back as 0 (section 3). | **Owner, accepted Nov 24** | lane AL-1's decision 2 |
 | S3 | The projection is inside storage, not at replay's call sites, and the names are swapped at the seam: `Storage::read_part` returns every column, and `Storage::read_part_for_detect` is the projected read the detectors use (section 2.4). | **Owner, accepted with a change, Nov 24** | lane AL-2's decision 2 made `read_part` the projected read; the swap keeps Phase 4's read API from losing the probe arrays by default |
 | S4 | Protocol 4 rows are read as before in this wave, with one follow-up in step 2: for `layers_entry_not_object` only, Rust reads `layers_json` entry by entry (lane AL-3′), so Python and Rust read the same old row. `layers_name_arrow_cannot_encode` on protocol 4 rows is not fixed: a known difference (sections 1.5, 9). | **Owner, accepted Nov 24. Built:** lane AL-3′, merged at `9bdc808` (step 2) | the cases' `rust_raw_v4` path (`layers_entry_not_object`'s target passes since, an ordinary test); AL-S1 pins the known difference on each side |
@@ -44,6 +44,10 @@ Base: `trial/ai-wave` at `f71d8e0` (lane AL-0's branch). Step 1 merged into `tri
 | S7 | A name Arrow cannot encode makes that row's whole `extra_json` unreadable in Rust (section 1.5). | **Owner, accepted as a known limit, Nov 24** | lane AL-3's pin `a_name_arrow_cannot_encode_is_not_read_by_non_finite` |
 | S8 | The refusal's wording: a protocol 5 server says "schema_version N is not supported; this server reads versions 1 and 2"; the sender's recogniser takes that and a protocol 4 server's "this server reads version 1" (sections 3, 5). | **The owner's seam note, Nov 24** | one fixture, `sdk/tests/fixtures/wave_al/refusal.json` (AL-S1), read by both engines' tests |
 | L1 | A value logged late inside a compiled function reaches its step's own record when a frozen parameter becomes trainable before the next step ends (step 2, lane AL-5). The stop of capture stays a stated limit (section 4.8). | **Owner, decided Nov 24. Built:** lane AL-5, merged at `0826958` (step 2) | "this will be fixed in AL", relayed by the coordinator; the place and the limit are this contract's recommendation. The target passes since, an ordinary test |
+| S9 | `flush()` writes the pending scalar-only records, with or without a step in memory: with steps in memory they go with that block, as built; with none (no step ever, or none since the last flush) that `flush()` hands them to the writer, as `close()` does (section 4.2). Section Q5's values with no `step=` are not moved: after a `flush()` with no step since they are still left out. | **Owner, decided Nov 24: turns what lane AL-5 built** (its decision 4, section 9.1). Being built by lane AL-5 on the joined tree, not yet joined | "flush() writes pending scalar-only records (turn it, failing test first, including flush() with no step in memory).", relayed by the coordinator. Case `scalar_flush_writes_pending_records`: its two setups with no step in memory are strict targets until AL-5's change is joined; the one with steps in memory is a pin |
+| S10 | `step=None` is no step, the same as leaving `step=` out. A bool, a float, a negative integer and anything else not an integer still raise, before anything is recorded (section 4.2). `log`'s docstring and the README say so. | **Owner, decided Nov 24: turns what lane AL-5 built** (its decision 1). Being built by lane AL-5 on the joined tree, not yet joined | "step=None is read as no step, the same as leaving step= out; a bool, a float and a negative integer still raise (turn it, failing test first, and say so in log's docstring and the README).", relayed by the coordinator. Case `scalar_log_step_none_is_no_step`, a strict target until AL-5's change is joined; `scalar_log_refusals` is unchanged, since it never listed `None` |
+| S11 | `step=` inside a function compiled with `torch.compile(fullgraph=True)` raises Dynamo's `Unsupported` before anything is recorded: a stated limit. Without `fullgraph=True` the call is one graph break. The README states the limit and the way out beside `step=` (sections 4.2, 4.8). | **Owner, accepted as built, Nov 24. Built:** lane AL-5, merged at `0826958` (its decision 9) | "step= under fullgraph=True: accepted as built, with the limit and the way out stated in the README beside step=.", relayed by the coordinator; lane AL-5's pin on torch 2.6 and 2.15. The README passage is the coordinator's, at the seam |
+| S12 | A version 2 record that is not a whole scalar-only record is refused by the readers, naming `schema_version` when it has no `record: "scalars"`, or `seq` when that is absent or not an integer of 0 or more (sections 3, 4.6). This does not decide the sender's predicate, lane AL-1′'s decision 1, which stays proposed for the seam that makes the two one rule. | **Owner, accepted Nov 24. Built:** lane AL-4′, merged at `ea3fcd0` (its decision 1) | "A version 2 record that is not a whole scalar-only record is refused: accepted.", relayed by the coordinator; lane AL-4′'s tests |
 
 ## The owner's decisions
 
@@ -134,6 +138,24 @@ A value pending at `close()` with no step at all (a session that never trained) 
 - **What would make it worth taking:** a real job whose evaluations reach the session under "eval" with no step in memory and are lost. For example, a mirror user whose own loop sets `phase("eval")` around evaluations logged only to W&B. Or a user who meets the step-0 point.
 
 **Weighed and not taken:** (d) a record with a null step before the first step. `step` is a key in `identity.check`, the sender, the Arrow schema and the server's null-key check, so all four and every series reader would change.
+
+### Step 2's lane decisions, decided Nov 24 (rows S9 to S12)
+
+**The owner's words**, relayed by the coordinator on Nov 24, on the decisions section 9.1 lists:
+1. **S9, turning lane AL-5's decision 4:** "flush() writes pending scalar-only records (turn it, failing test first, including flush() with no step in memory)."
+2. **S10, turning lane AL-5's decision 1:** "step=None is read as no step, the same as leaving step= out; a bool, a float and a negative integer still raise (turn it, failing test first, and say so in log's docstring and the README)."
+3. **S11, accepting lane AL-5's decision 9:** "step= under fullgraph=True: accepted as built, with the limit and the way out stated in the README beside step=."
+4. **S12, accepting lane AL-4′'s decision 1:** "A version 2 record that is not a whole scalar-only record is refused: accepted."
+5. **The rest:** "The other 25: bring me the list in one table before I accept them." So the other 25 stay proposed in section 9.1, and none is accepted.
+
+**Where they stand.**
+- S11 and S12 are built (`0826958`, `ea3fcd0`).
+- Lane AL-5 builds S9 and S10 on the joined tree, in `capture.py` and its own tests, failing test first.
+- Their targets in `test_wave_al_contract.py` are strict expected failures until that change is joined:
+  - `test_step_none_is_the_same_as_leaving_step_out`, all three scenarios (`raises=TypeError`);
+  - `test_flush_writes_the_pending_scalar_only_records[no_step_ever]` and `[no_step_since_a_flush]` (`raises=AssertionError`).
+- `test_flush_writes_the_pending_scalar_only_records[steps_in_memory]` is a pin: it passes at `0826958`.
+- The coordinator removes the marks at the join.
 
 ## 1. `layers` and `moe_stats` as typed columns (lanes AL-1, AL-3)
 
@@ -341,9 +363,12 @@ There are four, not three.
   - `scalars` holds numbers only, as `Session._scalar_values` gives them. A non-finite value is written as the sink's string.
 - **The capture writes one for an explicit `step=`.** It never writes one for a value logged without it that a step in memory takes, even one naming the step in progress.
 - **It writes none for a value with no step in memory and no `step=`** (Q5). That value is left out with one warning, which shows the explicit call. The Hugging Face callback passes `step=` itself in that situation, so its evaluation metrics are recorded.
-- **`step=` refuses, before anything is recorded:** a bool, a float, a negative integer and anything not an integer (case `scalar_log_refusals`). The refusals are `TypeError`, or `ValueError` for a negative.
+- **`step=None` is no step, the same as leaving `step=` out** (the owner, Nov 24, row S10). The value is ruled by the rest of this section and by section Q5 as if `step=` were not given. It writes no scalar-only record and takes no `seq` (case `scalar_log_step_none_is_no_step`).
+- **`step=` refuses, before anything is recorded:** a bool, a float, a negative integer and anything else not an integer (case `scalar_log_refusals`). The refusals are `TypeError`, or `ValueError` for a negative.
+- **Inside a compiled function the record is made eagerly:** the call is one graph break. Under `torch.compile(fullgraph=True)` Dynamo raises its `Unsupported` before anything is recorded, a stated limit (the owner, Nov 24, row S11). The way out, which the README states beside `step=`: call `session.log(..., step=N)` outside the compiled function, or compile it without `fullgraph=True`.
 - **A tensor value is copied on its device** and read with the next flush, with that flush's records, so no sync is added.
-- **The writer writes it with the next block of step records, or at `close()`.** A stop of capture loses a pending one, as it loses pending steps.
+- **The writer writes it with the next block of step records, at an explicit `flush()`, or at `close()`.** An explicit `flush()` writes it with or without a step in memory (the owner, Nov 24, row S9; case `scalar_flush_writes_pending_records`). A stop of capture loses a pending one, as it loses pending steps.
+  - S9 moves only scalar-only records. A value with no `step=` after a `flush()` with no step since is still left out (section Q5).
 - **Not done:** a record for a value the mirror brings with a tracker's own `step=` (Q7 a).
 
 ### 4.3 What a protocol 4 reader does with it
@@ -398,7 +423,7 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
 
 ### 4.7 The cases
 
-`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`, `scalar_no_step_baseline_warning`, `scalar_no_step_baseline_on_a_resume_warning`, `scalar_no_step_after_flush_warning`, `scalar_no_step_pending_at_close_after_flush_warning`, `scalar_no_step_mirrored_warning`, `scalar_no_step_said_once`, `scalar_hf_eval_on_start_baseline`, `scalar_hf_eval_on_start_on_a_resume`, `scalar_baseline_and_step_0_share_a_point`, `scalar_eager_late_before_unfreeze`, `scalar_compiled_late_before_unfreeze`, `scalar_compiled_late_at_a_stop` (section 4.8).
+`scalar_record_keys`, `scalar_not_a_training_step`, `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart`, `scalar_step_never_written`, `scalar_first_and_last_line`, `scalar_same_step_twice`, `scalar_rolled_back_by_a_later_attempt`, `scalar_old_reader`, `scalar_log_refusals`, `scalar_no_step_baseline_warning`, `scalar_no_step_baseline_on_a_resume_warning`, `scalar_no_step_after_flush_warning`, `scalar_no_step_pending_at_close_after_flush_warning`, `scalar_no_step_mirrored_warning`, `scalar_no_step_said_once`, `scalar_hf_eval_on_start_baseline`, `scalar_hf_eval_on_start_on_a_resume`, `scalar_baseline_and_step_0_share_a_point`, `scalar_eager_late_before_unfreeze`, `scalar_compiled_late_before_unfreeze`, `scalar_compiled_late_at_a_stop` (section 4.8). Added Nov 24 for the owner's rows S9 and S10: `scalar_flush_writes_pending_records`, `scalar_log_step_none_is_no_step`.
 
 ### 4.8 A value logged late inside a compiled function (lane AL-5; the owner, Nov 24)
 
@@ -459,6 +484,8 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
   - Like wave AK's compiled tests, it runs unguarded on CI's whole matrix.
 - `test_the_same_value_logged_eagerly_reaches_its_step` pins the eager twin.
 - The stop case is AL-5's own test to write, failing first if it does not hold.
+
+**`fullgraph=True`.** This section's value is logged without `step=`, so a function compiled with `fullgraph=True` still logs it (the target above compiles that way). `step=` under `fullgraph=True` raises: the limit of row S11, section 4.2.
 
 ## 5. The matrix
 
@@ -574,6 +601,10 @@ The other limits stand as written. The result files are the tree's `experiments/
     - The one line on step 0: a baseline logged with `step=0` and an evaluation after the first step, logged under the same name, are one point at step 0, and the series shows the baseline.
     - Under `torch.compile`, a value logged under "eval" lands on the step it followed, as the same value logged eagerly does, also when a frozen parameter becomes trainable on the next step (section 4.8).
     - After capture stops, values logged since the last step written are lost with that step, compiled or not.
+    - **Added Nov 24 (the owner, S9 to S11):**
+      - `step=None` is no step, the same as leaving `step=` out; a bool, a float, a negative integer and anything else not an integer raise (S10; `log`'s docstring says so too).
+      - An explicit `flush()` writes the pending scalar-only records, with or without a step in memory (S9).
+      - Beside `step=`: inside `torch.compile(fullgraph=True)` it raises Dynamo's `Unsupported`. The way out is to call it outside the compiled function, or to compile without `fullgraph=True`, where it is one graph break (S11).
   - **The versions (AL-1, AL-2):** section 3's table; the older-server message; "a downgrade is not supported", with how it shows (Q9).
   - **The probe (AL-1):** the maps and histograms are in their own columns; the `.jsonl` is unchanged.
 
@@ -597,7 +628,7 @@ The other limits stand as written. The result files are the tree's `experiments/
 
 | Lane | Owns | Does | Cases | Built |
 |---|---|---|---|---|
-| AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `huggingface.py` (`on_evaluate`'s explicit step), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases, the two `scalar_hf_*` cases; wave AK's tests of the old warning text change with it. Section 4.8's drain before the flush of a newly trainable parameter: `scalar_compiled_late_before_unfreeze` (`test_a_value_logged_late_inside_a_compiled_function_reaches_its_step`), keeping `scalar_eager_late_before_unfreeze` and `scalar_compiled_late_at_a_stop` | merged at `0826958` |
+| AL-5 | `capture.py` (`Session.log`, `_no_step_for`, the writer's block), `mirror.py` (the mark on a value it brings), `huggingface.py` (`on_evaluate`'s explicit step), `sink.py` if needed | Writes the record of section 4.2. Takes away `step=`'s `TypeError`. The warning text of section Q5 | `scalar_record_keys` (capture), `scalar_log_refusals`, the six `scalar_no_step_*` cases, the two `scalar_hf_*` cases; wave AK's tests of the old warning text change with it. Section 4.8's drain before the flush of a newly trainable parameter: `scalar_compiled_late_before_unfreeze` (`test_a_value_logged_late_inside_a_compiled_function_reaches_its_step`), keeping `scalar_eager_late_before_unfreeze` and `scalar_compiled_late_at_a_stop`. **Added Nov 24 (the owner, S9 and S10):** `scalar_flush_writes_pending_records` and `scalar_log_step_none_is_no_step`, on the joined tree | merged at `0826958`; S9 and S10 being built, not yet joined |
 | AL-1′ | `flight.py`, `server_detect.py` | The record's row (`seq`, `record_version`). Scalar-only records set apart before `_stream`, `FollowedDetect` and `stream_order` | `scalar_record_keys` (row) | merged at `6401aa1` |
 | AL-2′ | `ingest.rs`, `storage.rs`, `watchdog.rs` (`scalars_not_newer`) | Section 4.5 | `scalar_future_step_keeps_training_rows`, `scalar_replay_from_byte_0`, `scalar_seq_watermark_across_restart` | merged at `c295394` |
 | AL-4′ | `evidence.py`, `identity.py`, `compare.py`, `divergence.py`, `runs.py`, `mcp_server.py`, `compact.py` | Section 4.6, and section 1.5's Python changes: an entry or a `layers` value that is not an object read as absent; a `diversity` that is not a finite number taken from the counts. **Added Nov 24 (the owner, S5):** a row whose only `layers` entries are not objects holds no layer, where `evidence.py` counts a non-empty `layers` object as holding layers (near lines 1013 and 3354). The owner approved this as a change of detector behaviour (section 7) | every section 4 case's `python`, `runs` and `mcp_get_series` paths; `test_a_scalar_record_is_read_and_never_a_training_step`; the `python` targets of `layers_entry_not_object`, `layers_value_not_object` and `layers_only_entries_not_object`; the samples comparison of `moe_stats_diversity_refused` | merged at `ea3fcd0` |
@@ -605,26 +636,26 @@ The other limits stand as written. The result files are the tree's `experiments/
 
 Under Q4 (a), `detect.rs`'s only step 2 work is AL-3′'s. Under Q4 (b) it would gain context expectations too.
 
-### 9.1 The lanes' own decisions in step 2: proposed, not yet the owner's (Nov 24)
+### 9.1 The lanes' own decisions in step 2: four decided, 25 proposed (Nov 24)
 
-Each step 2 lane listed, in its report, the decisions it made that this page does not make. They are recorded here as the lanes made them, for the owner to accept or turn. **None is accepted.** Each says how it stands against the page:
+Each step 2 lane listed, in its report, the decisions it made that this page does not make. They are recorded here as the lanes made them, for the owner to accept or turn. **The owner decided four on Nov 24 (rows S9 to S12):** AL-5's 1 and 4 turned, AL-5's 9 and AL-4′'s 1 accepted. Each is marked below. **The other 25 are proposed, none accepted:** the owner asked for them in one table before accepting them. Each says how it stood against the page when the lane made it:
 - **agrees:** the page says it;
 - **goes beyond:** the page is silent, and the choice is consistent with it;
 - **reads differently:** the page's words say otherwise, or two lanes read them two ways.
 
 **Lane AL-5 (`capture.py`, `mirror.py`, `huggingface.py`; merged at `0826958`).**
-1. `step=None` is a `TypeError` ("anything not an integer"); W&B reads it as no step. **Agrees** with section 4.2.
+1. `step=None` is a `TypeError` ("anything not an integer"); W&B reads it as no step. **Agreed** with section 4.2 as it then read. **Turned by the owner, Nov 24 (row S10):** `step=None` is no step, the same as leaving `step=` out. Section 4.2 now says so.
 2. Any `numbers.Integral` but a bool is a step (NumPy's integers included), written as a JSON `int`. **Goes beyond** 4.2's "an integer".
 3. `log({}, step=N)` writes nothing and takes no `seq`. **Goes beyond.**
-4. A `flush()` with an empty ring does not write pending scalar-only records; they go with the next block or at `close()`. **Agrees** with 4.2's words. The consequence, that a process killed after such a `flush()` loses them, goes beyond 4.2's stated limit, which names only a stop of capture.
+4. A `flush()` with an empty ring does not write pending scalar-only records; they go with the next block or at `close()`. **Agrees** with 4.2's words. The consequence, that a process killed after such a `flush()` loses them, goes beyond 4.2's stated limit, which names only a stop of capture. **Turned by the owner, Nov 24 (row S9):** `flush()` writes them, with or without a step in memory. Section 4.2 now says so.
 5. A record is written after its block's step records, so at `every=1` it can follow its held step's line; readers order by `seq`. **Goes beyond**, consistent with 4.4 and 4.6.
 6. An explicit `step=` always writes a scalar-only record, also under "eval" and also naming a step still in memory; that step's own record is unchanged. **Agrees** with 4.2.
 7. The mirror's sentence for a value pending at `close()` also counts a name the user logged again after the mirror in the same step. A small imprecision, chosen so the traced `log` path reads nothing new. **Goes beyond** section Q5's mirror sentence.
 8. The Hugging Face callback passes the session's own step number, not `state.global_step`. **Reads differently:** section Q5 names `state.global_step` (and `state.global_step - 1` after a flush). The two agree in the lane's tests; they differ only when a `start_step=` is given to the callback, where the session's number is the x-axis TensorQuill's records use.
-9. `step=` under `torch.compile(fullgraph=True)` raises Dynamo's `Unsupported`, since the record is made eagerly; without `fullgraph` it is one graph break. **Goes beyond:** a limit the page does not state.
+9. `step=` under `torch.compile(fullgraph=True)` raises Dynamo's `Unsupported`, since the record is made eagerly; without `fullgraph` it is one graph break. **Went beyond:** a limit the page did not state. **Accepted as built by the owner, Nov 24 (row S11),** with the limit and the way out in the README beside `step=`. Sections 4.2 and 4.8 now state it.
 
 **Lane AL-1′ (`flight.py`, `server_detect.py`; merged at `6401aa1`).**
-1. The sender's predicate for a scalar-only row is the `record` key alone (`"scalars"`), whatever the version. A version-1 record so marked, with a valid `seq`, is a scalar row with `record_version` 1; a version-2 record without the mark is a step row. **Reads differently:** section 3 makes record version 2 the scalar-only record. The lane's predicate also differs from AL-4′'s reading below (decision 1), as the lane itself says: the seam must make them one (`flight.scalar_only` is there to be shared).
+1. The sender's predicate for a scalar-only row is the `record` key alone (`"scalars"`), whatever the version. A version-1 record so marked, with a valid `seq`, is a scalar row with `record_version` 1; a version-2 record without the mark is a step row. **Reads differently:** section 3 makes record version 2 the scalar-only record. The lane's predicate also differs from AL-4′'s reading below (decision 1), as the lane itself says: the seam must make them one (`flight.scalar_only` is there to be shared). Still proposed: the owner's row S12 accepts the readers' side (AL-4′'s decision 1) and leaves this one to the seam.
 2. A scalar-only record whose `seq` the column cannot hold is refused (`MalformedRecordError` naming `seq`), and the sender skips and counts the line; sent with a null `seq` it would be a step row in a `part-*` (D8). **Goes beyond**, consistent with D8 and 4.4.
 3. On a scalar-only row a null column reads back absent, and an explicit `null` travels in `extra_json`. **Goes beyond 4.4**, consistent with the round trip.
 4. `attempt` 0 and a missing `rank` read back as on a step row (`attempt` absent, `rank` 0), so a record written with `"attempt": 0` comes back without the key. **Goes beyond**; the capture always writes the session's attempt.
@@ -652,6 +683,7 @@ Each step 2 lane listed, in its report, the decisions it made that this page doe
    - **This contract's reading: agrees with section 3, goes beyond 4.6.** Section 3 makes record version 2 the scalar-only record, and refuses a record of a version no reader takes, naming it. A version 2 record that is not that record is, by the page, not a version the readers take. 4.6 says only that `identity.check` "now takes version 2".
    - It differs from AL-1′'s sender predicate (decision 1). A version 2 record without the mark is sent as a step row and stored, then refused by every reader. A version 1 record with the mark is sent as a scalar row.
    - So the seam's single predicate decides both. This contract's recommendation is that both follow section 3: version 2 and the mark together.
+   - **Accepted by the owner, Nov 24 (row S12).** The readers' refusal stands. AL-1′'s decision 1, the sender's predicate, is not decided by it and stays proposed.
 2. The tie-break across attempts at one step (only with `all_attempts`, or a resumed attempt logging below its first step): the attempt that first appears later wins, then the highest `seq` within it; `seq` restarts per session; a scalar-only point always wins over a training value at its step. **Goes beyond** Q6, which names `seq` within one attempt.
 3. The refusal text for an unknown version: "this tensorquill reads schema versions 0, 1 and 2". **Agrees** with section 3.
 4. The public names (`evidence.scalar_series`, `load_records(scalars=)`, `set_apart_scalars`, `merged_scalar_points`, `layer_entries`, `identity.is_scalar_record`). Exporting `scalar_series` from the package is the seam's choice. **Goes beyond.**

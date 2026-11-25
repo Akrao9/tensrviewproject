@@ -27,8 +27,11 @@ What runs here, on the base and on every lane's tree:
 - Section 4.8, on `tensorquill.init` and `Session.log` themselves: a value logged late inside a compiled
   function before the flush for a newly trainable parameter, and its eager twin.
 
-Since step 2 landed no test here is an expected failure: every target of the wave passes on the joined
-tree (0826958) and is an ordinary test.
+Since step 2 landed every target of the wave's two steps passes on the joined tree (0826958) and is an
+ordinary test. The owner's two turns of lane AL-5's decisions (Nov 24; contract rows S9 and S10) add the
+only expected failures left, strict, until AL-5's change is joined:
+`test_step_none_is_the_same_as_leaving_step_out` (all three) and
+`test_flush_writes_the_pending_scalar_only_records[no_step_ever]` and `[no_step_since_a_flush]`.
 
 The Rust paths need the server binary (`TENSORQUILL_SERVER_BIN`, or one beside the interpreter) and
 are skipped without it; anything that needs pyarrow is skipped without it (CI's plain jobs have none).
@@ -518,3 +521,132 @@ def test_a_scalar_record_on_a_live_server_is_stored_apart_and_never_judged(case,
     assert objects, "no scalars-* object stored"
     assert [r for o in objects for r in flight.read_scalar_object(o)] == scalars
 
+
+
+# --- The owner's decisions on lane AL-5's step 2 (Nov 24; contract rows S9 and S10) ---------------------
+
+LANE_STEP_NONE = ("lane AL-5 (capture.py), after step 2: step=None is no step, the same as leaving step= out "
+                  "(the owner, Nov 24; contract row S10, section 4.2)")
+LANE_FLUSH = ("lane AL-5 (capture.py), after step 2: flush() writes the pending scalar-only records, also with no "
+              "step in memory (the owner, Nov 24; contract row S9, section 4.2)")
+CASE = {c["name"]: c for c in SCALAR}
+
+
+def _session(every: int = 4):
+    import torch
+    from torch import nn
+
+    import tensorquill
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 1))
+    sink = tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=sink, every=every, run_id="al_owner", heartbeat_seconds=None,
+                               stack_seconds=None)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+    def step():
+        model(torch.randn(8, 4)).pow(2).mean().backward()
+        opt.step()  # the TensorQuill step ends here (auto_step)
+        opt.zero_grad()
+
+    return session, sink, step
+
+
+def _seen(sink) -> list[tuple]:
+    """What a reader reads of each record: its kind, step, `seq` and scalars (never `ts`)."""
+    return [(r.get("record"), r.get("step"), r.get("seq"), r.get("scalars")) for r in list(sink.records)
+            if "step" in r]
+
+
+def _no_step_run(scenario: str, step_none: bool):
+    """Section 4.2 (row S10): one scenario, logging with no `step=` or with `step=None`, then one
+    `log(..., step=7)`. Returns what the sink holds and the left-out warnings."""
+    import warnings
+
+    named = {"step": None} if step_none else {}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        session, sink, step = _session()
+        try:
+            if scenario == "before_the_first_step":
+                session.log({"train/x": 1.5}, **named)  # pending: on step 0's own record
+                step()
+            elif scenario == "eval_with_a_step_in_memory":
+                step()
+                with session.phase("eval"):
+                    session.log({"eval/x": 1.5}, **named)  # on the newest step, step 0
+            elif scenario == "eval_before_the_first_step":
+                with session.phase("eval"):
+                    session.log({"eval/x": 1.5}, **named)  # left out, with section Q5's one warning
+                step()
+            session.log({"eval/y": 2.5}, step=7)  # the first scalar-only record: seq 0
+        finally:
+            session.close()
+    return _seen(sink), [str(w.message) for w in caught if LEFT_OUT in str(w.message)]
+
+
+NO_STEP_SCENARIOS = CASE["scalar_log_step_none_is_no_step"]["expect"]["scenarios"]
+
+
+@pytest.mark.xfail(strict=True, raises=TypeError, reason=LANE_STEP_NONE)
+@pytest.mark.parametrize("scenario", NO_STEP_SCENARIOS)
+def test_step_none_is_the_same_as_leaving_step_out(scenario):
+    """Case `scalar_log_step_none_is_no_step`: `log(values, step=None)` records exactly what
+    `log(values)` does, in every place a value with no `step=` can go; it writes no scalar-only record
+    and takes no `seq`. At 0826958 `step=None` raises `TypeError` (lane AL-5's decision 1, turned)."""
+    without, without_warned = _no_step_run(scenario, step_none=False)
+    with_none, none_warned = _no_step_run(scenario, step_none=True)
+    assert with_none == without
+    assert none_warned == without_warned
+    scalar_only = [r for r in with_none if r[0] == "scalars"]
+    assert [(r[1], r[2]) for r in scalar_only] == [(7, 0)]
+
+
+def _flushed_scalar_records(sink, seconds: float = 5.0) -> list[tuple]:
+    """The scalar-only records the writer has taken, waiting up to `seconds` for the first: `flush()`
+    queues its block for the writer thread and does not wait (never a timing)."""
+    import time
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        found = [r for r in _seen(sink) if r[0] == "scalars"]
+        if found:
+            time.sleep(0.05)  # anything queued with it lands in the same block
+            return [r for r in _seen(sink) if r[0] == "scalars"]
+        time.sleep(0.01)
+    return []
+
+
+FLUSH_SETUPS = CASE["scalar_flush_writes_pending_records"]["expect"]["setups"]
+
+
+def _flush_param(name: str):
+    today = CASE["scalar_flush_writes_pending_records"]["today"]["capture"][name]
+    marks = [] if today.startswith("written") else [
+        pytest.mark.xfail(strict=True, raises=AssertionError, reason=LANE_FLUSH)]
+    return pytest.param(name, id=name, marks=marks)
+
+
+@pytest.mark.parametrize("setup", [_flush_param(n) for n in FLUSH_SETUPS])
+def test_flush_writes_the_pending_scalar_only_records(setup):
+    """Case `scalar_flush_writes_pending_records`: a scalar-only record logged with `step=` reaches
+    the sink at the next `flush()`, before `close()`, with steps in memory or none (no step ever, or
+    none since the last flush), and is written once. With steps in memory it goes with their block, as
+    at 0826958 (a pin); with none in memory it waited for the next block or `close()` (lane AL-5's
+    decision 4, turned)."""
+    spec = FLUSH_SETUPS[setup]
+    session, sink, step = _session(every=4)
+    try:
+        for _ in range(spec["steps_before"]):
+            step()
+        if spec["flush_before"]:
+            session.flush()
+        session.log({"eval/x": 1.5}, step=spec["step"])
+        session.flush()
+        before_close = _flushed_scalar_records(sink)
+    finally:
+        session.close()
+    want = [("scalars", spec["step"], 0, {"eval/x": 1.5})]
+    assert before_close == want
+    assert [r for r in _seen(sink) if r[0] == "scalars"] == want
