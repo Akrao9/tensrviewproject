@@ -28,10 +28,12 @@ What runs here, on the base and on every lane's tree:
   function before the flush for a newly trainable parameter, and its eager twin.
 
 Since step 2 landed every target of the wave's two steps passes on the joined tree (0826958) and is an
-ordinary test. The owner's two turns of lane AL-5's decisions (Nov 24; contract rows S9 and S10) add the
-only expected failures left, strict, until AL-5's change is joined:
+ordinary test. The owner's two turns of lane AL-5's decisions (Nov 24; contract rows S9 and S10) add
+expected failures, strict, until AL-5's change is joined:
 `test_step_none_is_the_same_as_leaving_step_out` (all three) and
-`test_flush_writes_the_pending_scalar_only_records[no_step_ever]` and `[no_step_since_a_flush]`.
+`test_flush_writes_the_pending_scalar_only_records[no_step_ever]` and `[no_step_since_a_flush]`. The
+owner's turn of lane AL-1′'s decision 6 (row S13) adds one more, until AL-1′'s change is joined:
+`test_a_batch_s_min_and_max_step_count_its_training_rows_only`.
 
 The Rust paths need the server binary (`TENSORQUILL_SERVER_BIN`, or one beside the interpreter) and
 are skipped without it; anything that needs pyarrow is skipped without it (CI's plain jobs have none).
@@ -651,3 +653,58 @@ def test_flush_writes_the_pending_scalar_only_records(setup):
     want = [("scalars", spec["step"], 0, {"eval/x": 1.5})]
     assert before_close == want
     assert [r for r in _seen(sink) if r[0] == "scalars"] == want
+
+
+# --- The owner's turn of lane AL-1′'s decision 6 (Nov 24; contract row S13) -----------------------------
+
+LANE_METADATA = ("lane AL-1' (flight.py), after its seam: a batch's min_step and max_step are its training rows' "
+                 "range, and a batch of scalar-only rows alone carries what a batch with no steps does (the "
+                 "owner, Nov 24; contract row S13)")
+
+
+def _sent_batches(tmp_path: Path, first: list[dict], then: list[dict]) -> list[dict]:
+    """`first` sent by a `FlightSender` to the repository's stand-in server, then `then` appended and
+    sent by a second sender from the saved offset, whose stream opens with the batch that asks for the
+    store (no rows, no steps). Returns every batch's metadata as the stand-in records it."""
+    import subprocess
+    import sys
+
+    from tensorquill.flight import FlightSender
+
+    run_id = first[0]["run_id"]
+    store = tmp_path / "stand-in-store"
+    store.mkdir()
+    script = Path(__file__).with_name("flight_fake_server.py")
+    process = subprocess.Popen([sys.executable, str(script), str(store), "0"], stdout=subprocess.PIPE, text=True)
+    try:
+        endpoint = f"grpc://127.0.0.1:{int(process.stdout.readline())}"
+        path = tmp_path / f"{run_id}.rank0.jsonl"
+        for records in (first, then):
+            with path.open("a") as file:
+                file.writelines(json.dumps(r) + "\n" for r in records)
+            sender = FlightSender(path, endpoint, run_id, 0, batch_seconds=0.05, poll_seconds=0.02, backoff_cap=0.2)
+            assert sender.close() is True
+    finally:
+        process.kill()
+        process.wait(10)
+        process.stdout.close()
+    return [json.loads(line) for line in (store / "batches.jsonl").read_text().splitlines()]
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=LANE_METADATA)
+def test_a_batch_s_min_and_max_step_count_its_training_rows_only(tmp_path):
+    """Case `scalar_batch_metadata_counts_training_rows`: a batch holding training rows and a
+    scalar-only row carries the training rows' range; a batch of scalar-only rows alone carries the
+    same `min_step` and `max_step` as the stream's batch with no steps. At 0826958 both count the
+    scalar rows' steps (lane AL-1′'s decision 6, turned)."""
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pyarrow.flight")
+    case = CASE["scalar_batch_metadata_counts_training_rows"]
+    records, expect = copy.deepcopy(case["records"]), case["expect"]
+    first, then = records[:expect["sent_first"]], records[expect["sent_first"]:]
+    assert len(then) == expect["appended"]
+    batches = _sent_batches(tmp_path, first, then)
+    assert [b["rows"] for b in batches] == [b["rows"] for b in expect["batches"]]  # the scenario, as the case has it
+    mixed, no_steps, scalar_only = batches
+    assert (mixed["min_step"], mixed["max_step"]) == (expect["batches"][0]["min_step"], expect["batches"][0]["max_step"])
+    assert (scalar_only["min_step"], scalar_only["max_step"]) == (no_steps["min_step"], no_steps["max_step"])

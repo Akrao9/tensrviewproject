@@ -481,6 +481,23 @@ def owner_after_step_2():
                                            "0826958; the strict target shows it)",
                            "no_step_since_a_flush": "pending until the next block or close() (lane AL-5's decision 4, "
                                                     "at 0826958; the strict target shows it)"}})
+    # The owner, Nov 24, on lane AL-1′'s decision 6 (row S13): a batch's min_step and max_step are its
+    # training rows' range; a batch of scalar-only rows alone carries what a batch with no steps does.
+    first = [rec("al_meta", s, grad_norm=1.0) for s in range(4)] + [scalar("al_meta", 500, 0, {"eval/loss": 1.0})]
+    then = [scalar("al_meta", 501, 1, {"eval/loss": 0.9}), scalar("al_meta", 502, 2, {"eval/loss": 0.8})]
+    add("scalar_batch_metadata_counts_training_rows",
+        "flight.FlightSender sends records, then the records appended after it closed, from its saved offset. The "
+        "first batch holds training steps 0 to 3 and a scalar-only record at step 500: its min_step and max_step are "
+        "the training rows' range, 0 and 3. The resumed stream opens with its batch that asks for the store, with no "
+        "steps; its next batch holds scalar-only rows alone, and carries the same min_step and max_step as that batch "
+        "with no steps (the owner, Nov 24; row S13)", first + then,
+        {"sent_first": len(first), "appended": len(then),
+         "batches": [{"rows": 5, "min_step": 0, "max_step": 3},
+                     {"rows": 0, "asks_for_the_store": True},
+                     {"rows": 2, "steps_as_the_batch_with_no_steps": True}]}, ("sender",),
+        today={"sender": "the scalar rows' steps are counted (lane AL-1′'s decision 6, read at 0826958): the first "
+                         "batch carries min_step 0 and max_step 500, the scalar-only batch 501 and 502; the strict "
+                         "target test_a_batch_s_min_and_max_step_count_its_training_rows_only shows it"})
     return cases
 
 
@@ -537,7 +554,8 @@ def main() -> None:
             "rust_raw = server_detect.server_report; rust_raw_v4 = tensorquill-server detect given protocol 4's rows "
             "(experiments/protocol-v5/flight_v4.py), as an older SDK sends them; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release "
             "server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; "
-            "mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
+            "mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; sender = flight.FlightSender's "
+            "batch metadata, as the repository's stand-in server (sdk/tests/flight_fake_server.py) records it; today = the base's readers.",
             "Sections 1 and 2: row is what record_to_row must give at row.step (typed columns as [name, value] pairs in stored order, "
             "non-finite floats as the sink's strings, null for a null column or a null struct; probe_json as text; extra as extra_json "
             "parsed, null for none), and row_to_record(record_to_row(r)) == r with the map's order kept. expect is today's engines on "

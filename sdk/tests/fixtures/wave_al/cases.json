@@ -3,7 +3,7 @@
  "base": "258095a06659eb75051c2b267876b949791b4156",
  "how_to_read": [
   "Base trial/ai-wave f71d8e0. The base field is the commit the file was last written on; today and expect are the base's (its Python readers, and protocol 4's rows through a binary that reads them as the base's did). The rules are WAVE_AL_CONTRACT.md.",
-  "paths: row = flight.record_to_row and row_to_record in protocol 5's layout; python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_raw_v4 = tensorquill-server detect given protocol 4's rows (experiments/protocol-v5/flight_v4.py), as an older SDK sends them; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; today = the base's readers.",
+  "paths: row = flight.record_to_row and row_to_record in protocol 5's layout; python = build_evidence(detectors='python'); rust_raw = server_detect.server_report; rust_raw_v4 = tensorquill-server detect given protocol 4's rows (experiments/protocol-v5/flight_v4.py), as an older SDK sends them; rust_sdk = build_evidence(detectors='rust'); live_server = a protocol 5 release server fed by flight.send_file, read from the rank's incidents.json and its stored objects; runs = python -m tensorquill runs; mcp_get_series = the MCP tool get_series; capture = tensorquill.init and Session.log; sender = flight.FlightSender's batch metadata, as the repository's stand-in server (sdk/tests/flight_fake_server.py) records it; today = the base's readers.",
   "Sections 1 and 2: row is what record_to_row must give at row.step (typed columns as [name, value] pairs in stored order, non-finite floats as the sink's strings, null for a null column or a null struct; probe_json as text; extra as extra_json parsed, null for none), and row_to_record(record_to_row(r)) == r with the map's order kept. expect is today's engines on clean_records (or on records when there are none): every engine path must report that on records. today is the base on records (never recomputed).",
   "known_difference: a path whose expect is today's, not the clean records' report, and why (the owner's word).",
   "Section 4: expect is written from the contract's rules; series maps a scalar name to [step, value] points in step order.",
@@ -17859,6 +17859,113 @@
      "no_step_ever": "pending until the next block or close() (lane AL-5's decision 4, at 0826958; the strict target shows it)",
      "no_step_since_a_flush": "pending until the next block or close() (lane AL-5's decision 4, at 0826958; the strict target shows it)"
     }
+   }
+  },
+  {
+   "name": "scalar_batch_metadata_counts_training_rows",
+   "section": 4,
+   "about": "flight.FlightSender sends records, then the records appended after it closed, from its saved offset. The first batch holds training steps 0 to 3 and a scalar-only record at step 500: its min_step and max_step are the training rows' range, 0 and 3. The resumed stream opens with its batch that asks for the store, with no steps; its next batch holds scalar-only rows alone, and carries the same min_step and max_step as that batch with no steps (the owner, Nov 24; row S13)",
+   "paths": [
+    "sender"
+   ],
+   "records": [
+    {
+     "schema_version": 1,
+     "run_id": "al_meta",
+     "rank": 0,
+     "attempt": 1,
+     "step": 0,
+     "ts": 0.0,
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_meta",
+     "rank": 0,
+     "attempt": 1,
+     "step": 1,
+     "ts": 1.0,
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_meta",
+     "rank": 0,
+     "attempt": 1,
+     "step": 2,
+     "ts": 2.0,
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 1,
+     "run_id": "al_meta",
+     "rank": 0,
+     "attempt": 1,
+     "step": 3,
+     "ts": 3.0,
+     "grad_norm": 1.0
+    },
+    {
+     "schema_version": 2,
+     "record": "scalars",
+     "run_id": "al_meta",
+     "rank": 0,
+     "attempt": 1,
+     "step": 500,
+     "seq": 0,
+     "ts": 100.0,
+     "scalars": {
+      "eval/loss": 1.0
+     }
+    },
+    {
+     "schema_version": 2,
+     "record": "scalars",
+     "run_id": "al_meta",
+     "rank": 0,
+     "attempt": 1,
+     "step": 501,
+     "seq": 1,
+     "ts": 101.0,
+     "scalars": {
+      "eval/loss": 0.9
+     }
+    },
+    {
+     "schema_version": 2,
+     "record": "scalars",
+     "run_id": "al_meta",
+     "rank": 0,
+     "attempt": 1,
+     "step": 502,
+     "seq": 2,
+     "ts": 102.0,
+     "scalars": {
+      "eval/loss": 0.8
+     }
+    }
+   ],
+   "expect": {
+    "sent_first": 5,
+    "appended": 2,
+    "batches": [
+     {
+      "rows": 5,
+      "min_step": 0,
+      "max_step": 3
+     },
+     {
+      "rows": 0,
+      "asks_for_the_store": true
+     },
+     {
+      "rows": 2,
+      "steps_as_the_batch_with_no_steps": true
+     }
+    ]
+   },
+   "today": {
+    "sender": "the scalar rows' steps are counted (lane AL-1\u2032's decision 6, read at 0826958): the first batch carries min_step 0 and max_step 500, the scalar-only batch 501 and 502; the strict target test_a_batch_s_min_and_max_step_count_its_training_rows_only shows it"
    }
   }
  ]
