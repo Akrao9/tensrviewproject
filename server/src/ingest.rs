@@ -1216,6 +1216,30 @@ impl Ingest {
             buffer.bytes = 0;
             buffer.since = None;
         }
+        // Then the scalar-only rows, in an object of their own (`WAVE_AL_CONTRACT.md` section 4.5),
+        // and only then the acknowledgement: an offset is acknowledged once every row before it is
+        // stored, of both kinds.
+        if !buffer.scalars.batches.is_empty() {
+            let scalars = &buffer.scalars;
+            let written = self
+                .storage
+                .write_scalars(
+                    &key.0,
+                    key.1,
+                    scalars.attempt,
+                    &scalars.batches,
+                    scalars.first_seq,
+                    scalars.last_seq,
+                )
+                .await;
+            if let Err(error) = written {
+                let message = format!("cannot write the scalar rows to the store: {error}");
+                eprintln!("tensorquill-server: {} rank {}: {message}", key.0, key.1);
+                return Err(Status::unavailable(message));
+            }
+            buffer.scalars.batches.clear();
+            buffer.scalars.rows = 0;
+        }
         if let (Some(offset), Some(ack)) = (buffer.pending_offset.take(), &buffer.ack) {
             // `{"end_byte_offset": N, "store_id": "..."}` (L3). The ID is known: `accept` read it
             // before it took the rows the offset covers.

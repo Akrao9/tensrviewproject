@@ -1,4 +1,9 @@
 //! Parquet part files under `{store_root}/runs/{run_id}/rank={rank}/attempt={attempt}/`.
+//!
+//! Beside the parts, the same folder holds the attempt's scalar-only rows (`WAVE_AL_CONTRACT.md`
+//! section 4.5): `scalars-<first_seq:08>-<last_seq:08>.parquet`, each created once and never replaced.
+//! They are their own family: `is_part`, `rank_parts`, `max_step` and the replay never list them, so a
+//! scalar row never raises the step watermark (D8) and the detectors never read one.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -697,20 +702,93 @@ impl Storage {
         min_step: i64,
         max_step: i64,
     ) -> Result<Path, Error> {
-        let properties = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build();
-        let mut bytes = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut bytes, batches[0].schema(), Some(properties))?;
-        for batch in batches {
-            writer.write(batch)?;
-        }
-        writer.close()?;
+        let bytes = parquet_bytes(batches)?;
         let path = self
             .attempt_dir(run_id, rank, attempt)
             .join(format!("part-{min_step:08}-{max_step:08}.parquet"));
         self.store.put(&path, PutPayload::from(Bytes::from(bytes))).await?;
         Ok(path)
+    }
+
+    /// Writes `batches`, scalar-only rows of one attempt whose `seq` rises from `first_seq` to
+    /// `last_seq`, as `attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet` (`WAVE_AL_CONTRACT.md`
+    /// section 4.5), and returns its path. All batches share a schema.
+    ///
+    /// The object is created only if there is none of that name (`PutMode::Create`: a hard link on
+    /// local disk, `If-None-Match` on S3, a generation match on GCS), so a stored object is never
+    /// replaced. A create that meets an existing object reads it for its `seq` range: the same range
+    /// means these rows are stored (a `PUT` that reported failure after storing them, tried again
+    /// under the same name), and is `Ok`; another range, or an object that is not one of these, is an
+    /// error, and the caller keeps the rows. A backend that cannot create conditionally (S3 with
+    /// `AWS_CONDITIONAL_PUT` set to `disabled`, on a store whose `store.json` was provisioned) is
+    /// asked whether the object exists and then written plainly: the server holds one buffer per rank,
+    /// so only another server on the same rank could write between the two.
+    pub async fn write_scalars(
+        &self,
+        run_id: &str,
+        rank: i32,
+        attempt: i64,
+        batches: &[RecordBatch],
+        first_seq: i64,
+        last_seq: i64,
+    ) -> Result<Path, Error> {
+        let bytes = Bytes::from(parquet_bytes(batches)?);
+        let path = self
+            .attempt_dir(run_id, rank, attempt)
+            .join(format!("{SCALARS_PREFIX}{first_seq:08}-{last_seq:08}.parquet"));
+        let create = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let met = match self
+            .store
+            .put_opts(&path, PutPayload::from(bytes.clone()), create)
+            .await
+        {
+            Ok(_) => return Ok(path),
+            Err(object_store::Error::AlreadyExists { .. }) => true,
+            Err(object_store::Error::NotImplemented { .. }) => match self.store.head(&path).await {
+                Ok(_) => true,
+                Err(object_store::Error::NotFound { .. }) => false,
+                Err(error) => return Err(error.into()),
+            },
+            Err(error) => return Err(error.into()),
+        };
+        if !met {
+            self.store.put(&path, PutPayload::from(bytes)).await?;
+            return Ok(path);
+        }
+        match self.seq_range(&path).await? {
+            Some(range) if range == (first_seq, last_seq) => Ok(path),
+            held => Err(format!(
+                "{path} already exists and holds {}, not the rows of seq {first_seq} to {last_seq}; the rows are kept and nothing is replaced",
+                held.map_or_else(|| "no seq".to_string(), |(first, last)| format!("seq {first} to {last}"))
+            )
+            .into()),
+        }
+    }
+
+    /// The lowest and highest `seq` in an object of scalar-only rows, read from its `seq` column
+    /// alone; none when it has no such column or no `seq` in it.
+    async fn seq_range(&self, path: &Path) -> Result<Option<(i64, i64)>, Error> {
+        use arrow::array::{Array, Int64Array};
+        let bytes = self.store.get(path).await?.bytes().await?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+        let Some(column) = leaf_index(builder.parquet_schema(), SEQ) else {
+            return Ok(None);
+        };
+        let mask = ProjectionMask::leaves(builder.parquet_schema(), [column]);
+        let mut range: Option<(i64, i64)> = None;
+        for batch in builder.with_projection(mask).build()? {
+            let batch = batch?;
+            let Some(seqs) = batch.column(0).as_any().downcast_ref::<Int64Array>() else {
+                return Ok(None);
+            };
+            for seq in seqs.iter().flatten() {
+                range = Some(range.map_or((seq, seq), |(low, high)| (low.min(seq), high.max(seq))));
+            }
+        }
+        Ok(range)
     }
 
     /// The highest step already stored for this attempt of this rank, from the `step` column statistics in
@@ -785,6 +863,34 @@ impl Storage {
         }
         Ok(max)
     }
+}
+
+/// The name every object of scalar-only rows starts with (section 4.5).
+pub const SCALARS_PREFIX: &str = "scalars-";
+
+/// The column that numbers a scalar-only row within its attempt.
+const SEQ: &str = "seq";
+
+/// `batches` as the bytes of one Parquet file, compressed as every part is.
+fn parquet_bytes(batches: &[RecordBatch]) -> Result<Vec<u8>, Error> {
+    let properties = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, batches[0].schema(), Some(properties))?;
+    for batch in batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    Ok(bytes)
+}
+
+/// The leaf of a Parquet schema whose path is `name`, a top-level column.
+fn leaf_index(schema: &parquet::schema::types::SchemaDescriptor, name: &str) -> Option<usize> {
+    schema
+        .columns()
+        .iter()
+        .position(|column| column.path().string() == name)
 }
 
 fn to_parquet_err(err: object_store::Error) -> ParquetError {
