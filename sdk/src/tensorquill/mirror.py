@@ -306,12 +306,16 @@ def _log_into(session: Any, values: list[tuple[str, Any]]) -> None:
     changes when a step ends. The mirror remembers, for each of the last two such places, the object
     it stored under each key: a key holding anything else was logged by the caller or an adapter, or
     was the step's own before it ended, and is kept. With nowhere to go the value is passed to
-    `session.log` all the same, which leaves it out and says so once."""
+    `session.log` all the same, which leaves it out and says so once.
+
+    Every value goes through `session._log_mirrored`, which calls `session.log` with the mirror's mark
+    set: a value left out for want of a step is then said to be the mirror's, which cannot pass a step
+    (`WAVE_AL_CONTRACT.md` section Q5; the tracker's own `step=` is ignored, Q7)."""
     if session._closed or session._stopped:
         return
     where, row = session._scalars_for_log()
     if row is None:
-        session.log(dict(values))
+        session._log_mirrored(dict(values))  # left out, with the warning's sentence for the mirror's values
         return
     marks = _written.get(id(session))
     if not isinstance(marks, dict):
@@ -333,7 +337,7 @@ def _log_into(session: Any, values: list[tuple[str, Any]]) -> None:
     if not take:
         return
     try:
-        session.log(take)
+        session._log_mirrored(take)
     finally:
         now, row = session._scalars_for_log()
         if now == where and row is not None:

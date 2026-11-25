@@ -1736,6 +1736,10 @@ class Session:
         self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
         self._late_said = False  # a scalar left out for want of a step in memory was said (`_no_step_for`)
+        # The mirror's mark (`mirror._log_into`, section Q5): set while it logs a value it brought, and
+        # the names it left pending, with the count of steps ended when it did.
+        self._mirroring = False
+        self._mirrored_pending: tuple[int, set[str]] = (0, set())
         self._late_traced: dict[str, Any] = {}  # logged late inside a compiled function (`_log_late`)
         # Scalar-only records (`log(..., step=N)`) not yet handed to the writer, their values as
         # logged (a tensor still on its device), and the next one's `seq`, counted from 0 per session.
@@ -2907,8 +2911,7 @@ class Session:
         self._take_traced_late()
         row = self._newest_scalars()
         if row is None:
-            self._no_step_for(values, "logged inside session.phase(\"eval\") with no step in memory (before the "
-                                      "first step, or after flush() with no step since)")
+            self._no_step_for(values, "log")
             return
         self._ring_scalars[-1] = {**row, **values}
         self._mark_held("scalars")
@@ -2932,31 +2935,71 @@ class Session:
             return
         row = self._newest_scalars()
         if row is None:
-            self._no_step_for(pending, "pending at close() with no step in memory (no step ended, or none since "
-                                       "flush())")
+            self._no_step_for(pending, "close")
             return
         added = {name: value for name, value in pending.items() if name not in row}
         if added:
             self._ring_scalars[-1] = {**row, **added}
             self._mark_held("scalars")
 
-    def _no_step_for(self, values: Mapping[str, Any], why: str) -> None:
-        """A scalar with no step in memory to be recorded on: left out, and said once per session.
+    def _log_mirrored(self, values: dict[str, Any]) -> None:
+        """`log(values)` for a value the mirror brought from a tracker's call (`mirror._log_into`): the
+        mark `_no_step_for` reads, so its warning says the mirror cannot pass a step (section Q5, Q7).
+        Through `self.log` itself, so what replaces `log` on the session sees the mirror's call too."""
+        self._mirroring = True
+        try:
+            self.log(values)
+        finally:
+            self._mirroring = False
+        if not self._evaluating.on:  # pending: left out at `close()` if no step takes it
+            committed, names = self._mirrored_pending
+            if committed != self._steps_committed:
+                names = set()
+            self._mirrored_pending = (self._steps_committed, names | set(values))
 
-        The coordinator's reading of the owner's decision of Nov 24 (OPEN_BUGS, section 20), which
-        the owner may overrule: a record already written is never changed, and the value is not put
-        on a later step, as it was before (a baseline evaluation on step 0, a value after `flush()`
-        on the next step). Protocol 5's scalar-only record is to give it a place. This is the one
+    def _suggested_step(self) -> int:
+        """The step a value with no step in memory is shown to be logged at (section Q5's table): the
+        step training starts at (`start_step`, unless a step was committed), else the last step training
+        finished. Host integers the session keeps, the ones `_record_manifest` uses: no device read."""
+        return self._next_step if self._steps_committed == 0 else self._next_step - 1
+
+    def _no_step_for(self, values: Mapping[str, Any], at: str) -> None:
+        """A scalar with no step in memory to be recorded on, and no `step=`: left out, said once per
+        session (`WAVE_AL_CONTRACT.md` section Q5, the owner's decision of Nov 24).
+
+        A record already written is never changed, and the value is not put on a later step. The
+        warning names the case and shows the explicit call that records it, `log({...}, step=N)`,
+        which writes a scalar-only record, with `N` from `_suggested_step`. `at` is "log" for a value
+        logged under "eval", "close" for one pending at `close()`. A value the mirror brought (its
+        mark, `_log_mirrored`) gets one more sentence: the mirror passes no step (Q7). The text is
+        the case of the first value left out; later ones are left out silently. This is the one
         place that decides it."""
         if self._late_said:
             return
         self._late_said = True
         names = sorted(values)
         shown = ", ".join(repr(n) for n in names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+        if self._steps_committed == 0:
+            # No step committed: a baseline evaluation, or a value pending at close() in a session that
+            # never trained, which section Q5 counts as the same case.
+            case = "it was logged before the first training step (a baseline evaluation)"
+            which = "the step training starts at"
+        elif at == "close":
+            case = "it was still pending at close() after flush() with no training step since"
+            which = "the last step training finished"
+        else:
+            case = "it was logged after flush() with no training step since (an evaluation after flush())"
+            which = "the last step training finished"
+        committed, pending = self._mirrored_pending
+        mirrored = self._mirroring or (at == "close" and committed == self._steps_committed
+                                       and any(name in pending for name in names))
+        mirror = (" It came from your tracker's log call through mirror_scalars, which cannot pass a step (the "
+                  "tracker's own step is ignored): call session.log(..., step=...) yourself for it.") if mirrored else ""
         _warn(
-            f"TensorQuill left out the scalar{'s' if len(names) != 1 else ''} {shown}: {why}. A step already "
-            "written is never changed, and the value is not put on a later step; a scalar with a step of its own "
-            "comes with protocol 5's scalar-only record. Said once per session.",
+            f"TensorQuill left out the scalar{'s' if len(names) != 1 else ''} {shown}: {case}, when no step is in "
+            "memory. To record it, log it with an explicit step, which writes a scalar-only record: "
+            f"session.log({{{names[0]!r}: value}}, step={self._suggested_step()}), {which}.{mirror} Said once per "
+            "session.",
             stacklevel=4,
         )
 
