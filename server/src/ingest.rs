@@ -1149,7 +1149,21 @@ impl Ingest {
         batch: RecordBatch,
         buffer: &mut RankBuffer,
     ) -> Result<u64, Status> {
-        let watermark = buffer.seq_watermarks.get(&attempt).copied().flatten();
+        let watermark = match buffer.seq_watermarks.get(&attempt) {
+            Some(watermark) => *watermark,
+            None => {
+                // The attempt's first scalar rows since this server took the rank up: its watermark
+                // is read from the names of its `scalars-*` objects (footers only for a name that
+                // does not parse), so a replay after a restart stores nothing twice.
+                let stored = self
+                    .storage
+                    .max_seq(&key.0, key.1, attempt)
+                    .await
+                    .map_err(|error| Status::unavailable(format!("cannot read the store: {error}")))?;
+                buffer.seq_watermarks.insert(attempt, stored);
+                stored
+            }
+        };
         let (batch, first, last, discarded) = keep_new_seqs(key, batch, watermark)?;
         if batch.num_rows() == 0 {
             return Ok(discarded);

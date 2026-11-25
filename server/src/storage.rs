@@ -811,44 +811,68 @@ impl Storage {
         named.retain(|(step, _, _)| step.is_none() || *step == newest);
         let mut max = None;
         for (_, path, size) in named {
-            // The default PageIndexPolicy::Skip: the row-group statistics in the footer hold
-            // the step range, so the page indexes, stored before the footer, are never fetched.
-            // (Loading them after a suffix read sliced the wrong bytes before parquet 60.0,
-            // arrow-rs#11207, fixed by #11208; the pinned 60.1.0 has the fix.)
-            let metadata = ParquetMetaDataReader::new()
-                .with_prefetch_hint(Some(FOOTER_PREFETCH_BYTES))
-                .load_via_suffix_and_finish(FooterSuffixFetch {
-                    store: self.store.as_ref(),
-                    path: &path,
-                    size,
-                })
-                .await?;
-            let column = metadata
-                .file_metadata()
-                .schema_descr()
-                .columns()
-                .iter()
-                .position(|column| column.path().string() == "step");
-            let Some(column) = column else { continue };
-            let mut complete = true;
-            for row_group in metadata.row_groups() {
-                match row_group.column(column).statistics() {
-                    Some(Statistics::Int64(stats)) if stats.max_opt().is_some() => {
-                        max = max.max(stats.max_opt().copied());
-                    }
-                    // No statistics, or none for this row group (all its steps null, which no
-                    // writer makes, gives none too): its steps are read.
-                    _ => complete = complete && row_group.num_rows() == 0,
-                }
-            }
-            if !complete {
-                max = max.max(self.highest_step(&path, column).await?);
-            }
+            max = max.max(self.footer_max(&path, size, "step").await?);
         }
         Ok(max)
     }
 
-    /// The highest step in a part, read from its step column (leaf `column`) alone.
+    /// The highest `seq` already stored for this attempt of this rank: its scalar-only rows' own
+    /// watermark (`WAVE_AL_CONTRACT.md` section 4.5), from the names of the attempt's
+    /// `scalars-<first>-<last>.parquet` objects, the highest last `seq` they name. An object whose
+    /// name gives no `seq` range is read by its footer (the `seq` column's statistics, or the column
+    /// itself without them), as `max_step` reads a part. None when the attempt has no such object.
+    pub async fn max_seq(&self, run_id: &str, rank: i32, attempt: i64) -> Result<Option<i64>, Error> {
+        let dir = self.attempt_dir(run_id, rank, attempt);
+        let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
+        let mut max = None;
+        for object in objects.into_iter().filter(|object| is_scalars(&object.location)) {
+            let held = match name_seqs(&object.location) {
+                Some((_, last)) => Some(last),
+                None => self.footer_max(&object.location, object.size, SEQ).await?,
+            };
+            max = max.max(held);
+        }
+        Ok(max)
+    }
+
+    /// The highest value of the Int64 column `name` in the Parquet file at `path` of `size` bytes, from
+    /// the row-group statistics in its footer, or from the column itself where they are missing; none
+    /// when the file has no such column.
+    async fn footer_max(&self, path: &Path, size: u64, name: &str) -> Result<Option<i64>, Error> {
+        // The default PageIndexPolicy::Skip: the row-group statistics in the footer hold
+        // the step range, so the page indexes, stored before the footer, are never fetched.
+        // (Loading them after a suffix read sliced the wrong bytes before parquet 60.0,
+        // arrow-rs#11207, fixed by #11208; the pinned 60.1.0 has the fix.)
+        let metadata = ParquetMetaDataReader::new()
+            .with_prefetch_hint(Some(FOOTER_PREFETCH_BYTES))
+            .load_via_suffix_and_finish(FooterSuffixFetch {
+                store: self.store.as_ref(),
+                path,
+                size,
+            })
+            .await?;
+        let Some(column) = leaf_index(metadata.file_metadata().schema_descr(), name) else {
+            return Ok(None);
+        };
+        let mut max = None;
+        let mut complete = true;
+        for row_group in metadata.row_groups() {
+            match row_group.column(column).statistics() {
+                Some(Statistics::Int64(stats)) if stats.max_opt().is_some() => {
+                    max = max.max(stats.max_opt().copied());
+                }
+                // No statistics, or none for this row group (all its values null, which no
+                // writer makes for a step, gives none too): its values are read.
+                _ => complete = complete && row_group.num_rows() == 0,
+            }
+        }
+        if !complete {
+            max = max.max(self.highest_step(path, column).await?);
+        }
+        Ok(max)
+    }
+
+    /// The highest value in a part's Int64 column (leaf `column`, its step or `seq`), read alone.
     async fn highest_step(&self, path: &Path, column: usize) -> Result<Option<i64>, Error> {
         use arrow::array::{Array, Int64Array};
         let bytes = self.store.get(path).await?.bytes().await?;
@@ -953,6 +977,27 @@ fn name_steps(path: &Path) -> Option<(i64, i64)> {
     let name = path.filename()?.strip_prefix("part-")?.strip_suffix(".parquet")?;
     let at = name.get(1..)?.find('-')? + 1;
     Some((name[..at].parse().ok()?, name[at + 1..].parse().ok()?))
+}
+
+/// Whether `path` is an object of scalar-only rows: a `scalars-*.parquet` file (section 4.5). Never a
+/// part.
+fn is_scalars(path: &Path) -> bool {
+    path.extension() == Some("parquet") && path.filename().is_some_and(|name| name.starts_with(SCALARS_PREFIX))
+}
+
+/// An object of scalar-only rows' `seq` range as its name gives it:
+/// `scalars-00000000-00000004.parquet` -> `(0, 4)`. A `seq` is never negative, so the name has no sign.
+fn name_seqs(path: &Path) -> Option<(i64, i64)> {
+    let name = path
+        .filename()?
+        .strip_prefix(SCALARS_PREFIX)?
+        .strip_suffix(".parquet")?;
+    let (first, last) = name.split_once('-')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits(first) || !digits(last) {
+        return None;
+    }
+    Some((first.parse().ok()?, last.parse().ok()?))
 }
 
 /// `part-00000000-00000049.parquet` -> `49`.
@@ -1727,5 +1772,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage.attempt_order("r", 0).await.unwrap().attempts(), [900, 1, 2]);
+    }
+
+    // Wave AL, section 4.5 (lane AL-2′): the scalar-only rows' objects.
+
+    /// Rows with a `seq` column, as scalar-only rows have one.
+    fn seq_batch(seqs: Range<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("step", DataType::Int64, true),
+            Field::new("seq", DataType::Int64, true),
+        ]));
+        let seqs: Vec<i64> = seqs.collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1000; seqs.len()])),
+                Arc::new(Int64Array::from(seqs)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_scalars_objects_name_gives_its_seq_range_and_is_never_a_part() {
+        let cases = [
+            ("scalars-00000000-00000004.parquet", Some((0, 4))),
+            ("scalars-00000012-123456789.parquet", Some((12, 123456789))),
+            ("scalars-legacy.parquet", None),
+            ("scalars--0000001-00000004.parquet", None),
+            ("scalars-00000000.parquet", None),
+            ("scalars-00000000-00000004.json", None),
+        ];
+        for (name, range) in cases {
+            let path = Path::from(format!("runs/r/rank=0/attempt=1/{name}"));
+            assert_eq!(name_seqs(&path), range, "{name}");
+            assert!(!is_part(&path), "{name}");
+            assert_eq!(is_scalars(&path), name.ends_with(".parquet"), "{name}");
+        }
+        let part = Path::from("runs/r/rank=0/attempt=1/part-00000000-00000004.parquet");
+        assert!(is_part(&part) && !is_scalars(&part));
+    }
+
+    #[tokio::test]
+    async fn the_seq_watermark_is_read_from_the_names_and_a_footer_only_for_a_name_that_does_not_parse() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let spy = Arc::new(SpyStore::new(inner, false));
+        let storage = Storage::new(spy.clone(), Path::from("root"));
+        assert_eq!(storage.max_seq("r", 0, 1).await.unwrap(), None);
+        storage
+            .write_scalars("r", 0, 1, &[seq_batch(0..3)], 0, 2)
+            .await
+            .unwrap();
+        storage
+            .write_scalars("r", 0, 1, &[seq_batch(3..5)], 3, 4)
+            .await
+            .unwrap();
+        storage
+            .write_part("r", 0, 1, &[make_batch(0..9, 4)], 0, 8)
+            .await
+            .unwrap();
+        spy.clear_gets();
+        assert_eq!(storage.max_seq("r", 0, 1).await.unwrap(), Some(4));
+        assert!(spy.recorded_gets().is_empty(), "named objects are not opened");
+        // Another attempt's objects are its own.
+        assert_eq!(storage.max_seq("r", 0, 2).await.unwrap(), None);
+        // A name that does not parse is read by its footer, with or without statistics.
+        let unnamed = storage.attempt_dir("r", 0, 1).join("scalars-legacy.parquet");
+        put_parquet(spy.as_ref(), &unnamed, &seq_batch(5..9), true).await;
+        spy.clear_gets();
+        assert_eq!(storage.max_seq("r", 0, 1).await.unwrap(), Some(8));
+        assert!(!spy.recorded_gets().is_empty());
+        let bare = storage.attempt_dir("r", 0, 3).join("scalars-x.parquet");
+        put_parquet(spy.as_ref(), &bare, &seq_batch(2..6), false).await;
+        assert_eq!(storage.max_seq("r", 0, 3).await.unwrap(), Some(5));
+        // D8: none of them is a part, so the step watermark and the replay's list are the parts'.
+        assert_eq!(storage.max_step("r", 0, 1).await.unwrap(), Some(8));
+        let parts = storage.rank_parts("r", 0).await.unwrap();
+        let names: Vec<&str> = parts.iter().map(|part| part.location.filename().unwrap()).collect();
+        assert_eq!(names, ["part-00000000-00000008.parquet"]);
+        assert_eq!(storage.stored_attempts("r", 0).await.unwrap(), [1]);
+    }
+
+    #[tokio::test]
+    async fn a_scalars_object_is_created_once_and_a_create_that_meets_one_reads_its_seq_range() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let storage = Storage::new(store.clone(), Path::from("root"));
+        let path = storage
+            .write_scalars("r", 0, 1, &[seq_batch(0..2)], 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(path.filename(), Some("scalars-00000000-00000001.parquet"));
+        let before = store.get(&path).await.unwrap().bytes().await.unwrap();
+        // The same rows again: the same range, stored.
+        storage
+            .write_scalars("r", 0, 1, &[seq_batch(0..2)], 0, 1)
+            .await
+            .unwrap();
+        // The range is what is compared, as section 4.5 says, and the object is never replaced.
+        storage
+            .write_scalars("r", 0, 1, &[seq_batch(0..2)], 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), before);
+        // An object under the rows' name that holds another range: refused, and left as it was.
+        let mismatched = Path::from("root/runs/r/rank=0/attempt=1/scalars-00000005-00000006.parquet");
+        put_parquet(store.as_ref(), &mismatched, &seq_batch(7..9), true).await;
+        let refused = storage
+            .write_scalars("r", 0, 1, &[seq_batch(5..7)], 5, 6)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("holds seq 7 to 8"), "{refused}");
+        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), before);
+        // An object with no `seq` column under such a name is not these rows either.
+        let foreign = Path::from("root/runs/r/rank=0/attempt=1/scalars-00000010-00000011.parquet");
+        put_parquet(store.as_ref(), &foreign, &make_batch(0..2, 4), true).await;
+        let refused = storage
+            .write_scalars("r", 0, 1, &[seq_batch(10..12)], 10, 11)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("holds no seq"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn without_a_conditional_create_a_scalars_object_is_written_once_and_never_replaced() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = Arc::new(SpyStore::without_conditional_create(inner.clone()));
+        let storage = Storage::new(store, Path::from("root"));
+        let path = storage
+            .write_scalars("r", 0, 1, &[seq_batch(0..2)], 0, 1)
+            .await
+            .unwrap();
+        let before = inner.get(&path).await.unwrap().bytes().await.unwrap();
+        storage
+            .write_scalars("r", 0, 1, &[seq_batch(0..2)], 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(inner.get(&path).await.unwrap().bytes().await.unwrap(), before);
+        let mismatched = Path::from("root/runs/r/rank=0/attempt=1/scalars-00000005-00000006.parquet");
+        put_parquet(inner.as_ref(), &mismatched, &seq_batch(7..9), true).await;
+        let held = inner.get(&mismatched).await.unwrap().bytes().await.unwrap();
+        let refused = storage
+            .write_scalars("r", 0, 1, &[seq_batch(5..7)], 5, 6)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("holds seq 7 to 8"), "{refused}");
+        assert_eq!(inner.get(&mismatched).await.unwrap().bytes().await.unwrap(), held);
     }
 }
