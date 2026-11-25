@@ -95,17 +95,20 @@ use crate::watchdog::{RankReport, Watchdog, WatchdogConfig, DEFAULT_WATCHDOG_INT
 
 /// The batch metadata versions this server takes: 1, a protocol 4 sender's, and 2, protocol 5's
 /// layout (`WAVE_AL_CONTRACT.md` section 3, D6). Any other refuses the stream.
-pub const SCHEMA_VERSIONS: [i64; 2] = [ROW_VERSIONS[0].0, ROW_VERSIONS[1].0];
+pub const SCHEMA_VERSIONS: [i64; 2] = [1, 2];
 
-/// The one place that says which row versions a batch of each metadata version may hold (the
-/// owner's decision of Nov 25, 2026): under metadata 1, a protocol 4 sender's, rows of versions 0 and
-/// 1; under metadata 2, protocol 5's layout, rows of versions 0, 1 and 2 (`SUPPORTED_ROW_VERSIONS`).
+/// The one place that says which row versions a batch of each metadata version may hold, keyed by
+/// `SCHEMA_VERSIONS` in its order (the owner's decision of Nov 25, 2026): under metadata 1, a
+/// protocol 4 sender's, rows of versions 0 and 1; under metadata 2, protocol 5's layout, rows of versions 0, 1 and 2 (`SUPPORTED_ROW_VERSIONS`).
 /// A row of another version than its batch's metadata allows is dropped and counted under
 /// `unsupported_schema_version` (RS10). Until then every version in `SUPPORTED_ROW_VERSIONS` was
 /// stored whatever the metadata: a protocol 4 sender sending a protocol 5 capture's scalar-only
 /// record (row version 2, no `seq` column) had it stored as a training step, and the step watermark
 /// it raised dropped the training steps after it.
-pub const ROW_VERSIONS: [(i64, &[i32]); 2] = [(1, &PROTOCOL_4_ROW_VERSIONS), (2, &SUPPORTED_ROW_VERSIONS)];
+pub const ROW_VERSIONS: [(i64, &[i32]); 2] = [
+    (SCHEMA_VERSIONS[0], &PROTOCOL_4_ROW_VERSIONS),
+    (SCHEMA_VERSIONS[1], &SUPPORTED_ROW_VERSIONS),
+];
 
 /// The row versions a protocol 4 sender writes: 0 for a record that named none, and 1.
 const PROTOCOL_4_ROW_VERSIONS: [i32; 2] = [0, 1];
