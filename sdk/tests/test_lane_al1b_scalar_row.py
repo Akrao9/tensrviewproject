@@ -307,3 +307,22 @@ def test_load_records_reads_a_store_s_scalars_objects_beside_its_parts(tmp_path)
     read = evidence.load_records(run, rank=0, all_attempts=True)
     assert [r for r in read if not _is_scalar(r)] == made["steps"]
     assert [r for r in read if _is_scalar(r)] == made["rank0"]
+
+
+def test_a_rank_s_listing_never_enters_another_rank_s_folder(tmp_path, monkeypatch):
+    """As `_parquet_parts` does for parts: with `rank`, the `rank=<n>` folders of other ranks are not read,
+    so one rank's read never costs the rest of the run's listing."""
+    import os
+
+    run, _ = _store(tmp_path)
+    opened: list[str] = []
+    scandir = os.scandir
+
+    def watched(path="."):
+        opened.append(os.fspath(path))
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", watched)
+    assert [p.name for p in flight.scalar_objects(run, rank=0)] == ["scalars-00000000-00000000.parquet",
+                                                                   "scalars-00000001-00000002.parquet"]
+    assert opened and not [p for p in opened if "rank=1" in Path(p).parts], opened
