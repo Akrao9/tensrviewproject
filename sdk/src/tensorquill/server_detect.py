@@ -27,6 +27,8 @@ import sysconfig
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .flight import scalar_only
+
 BINARY_ENV = "TENSORQUILL_SERVER_BIN"
 BINARY_NAME = "tensorquill-server"
 # The number `tensorquill-server protocol` must print for this module to run the binary. It is
@@ -199,12 +201,15 @@ def _stream(records: Iterable[Mapping[str, Any]]) -> bytes:
     """`records` as an Arrow IPC stream of `flight_schema()`, in `stream_order`. Each record's
     identity fields are checked first, in the order given (`identity.check`, `WAVE_AF_CONTRACT.md`
     section 1): one that is not valid raises `identity.MalformedRecordError` naming its position
-    in `records`, and nothing is judged."""
+    in `records`, and nothing is judged. Then the scalar-only records are set apart (`flight.scalar_only`,
+    `WAVE_AL_CONTRACT.md` section 4.6; Q4 a): the Rust detectors are never sent one, and judge the
+    training records alone."""
     from .identity import check, in_list
 
     listed = list(records)
     for index, record in enumerate(listed):
         check(record, in_list(index))
+    listed = _training(listed)
     try:
         import pyarrow as pa
     except ImportError as error:
@@ -253,8 +258,7 @@ def server_report(
     Raises `RuntimeError` when the binary or `pyarrow` is missing, or the binary fails.
     """
     records = list(records)
-    if not records:
-        raise ValueError("no records to judge")
+    _something_to_judge(records)
     chosen = server_binary(binary)
     command = [chosen, "detect", *(["--samples"] if samples else [])]
     if thresholds is not None:
@@ -269,6 +273,20 @@ def server_report(
     if done.returncode != 0:
         raise _detect_failure(chosen, done.stderr.decode("utf-8", "replace").strip() or f"exit status {done.returncode}")
     return _report_of(chosen, done.stdout, samples)
+
+
+def _training(records: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """`records` without the scalar-only ones (`flight.scalar_only`), in their order: what the Rust
+    detectors read (`WAVE_AL_CONTRACT.md` section 4.6). No detector reads a scalar-only record (Q4 a)."""
+    return [record for record in records if not scalar_only(record)]
+
+
+def _something_to_judge(records: list[Mapping[str, Any]]) -> None:
+    """Raise `ValueError` when no record of `records` is one the detectors read."""
+    if not records:
+        raise ValueError("no records to judge")
+    if not _training(records):
+        raise ValueError("no records to judge: every record given is a scalar-only record, which no detector reads")
 
 
 def _detect_failure(chosen: str, message: str) -> Exception:
@@ -321,6 +339,10 @@ class FollowedDetect:
     - the records given before are the first records now, each the same record in its place;
     - the thresholds are the same;
     - each new record is of the newest attempt, with a step above every step before, in order.
+
+    Scalar-only records are set apart first (`flight.scalar_only`, `WAVE_AL_CONTRACT.md` section 4.6):
+    they are never sent, never kept and never decide what a look is, so a scalar-only record logged at
+    any step leaves an append an append.
 
     Anything else (a first look, late rows, a new attempt, a truncated or replaced file, which give
     other records, a threshold changed) ends the child and starts another that is sent every
@@ -442,8 +464,8 @@ class FollowedDetect:
         from .evidence import _same_record
 
         records = list(records)
-        if not records:
-            raise ValueError("no records to judge")
+        _something_to_judge(records)
+        records = _training(records)
         try:
             sent = None if thresholds is None else json.dumps(dict(thresholds), allow_nan=False)
         except (TypeError, ValueError) as error:
@@ -552,8 +574,9 @@ def stream_order(records: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]
     the order they first appear (contract 1: an attempt number is an identity, not an order),
     then by step within an attempt, rows of one step in the order given (lane W3's step-order
     rule). A stable sort, so nothing else moves. A key that is not a whole number sorts as 0;
-    the binary refuses such a row anyway."""
-    listed = list(records)
+    the binary refuses such a row anyway. The scalar-only records are not among them: the Rust
+    detectors never read one (`WAVE_AL_CONTRACT.md` section 4.6)."""
+    listed = _training(records)
     places: dict[tuple[int, int], int] = {}
     for record in listed:
         places.setdefault((_whole(record.get("rank", 0)), _whole(record.get("attempt", 0))), len(places))
@@ -591,8 +614,7 @@ def server_run_report(
     `thresholds`, `binary` and the errors are `server_report`'s.
     """
     records = list(records)
-    if not records:
-        raise ValueError("no records to judge")
+    _something_to_judge(records)
     chosen = server_binary(binary)
     command = [chosen, "detect", "--run"]
     if thresholds is not None:
@@ -638,7 +660,8 @@ def server_duplicate_batches(
     answer when fewer than two ranks drew a hashed batch; `server_run_report`'s
     `ranks_compared` tells the two apart.
     """
-    slim = [{key: record[key] for key in _DATA_KEYS if key in record} for record in records]
+    # A scalar-only record is set apart before its keys are slimmed away, which would make it a step's.
+    slim = [{key: record[key] for key in _DATA_KEYS if key in record} for record in _training(records)]
     if not slim:
         return None
     document = server_run_report(slim, binary=binary, timeout=timeout)
