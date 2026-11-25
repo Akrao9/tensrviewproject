@@ -430,3 +430,66 @@ def test_load_records_reads_a_store_s_scalar_objects_only_when_asked(tmp_path):
     assert [r for r in both if not identity.is_scalar_record(r)] == training
     assert [r for r in both if identity.is_scalar_record(r)] == scalars
     assert evidence.scalar_series(run)["eval/final"] == [[5, 1.0]]
+
+
+# ---- The Rust path, the watcher's tail and a file still being written --------------------------
+
+
+def _binary():
+    import importlib.util
+
+    if importlib.util.find_spec("pyarrow") is None:
+        return None
+    from tensorquill.server_detect import find_binary
+
+    return find_binary()
+
+
+@pytest.mark.parametrize("name", PYTHON)
+def test_build_evidence_with_the_rust_detectors_judges_the_training_records_alone(name):
+    """The `rust_sdk` path: `build_evidence(detectors="rust")` never sends a scalar-only record to the
+    binary, so the evidence is the training records' under the Rust detectors too."""
+    binary = _binary()
+    if binary is None:
+        pytest.skip("tensorquill-server is not built (TENSORQUILL_SERVER_BIN), or pyarrow is not installed")
+    case = _case(name)
+    built = evidence.build_evidence(copy.deepcopy(case["records"]), detectors="rust", server_binary=binary)
+    alone = evidence.build_evidence(copy.deepcopy(_training(case["records"])), detectors="rust", server_binary=binary)
+    assert built["detectors"] == "rust"
+    assert json.dumps(built, sort_keys=True) == json.dumps(alone, sort_keys=True)
+
+
+def test_the_watcher_s_tail_sets_scalar_records_apart(tmp_path):
+    records = _records("scalar_first_and_last_line")
+    path = _write(tmp_path / "w.jsonl", records[:3])
+    tail = evidence._Tail(path, None)
+    assert tail.poll() is True
+    assert tail.records == _training(records[:3]) and tail.scalars == records[:1]
+    with path.open("a") as file:
+        file.write(json.dumps(records[-1]) + "\n")  # a scalar-only line alone
+    assert tail.poll() is False  # no news: the evidence of the training records is the same
+    assert tail.scalars == [records[0], records[-1]] and tail.records == _training(records[:3])
+
+
+def _torn(tmp_path: Path, name: str, records: list[dict]) -> Path:
+    path = _write(tmp_path / name, records)
+    with path.open("a") as file:
+        file.write('{"schema_version": 1, "run_id": "')  # a last line still being written
+    return path
+
+
+def test_a_file_still_being_written_gives_the_merged_series_and_compares(tmp_path):
+    """The readers' fallbacks for a last line with no end: MCP's `_complete_lines` and `compare`'s
+    `_Tail` read the whole lines, the scalar-only records among them."""
+    source = mcp_server.Source(_torn(tmp_path, "edges.jsonl", _records("scalar_same_step_twice")))
+    error, got = _tool(source, "get_series", {"name": "eval/loss", "kind": "scalar"})
+    assert not error, got
+    assert (got["steps"], got["values"]["value"]) == ([4], [1.25])
+    from tensorquill.compare import compare_runs
+
+    a, b = _pair_of_runs()
+    _write(tmp_path / "a.rank0.jsonl", a)
+    _torn(tmp_path, "b.rank0.jsonl", b)
+    found = compare_runs("a", "b", source=tmp_path)["divergence"]
+    assert found["state"] == "diverged", found
+    assert (found["divergence"]["name"], found["divergence"]["step"]) == ("eval/loss", 40)

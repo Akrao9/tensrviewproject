@@ -165,3 +165,40 @@ def test_the_refused_diversity_case_is_one_where_the_two_readings_differ():
     at = next(r for r in records if r["step"] == 14)
     assert at["moe_stats"][router]["diversity"] is True
     assert _from_counts(at["moe"][router]) != pytest.approx(1.0)
+
+
+S5_INPUTS = {
+    # Every entry not an object, no gradient at all: what S5 moves in the input counts (`numbers` too).
+    "only_entries_not_objects_no_gradient": [
+        {"schema_version": 1, "run_id": "s5", "rank": 0, "attempt": 1, "step": s, "ts": float(s), "layers": {"a": 5, "b": 5}}
+        for s in range(12)],
+    # The `layers_not_read` coverage's side.
+    "only_entries_not_objects_layers_not_read": [
+        {"schema_version": 1, "run_id": "s5", "rank": 0, "attempt": 1, "step": s, "ts": float(s), "layers": {"a": 5},
+         "layers_not_read": {"model.layers.9": "a module the capture could not read"}} for s in range(12)],
+    "a_layers_value_not_an_object_no_gradient": [
+        {"schema_version": 1, "run_id": "s5", "rank": 0, "attempt": 1, "step": s, "ts": float(s), "layers": [1, 2]}
+        for s in range(12)],
+}
+
+
+@pytest.mark.parametrize("name", list(S5_INPUTS))
+def test_row_s5_reads_as_rust_reads_it(name):
+    """Row S5 on both engines: the kinds' values, the incidents and the `layers` entry of
+    `not_checked` are the same under `detectors="python"` and `"rust"`."""
+    binary = _binary()
+    if binary is None:
+        pytest.skip("tensorquill-server is not built (TENSORQUILL_SERVER_BIN), or pyarrow is not installed")
+    records = S5_INPUTS[name]
+    python = evidence.build_evidence(copy.deepcopy(records), detectors="python")
+    rust = evidence.build_evidence(copy.deepcopy(records), detectors="rust", server_binary=binary)
+    kinds = ("non_finite", "activation_spike", "activation_drift", "dead_activations", "grad_spike")
+    assert {k: python["kind_checks"].get(k) for k in kinds} == {k: rust["kind_checks"].get(k) for k in kinds}
+    # No layer is read: not checked (`not_configured`, or `unavailable` where the capture said why).
+    assert python["kind_checks"]["activation_spike"]["value"] in ("not_configured", "unavailable")
+    assert python["incidents"] == rust["incidents"]
+
+    def layers(built: dict) -> list:
+        return [x for x in built.get("not_checked") or () if x.get("check") == "layers"]
+
+    assert layers(python) == layers(rust)
