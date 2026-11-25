@@ -144,17 +144,22 @@ def test_with_a_wandb_logger_each_value_is_recorded_once_and_the_explicit_one_wi
     assert any(entry.get("eval/loss") is not None for entry in wandb.values())
 
 
-def test_a_baseline_evaluation_is_left_out_with_one_warning(tmp_path):
+def test_a_baseline_evaluation_is_a_scalar_only_record_and_nothing_is_warned(tmp_path):
+    """Moved by wave AL (section Q5, the addition): with no step in memory the callback passes `step=`
+    itself, so `eval_on_start`'s baseline is a scalar-only record at step 0, not left out with a warning.
+    It is still on no training step's record."""
     sink = tensorquill.MemorySink()
     trainer = _trainer(tmp_path, Model(), [TensorQuillCallback(sink=sink, every=4)], max_steps=2,
                        eval_on_start=True)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         trainer.train()
-    said = [w for w in caught if "protocol 5" in str(w.message)]
-    assert len(said) == 1
-    records = {r["step"]: r["scalars"] for r in sink.records}
+    said = [w for w in caught if "left out the scalar" in str(w.message)]
+    assert said == []
+    records = {r["step"]: r["scalars"] for r in sink.records if r.get("record") != "scalars"}
     assert "eval/loss" not in records[0] and "eval/loss" in records[1]
+    baseline = [r for r in sink.records if r.get("record") == "scalars"]
+    assert [(r["step"], r["seq"]) for r in baseline] == [(0, 0)] and "eval/loss" in baseline[0]["scalars"]
 
 
 def test_a_phase_left_behind_is_set_back_when_the_next_step_begins(tmp_path):
