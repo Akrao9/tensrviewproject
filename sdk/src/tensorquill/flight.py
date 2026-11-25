@@ -922,7 +922,7 @@ def rows_to_send(
     records: Iterable[Mapping[str, Any]], schema: Any, moved: list[tuple[int, str]] | None = None,
     refused: list[tuple[int, str, Any]] | None = None,
 ) -> tuple[Any, list[int], int]:
-    """`records` as one record batch of `schema`, the steps it holds, and how many records were
+    """`records` as one record batch of `schema`, the training steps it holds, and how many records were
     left out for a key: a `rank`, `attempt` or `step` that `identity.check` does not take (negative,
     not an integer, or a missing `step`; wave AG, `WAVE_AF_CONTRACT.md` section 10), or a key
     column whose value cannot be stored (a null or a string where a key column needs an integer,
@@ -938,7 +938,10 @@ def rows_to_send(
     of the row sent (lane AD4; before, the whole step was left out), and `(step, key)` is added to
     `moved`: the server reads such a value as absent from its column, and the sender says so.
 
-    The rows are `_row`'s, so a valid record's row is what `record_to_row` makes of it."""
+    The rows are `_row`'s, so a valid record's row is what `record_to_row` makes of it. The steps returned,
+    the batch's `min_step` and `max_step`, are the training rows' alone: a scalar-only row (`seq` set) is in
+    the batch but never one of its steps, so a batch of scalar-only rows alone has none and sends null for
+    both, as a batch with no steps does (the owner, Nov 24, on lane AL-1''s decision 6)."""
     import pyarrow as pa
 
     def strict(record: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]] | None:
@@ -1002,7 +1005,7 @@ def rows_to_send(
     rows = [row for _, _, row, _ in kept]
     if moved is not None:
         moved.extend((row["step"], key) for _, _, row, keys in kept for key in keys)
-    return batch, [row["step"] for row in rows], skipped
+    return batch, [row["step"] for row in rows if row["seq"] is None], skipped
 
 
 class BatchRefused(ConnectionError):
