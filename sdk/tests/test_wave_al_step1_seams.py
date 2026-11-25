@@ -406,7 +406,10 @@ def test_the_version_table_gives_section_3_s_four_numbers_as_the_code_has_them()
     assert "`flight.SCHEMA_VERSION`" in metadata[0] and metadata[1].startswith(f"{flight.SCHEMA_VERSION} (1)")
     assert "`flight.ROW_VERSION`" in row[0] and row[1].startswith(f"{flight.ROW_VERSION} (0 or 1: the record's own), with the record's own version in `record_version`")
     assert "`identity.SCHEMA_VERSIONS`" in record[0]
-    assert record[1].startswith(" or ".join(map(str, identity.SCHEMA_VERSIONS)) + ", unchanged")
+    # Step 2: a step record stays 0 or 1, and 2 is the scalar-only record (section 3, Q1 a).
+    assert identity.SCHEMA_VERSIONS == (0, 1, 2) and identity.SCALAR_VERSION == 2
+    assert record[1].startswith("0 or 1; 2 for a scalar-only record (0 or 1)")
+    assert "of version 2 that is not a whole scalar-only record" in record[2]
     # What the server takes and stores, as `ingest.rs` has it.
     ingest = server_source("ingest.rs")
     assert "pub const SCHEMA_VERSIONS: [i64; 2] = [1, 2];" in ingest
@@ -414,8 +417,6 @@ def test_the_version_table_gives_section_3_s_four_numbers_as_the_code_has_them()
     assert "this server reads versions 1 and 2" in ingest and "this server reads versions 1 and 2" in metadata[2]
     assert "the server stores 0, 1 and 2" in row[1]
     assert "`unsupported_schema_version`" in row[2] and "`tensorquill-server detect` refuses the input" in row[2]
-    # Not step 2 of the wave: no scalar-only record is described as built.
-    assert "scalar-only" not in versions_passage() and "scalars-" not in versions_passage()
 
 
 def test_the_older_server_message_the_readme_quotes_is_the_senders():
@@ -458,7 +459,8 @@ def test_the_columns_bullet_gives_protocol_5_s_columns_and_the_probe_split():
 def test_the_identity_rules_name_the_row_versions_detect_reads():
     identity_section = flat(README[README.index("**A record's identity fields.**"):
                                    README.index("**Several refused batches in a row.**")])
-    assert "| `schema_version` | read as 0, the legacy version | the integer 0 or 1 |" in identity_section
+    assert ("| `schema_version` | read as 0, the legacy version | the integer 0 or 1, or 2 for a scalar-only record: "
+            '`"record": "scalars"` and a `seq` that is an integer of 0 or more |') in identity_section
     assert "a row the server stores carries row version 2, with the record's own in `record_version`" in identity_section
     assert "and a `schema_version` other than 0, 1 or 2." in identity_section
     assert "other than 0 or 1" not in identity_section

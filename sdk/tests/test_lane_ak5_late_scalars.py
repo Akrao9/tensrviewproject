@@ -591,4 +591,4 @@ def test_the_readme_says_where_a_late_value_is_recorded():
     text = " ".join((SDK / "README.md").read_text(encoding="utf-8").split())
     assert 'session.phase("eval")' in text
     assert "newest step" in text and "still in memory" in text
-    assert "step=" in text and "TypeError" in text and "protocol 5" in text
+    assert "step=" in text and "scalar-only record" in text
