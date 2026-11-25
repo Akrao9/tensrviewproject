@@ -178,6 +178,14 @@
 //! step kept when that part began, not kept, and not counted before in the part, each counted
 //! once, when the part is stored. It is a lower bound: a late step that crosses a part's edge is
 //! not in it. The rest of `rows_not_newer` is not classified. No such row is stored.
+//!
+//! # Scalar-only rows not stored because their `seq` was not newer (wave AL, section 4.5)
+//!
+//! A scalar-only row (one whose `seq` is not null) is deduplicated by `(run_id, rank, attempt, seq)`:
+//! one at or below the highest `seq` kept for its attempt is not stored. `scalars_not_newer` counts
+//! them, on the rank's entry and in `restart` only when above zero, as `rows_not_newer` is counted:
+//! on arrival, a row sent again counted again. Such a row is never progress and never in
+//! `rows_not_newer`, which counts step rows only.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -392,6 +400,10 @@ pub struct Progress {
     /// Distinct steps confirmed to have arrived out of order inside one stored part and not stored
     /// (L30, wave AE): a lower bound on the late steps, counted when their part is stored.
     late_steps_confirmed: u64,
+    /// Scalar-only rows received with their keys readable and not stored because their `seq` was not
+    /// above the highest `seq` kept for their attempt (`WAVE_AL_CONTRACT.md` section 4.5): a replay,
+    /// a row sent again counted again.
+    scalars_not_newer: u64,
     /// The owner attempt's capture stopped (contract 3), its reason, since when the server saw
     /// it, and the last step committed before it stopped as the beat said it ([`StoppedAt`]).
     /// Kept whatever state the rank reads, until a newer attempt owns the rank.
@@ -441,6 +453,7 @@ impl Progress {
             refused_batches: BTreeMap::new(),
             rows_not_newer: 0,
             late_steps_confirmed: 0,
+            scalars_not_newer: 0,
             capture_stopped: None,
             held: None,
         }
@@ -747,6 +760,10 @@ impl Progress {
         if self.late_steps_confirmed > 0 {
             carry["late_steps_confirmed"] = json!(self.late_steps_confirmed);
         }
+        // Wave AL, section 4.5: likewise only when above zero.
+        if self.scalars_not_newer > 0 {
+            carry["scalars_not_newer"] = json!(self.scalars_not_newer);
+        }
         carry
     }
 
@@ -859,6 +876,8 @@ impl Progress {
             // Absent from a status written before wave AE, or that counted none: none.
             rows_not_newer: carry["rows_not_newer"].as_u64().unwrap_or(0),
             late_steps_confirmed: carry["late_steps_confirmed"].as_u64().unwrap_or(0),
+            // Absent from a status written before wave AL's step 2, or that counted none: none.
+            scalars_not_newer: carry["scalars_not_newer"].as_u64().unwrap_or(0),
             // Kept in the entry in every state once seen (contract 3), so a restart keeps it.
             capture_stopped: entry["capture_stopped"].as_object().map(|stopped| {
                 let reason = stopped
@@ -1191,6 +1210,16 @@ impl Watchdog {
     pub fn not_newer(&self, key: &Key, rows: u64, now: Instant) {
         if rows > 0 {
             self.with(key, now, |p| p.rows_not_newer = p.rows_not_newer.saturating_add(rows));
+        }
+    }
+
+    /// Scalar-only rows of the rank were not stored because their `seq` was not above the highest
+    /// `seq` kept for their attempt (section 4.5): counted in `scalars_not_newer`.
+    pub fn scalars_not_newer(&self, key: &Key, rows: u64, now: Instant) {
+        if rows > 0 {
+            self.with(key, now, |p| {
+                p.scalars_not_newer = p.scalars_not_newer.saturating_add(rows)
+            });
         }
     }
 
@@ -1565,6 +1594,9 @@ pub fn run_status(
             }
             if p.late_steps_confirmed > 0 {
                 entry["late_steps_confirmed"] = json!(p.late_steps_confirmed);
+            }
+            if p.scalars_not_newer > 0 {
+                entry["scalars_not_newer"] = json!(p.scalars_not_newer);
             }
             if let Some((reason, since, step)) = &p.capture_stopped {
                 entry["capture_stopped"] = json!({
@@ -4354,5 +4386,38 @@ mod tests {
             (&json!(6), &json!(1)),
             "{entry}"
         );
+    }
+
+    // Wave AL, section 4.5 (lane AL-2′): scalar-only rows not stored because their `seq` was not newer.
+
+    #[test]
+    fn scalars_not_newer_is_on_the_entry_and_in_restart_only_above_zero_survives_a_restart_and_is_no_progress() {
+        let t0 = Instant::now();
+        let dog = Watchdog::new(config(60));
+        dog.stream_opened(&key(0), t0);
+        dog.batch(&key(0), 1, Some(9), Some(1), at(t0, 1));
+        dog.scalars_not_newer(&key(0), 0, at(t0, 1));
+        let status = dog.statuses(at(t0, 2), true)["run"].clone();
+        for (place, value) in [("entry", &status["ranks"][0]), ("restart", &status["restart"][0])] {
+            assert!(value.get("scalars_not_newer").is_none(), "{place}: {value}");
+        }
+        dog.scalars_not_newer(&key(0), 2, at(t0, 30));
+        let status = dog.statuses(at(t0, 31), true)["run"].clone();
+        for value in [&status["ranks"][0], &status["restart"][0]] {
+            assert_eq!(value["scalars_not_newer"], json!(2), "{value}");
+            assert!(value.get("rows_not_newer").is_none(), "{value}");
+        }
+        let entry = &status["ranks"][0];
+        assert_eq!(entry["last_step"], json!(9), "{entry}");
+        assert_eq!(
+            entry["seconds_since_progress"],
+            json!(30.0),
+            "a scalar row is no progress: {entry}"
+        );
+        let now = Instant::now();
+        let again = restarted(&status, 60, now);
+        again.scalars_not_newer(&key(0), 1, now);
+        let entry = &again.statuses(now, true)["run"]["ranks"][0];
+        assert_eq!(entry["scalars_not_newer"], json!(3), "{entry}");
     }
 }

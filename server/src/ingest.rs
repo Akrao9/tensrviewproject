@@ -423,8 +423,10 @@ struct RankBuffer {
     /// not stored (L30), counted in `late_steps_confirmed` when the part is stored. At most one per
     /// row received while the part is open.
     late_steps: std::collections::BTreeSet<i64>,
-    /// The scalar-only rows waiting to be stored, apart from the step rows (`WAVE_AL_CONTRACT.md`
-    /// section 4.5).
+    /// Per attempt, the highest `seq` kept so far, buffered or stored (`WAVE_AL_CONTRACT.md` section
+    /// 4.5): the scalar-only rows' own watermark, apart from the steps'.
+    seq_watermarks: HashMap<i64, Option<i64>>,
+    /// The scalar-only rows waiting to be stored, apart from the step rows (section 4.5).
     scalars: ScalarBuffer,
 }
 
@@ -434,6 +436,9 @@ struct ScalarBuffer {
     attempt: i64,
     batches: Vec<RecordBatch>,
     rows: usize,
+    /// The first and last `seq` buffered: the `seq` rises from one row to the next.
+    first_seq: i64,
+    last_seq: i64,
 }
 
 impl RankBuffer {
@@ -990,8 +995,9 @@ impl Ingest {
         }
         // The scalar-only rows never meet the step watermark and are never progress: not the rank's
         // `last_step`, not the step given to the watchdog below, never a step the detectors read.
+        let mut scalars_not_newer = 0;
         for (attempt, batch) in scalar_pieces {
-            self.accept_scalars(key, attempt, batch, &mut buffer).await?;
+            scalars_not_newer += self.accept_scalars(key, attempt, batch, &mut buffer).await?;
         }
         // Counted once the rest of the batch is taken: a batch refused before (the store could not
         // be read) is sent again, and its rows would be counted twice.
@@ -1004,6 +1010,8 @@ impl Ingest {
         // L30: every row not stored for a step that was not newer, on arrival. A row sent again is
         // counted again; which of them arrived late is counted apart, when their part is stored.
         self.watchdog.not_newer(key, not_newer, now);
+        // Section 4.5: every scalar row not stored for a `seq` that was not newer, on arrival.
+        self.watchdog.scalars_not_newer(key, scalars_not_newer, now);
         self.watchdog.batch(
             key,
             progressed.map_or(owner.unwrap_or(buffer.attempt), |(attempt, _)| attempt),
@@ -1128,25 +1136,34 @@ impl Ingest {
         Ok((None, not_newer))
     }
 
-    /// Buffers the scalar-only rows of a batch whose rows all belong to one attempt
-    /// (`WAVE_AL_CONTRACT.md` section 4.5). They are kept apart from the step rows, so they never
-    /// raise the step watermark (D8) and are never progress.
+    /// Buffers the new scalar-only rows of a batch whose rows all belong to one attempt
+    /// (`WAVE_AL_CONTRACT.md` section 4.5), and returns how many were not kept because their `seq` was
+    /// not newer. They are kept apart from the step rows, so they never raise the step watermark (D8)
+    /// and are never progress. A row is deduplicated by `(run_id, rank, attempt, seq)`: one at or
+    /// below the attempt's `seq` watermark, or not above the rows before it, is dropped, so a replay
+    /// stores nothing twice.
     async fn accept_scalars(
         &self,
         key: &Key,
         attempt: i64,
         batch: RecordBatch,
         buffer: &mut RankBuffer,
-    ) -> Result<(), Status> {
-        let _ = key;
+    ) -> Result<u64, Status> {
+        let watermark = buffer.seq_watermarks.get(&attempt).copied().flatten();
+        let (batch, first, last, discarded) = keep_new_seqs(key, batch, watermark)?;
         if batch.num_rows() == 0 {
-            return Ok(());
+            return Ok(discarded);
         }
+        buffer.seq_watermarks.insert(attempt, Some(last));
         let scalars = &mut buffer.scalars;
+        if scalars.batches.is_empty() {
+            scalars.first_seq = first;
+        }
         scalars.attempt = attempt;
+        scalars.last_seq = last;
         scalars.rows += batch.num_rows();
         scalars.batches.push(batch);
-        Ok(())
+        Ok(discarded)
     }
 
     /// Stores what the buffer holds as one part, then acknowledges the offset it covers.
@@ -2100,7 +2117,7 @@ impl Ingest {
                 "replica": replica_version,
                 "run_state": status["run_state"],
                 "ranks": status["ranks"].as_array().map(|ranks| {
-                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone(), (r["refused_batch_keys"].clone(), r["rows_not_newer"].clone(), r["late_steps_confirmed"].clone()))).collect::<Vec<_>>()
+                    ranks.iter().map(|r| (r["rank"].clone(), r["state"].clone(), r["stream"].clone(), r["last_step"].clone(), r["phase"].clone(), r["severity"].clone(), r["stack"].is_object(), (r["attempt"].clone(), r["attempt_without_steps"].clone(), r["superseded_rows"].clone(), r["capture_stopped"]["reason"].clone()), r["dropped_row_keys"].clone(), (r["refused_batch_keys"].clone(), r["rows_not_newer"].clone(), r["late_steps_confirmed"].clone(), r["scalars_not_newer"].clone()))).collect::<Vec<_>>()
                 }),
             })
             .to_string();
@@ -2432,6 +2449,55 @@ fn keep_new_rows(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Resul
             first.get_or_insert(*step);
         } else {
             discarded.push(*step);
+        }
+        keep.append_value(new);
+    }
+    let keep = keep.finish();
+    let batch = if keep.true_count() == batch.num_rows() {
+        batch
+    } else {
+        filter_record_batch(&batch, &keep).map_err(|error| Status::internal(error.to_string()))?
+    };
+    Ok((batch, first.unwrap_or(0), mark.unwrap_or(0), discarded))
+}
+
+/// The kept scalar-only rows of a batch, their first and last `seq`, and how many were not kept.
+type NewSeqs = (RecordBatch, i64, i64, u64);
+
+/// Drops scalar-only rows whose `seq` is not above `watermark` or above the rows before them
+/// (`WAVE_AL_CONTRACT.md` section 4.5), as `keep_new_rows` drops step rows by their step. Returns the
+/// kept rows with their first and last `seq`, and how many were dropped. The rows' run and rank must
+/// be the descriptor's, as for step rows.
+fn keep_new_seqs(key: &Key, batch: RecordBatch, watermark: Option<i64>) -> Result<NewSeqs, Status> {
+    let run_ids = batch
+        .column_by_name("run_id")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| Status::invalid_argument("column `run_id` is missing or of the wrong type"))?;
+    let ranks = batch
+        .column_by_name("rank")
+        .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+        .ok_or_else(|| Status::invalid_argument("column `rank` is missing or of the wrong type"))?;
+    if run_ids.iter().any(|run_id| run_id != Some(key.0.as_str())) || ranks.values().iter().any(|rank| *rank != key.1) {
+        return Err(Status::invalid_argument(
+            "a row belongs to another run or rank than the descriptor",
+        ));
+    }
+    let seqs = batch
+        .column_by_name(SEQ_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .filter(|seqs| seqs.null_count() == 0)
+        .ok_or_else(|| Status::invalid_argument("column `seq` is missing, null or of the wrong type"))?;
+    let mut mark = watermark;
+    let mut first = None;
+    let mut discarded = 0;
+    let mut keep = BooleanBuilder::with_capacity(seqs.len());
+    for seq in seqs.values() {
+        let new = mark.is_none_or(|mark| *seq > mark);
+        if new {
+            mark = Some(*seq);
+            first.get_or_insert(*seq);
+        } else {
+            discarded += 1;
         }
         keep.append_value(new);
     }
