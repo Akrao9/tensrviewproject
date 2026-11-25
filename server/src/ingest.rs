@@ -439,6 +439,11 @@ struct ScalarBuffer {
     /// The first and last `seq` buffered: the `seq` rises from one row to the next.
     first_seq: i64,
     last_seq: i64,
+    /// Arrow bytes held, counted in the server's quota as step rows are.
+    bytes: usize,
+    /// Set when writing these rows failed: a `PUT` that reports failure may have stored the object,
+    /// so no row is added until a write of them succeeds (as `RankBuffer::sealed` for a part).
+    sealed: bool,
 }
 
 impl RankBuffer {
@@ -1168,14 +1173,41 @@ impl Ingest {
         if batch.num_rows() == 0 {
             return Ok(discarded);
         }
-        buffer.seq_watermarks.insert(attempt, Some(last));
-        let scalars = &mut buffer.scalars;
-        if scalars.batches.is_empty() {
-            scalars.first_seq = first;
+        // A write of the buffered rows that failed may have stored their object (a timeout after the
+        // store committed it): no row is added until it is stored, so the retry is the same object
+        // under the same name, which meets the stored one, and no second object over the same `seq`
+        // is made.
+        if buffer.scalars.sealed {
+            self.flush(key, buffer).await?;
         }
+        // An object holds one attempt and has one schema.
+        if buffer
+            .scalars
+            .batches
+            .first()
+            .is_some_and(|held| held.schema() != batch.schema() || buffer.scalars.attempt != attempt)
+        {
+            self.flush(key, buffer).await?;
+        }
+        let bytes = batch_bytes(&batch)?;
+        if !self.reserve(bytes) {
+            // Writing this rank's own buffer may make the room; otherwise refuse.
+            self.flush(key, buffer).await?;
+            if !self.reserve(bytes) {
+                return Err(Status::resource_exhausted("ingest buffer full"));
+            }
+        }
+        buffer.seq_watermarks.insert(attempt, Some(last));
+        if buffer.scalars.batches.is_empty() {
+            buffer.scalars.first_seq = first;
+            // The timed flush writes the rank once its oldest row has waited, of either kind.
+            buffer.since.get_or_insert_with(Instant::now);
+        }
+        let scalars = &mut buffer.scalars;
         scalars.attempt = attempt;
         scalars.last_seq = last;
         scalars.rows += batch.num_rows();
+        scalars.bytes += bytes;
         scalars.batches.push(batch);
         Ok(discarded)
     }
@@ -1232,27 +1264,15 @@ impl Ingest {
         }
         // Then the scalar-only rows, in an object of their own (`WAVE_AL_CONTRACT.md` section 4.5),
         // and only then the acknowledgement: an offset is acknowledged once every row before it is
-        // stored, of both kinds.
-        if !buffer.scalars.batches.is_empty() {
-            let scalars = &buffer.scalars;
-            let written = self
-                .storage
-                .write_scalars(
-                    &key.0,
-                    key.1,
-                    scalars.attempt,
-                    &scalars.batches,
-                    scalars.first_seq,
-                    scalars.last_seq,
-                )
-                .await;
-            if let Err(error) = written {
-                let message = format!("cannot write the scalar rows to the store: {error}");
-                eprintln!("tensorquill-server: {} rank {}: {message}", key.0, key.1);
-                return Err(Status::unavailable(message));
+        // stored, of both kinds. A part stored before a scalars write that failed is still judged
+        // below; the offset waits for the next flush that stores the scalar rows.
+        let scalars_stored = self.flush_scalars(key, buffer).await;
+        if scalars_stored.is_err() {
+            if self.config.detect && !stored.is_empty() {
+                self.take_replicas(key, &stored).await;
+                self.detect(key, buffer, &stored).await;
             }
-            buffer.scalars.batches.clear();
-            buffer.scalars.rows = 0;
+            return scalars_stored;
         }
         if let (Some(offset), Some(ack)) = (buffer.pending_offset.take(), &buffer.ack) {
             // `{"end_byte_offset": N, "store_id": "..."}` (L3). The ID is known: `accept` read it
@@ -1519,6 +1539,44 @@ impl Ingest {
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
         self.flush(key, &mut buffer).await
+    }
+
+    /// Stores the rank's buffered scalar-only rows as one `scalars-*` object (section 4.5), after its
+    /// step part. On a store error the rows stay buffered and the buffer takes no new scalar row
+    /// until a write of them succeeds (`ScalarBuffer::sealed`); the timed flush tries again after
+    /// `flush_interval`.
+    async fn flush_scalars(&self, key: &Key, buffer: &mut RankBuffer) -> Result<(), Status> {
+        if buffer.scalars.batches.is_empty() {
+            return Ok(());
+        }
+        let scalars = &buffer.scalars;
+        let written = self
+            .storage
+            .write_scalars(
+                &key.0,
+                key.1,
+                scalars.attempt,
+                &scalars.batches,
+                scalars.first_seq,
+                scalars.last_seq,
+            )
+            .await;
+        if let Err(error) = written {
+            buffer.scalars.sealed = true;
+            buffer.since.get_or_insert_with(Instant::now);
+            let message = format!("cannot write the scalar rows to the store: {error}");
+            eprintln!("tensorquill-server: {} rank {}: {message}", key.0, key.1);
+            return Err(Status::unavailable(message));
+        }
+        self.used.fetch_sub(buffer.scalars.bytes, Ordering::SeqCst);
+        let attempt = buffer.scalars.attempt;
+        buffer.scalars = ScalarBuffer {
+            attempt,
+            ..ScalarBuffer::default()
+        };
+        // The step part, if any, was stored before: nothing of either kind waits now.
+        buffer.since = None;
+        Ok(())
     }
 
     /// Writes every buffer whose oldest row has waited `flush_interval`. Ranks are written
@@ -2068,7 +2126,13 @@ impl Ingest {
             let Ok(held) = buffer.try_lock() else {
                 return false;
             };
-            if !held.batches.is_empty() || held.pending_offset.is_some() || held.ack.is_some() || held.sealed {
+            // Scalar-only rows still buffered (section 4.5) keep the run as step rows do.
+            if !held.batches.is_empty()
+                || !held.scalars.batches.is_empty()
+                || held.pending_offset.is_some()
+                || held.ack.is_some()
+                || held.sealed
+            {
                 return false;
             }
         }
