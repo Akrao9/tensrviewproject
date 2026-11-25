@@ -389,7 +389,11 @@ def test_the_readme_says_a_downgrade_is_not_supported_and_how_it_shows():
     start = passage.index("**A downgrade is not supported.**")
     downgrade = passage[start:start + 900]
     for words in ("A protocol 4 server", "protocol 5 parts", "without a word", "no layers", "no MoE statistics",
-                  "no attention maps", "refuses a store that holds protocol 5 parts, naming the part and the row"):
+                  "no attention maps",
+                  # Corrected Nov 24 from the run across a real protocol 4 build (experiments/protocol-v5/
+                  # cross_version.py, row 4): the old load_records and a read refuse such a store; its runs does not.
+                  "`load_records` and a read of the run", "refuse a store that holds protocol 5 parts, naming the part and the row",
+                  "its `runs` lists the run from the server's own reports"):
         assert words in downgrade, words
 
 

@@ -1,44 +1,95 @@
 {
- "started": "2026-11-24 14:54:48",
+ "started": "2026-11-24 19:21:00",
  "load_at_start": [
-  1.93017578125,
-  3.583984375,
-  3.71923828125
+  6.244140625,
+  4.30859375,
+  3.8134765625
  ],
  "cpu_count": 8,
  "python": "3.12.3",
  "pyarrow": "26.0.1",
+ "smoke": false,
+ "flight_schema_version": 2,
+ "row_version": 2,
  "bench_store": {
-  "ranks": 64,
-  "steps": 1000,
-  "shape": {
-   "blocks": 24,
-   "experts": 32,
-   "top_k": 8
+  "v5": {
+   "ranks": 64,
+   "steps": 1000,
+   "shape": {
+    "blocks": 24,
+    "experts": 32,
+    "top_k": 8
+   },
+   "parts": 1280,
+   "bytes": 279283088,
+   "write_seconds": 4.3,
+   "columns": [
+    "schema_version",
+    "run_id",
+    "rank",
+    "attempt",
+    "step",
+    "ts",
+    "lr",
+    "grad_norm",
+    "clip_grad_norm",
+    "weight_norm",
+    "weights_unchanged",
+    "step_skipped",
+    "grad_scale",
+    "scalars",
+    "grad_norms",
+    "weight_norms",
+    "update_rms",
+    "moe_top_k",
+    "moe_counts",
+    "replica_spread",
+    "layers",
+    "moe_stats",
+    "probe_json",
+    "probe_maps",
+    "probe_histograms",
+    "data_json",
+    "checkpoint_json",
+    "data_wait",
+    "step_time",
+    "system_json",
+    "record_version",
+    "extra_json"
+   ]
   },
-  "parts": 1280,
-  "bytes": 310768136,
-  "write_seconds": 4.4
+  "v4": {
+   "ranks": 64,
+   "steps": 1000,
+   "shape": {
+    "blocks": 24,
+    "experts": 32,
+    "top_k": 8
+   },
+   "parts": 1280,
+   "bytes": 310774024,
+   "layout": "protocol 4 (flight_v4.py)"
+  }
  },
  "part_bytes": {
-  "v4": 4855076,
-  "v5": 4367631
+  "v4": 4855168,
+  "v5": 4363743
  },
  "rounds": [
   {
-   "load_before": 2.42,
+   "load_before": 5.8,
    "v4": {
     "checksum": 44203.27124582506,
     "layers_decode": {
-     "max_ms": 5.606415000000001,
-     "median_ms": 5.606415000000001,
-     "min_ms": 5.606415000000001,
+     "max_ms": 4.813043,
+     "median_ms": 4.813043,
+     "min_ms": 4.813043,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 4.62858,
-     "median_ms": 4.62858,
-     "min_ms": 4.62858,
+     "max_ms": 4.205165,
+     "median_ms": 4.205165,
+     "min_ms": 4.205165,
      "rounds": 1
     },
     "parts": 20,
@@ -55,9 +106,9 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 28.231584,
-     "median_ms": 28.231584,
-     "min_ms": 28.231584,
+     "max_ms": 22.322169,
+     "median_ms": 22.322169,
+     "min_ms": 22.322169,
      "rounds": 1
     },
     "rows": 1000
@@ -65,15 +116,15 @@
    "v5": {
     "checksum": 44203.271245824806,
     "layers_decode": {
-     "max_ms": 0.17954299999999998,
-     "median_ms": 0.17954299999999998,
-     "min_ms": 0.17954299999999998,
+     "max_ms": 0.173334,
+     "median_ms": 0.173334,
+     "min_ms": 0.173334,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 0.06858400000000002,
-     "median_ms": 0.06858400000000002,
-     "min_ms": 0.06858400000000002,
+     "max_ms": 0.06587300000000003,
+     "median_ms": 0.06587300000000003,
+     "min_ms": 0.06587300000000003,
      "rounds": 1
     },
     "parts": 20,
@@ -90,32 +141,32 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 21.4495,
-     "median_ms": 21.4495,
-     "min_ms": 21.4495,
+     "max_ms": 16.67775,
+     "median_ms": 16.67775,
+     "min_ms": 16.67775,
      "rounds": 1
     },
     "rows": 1000
    },
-   "python_load_records_v4_ms": 394.75470897741616,
+   "python_load_records_v4_ms": 380.02254208549857,
    "python_records_v4": 1000,
-   "python_load_records_v5_ms": 325.4967919783667,
+   "python_load_records_v5_ms": 325.28179103974253,
    "python_records_v5": 1000
   },
   {
-   "load_before": 2.31,
+   "load_before": 5.8,
    "v4": {
     "checksum": 44203.27124582506,
     "layers_decode": {
-     "max_ms": 5.009874999999999,
-     "median_ms": 5.009874999999999,
-     "min_ms": 5.009874999999999,
+     "max_ms": 4.711500000000001,
+     "median_ms": 4.711500000000001,
+     "min_ms": 4.711500000000001,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 4.5307509999999995,
-     "median_ms": 4.5307509999999995,
-     "min_ms": 4.5307509999999995,
+     "max_ms": 4.1043330000000005,
+     "median_ms": 4.1043330000000005,
+     "min_ms": 4.1043330000000005,
      "rounds": 1
     },
     "parts": 20,
@@ -132,9 +183,9 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 21.075373000000003,
-     "median_ms": 21.075373000000003,
-     "min_ms": 21.075373000000003,
+     "max_ms": 16.701292,
+     "median_ms": 16.701292,
+     "min_ms": 16.701292,
      "rounds": 1
     },
     "rows": 1000
@@ -142,15 +193,15 @@
    "v5": {
     "checksum": 44203.271245824806,
     "layers_decode": {
-     "max_ms": 0.19304100000000002,
-     "median_ms": 0.19304100000000002,
-     "min_ms": 0.19304100000000002,
+     "max_ms": 0.17291600000000001,
+     "median_ms": 0.17291600000000001,
+     "min_ms": 0.17291600000000001,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 0.084667,
-     "median_ms": 0.084667,
-     "min_ms": 0.084667,
+     "max_ms": 0.06637000000000003,
+     "median_ms": 0.06637000000000003,
+     "min_ms": 0.06637000000000003,
      "rounds": 1
     },
     "parts": 20,
@@ -167,32 +218,32 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 22.784499,
-     "median_ms": 22.784499,
-     "min_ms": 22.784499,
+     "max_ms": 16.641455999999998,
+     "median_ms": 16.641455999999998,
+     "min_ms": 16.641455999999998,
      "rounds": 1
     },
     "rows": 1000
    },
-   "python_load_records_v4_ms": 493.6690829927102,
+   "python_load_records_v4_ms": 266.87375002074987,
    "python_records_v4": 1000,
-   "python_load_records_v5_ms": 333.33845797460526,
+   "python_load_records_v5_ms": 322.13145797140896,
    "python_records_v5": 1000
   },
   {
-   "load_before": 2.31,
+   "load_before": 5.8,
    "v4": {
     "checksum": 44203.27124582506,
     "layers_decode": {
-     "max_ms": 4.893251,
-     "median_ms": 4.893251,
-     "min_ms": 4.893251,
+     "max_ms": 4.7266710000000005,
+     "median_ms": 4.7266710000000005,
+     "min_ms": 4.7266710000000005,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 4.208544,
-     "median_ms": 4.208544,
-     "min_ms": 4.208544,
+     "max_ms": 4.1205430000000005,
+     "median_ms": 4.1205430000000005,
+     "min_ms": 4.1205430000000005,
      "rounds": 1
     },
     "parts": 20,
@@ -209,9 +260,9 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 19.503417999999996,
-     "median_ms": 19.503417999999996,
-     "min_ms": 19.503417999999996,
+     "max_ms": 16.747458,
+     "median_ms": 16.747458,
+     "min_ms": 16.747458,
      "rounds": 1
     },
     "rows": 1000
@@ -219,15 +270,15 @@
    "v5": {
     "checksum": 44203.271245824806,
     "layers_decode": {
-     "max_ms": 0.17591699999999996,
-     "median_ms": 0.17591699999999996,
-     "min_ms": 0.17591699999999996,
+     "max_ms": 0.172752,
+     "median_ms": 0.172752,
+     "min_ms": 0.172752,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 0.07029400000000002,
-     "median_ms": 0.07029400000000002,
-     "min_ms": 0.07029400000000002,
+     "max_ms": 0.06612400000000003,
+     "median_ms": 0.06612400000000003,
+     "min_ms": 0.06612400000000003,
      "rounds": 1
     },
     "parts": 20,
@@ -244,32 +295,32 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 20.065292,
-     "median_ms": 20.065292,
-     "min_ms": 20.065292,
+     "max_ms": 16.666124,
+     "median_ms": 16.666124,
+     "min_ms": 16.666124,
      "rounds": 1
     },
     "rows": 1000
    },
-   "python_load_records_v4_ms": 274.9697909457609,
+   "python_load_records_v4_ms": 330.30912501271814,
    "python_records_v4": 1000,
-   "python_load_records_v5_ms": 299.6724999975413,
+   "python_load_records_v5_ms": 319.4886250421405,
    "python_records_v5": 1000
   },
   {
-   "load_before": 2.31,
+   "load_before": 5.65,
    "v4": {
     "checksum": 44203.27124582506,
     "layers_decode": {
-     "max_ms": 5.125792000000001,
-     "median_ms": 5.125792000000001,
-     "min_ms": 5.125792000000001,
+     "max_ms": 4.743997,
+     "median_ms": 4.743997,
+     "min_ms": 4.743997,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 4.350001999999999,
-     "median_ms": 4.350001999999999,
-     "min_ms": 4.350001999999999,
+     "max_ms": 4.137123,
+     "median_ms": 4.137123,
+     "min_ms": 4.137123,
      "rounds": 1
     },
     "parts": 20,
@@ -286,9 +337,9 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 20.68741799999999,
-     "median_ms": 20.68741799999999,
-     "min_ms": 20.68741799999999,
+     "max_ms": 16.771748,
+     "median_ms": 16.771748,
+     "min_ms": 16.771748,
      "rounds": 1
     },
     "rows": 1000
@@ -296,15 +347,15 @@
    "v5": {
     "checksum": 44203.271245824806,
     "layers_decode": {
-     "max_ms": 0.18454299999999996,
-     "median_ms": 0.18454299999999996,
-     "min_ms": 0.18454299999999996,
+     "max_ms": 0.17450099999999996,
+     "median_ms": 0.17450099999999996,
+     "min_ms": 0.17450099999999996,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 0.06912700000000001,
-     "median_ms": 0.06912700000000001,
-     "min_ms": 0.06912700000000001,
+     "max_ms": 0.06625100000000002,
+     "median_ms": 0.06625100000000002,
+     "min_ms": 0.06625100000000002,
      "rounds": 1
     },
     "parts": 20,
@@ -321,32 +372,32 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 21.616414000000002,
-     "median_ms": 21.616414000000002,
-     "min_ms": 21.616414000000002,
+     "max_ms": 16.541707,
+     "median_ms": 16.541707,
+     "min_ms": 16.541707,
      "rounds": 1
     },
     "rows": 1000
    },
-   "python_load_records_v4_ms": 344.35854107141495,
+   "python_load_records_v4_ms": 335.6966250576079,
    "python_records_v4": 1000,
-   "python_load_records_v5_ms": 242.61295900214463,
+   "python_load_records_v5_ms": 321.0423330310732,
    "python_records_v5": 1000
   },
   {
-   "load_before": 2.31,
+   "load_before": 5.65,
    "v4": {
     "checksum": 44203.27124582506,
     "layers_decode": {
-     "max_ms": 4.802414000000001,
-     "median_ms": 4.802414000000001,
-     "min_ms": 4.802414000000001,
+     "max_ms": 4.767335999999999,
+     "median_ms": 4.767335999999999,
+     "min_ms": 4.767335999999999,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 4.179417,
-     "median_ms": 4.179417,
-     "min_ms": 4.179417,
+     "max_ms": 4.169208,
+     "median_ms": 4.169208,
+     "min_ms": 4.169208,
      "rounds": 1
     },
     "parts": 20,
@@ -363,9 +414,9 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 18.662295,
-     "median_ms": 18.662295,
-     "min_ms": 18.662295,
+     "max_ms": 16.848083999999997,
+     "median_ms": 16.848083999999997,
+     "min_ms": 16.848083999999997,
      "rounds": 1
     },
     "rows": 1000
@@ -373,15 +424,15 @@
    "v5": {
     "checksum": 44203.271245824806,
     "layers_decode": {
-     "max_ms": 0.17191600000000004,
-     "median_ms": 0.17191600000000004,
-     "min_ms": 0.17191600000000004,
+     "max_ms": 0.17429399999999995,
+     "median_ms": 0.17429399999999995,
+     "min_ms": 0.17429399999999995,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 0.06579400000000002,
-     "median_ms": 0.06579400000000002,
-     "min_ms": 0.06579400000000002,
+     "max_ms": 0.06604000000000003,
+     "median_ms": 0.06604000000000003,
+     "min_ms": 0.06604000000000003,
      "rounds": 1
     },
     "parts": 20,
@@ -398,32 +449,32 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 18.160586000000002,
-     "median_ms": 18.160586000000002,
-     "min_ms": 18.160586000000002,
+     "max_ms": 16.579373999999998,
+     "median_ms": 16.579373999999998,
+     "min_ms": 16.579373999999998,
      "rounds": 1
     },
     "rows": 1000
    },
-   "python_load_records_v4_ms": 325.0202920753509,
+   "python_load_records_v4_ms": 339.5172090968117,
    "python_records_v4": 1000,
-   "python_load_records_v5_ms": 297.9227500036359,
+   "python_load_records_v5_ms": 325.7272499613464,
    "python_records_v5": 1000
   },
   {
-   "load_before": 2.31,
+   "load_before": 5.65,
    "v4": {
     "checksum": 44203.27124582506,
     "layers_decode": {
-     "max_ms": 4.872084,
-     "median_ms": 4.872084,
-     "min_ms": 4.872084,
+     "max_ms": 4.741874,
+     "median_ms": 4.741874,
+     "min_ms": 4.741874,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 4.2433320000000005,
-     "median_ms": 4.2433320000000005,
-     "min_ms": 4.2433320000000005,
+     "max_ms": 4.140917,
+     "median_ms": 4.140917,
+     "min_ms": 4.140917,
      "rounds": 1
     },
     "parts": 20,
@@ -440,9 +491,9 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 17.99017,
-     "median_ms": 17.99017,
-     "min_ms": 17.99017,
+     "max_ms": 16.91204,
+     "median_ms": 16.91204,
+     "min_ms": 16.91204,
      "rounds": 1
     },
     "rows": 1000
@@ -450,15 +501,15 @@
    "v5": {
     "checksum": 44203.271245824806,
     "layers_decode": {
-     "max_ms": 0.17846099999999998,
-     "median_ms": 0.17846099999999998,
-     "min_ms": 0.17846099999999998,
+     "max_ms": 0.177334,
+     "median_ms": 0.177334,
+     "min_ms": 0.177334,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 0.07250000000000004,
-     "median_ms": 0.07250000000000004,
-     "min_ms": 0.07250000000000004,
+     "max_ms": 0.06562600000000002,
+     "median_ms": 0.06562600000000002,
+     "min_ms": 0.06562600000000002,
      "rounds": 1
     },
     "parts": 20,
@@ -475,32 +526,32 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 18.988919,
-     "median_ms": 18.988919,
-     "min_ms": 18.988919,
+     "max_ms": 16.440963,
+     "median_ms": 16.440963,
+     "min_ms": 16.440963,
      "rounds": 1
     },
     "rows": 1000
    },
-   "python_load_records_v4_ms": 336.10291697550565,
+   "python_load_records_v4_ms": 268.11954099684954,
    "python_records_v4": 1000,
-   "python_load_records_v5_ms": 297.5666250567883,
+   "python_load_records_v5_ms": 327.7167089981958,
    "python_records_v5": 1000
   },
   {
-   "load_before": 2.31,
+   "load_before": 5.65,
    "v4": {
     "checksum": 44203.27124582506,
     "layers_decode": {
-     "max_ms": 4.775582999999999,
-     "median_ms": 4.775582999999999,
-     "min_ms": 4.775582999999999,
+     "max_ms": 4.752956999999999,
+     "median_ms": 4.752956999999999,
+     "min_ms": 4.752956999999999,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 4.157038999999999,
-     "median_ms": 4.157038999999999,
-     "min_ms": 4.157038999999999,
+     "max_ms": 4.1369180000000005,
+     "median_ms": 4.1369180000000005,
+     "min_ms": 4.1369180000000005,
      "rounds": 1
     },
     "parts": 20,
@@ -517,9 +568,9 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 17.234586999999998,
-     "median_ms": 17.234586999999998,
-     "min_ms": 17.234586999999998,
+     "max_ms": 16.822543999999994,
+     "median_ms": 16.822543999999994,
+     "min_ms": 16.822543999999994,
      "rounds": 1
     },
     "rows": 1000
@@ -527,15 +578,15 @@
    "v5": {
     "checksum": 44203.271245824806,
     "layers_decode": {
-     "max_ms": 0.17475,
-     "median_ms": 0.17475,
-     "min_ms": 0.17475,
+     "max_ms": 0.17333299999999996,
+     "median_ms": 0.17333299999999996,
+     "min_ms": 0.17333299999999996,
      "rounds": 1
     },
     "moe_stats_decode": {
-     "max_ms": 0.06654100000000002,
-     "median_ms": 0.06654100000000002,
-     "min_ms": 0.06654100000000002,
+     "max_ms": 0.06616800000000002,
+     "median_ms": 0.06616800000000002,
+     "min_ms": 0.06616800000000002,
      "rounds": 1
     },
     "parts": 20,
@@ -552,69 +603,69 @@
      "rounds": 1
     },
     "read_part": {
-     "max_ms": 18.520207000000003,
-     "median_ms": 18.520207000000003,
-     "min_ms": 18.520207000000003,
+     "max_ms": 16.500414999999997,
+     "median_ms": 16.500414999999997,
+     "min_ms": 16.500414999999997,
      "rounds": 1
     },
     "rows": 1000
    },
-   "python_load_records_v4_ms": 264.0145410550758,
+   "python_load_records_v4_ms": 339.4049999769777,
    "python_records_v4": 1000,
-   "python_load_records_v5_ms": 297.2630829317495,
+   "python_load_records_v5_ms": 322.38637492991984,
    "python_records_v5": 1000
   }
  ],
  "summary": {
   "v4": {
    "read_part": {
-    "median": 19.503417999999996,
-    "min": 17.234586999999998,
-    "max": 28.231584,
+    "median": 16.822543999999994,
+    "min": 16.701292,
+    "max": 22.322169,
     "n": 7
    },
    "layers_decode": {
-    "median": 4.893251,
-    "min": 4.775582999999999,
-    "max": 5.606415000000001,
+    "median": 4.743997,
+    "min": 4.711500000000001,
+    "max": 4.813043,
     "n": 7
    },
    "moe_stats_decode": {
-    "median": 4.2433320000000005,
-    "min": 4.157038999999999,
-    "max": 4.62858,
+    "median": 4.137123,
+    "min": 4.1043330000000005,
+    "max": 4.205165,
     "n": 7
    },
    "python_load_records_ms": {
-    "median": 336.10291697550565,
-    "min": 264.0145410550758,
-    "max": 493.6690829927102,
+    "median": 335.6966250576079,
+    "min": 266.87375002074987,
+    "max": 380.02254208549857,
     "n": 7
    }
   },
   "v5": {
    "read_part": {
-    "median": 20.065292,
-    "min": 18.160586000000002,
-    "max": 22.784499,
+    "median": 16.579373999999998,
+    "min": 16.440963,
+    "max": 16.67775,
     "n": 7
    },
    "layers_decode": {
-    "median": 0.17846099999999998,
-    "min": 0.17191600000000004,
-    "max": 0.19304100000000002,
+    "median": 0.173334,
+    "min": 0.172752,
+    "max": 0.177334,
     "n": 7
    },
    "moe_stats_decode": {
-    "median": 0.06912700000000001,
-    "min": 0.06579400000000002,
-    "max": 0.084667,
+    "median": 0.06612400000000003,
+    "min": 0.06562600000000002,
+    "max": 0.06637000000000003,
     "n": 7
    },
    "python_load_records_ms": {
-    "median": 297.9227500036359,
-    "min": 242.61295900214463,
-    "max": 333.33845797460526,
+    "median": 322.38637492991984,
+    "min": 319.4886250421405,
+    "max": 327.7167089981958,
     "n": 7
    }
   }
@@ -622,51 +673,107 @@
  "rows": 1000,
  "detect_store_bench": [
   {
-   "load_before": 2.31,
-   "exit": 0,
-   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 71.21 / 79.03\n    of which JSON decoding alone (measured apart): 34.17 / 35.46\n  writing the Parquet parts: 134.98 / 159.98\n  writing incidents.json for every rank: 12.54 / 23.52\n  reading the parts back (not on the live path): 61.17 / 124.20\n  detectors per step: 22.25 us\nreplay of one rank (1000 steps): 41 ms\nreplay of all 64 ranks at once (64000 steps): 541 ms\n",
-   "stderr": ""
+   "v5": {
+    "load_before": 5.65,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 41.66 / 43.58\n    of which JSON decoding alone (measured apart): 0.02 / 0.03\n  writing the Parquet parts: 126.82 / 135.56\n  writing incidents.json for every rank: 12.32 / 15.04\n  reading the parts back (not on the live path): 53.82 / 68.82\n  detectors per step: 13.02 us\nreplay of one rank (1000 steps): 29 ms\nreplay of all 64 ranks at once (64000 steps): 437 ms\n",
+    "stderr": ""
+   },
+   "v4": {
+    "load_before": 5.44,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 69.95 / 70.68\n    of which JSON decoding alone (measured apart): 33.76 / 34.94\n  writing the Parquet parts: 128.09 / 136.70\n  writing incidents.json for every rank: 12.00 / 12.67\n  reading the parts back (not on the live path): 67.29 / 75.58\n  detectors per step: 21.86 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 511 ms\n",
+    "stderr": ""
+   }
   },
   {
-   "load_before": 3.16,
-   "exit": 0,
-   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.55 / 72.15\n    of which JSON decoding alone (measured apart): 33.81 / 35.43\n  writing the Parquet parts: 129.48 / 141.18\n  writing incidents.json for every rank: 12.38 / 13.27\n  reading the parts back (not on the live path): 54.21 / 61.76\n  detectors per step: 22.05 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 547 ms\n",
-   "stderr": ""
+   "v5": {
+    "load_before": 5.14,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 41.18 / 42.59\n    of which JSON decoding alone (measured apart): 0.01 / 0.02\n  writing the Parquet parts: 119.78 / 126.18\n  writing incidents.json for every rank: 11.90 / 12.69\n  reading the parts back (not on the live path): 52.84 / 59.91\n  detectors per step: 12.87 us\nreplay of one rank (1000 steps): 30 ms\nreplay of all 64 ranks at once (64000 steps): 431 ms\n",
+    "stderr": ""
+   },
+   "v4": {
+    "load_before": 5.05,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 69.81 / 70.68\n    of which JSON decoding alone (measured apart): 33.63 / 34.93\n  writing the Parquet parts: 126.30 / 132.26\n  writing incidents.json for every rank: 11.61 / 12.39\n  reading the parts back (not on the live path): 53.28 / 61.29\n  detectors per step: 21.81 us\nreplay of one rank (1000 steps): 38 ms\nreplay of all 64 ranks at once (64000 steps): 511 ms\n",
+    "stderr": ""
+   }
   },
   {
-   "load_before": 3.06,
-   "exit": 0,
-   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 71.42 / 86.09\n    of which JSON decoding alone (measured apart): 34.40 / 120.23\n  writing the Parquet parts: 137.92 / 169.46\n  writing incidents.json for every rank: 12.93 / 69.21\n  reading the parts back (not on the live path): 57.90 / 73.86\n  detectors per step: 22.32 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 512 ms\n",
-   "stderr": ""
+   "v5": {
+    "load_before": 4.81,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 41.39 / 42.61\n    of which JSON decoding alone (measured apart): 0.02 / 0.02\n  writing the Parquet parts: 120.96 / 128.12\n  writing incidents.json for every rank: 11.65 / 12.55\n  reading the parts back (not on the live path): 52.55 / 60.41\n  detectors per step: 12.94 us\nreplay of one rank (1000 steps): 29 ms\nreplay of all 64 ranks at once (64000 steps): 428 ms\n",
+    "stderr": ""
+   },
+   "v4": {
+    "load_before": 4.66,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.00 / 70.87\n    of which JSON decoding alone (measured apart): 33.80 / 34.81\n  writing the Parquet parts: 127.82 / 134.74\n  writing incidents.json for every rank: 11.99 / 24.29\n  reading the parts back (not on the live path): 53.30 / 60.39\n  detectors per step: 21.88 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 508 ms\n",
+    "stderr": ""
+   }
   },
   {
-   "load_before": 4.96,
-   "exit": 0,
-   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.72 / 72.83\n    of which JSON decoding alone (measured apart): 34.01 / 34.60\n  writing the Parquet parts: 127.88 / 133.87\n  writing incidents.json for every rank: 12.07 / 13.19\n  reading the parts back (not on the live path): 53.83 / 63.60\n  detectors per step: 22.10 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 510 ms\n",
-   "stderr": ""
+   "v5": {
+    "load_before": 4.69,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 41.49 / 43.80\n    of which JSON decoding alone (measured apart): 0.02 / 0.02\n  writing the Parquet parts: 120.42 / 128.80\n  writing incidents.json for every rank: 12.13 / 13.48\n  reading the parts back (not on the live path): 52.69 / 61.02\n  detectors per step: 12.97 us\nreplay of one rank (1000 steps): 29 ms\nreplay of all 64 ranks at once (64000 steps): 425 ms\n",
+    "stderr": ""
+   },
+   "v4": {
+    "load_before": 4.47,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.47 / 72.18\n    of which JSON decoding alone (measured apart): 34.21 / 34.26\n  writing the Parquet parts: 125.88 / 135.31\n  writing incidents.json for every rank: 11.97 / 13.17\n  reading the parts back (not on the live path): 53.19 / 63.33\n  detectors per step: 22.02 us\nreplay of one rank (1000 steps): 38 ms\nreplay of all 64 ranks at once (64000 steps): 514 ms\n",
+    "stderr": ""
+   }
   },
   {
-   "load_before": 4.64,
-   "exit": 0,
-   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.78 / 78.73\n    of which JSON decoding alone (measured apart): 33.90 / 37.84\n  writing the Parquet parts: 129.68 / 161.24\n  writing incidents.json for every rank: 12.56 / 16.59\n  reading the parts back (not on the live path): 54.60 / 74.66\n  detectors per step: 22.12 us\nreplay of one rank (1000 steps): 40 ms\nreplay of all 64 ranks at once (64000 steps): 511 ms\n",
-   "stderr": ""
+   "v5": {
+    "load_before": 4.24,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 41.68 / 43.12\n    of which JSON decoding alone (measured apart): 0.01 / 0.02\n  writing the Parquet parts: 119.82 / 126.09\n  writing incidents.json for every rank: 11.80 / 12.47\n  reading the parts back (not on the live path): 52.65 / 61.11\n  detectors per step: 13.02 us\nreplay of one rank (1000 steps): 32 ms\nreplay of all 64 ranks at once (64000 steps): 438 ms\n",
+    "stderr": ""
+   },
+   "v4": {
+    "load_before": 4.14,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 69.94 / 71.53\n    of which JSON decoding alone (measured apart): 33.67 / 34.36\n  writing the Parquet parts: 126.31 / 132.66\n  writing incidents.json for every rank: 11.76 / 12.51\n  reading the parts back (not on the live path): 53.59 / 60.98\n  detectors per step: 21.86 us\nreplay of one rank (1000 steps): 38 ms\nreplay of all 64 ranks at once (64000 steps): 505 ms\n",
+    "stderr": ""
+   }
   },
   {
-   "load_before": 4.59,
-   "exit": 0,
-   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 71.05 / 72.86\n    of which JSON decoding alone (measured apart): 34.04 / 34.43\n  writing the Parquet parts: 129.17 / 144.01\n  writing incidents.json for every rank: 12.17 / 14.17\n  reading the parts back (not on the live path): 55.21 / 61.92\n  detectors per step: 22.20 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 521 ms\n",
-   "stderr": ""
+   "v5": {
+    "load_before": 4.13,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 41.35 / 42.46\n    of which JSON decoding alone (measured apart): 0.01 / 0.02\n  writing the Parquet parts: 119.25 / 129.12\n  writing incidents.json for every rank: 11.75 / 12.37\n  reading the parts back (not on the live path): 52.94 / 59.26\n  detectors per step: 12.92 us\nreplay of one rank (1000 steps): 29 ms\nreplay of all 64 ranks at once (64000 steps): 424 ms\n",
+    "stderr": ""
+   },
+   "v4": {
+    "load_before": 3.96,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.36 / 72.44\n    of which JSON decoding alone (measured apart): 34.14 / 34.50\n  writing the Parquet parts: 126.25 / 132.47\n  writing incidents.json for every rank: 11.93 / 12.33\n  reading the parts back (not on the live path): 53.64 / 62.25\n  detectors per step: 21.99 us\nreplay of one rank (1000 steps): 40 ms\nreplay of all 64 ranks at once (64000 steps): 500 ms\n",
+    "stderr": ""
+   }
   },
   {
-   "load_before": 4.12,
-   "exit": 0,
-   "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.90 / 75.53\n    of which JSON decoding alone (measured apart): 34.06 / 34.41\n  writing the Parquet parts: 129.43 / 162.16\n  writing incidents.json for every rank: 12.23 / 13.80\n  reading the parts back (not on the live path): 54.35 / 63.98\n  detectors per step: 22.16 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 501 ms\n",
-   "stderr": ""
+   "v5": {
+    "load_before": 3.8,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 41.67 / 42.15\n    of which JSON decoding alone (measured apart): 0.02 / 0.02\n  writing the Parquet parts: 120.48 / 126.57\n  writing incidents.json for every rank: 12.10 / 12.52\n  reading the parts back (not on the live path): 52.97 / 59.47\n  detectors per step: 13.02 us\nreplay of one rank (1000 steps): 30 ms\nreplay of all 64 ranks at once (64000 steps): 427 ms\n",
+    "stderr": ""
+   },
+   "v4": {
+    "load_before": 3.66,
+    "exit": 0,
+    "stdout": "64 ranks, 20 flushes each\n64000 rows read, 50 steps per rank and flush, 0 incidents\nper flush of 64 ranks, one thread, ms (median / worst):\n  detectors: 70.72 / 71.46\n    of which JSON decoding alone (measured apart): 34.13 / 34.51\n  writing the Parquet parts: 126.46 / 134.23\n  writing incidents.json for every rank: 11.74 / 12.22\n  reading the parts back (not on the live path): 53.88 / 61.18\n  detectors per step: 22.10 us\nreplay of one rank (1000 steps): 39 ms\nreplay of all 64 ranks at once (64000 steps): 509 ms\n",
+    "stderr": ""
+   }
   }
  ],
  "load_at_end": [
-  4.0302734375,
-  3.92578125,
-  3.8369140625
+  3.4013671875,
+  3.95751953125,
+  3.73974609375
  ]
 }
