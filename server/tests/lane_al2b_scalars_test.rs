@@ -493,6 +493,9 @@ async fn scalar_replay_from_byte_0() {
     assert_eq!(send_one(&server.address, &run, batch(&records), 5).await.unwrap(), 5);
     assert_eq!(stored_steps(root, &run), [0, 1, 2]);
     assert_eq!(stored_seqs(root, &run), [0, 1]);
+    // Dropped on arrival, not written again and met as an existing object: this server counts both.
+    let entry = rank_entry(&server.ingest, &run);
+    assert_eq!(entry["scalars_not_newer"], 2, "{entry}");
     server.ingest.shutdown().await.unwrap();
 }
 
