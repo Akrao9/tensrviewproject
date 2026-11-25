@@ -27,7 +27,7 @@ import sysconfig
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .flight import scalar_only
+from .identity import is_scalar_record
 
 BINARY_ENV = "TENSORQUILL_SERVER_BIN"
 BINARY_NAME = "tensorquill-server"
@@ -201,7 +201,7 @@ def _stream(records: Iterable[Mapping[str, Any]]) -> bytes:
     """`records` as an Arrow IPC stream of `flight_schema()`, in `stream_order`. Each record's
     identity fields are checked first, in the order given (`identity.check`, `WAVE_AF_CONTRACT.md`
     section 1): one that is not valid raises `identity.MalformedRecordError` naming its position
-    in `records`, and nothing is judged. Then the scalar-only records are set apart (`flight.scalar_only`,
+    in `records`, and nothing is judged. Then the scalar-only records are set apart (`identity.is_scalar_record`,
     `WAVE_AL_CONTRACT.md` section 4.6; Q4 a): the Rust detectors are never sent one, and judge the
     training records alone."""
     from .identity import check, in_list
@@ -276,9 +276,9 @@ def server_report(
 
 
 def _training(records: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    """`records` without the scalar-only ones (`flight.scalar_only`), in their order: what the Rust
+    """`records` without the scalar-only ones (`identity.is_scalar_record`), in their order: what the Rust
     detectors read (`WAVE_AL_CONTRACT.md` section 4.6). No detector reads a scalar-only record (Q4 a)."""
-    return [record for record in records if not scalar_only(record)]
+    return [record for record in records if not is_scalar_record(record)]
 
 
 def _something_to_judge(records: list[Mapping[str, Any]]) -> None:
@@ -340,7 +340,7 @@ class FollowedDetect:
     - the thresholds are the same;
     - each new record is of the newest attempt, with a step above every step before, in order.
 
-    Scalar-only records are set apart first (`flight.scalar_only`, `WAVE_AL_CONTRACT.md` section 4.6):
+    Scalar-only records are set apart first (`identity.is_scalar_record`, `WAVE_AL_CONTRACT.md` section 4.6):
     they are never sent, never kept and never decide what a look is, so a scalar-only record logged at
     any step leaves an append an append.
 
