@@ -2489,7 +2489,7 @@ def load_records(
     which names the field, the value, and the file and line, the part and row, or the place in
     the list (WAVE_AF_CONTRACT.md, section 1). Nothing is judged from such an input.
 
-    Scalar-only records (`identity.is_scalar_record`, `session.log(..., step=N)`: WAVE_AL_CONTRACT.md
+    Scalar-only records (`identity.is_scalar_record`, written by `session.log(..., step=...)`: WAVE_AL_CONTRACT.md
     section 4) are set apart here, after that check: by default they are left out, so the records
     returned are the training records alone, as before them. `scalars=True` keeps them, in their
     place among the training records, for a reader of series (`scalar_series`); a store's
