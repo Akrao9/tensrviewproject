@@ -1,0 +1,855 @@
+{
+ "started": "2026-11-24 19:47:20",
+ "old_commit": "85a477aaae5ee8070277e62b57bca3db59754814",
+ "new_commit": "ce504e42fedd2c85f91b2695ce9c1bd96d6fd67a",
+ "old_protocol": 4,
+ "new_protocol": 5,
+ "row_1": {
+  "fresh": {
+   "old_server": {
+    "ready": "tensorquill-server listening on 127.0.0.1:49569",
+    "sender": {
+     "phase": "refused",
+     "last_error_type": "OlderServer",
+     "last_error": "the server at grpc://127.0.0.1:49569 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-fresh.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
+     "unacked_bytes": 24960,
+     "offset_file": 0
+    },
+    "parts_after": [],
+    "parts_before": [],
+    "lines_in_file": 40,
+    "lines_before": 40,
+    "stderr": [
+     "tensorquill-server: store ID 871f438e276e22c74b634d496a24687a",
+     "tensorquill-server: the stream of xv-fresh rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 40 rows, 27775 bytes; nothing acknowledged; the request had not ended first; the response was open; open 2.1 s"
+    ]
+   },
+   "new_server": {
+    "ready": "tensorquill-server listening on 127.0.0.1:49569",
+    "sender": {
+     "confirmed": true,
+     "last_error": null,
+     "offset": 24960
+    },
+    "report": {
+     "last_step": 39,
+     "incidents": [
+      [
+       "activation_spike",
+       35,
+       1
+      ]
+     ],
+     "activation_spike": "checked"
+    },
+    "stderr": [
+     "tensorquill-server: watching 1 unfinished runs from the last server's status",
+     "tensorquill-server: store ID 871f438e276e22c74b634d496a24687a",
+     "tensorquill-server: the stream of xv-fresh rank 0 ended (code Ok); received 1 batches, 40 rows, 27775 bytes; acknowledged to offset 24960; the request had ended first; the response was open; open 0.0 s"
+    ],
+    "parts": [
+     {
+      "part": "part-00000000-00000039.parquet",
+      "layout": "protocol 5",
+      "steps": [
+       0,
+       39
+      ],
+      "row_versions": [
+       2
+      ]
+     }
+    ],
+    "load_records": {
+     "records": 40,
+     "steps_in_order": true,
+     "equal_to_file": true,
+     "stderr": []
+    }
+   },
+   "sender_stderr": [
+    "tensorquill: the server at grpc://127.0.0.1:49569 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-fresh.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
+   ],
+   "older_message_said": 1
+  },
+  "resumed": {
+   "before": {
+    "confirmed": true,
+    "offset": 12510,
+    "stderr": []
+   },
+   "old_server": {
+    "ready": "tensorquill-server listening on 127.0.0.1:49575",
+    "sender": {
+     "phase": "refused",
+     "last_error_type": "OlderServer",
+     "last_error": "the server at grpc://127.0.0.1:49575 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-resumed.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
+     "unacked_bytes": 25040,
+     "offset_file": 12510
+    },
+    "parts_after": [
+     {
+      "part": "part-00000000-00000019.parquet",
+      "layout": "protocol 5",
+      "steps": [
+       0,
+       19
+      ],
+      "row_versions": [
+       2
+      ]
+     }
+    ],
+    "parts_before": [
+     {
+      "part": "part-00000000-00000019.parquet",
+      "layout": "protocol 5",
+      "steps": [
+       0,
+       19
+      ],
+      "row_versions": [
+       2
+      ]
+     }
+    ],
+    "lines_in_file": 40,
+    "lines_before": 40,
+    "stderr": [
+     "tensorquill-server: store ID 34295d2c709b5a090cbae3aae15e5246",
+     "tensorquill-server: the stream of xv-resumed rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8754 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s"
+    ]
+   },
+   "new_server": {
+    "ready": "tensorquill-server listening on 127.0.0.1:49575",
+    "sender": {
+     "confirmed": true,
+     "last_error": null,
+     "offset": 25040
+    },
+    "report": {
+     "last_step": 39,
+     "incidents": [
+      [
+       "activation_spike",
+       35,
+       1
+      ]
+     ],
+     "activation_spike": "checked"
+    },
+    "stderr": [
+     "tensorquill-server: watching 1 unfinished runs from the last server's status",
+     "tensorquill-server: store ID 34295d2c709b5a090cbae3aae15e5246",
+     "tensorquill-server: the stream of xv-resumed rank 0 ended (code Ok); received 2 batches, 20 rows, 23048 bytes; acknowledged to offset 25040; the request had ended first; the response was open; open 0.0 s"
+    ],
+    "parts": [
+     {
+      "part": "part-00000000-00000019.parquet",
+      "layout": "protocol 5",
+      "steps": [
+       0,
+       19
+      ],
+      "row_versions": [
+       2
+      ]
+     },
+     {
+      "part": "part-00000020-00000039.parquet",
+      "layout": "protocol 5",
+      "steps": [
+       20,
+       39
+      ],
+      "row_versions": [
+       2
+      ]
+     }
+    ],
+    "load_records": {
+     "records": 40,
+     "steps_in_order": true,
+     "equal_to_file": true,
+     "stderr": []
+    }
+   },
+   "sender_stderr": [
+    "tensorquill: the server at grpc://127.0.0.1:49575 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-resumed.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
+   ],
+   "older_message_said": 1
+  }
+ },
+ "row_2": {
+  "old_sender": {
+   "confirmed": true,
+   "offset": 37456,
+   "stderr": [],
+   "report": {
+    "last_step": 59,
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      1
+     ]
+    ],
+    "activation_spike": "checked"
+   },
+   "parts": [
+    {
+     "part": "part-00000000-00000059.parquet",
+     "layout": "protocol 4",
+     "steps": [
+      0,
+      59
+     ],
+     "row_versions": [
+      1
+     ]
+    }
+   ],
+   "server_stderr": [
+    "tensorquill-server: store ID 3c5d858a5e8c92aa862ffae462d8259a",
+    "tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 2 batches, 60 rows, 45651 bytes; acknowledged to offset 37456; the request had ended first; the response was open; open 0.0 s"
+   ]
+  },
+  "new_sender_after_restart": {
+   "confirmed": true,
+   "offset": 74972,
+   "stderr": [],
+   "report": {
+    "last_step": 119,
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      2
+     ]
+    ],
+    "activation_spike": "checked"
+   },
+   "server_stderr": [
+    "tensorquill-server: store ID 3c5d858a5e8c92aa862ffae462d8259a",
+    "tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 3 batches, 60 rows, 46667 bytes; acknowledged to offset 74972; the request had ended first; the response was open; open 0.0 s"
+   ]
+  },
+  "parts": [
+   {
+    "part": "part-00000000-00000059.parquet",
+    "layout": "protocol 4",
+    "steps": [
+     0,
+     59
+    ],
+    "row_versions": [
+     1
+    ]
+   },
+   {
+    "part": "part-00000060-00000119.parquet",
+    "layout": "protocol 5",
+    "steps": [
+     60,
+     119
+    ],
+    "row_versions": [
+     2
+    ]
+   }
+  ],
+  "new_load_records": {
+   "records": 120,
+   "steps_in_order": true,
+   "equal_to_file": true,
+   "stderr": []
+  }
+ },
+ "row_3": {
+  "new_sdk_old_binary": {
+   "build_evidence_rust": {
+    "raised": "RuntimeError: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source",
+    "warnings": [],
+    "stderr": []
+   },
+   "build_evidence_auto": {
+    "detectors": null,
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      2
+     ]
+    ],
+    "warnings": [
+     "RuntimeWarning: using the Python detectors, not the Rust ones: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source"
+    ],
+    "stderr": []
+   },
+   "cli_rust": {
+    "exit": 2,
+    "stderr": [
+     "usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]",
+     "                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]",
+     "                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]",
+     "                   [--traincheck TRAINCHECK]",
+     "                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]",
+     "                   [--overload-threshold OVERLOAD_THRESHOLD]",
+     "                   [--drift-tolerance DRIFT_TOLERANCE]",
+     "                   [--starve-window STARVE_WINDOW]",
+     "                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]",
+     "                   [--update-window UPDATE_WINDOW]",
+     "                   [--detectors {auto,python,rust}] [--compact]",
+     "                   [--compact-window N] [--on-incident COMMAND]",
+     "                   [--webhook URL] [--webhook-timeout SECONDS]",
+     "                   [--fire-anomalies] [--fire-kind KIND]",
+     "                   input",
+     "__main__.py: error: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source"
+    ],
+    "files_written": []
+   },
+   "cli_auto": {
+    "exit": 0,
+    "stderr": [
+     "tensorquill: warning: using the Python detectors, not the Rust ones: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. `--detectors python` asks for the Python detectors without this warning"
+    ],
+    "files_written": [
+     "xv-mixed.rank0.evidence.json"
+    ]
+   },
+   "cli_watch": {
+    "exit": 2,
+    "stderr": [
+     "usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]",
+     "                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]",
+     "                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]",
+     "                   [--traincheck TRAINCHECK]",
+     "                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]",
+     "                   [--overload-threshold OVERLOAD_THRESHOLD]",
+     "                   [--drift-tolerance DRIFT_TOLERANCE]",
+     "                   [--starve-window STARVE_WINDOW]",
+     "                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]",
+     "                   [--update-window UPDATE_WINDOW]",
+     "                   [--detectors {auto,python,rust}] [--compact]",
+     "                   [--compact-window N] [--on-incident COMMAND]",
+     "                   [--webhook URL] [--webhook-timeout SECONDS]",
+     "                   [--fire-anomalies] [--fire-kind KIND]",
+     "                   input",
+     "__main__.py: error: --watch needs the Rust detectors: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. To watch with the Python detectors, add --detectors python"
+    ],
+    "files_written": []
+   }
+  },
+  "old_sdk_new_binary": {
+   "build_evidence_rust": {
+    "raised": "RuntimeError: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source",
+    "warnings": [],
+    "stderr": []
+   },
+   "build_evidence_auto": {
+    "detectors": null,
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      2
+     ]
+    ],
+    "warnings": [
+     "RuntimeWarning: using the Python detectors, not the Rust ones: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source"
+    ],
+    "stderr": []
+   },
+   "cli_rust": {
+    "exit": 2,
+    "stderr": [
+     "usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]",
+     "                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]",
+     "                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]",
+     "                   [--traincheck TRAINCHECK]",
+     "                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]",
+     "                   [--overload-threshold OVERLOAD_THRESHOLD]",
+     "                   [--drift-tolerance DRIFT_TOLERANCE]",
+     "                   [--starve-window STARVE_WINDOW]",
+     "                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]",
+     "                   [--update-window UPDATE_WINDOW]",
+     "                   [--detectors {auto,python,rust}] [--compact]",
+     "                   [--compact-window N] [--on-incident COMMAND]",
+     "                   [--webhook URL] [--webhook-timeout SECONDS]",
+     "                   [--fire-anomalies] [--fire-kind KIND]",
+     "                   input",
+     "__main__.py: error: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source"
+    ],
+    "files_written": []
+   },
+   "cli_auto": {
+    "exit": 0,
+    "stderr": [
+     "tensorquill: warning: using the Python detectors, not the Rust ones: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. `--detectors python` asks for the Python detectors without this warning"
+    ],
+    "files_written": [
+     "xv-mixed.rank0.evidence.json"
+    ]
+   },
+   "cli_watch": {
+    "exit": 2,
+    "stderr": [
+     "usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]",
+     "                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]",
+     "                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]",
+     "                   [--traincheck TRAINCHECK]",
+     "                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]",
+     "                   [--overload-threshold OVERLOAD_THRESHOLD]",
+     "                   [--drift-tolerance DRIFT_TOLERANCE]",
+     "                   [--starve-window STARVE_WINDOW]",
+     "                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]",
+     "                   [--update-window UPDATE_WINDOW]",
+     "                   [--detectors {auto,python,rust}] [--compact]",
+     "                   [--compact-window N] [--on-incident COMMAND]",
+     "                   [--webhook URL] [--webhook-timeout SECONDS]",
+     "                   [--fire-anomalies] [--fire-kind KIND]",
+     "                   input",
+     "__main__.py: error: --watch needs the Rust detectors: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. To watch with the Python detectors, add --detectors python"
+    ],
+    "files_written": []
+   }
+  },
+  "new_sdk_new_binary": {
+   "build_evidence_rust": {
+    "detectors": "rust",
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      2
+     ]
+    ],
+    "warnings": [],
+    "stderr": []
+   },
+   "build_evidence_auto": {
+    "detectors": "rust",
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      2
+     ]
+    ],
+    "warnings": [],
+    "stderr": []
+   }
+  },
+  "old_sdk_old_binary": {
+   "build_evidence_rust": {
+    "detectors": "rust",
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      2
+     ]
+    ],
+    "warnings": [],
+    "stderr": []
+   },
+   "build_evidence_auto": {
+    "detectors": "rust",
+    "incidents": [
+     [
+      "activation_spike",
+      35,
+      2
+     ]
+    ],
+    "warnings": [],
+    "stderr": []
+   }
+  }
+ },
+ "row_4": {
+  "parts": [
+   {
+    "part": "part-00000000-00000039.parquet",
+    "layout": "protocol 5",
+    "steps": [
+     0,
+     39
+    ],
+    "row_versions": [
+     2
+    ]
+   }
+  ],
+  "old_load_records": {
+   "raised": "MalformedRecordError: schema_version is 2 at <tmp>/store-1-fresh/runs/xv-fresh/rank=0/attempt=1/part-00000000-00000039.parquet, row 0: this tensorquill reads schema versions 0 and 1",
+   "stderr": []
+  },
+  "old_runs": [
+   {
+    "project": "uncategorized",
+    "name": "xv-fresh",
+    "run_id": "xv-fresh",
+    "group": null,
+    "tags": [],
+    "has_manifest": false,
+    "source": "store",
+    "path": "<tmp>/store-1-fresh/runs/xv-fresh",
+    "started": null,
+    "run_state": "unhealthy",
+    "last_step": 39,
+    "incidents": {
+     "anomaly": 1
+    },
+    "first_incident": {
+     "kind": "activation_spike",
+     "step": 35
+    },
+    "kinds_checked": {
+     "checked": 8,
+     "of": 33,
+     "rank": 0
+    },
+    "ranks": [
+     0
+    ],
+    "evidence": {
+     "state": "current",
+     "from": "each rank's incidents.json and the run's watchdog.json",
+     "judged_ranks": 1,
+     "unknown_ranks": 0
+    },
+    "rank_count": 1
+   }
+  ],
+  "old_runs_exit": 0,
+  "old_runs_stderr": [],
+  "old_one_read": {
+   "exit": 2,
+   "stderr": [
+    "tensorquill: error: schema_version is 2 at <tmp>/store-1-fresh/runs/xv-fresh/rank=0/attempt=1/part-00000000-00000039.parquet, row 0: this tensorquill reads schema versions 0 and 1"
+   ],
+   "files_written": []
+  },
+  "new_runs_control": [
+   {
+    "project": "uncategorized",
+    "name": "xv-fresh",
+    "run_id": "xv-fresh",
+    "group": null,
+    "tags": [],
+    "has_manifest": false,
+    "source": "store",
+    "path": "<tmp>/store-1-fresh/runs/xv-fresh",
+    "started": null,
+    "run_state": "unhealthy",
+    "last_step": 39,
+    "incidents": {
+     "anomaly": 1
+    },
+    "first_incident": {
+     "kind": "activation_spike",
+     "step": 35
+    },
+    "kinds_checked": {
+     "checked": 8,
+     "of": 33,
+     "rank": 0
+    },
+    "ranks": [
+     0
+    ],
+    "evidence": {
+     "state": "current",
+     "from": "each rank's incidents.json and the run's watchdog.json",
+     "judged_ranks": 1,
+     "unknown_ranks": 0
+    },
+    "rank_count": 1
+   }
+  ]
+ },
+ "row_5": {
+  "parts_before": [
+   {
+    "part": "part-00000000-00000059.parquet",
+    "layout": "protocol 4",
+    "steps": [
+     0,
+     59
+    ],
+    "row_versions": [
+     1
+    ]
+   },
+   {
+    "part": "part-00000060-00000119.parquet",
+    "layout": "protocol 5",
+    "steps": [
+     60,
+     119
+    ],
+    "row_versions": [
+     2
+    ]
+   }
+  ],
+  "ready": "tensorquill-server listening on 127.0.0.1:49598",
+  "old_sender": {
+   "confirmed": true,
+   "offset": 87502,
+   "stderr": []
+  },
+  "report": {
+   "last_step": 139,
+   "incidents": [
+    [
+     "activation_spike",
+     35,
+     1
+    ]
+   ],
+   "activation_spike": "checked"
+  },
+  "watchdog_rank0": {
+   "attempt": 1,
+   "heartbeat_age_seconds": null,
+   "last_step": 139,
+   "phase": "train",
+   "phase_seconds": 0.4,
+   "rank": 0,
+   "seconds_since_progress": 0.4,
+   "severity": null,
+   "state": "finished",
+   "stream": "finished",
+   "work": null
+  },
+  "server_stderr": [
+   "tensorquill-server: store ID 3c5d858a5e8c92aa862ffae462d8259a",
+   "tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 2 batches, 20 rows, 21262 bytes; acknowledged to offset 87502; the request had ended first; the response was open; open 0.0 s"
+  ],
+  "parts_after": [
+   {
+    "part": "part-00000000-00000059.parquet",
+    "layout": "protocol 4",
+    "steps": [
+     0,
+     59
+    ],
+    "row_versions": [
+     1
+    ]
+   },
+   {
+    "part": "part-00000060-00000119.parquet",
+    "layout": "protocol 5",
+    "steps": [
+     60,
+     119
+    ],
+    "row_versions": [
+     2
+    ]
+   },
+   {
+    "part": "part-00000120-00000139.parquet",
+    "layout": "protocol 4",
+    "steps": [
+     120,
+     139
+    ],
+    "row_versions": [
+     1
+    ]
+   }
+  ]
+ },
+ "checks": [
+  {
+   "row": "1 fresh",
+   "claim": "the old server refuses the new sender's stream and acknowledges nothing",
+   "holds": true,
+   "seen": "parts before 0, after 0; saved offset 0, offset while refused 0; unacked 24960 bytes"
+  },
+  {
+   "row": "1 fresh",
+   "claim": "last_error is OlderServer",
+   "holds": true,
+   "seen": "OlderServer"
+  },
+  {
+   "row": "1 fresh",
+   "claim": "the lines stay in the sender's file",
+   "holds": true,
+   "seen": "40 lines"
+  },
+  {
+   "row": "1 fresh",
+   "claim": "the older-server message is said once",
+   "holds": true,
+   "seen": "said 1 time(s)"
+  },
+  {
+   "row": "1 fresh",
+   "claim": "with the new server in its place, the same sender finishes and every line is stored",
+   "holds": true,
+   "seen": "confirmed True; load_records 40 records, equal to the file True"
+  },
+  {
+   "row": "1 resumed",
+   "claim": "the old server refuses the new sender's stream and acknowledges nothing",
+   "holds": true,
+   "seen": "parts before 1, after 1; saved offset 12510, offset while refused 12510; unacked 25040 bytes"
+  },
+  {
+   "row": "1 resumed",
+   "claim": "the stream's first batch is the empty one that asks for the store, and that is what is refused",
+   "holds": true,
+   "seen": "tensorquill-server: store ID 34295d2c709b5a090cbae3aae15e5246 | tensorquill-server: the stream of xv-resumed rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8754 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s"
+  },
+  {
+   "row": "1 resumed",
+   "claim": "last_error is OlderServer",
+   "holds": true,
+   "seen": "OlderServer"
+  },
+  {
+   "row": "1 resumed",
+   "claim": "the lines stay in the sender's file",
+   "holds": true,
+   "seen": "40 lines"
+  },
+  {
+   "row": "1 resumed",
+   "claim": "the older-server message is said once",
+   "holds": true,
+   "seen": "said 1 time(s)"
+  },
+  {
+   "row": "1 resumed",
+   "claim": "with the new server in its place, the same sender finishes and every line is stored",
+   "holds": true,
+   "seen": "confirmed True; load_records 40 records, equal to the file True"
+  },
+  {
+   "row": "2",
+   "claim": "the old sender's batches are stored as sent, in protocol 4's layout",
+   "holds": true,
+   "seen": "[{'part': 'part-00000000-00000059.parquet', 'layout': 'protocol 4', 'steps': [0, 59], 'row_versions': [1]}]"
+  },
+  {
+   "row": "2",
+   "claim": "the new server's detectors judge the layers from layers_json",
+   "holds": true,
+   "seen": "{'last_step': 59, 'incidents': [('activation_spike', 35, 1)], 'activation_spike': 'checked'}"
+  },
+  {
+   "row": "2",
+   "claim": "after a restart, and the new sender continuing the rank, both layouts are judged",
+   "holds": true,
+   "seen": "{'last_step': 119, 'incidents': [('activation_spike', 35, 2)], 'activation_spike': 'checked'}"
+  },
+  {
+   "row": "2",
+   "claim": "the store holds parts of both layouts",
+   "holds": true,
+   "seen": "[{'part': 'part-00000000-00000059.parquet', 'layout': 'protocol 4', 'steps': [0, 59], 'row_versions': [1]}, {'part': 'part-00000060-00000119.parquet', 'layout': 'protocol 5', 'steps': [60, 119], 'row_versions': [2]}]"
+  },
+  {
+   "row": "2",
+   "claim": "the new load_records reads them all, in step order",
+   "holds": true,
+   "seen": "{'records': 120, 'steps_in_order': True, 'equal_to_file': True}"
+  },
+  {
+   "row": "3 new_sdk_old_binary",
+   "claim": "detectors=\"rust\" raises, with the protocol message",
+   "holds": true,
+   "seen": "RuntimeError: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source"
+  },
+  {
+   "row": "3 new_sdk_old_binary",
+   "claim": "detectors=\"auto\" falls back to Python, with the protocol message",
+   "holds": true,
+   "seen": "detectors None; warnings ['RuntimeWarning: using the Python detectors, not the Rust ones: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source']"
+  },
+  {
+   "row": "3 new_sdk_old_binary",
+   "claim": "one read with --detectors rust stops with exit 2 and the message, no evidence file",
+   "holds": true,
+   "seen": "{'exit': 2, 'stderr': ['usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]', '                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]', '                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]', '                   [--traincheck TRAINCHECK]', '                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]', '                   [--overload-threshold OVERLOAD_THRESHOLD]', '                   [--drift-tolerance DRIFT_TOLERANCE]', '                   [--starve-window STARVE_WINDOW]', '                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]', '                   [--update-window UPDATE_WINDOW]', '                   [--detectors {auto,python,rust}] [--compact]', '                   [--compact-window N] [--on-incident COMMAND]', '                   [--webhook URL] [--webhook-timeout SECONDS]', '                   [--fire-anomalies] [--fire-kind KIND]', '                   input', '__main__.py: error: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source'], 'files_written': []}"
+  },
+  {
+   "row": "3 new_sdk_old_binary",
+   "claim": "one read with auto uses Python, writes the evidence, warns once with the message",
+   "holds": true,
+   "seen": "{'exit': 0, 'stderr': ['tensorquill: warning: using the Python detectors, not the Rust ones: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. `--detectors python` asks for the Python detectors without this warning'], 'files_written': ['xv-mixed.rank0.evidence.json']}"
+  },
+  {
+   "row": "3 new_sdk_old_binary",
+   "claim": "--watch stops before the first look with exit 2 and the message, no evidence file",
+   "holds": true,
+   "seen": "{'exit': 2, 'stderr': ['usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]', '                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]', '                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]', '                   [--traincheck TRAINCHECK]', '                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]', '                   [--overload-threshold OVERLOAD_THRESHOLD]', '                   [--drift-tolerance DRIFT_TOLERANCE]', '                   [--starve-window STARVE_WINDOW]', '                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]', '                   [--update-window UPDATE_WINDOW]', '                   [--detectors {auto,python,rust}] [--compact]', '                   [--compact-window N] [--on-incident COMMAND]', '                   [--webhook URL] [--webhook-timeout SECONDS]', '                   [--fire-anomalies] [--fire-kind KIND]', '                   input', '__main__.py: error: --watch needs the Rust detectors: <old>/server/target/release/tensorquill-server speaks protocol 4 and this tensorquill needs protocol 5: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. To watch with the Python detectors, add --detectors python'], 'files_written': []}"
+  },
+  {
+   "row": "3 old_sdk_new_binary",
+   "claim": "detectors=\"rust\" raises, with the protocol message",
+   "holds": true,
+   "seen": "RuntimeError: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source"
+  },
+  {
+   "row": "3 old_sdk_new_binary",
+   "claim": "detectors=\"auto\" falls back to Python, with the protocol message",
+   "holds": true,
+   "seen": "detectors None; warnings ['RuntimeWarning: using the Python detectors, not the Rust ones: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source']"
+  },
+  {
+   "row": "3 old_sdk_new_binary",
+   "claim": "one read with --detectors rust stops with exit 2 and the message, no evidence file",
+   "holds": true,
+   "seen": "{'exit': 2, 'stderr': ['usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]', '                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]', '                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]', '                   [--traincheck TRAINCHECK]', '                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]', '                   [--overload-threshold OVERLOAD_THRESHOLD]', '                   [--drift-tolerance DRIFT_TOLERANCE]', '                   [--starve-window STARVE_WINDOW]', '                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]', '                   [--update-window UPDATE_WINDOW]', '                   [--detectors {auto,python,rust}] [--compact]', '                   [--compact-window N] [--on-incident COMMAND]', '                   [--webhook URL] [--webhook-timeout SECONDS]', '                   [--fire-anomalies] [--fire-kind KIND]', '                   input', '__main__.py: error: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source'], 'files_written': []}"
+  },
+  {
+   "row": "3 old_sdk_new_binary",
+   "claim": "one read with auto uses Python, writes the evidence, warns once with the message",
+   "holds": true,
+   "seen": "{'exit': 0, 'stderr': ['tensorquill: warning: using the Python detectors, not the Rust ones: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. `--detectors python` asks for the Python detectors without this warning'], 'files_written': ['xv-mixed.rank0.evidence.json']}"
+  },
+  {
+   "row": "3 old_sdk_new_binary",
+   "claim": "--watch stops before the first look with exit 2 and the message, no evidence file",
+   "holds": true,
+   "seen": "{'exit': 2, 'stderr': ['usage: __main__.py [-h] [-o OUTPUT] [--watch] [--interval INTERVAL]', '                   [--recompute] [--report-grace REPORT_GRACE] [--rank RANK]', '                   [--rerun RERUN] [--flight-recorder FLIGHT_RECORDER]', '                   [--traincheck TRAINCHECK]', '                   [--flight-recorder-prefix FLIGHT_RECORDER_PREFIX]', '                   [--overload-threshold OVERLOAD_THRESHOLD]', '                   [--drift-tolerance DRIFT_TOLERANCE]', '                   [--starve-window STARVE_WINDOW]', '                   [--starve-ratio STARVE_RATIO] [--top-k TOP_K]', '                   [--update-window UPDATE_WINDOW]', '                   [--detectors {auto,python,rust}] [--compact]', '                   [--compact-window N] [--on-incident COMMAND]', '                   [--webhook URL] [--webhook-timeout SECONDS]', '                   [--fire-anomalies] [--fire-kind KIND]', '                   input', '__main__.py: error: --watch needs the Rust detectors: <new>/server/target/release/tensorquill-server speaks protocol 5 and this tensorquill needs protocol 4: install a tensorquill and a tensorquill-server that match (pip install --upgrade tensorquill tensorquill-server), or rebuild the binary from this source. To watch with the Python detectors, add --detectors python'], 'files_written': []}"
+  },
+  {
+   "row": "4",
+   "claim": "the old load_records refuses a store of protocol 5 parts, naming the part and the row",
+   "holds": true,
+   "seen": "MalformedRecordError: schema_version is 2 at <tmp>/store-1-fresh/runs/xv-fresh/rank=0/attempt=1/part-00000000-00000039.parquet, row 0: this tensorquill reads schema versions 0 and 1"
+  },
+  {
+   "row": "4",
+   "claim": "the old runs lists it as a run with no evidence",
+   "holds": false,
+   "seen": "[{\"project\": \"uncategorized\", \"name\": \"xv-fresh\", \"run_id\": \"xv-fresh\", \"group\": null, \"tags\": [], \"has_manifest\": false, \"source\": \"store\", \"path\": \"<tmp>/store-1-fresh/runs/xv-fresh\", \"started\": null, \"run_state\": \"unhealthy\", \"last_step\": 39, \"incidents\": {\"anomaly\": 1}, \"first_incident\": {\"kind\": \"activation_spike\", \"step\": 35}, \"kinds_checked\": {\"checked\": 8, \"of\": 33, \"rank\": 0}, \"ranks\": [0], \"evidence\": {\"state\": \"current\", \"from\": \"each rank's incidents.json and the run's watchdog.json\", \"judged_ranks\": 1, \"unknown_ranks\": 0}, \"rank_count\": 1}]"
+  },
+  {
+   "row": "4",
+   "claim": "the old one read of the store's run refuses it, naming the part and the row",
+   "holds": true,
+   "seen": "{'exit': 2, 'stderr': ['tensorquill: error: schema_version is 2 at <tmp>/store-1-fresh/runs/xv-fresh/rank=0/attempt=1/part-00000000-00000039.parquet, row 0: this tensorquill reads schema versions 0 and 1'], 'files_written': []}"
+  },
+  {
+   "row": "5",
+   "claim": "the old server reads the protocol 5 parts without a word (nothing on its stderr about them)",
+   "holds": true,
+   "seen": "['tensorquill-server: store ID 3c5d858a5e8c92aa862ffae462d8259a', 'tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 2 batches, 20 rows, 21262 bytes; acknowledged to offset 87502; the request had ended first; the response was open; open 0.0 s']"
+  },
+  {
+   "row": "5",
+   "claim": "their steps have no layers to it: the spike in a protocol 5 part is not judged, the one in a protocol 4 part is",
+   "holds": true,
+   "seen": "{'last_step': 139, 'incidents': [('activation_spike', 35, 1)], 'activation_spike': 'checked'}"
+  }
+ ]
+}
