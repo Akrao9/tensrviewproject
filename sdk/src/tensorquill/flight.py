@@ -173,8 +173,10 @@ _KEY_COLUMNS = ("schema_version", "run_id", "rank", "attempt", "step")
 # Capture always writes these two, as null when there is no value, so a null column reads
 # back as a present `None`. Every other null column reads back as an absent key.
 _ALWAYS = ("ts", "grad_norm")
+# A scalar-only record's keys that its row holds in the `seq` column alone (section 4.4).
+_SCALAR_KEYS = ("record", "seq")
 _COLUMNS = (*_KEY_COLUMNS, *(column for column, _ in _FIELDS.values()), "probe_maps", "probe_histograms",
-            "record_version", "extra_json")
+            "seq", "record_version", "extra_json")
 
 # The struct maps of section 1.2: their fields in the capture's order (`capture.py` `STATS`,
 # `_router_stats`), and the fields that are Int64. Readers look a field up by name, so a field added
@@ -194,9 +196,9 @@ _INT64 = (-(2**63), 2**63 - 1)
 def flight_schema() -> Any:
     """The Arrow schema of one step per row, in protocol 5's layout (row `schema_version` 2,
     `WAVE_AL_CONTRACT.md` sections 1 to 3): `layers` and `moe_stats` as maps of structs,
-    the probe's maps and histograms in `probe_maps` and `probe_histograms` beside `probe_json`, and the
-    record's own version in `record_version`. No map is marked `keys_sorted`: entries keep the
-    record's order (D1)."""
+    the probe's maps and histograms in `probe_maps` and `probe_histograms` beside `probe_json`, the
+    scalar-only record's `seq` (null on a step row; section 4.4), and the record's own version in
+    `record_version`. No map is marked `keys_sorted`: entries keep the record's order (D1)."""
     import pyarrow as pa
 
     f64, f32, i64 = pa.float64(), pa.float32(), pa.int64()
@@ -237,6 +239,7 @@ def flight_schema() -> Any:
             pa.field("data_wait", f64),
             pa.field("step_time", f64),
             pa.field("system_json", pa.string()),
+            pa.field("seq", pa.int64()),  # a scalar-only record's; a server stores such rows apart (section 4.5)
             pa.field("record_version", pa.int32()),
             pa.field("extra_json", pa.string()),
         ]
@@ -255,9 +258,34 @@ def record_to_row(
     (`rows_to_send`) makes its rows without this check, as before: a line the server refuses and
     counts stays the server's to refuse and count (live ingest is unchanged, RS10).
 
+    A scalar-only record (`scalar_only`) whose `seq` the column cannot hold raises the same error,
+    naming `seq` (section 4.4).
+
     The rest is `_row`'s."""
     check(record, where)
+    if scalar_only(record):
+        _seq(record, where)
     return _row(record, schema, moved)
+
+
+def scalar_only(record: Mapping[str, Any]) -> bool:
+    """Whether `record` is a scalar-only record (`WAVE_AL_CONTRACT.md` section 4.2): its `record` key is
+    `"scalars"`. Its row carries `seq` and no `record` (section 4.4); the Rust detectors are never sent
+    one (section 4.6, `server_detect`)."""
+    return isinstance(record, Mapping) and record.get("record") == "scalars"
+
+
+def _seq(record: Mapping[str, Any], where: str | None = None) -> int:
+    """A scalar-only record's `seq`, which its row's `seq` column holds: an integer from 0 that Int64
+    holds. Else `MalformedRecordError` naming `seq`: such a row would carry a null `seq`, which a server
+    stores as a training row in a part, moving the step watermark (D8), so the line is refused instead,
+    and on the sender's path skipped and counted like a line whose key column cannot be stored."""
+    value = record.get("seq", MalformedRecordError.ABSENT)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _INT64[1]:
+        raise MalformedRecordError("seq", value, where,
+                                   'a scalar-only record ("record": "scalars") needs a seq, an integer of 0 or more '
+                                   "that Int64 holds")
+    return value
 
 
 def _row(
@@ -283,14 +311,25 @@ def _row(
     is `ROW_VERSION` and the record's own version is in `record_version` (section 3, Q1 a): null when
     the record has no `schema_version` key. A record of a version this package does not read keeps
     that version as its row's too, so a server drops and counts it as before (RS10) and never stores
-    it as a row it reads."""
+    it as a row it reads.
+
+    A scalar-only record (`scalar_only`, section 4.4) converts like any line, with its `seq` in the
+    `seq` column (null on every other row) and its `record` key in no column: `row_to_record` restores
+    it from the non-null `seq`. Its `scalars` follow wave W3's rule, as a step record's. A null travels
+    in its row's columns only as an absent key: an explicit `null`, even for `ts` or `grad_norm`
+    (`_ALWAYS`, which a step row reads back as present), travels in `extra_json`, so its row gives the
+    record back exactly. A `seq` the column cannot hold raises `MalformedRecordError` (`_seq`)."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
     extra: dict[str, Any] = {}
+    scalar = scalar_only(record)
+    if scalar:
+        row["seq"] = _seq(record)
+    always = () if scalar else _ALWAYS
     for key, value in record.items():
-        if key in _KEY_COLUMNS:
+        if key in _KEY_COLUMNS or (scalar and key in _SCALAR_KEYS):
             continue
         spec = _FIELDS.get(key)
-        if spec is None or (value is None and key not in _ALWAYS):
+        if spec is None or (value is None and key not in always):
             extra[key] = value
             continue
         if key in _STRUCT_MAPS:
@@ -603,17 +642,26 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
     protocol 5's (`record_version`, `layers` and `moe_stats` as maps, `probe_maps`, `probe_histograms`)
     or protocol 4's (`layers_json`, `moe_stats_json`, the whole probe in `probe_json`). So `load_records`
     reads a store of either layout, or a rank with parts of both. A struct's null field reads back
-    absent, and the fields it could not hold come back from `extra_json` (section 1.4)."""
+    absent, and the fields it could not hold come back from `extra_json` (section 1.4).
+
+    A row with a non-null `seq` is a scalar-only record's (section 4.4): `record: "scalars"` comes back
+    from it, with the keys in the capture's order, and a null column reads back absent. A row with no
+    `seq` column (step 1's schema, protocol 4's) or a null one is a step row, read as before."""
     record: dict[str, Any] = {}
+    seq = row.get("seq")
     if "record_version" in row:  # protocol 5's layout: the record's own version, null for none
         if row["record_version"] is not None:
             record["schema_version"] = row["record_version"]
     elif row["schema_version"]:
         record["schema_version"] = row["schema_version"]
+    if seq is not None:
+        record["record"] = "scalars"
     record.update(run_id=row["run_id"], rank=row["rank"])
     if row.get("attempt"):
         record["attempt"] = row["attempt"]
     record["step"] = row["step"]
+    if seq is not None:
+        record["seq"] = seq
     extra = json.loads(row["extra_json"]) if row.get("extra_json") else {}
     for key, (column, convert) in _FIELDS.items():
         if key in _STRUCT_MAPS:
@@ -630,7 +678,7 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
             continue
         value = row.get(column)
         if value is None:
-            if key in _ALWAYS:
+            if key in _ALWAYS and seq is None:
                 record[key] = None
         elif convert in (_json, _ordered_json):
             record[key] = json.loads(value)
@@ -687,6 +735,63 @@ def _probe_back(row: Mapping[str, Any]) -> Any:
 _MAP_COLUMNS = frozenset(
     {"scalars", "grad_norms", "weight_norms", "update_rms", "moe_top_k", "moe_counts", "replica_spread"}
 )
+
+
+# --- A store's scalar-only records: its `scalars-*` objects ---------------------------------
+#
+# A server stores the rows whose `seq` is not null apart from its parts, as
+# `rank=<r>/attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet` (`WAVE_AL_CONTRACT.md` section 4.5),
+# never as `part-*`, so the readers that list parts never list them. These are read beside the parts.
+_SCALARS_NAME = re.compile(r"scalars-([0-9]+)-([0-9]+)\.parquet")
+_RANK_FOLDER = re.compile(r"rank=([0-9]+)")
+_ATTEMPT_FOLDER = re.compile(r"attempt=(-?[0-9]+)")
+
+
+def scalar_objects(directory: str | Path, rank: int | None = None) -> list[Path]:
+    """The `scalars-*` objects under `directory` (a run's `runs/<run_id>` folder, a `rank=<r>` folder or an
+    `attempt=<a>` folder), ordered by the rank and attempt numbers of their folders and the first `seq` of
+    their names. An object whose name does not parse by section 4.5's naming comes after the named ones of
+    its rank and attempt, by name (a server reads the footer for such a name; its rows read as any
+    object's). With `rank`, another rank's `rank=<n>` folder is not entered. A path that is
+    not a folder holds none. The stored attempt order (`attempts.json`) is not applied here: each path
+    names its rank and attempt, and the caller reorders by its own rule."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+
+    def order(path: Path) -> tuple[int, int, int, str]:
+        rank_of, attempt = 0, 0
+        for folder in path.relative_to(directory.parent).parts[:-1]:
+            if found := _RANK_FOLDER.fullmatch(folder):
+                rank_of = int(found.group(1))
+            elif found := _ATTEMPT_FOLDER.fullmatch(folder):
+                attempt = int(found.group(1))
+        named = _SCALARS_NAME.fullmatch(path.name)
+        return rank_of, attempt, int(named.group(1)) if named else 2**63, path.name
+
+    def other_rank(path: Path) -> bool:
+        return rank is not None and any(
+            (found := _RANK_FOLDER.fullmatch(folder)) and int(found.group(1)) != rank
+            for folder in path.relative_to(directory.parent).parts[:-1])
+
+    found: list[Path] = []
+    for top, folders, files in os.walk(directory):
+        if rank is not None:  # another rank's folder is never entered, as `evidence._parquet_parts` does for parts
+            folders[:] = [f for f in folders if not ((m := _RANK_FOLDER.fullmatch(f)) and int(m.group(1)) != rank)]
+        found.extend(Path(top) / name for name in files if name.startswith("scalars-") and name.endswith(".parquet"))
+    return sorted((p for p in found if not other_rank(p)), key=order)
+
+
+def read_scalar_object(path: str | Path) -> list[dict[str, Any]]:
+    """The scalar-only records of one `scalars-*` object, its rows through `row_to_record` in their order.
+    Nothing is checked: the caller checks each record's identity and names the object and row
+    (`identity.check` with `identity.in_part(path, row)`), as for a part. Needs `pyarrow`."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise ImportError("reading Parquet parts needs pyarrow: pip install pyarrow") from error
+    # `partitioning=None`: the object's own columns only, not `rank=` and `attempt=` from its folders.
+    return [row_to_record(row) for row in pq.read_table(path, partitioning=None).to_pylist()]
 
 
 # --- The local file and its offset ----------------------------------------------------
@@ -868,6 +973,11 @@ def _unheld_key(record: Mapping[str, Any], schema: Any) -> tuple[str, Any]:
                 return key, value
         elif isinstance(value, bool) or not isinstance(value, int) or not _fits(value, schema.field(key).type):
             return key, value
+    if scalar_only(record):
+        try:
+            _seq(record)
+        except MalformedRecordError as error:
+            return error.field, error.value
     return "a key column", None
 
 
