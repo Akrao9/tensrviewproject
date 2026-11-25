@@ -106,6 +106,7 @@ def _seen(transformers, tq, seen: list):
 def test_eval_on_start_baseline_is_a_scalar_only_record_and_nothing_is_warned(tmp_path):
     """`scalar_hf_eval_on_start_baseline`: on a fresh run the baseline's metrics are one scalar-only
     record at step 0 (`state.global_step`), `seq` 0, names under `eval/`, and no warning."""
+    _transformers()  # skipped here, test by test, without Transformers or Accelerate
     from tensorquill.huggingface import TensorQuillCallback
 
     expect = _case("scalar_hf_eval_on_start_baseline")["expect"]
@@ -136,6 +137,7 @@ def test_eval_on_start_on_a_resume_is_recorded_at_the_resumed_step(tmp_path):
     The checkpoint is made by a real `Trainer` at step 2, then named `checkpoint-500` with its
     `trainer_state.json` saying step 500 (the Trainer reads `global_step` from there), and the data is
     not skipped ahead (`ignore_data_skip`), so 500 steps need not be trained to resume at 500."""
+    _transformers()  # skipped here, test by test, without Transformers or Accelerate
     from tensorquill.huggingface import TensorQuillCallback
 
     expect = _case("scalar_hf_eval_on_start_on_a_resume")["expect"]
@@ -170,6 +172,7 @@ def test_eval_on_start_on_a_resume_is_recorded_at_the_resumed_step(tmp_path):
 def test_an_evaluation_after_a_flush_is_recorded_at_the_last_step_that_ended(tmp_path, accumulation):
     """With no step in memory after a `flush()`, `N = state.global_step - 1`, the session's
     `_next_step - 1`: shown to agree on a real `Trainer`, with gradient accumulation too."""
+    _transformers()  # skipped here, test by test, without Transformers or Accelerate
     from tensorquill.huggingface import TensorQuillCallback
 
     transformers = _transformers()
@@ -202,6 +205,7 @@ def test_an_evaluation_after_a_flush_is_recorded_at_the_last_step_that_ended(tmp
 
 
 def test_with_a_step_in_memory_it_logs_as_before(tmp_path):
+    _transformers()  # skipped here, test by test, without Transformers or Accelerate
     from tensorquill.huggingface import TensorQuillCallback
 
     path = tmp_path / "hf.jsonl"
@@ -217,6 +221,7 @@ def test_with_a_wandb_logger_the_baseline_is_on_step_0_and_in_its_own_record(tmp
     """Section Q5, "What shares a step": the mirror brings the `Trainer`'s logged baseline outside
     "eval", before `on_evaluate`, so it is pending and lands on step 0's own record; the callback's
     scalar-only record holds the same values under the same names. Nothing is warned."""
+    _transformers()  # skipped here, test by test, without Transformers or Accelerate
     from tensorquill.huggingface import TensorQuillCallback
 
     from test_lane_ak1_mirror import wandb_stand_in
@@ -247,6 +252,7 @@ def test_with_a_wandb_logger_the_baseline_is_on_step_0_and_in_its_own_record(tmp
 def test_on_evaluate_with_no_state_still_never_raises():
     """`on_evaluate` reads the session's own number, not `state`: called with no state (as wave AK's
     test calls it), the baseline is still recorded."""
+    _transformers()  # skipped here, test by test, without Transformers or Accelerate
     from tensorquill.huggingface import TensorQuillCallback
 
     import types
