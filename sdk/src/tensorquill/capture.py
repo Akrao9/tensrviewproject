@@ -504,24 +504,11 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
-class _NoStep:
-    """The type of `Session.log`'s `step=` when not given. A value given is a step of its own: a
-    scalar-only record. Told by its type (`type(step) is not _NoStep`), which Dynamo traces on every
-    PyTorch the SDK supports; `step is not <an object()>` with an integer step fails to trace on 2.6."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "<no step>"
-
-
-_NO_STEP: Any = _NoStep()
-
-
 def _explicit_step(step: Any) -> int:
     """`Session.log`'s `step=` as an `int`, or the refusal of contract section 4.2: a bool, a float and
-    anything not an integer raise `TypeError` (`None` too: no step is no `step=`), a negative integer
-    `ValueError`. Any `numbers.Integral` but a bool is an integer, as `identity.check` takes a step."""
+    anything not an integer raise `TypeError`, a negative integer `ValueError`. Any `numbers.Integral`
+    but a bool is an integer, as `identity.check` takes a step. `None` never reaches here: it is no
+    step, the same as leaving `step=` out (the owner's decision, Nov 24)."""
     if isinstance(step, bool) or not isinstance(step, numbers.Integral):
         raise TypeError(f"session.log(..., step=...): step must be an integer of 0 or more, not "
                         f"{type(step).__name__} {step!r}")
@@ -2806,7 +2793,7 @@ class Session:
             # its record has no key, as the count is not known there.
             self._clip_step_calls += 1
 
-    def log(self, values: Mapping[str, Any] | None = None, *, step: Any = _NO_STEP, **named: Any) -> None:
+    def log(self, values: Mapping[str, Any] | None = None, *, step: Any = None, **named: Any) -> None:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
 
         `session.log({"train/loss": loss})` or `session.log(loss=loss)`. Values are
@@ -2838,7 +2825,7 @@ class Session:
         """
         if self._closed_call("log()"):
             return
-        if type(step) is not _NoStep:
+        if step is not None:  # `None` is no step (the owner, Nov 24); traced as a constant under compile
             self._log_at(step, dict(values or {}, **named))
             return
         converted = self._scalar_values(dict(values or {}, **named))
