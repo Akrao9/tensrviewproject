@@ -30,7 +30,7 @@ from typing import Any, Iterable, Mapping
 from . import manifest as _manifest
 # A record's identity fields (WAVE_AF_CONTRACT.md, section 1): checked where records are loaded,
 # before either engine is chosen, by lane F's one check (`identity.check`).
-from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part
+from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part, is_scalar_record
 from .sink import read_end_marker
 from .data_checks import (
     CHANGES_LISTED,
@@ -164,6 +164,32 @@ def _is_non_finite(value: Any) -> bool:
 _INT64 = (-(2**63), 2**63 - 1)
 _WIRE_NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}  # as JsonlSink writes them
 _UNCARRIED = object()
+
+
+def layer_entries(record: Mapping[str, Any]) -> list[tuple[Any, Mapping[str, Any]]]:
+    """The layers a record holds, `(name, stats)` in stored order: the entries of its `layers`
+    that are objects (WAVE_AL_CONTRACT.md section 1.5). An entry that is not an object (`5`, a
+    null struct in protocol 5's column) and a `layers` value that is not an object (`[1, 2]`,
+    `null`) are absent to every detector, as Rust reads them, and are never raised on."""
+    layers = record.get("layers")
+    if not isinstance(layers, Mapping):
+        return []
+    return [(name, stats) for name, stats in layers.items() if isinstance(stats, Mapping)]
+
+
+def _recorded_diversity(stats: Any) -> float | None:
+    """A router's recorded `diversity` when it is a finite number, else None, so the rule takes it
+    from the counts (WAVE_AL_CONTRACT.md section 1.5): as Rust's `Number` reads it, a bool, a
+    string (the sink's `"nan"` among them), `null`, a list, an object and a value that is not
+    finite are absent, and so is the whole entry when it is not an object."""
+    value = stats.get("diversity") if isinstance(stats, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:  # an integer past a float's range reads as infinite in Rust: not finite
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _router_counts(value: Any) -> list[int] | None:
@@ -1010,7 +1036,9 @@ def layers_not_read_not_checked(records: Iterable[Mapping[str, Any]]) -> dict[st
     first: dict[str, tuple[int, str]] = {}
     read = False
     for record in records:
-        read = read or (isinstance(record.get("layers"), Mapping) and bool(record["layers"]))
+        # A record holds a layer only through an entry that is an object (row S5, the owner's
+        # approved change, Nov 24): one whose only entries are not objects read no layer, as Rust reads it.
+        read = read or bool(layer_entries(record))
         said = record.get("layers_not_read")
         if not isinstance(said, Mapping):
             continue
@@ -1986,7 +2014,7 @@ class _ActivationAnomalies:
         for record in sorted(records, key=lambda r: r["step"]):
             step = int(record["step"])
             spikes, drifts, dead = [], [], []
-            for name, stats in record.get("layers", {}).items():
+            for name, stats in layer_entries(record):  # an entry that is not an object is absent (section 1.5)
                 std, amax, zfrac = (_finite(stats.get(k)) for k in ("std", "abs_max", "zero_frac"))
                 if std is None or amax is None or zfrac is None:
                     continue
@@ -2442,6 +2470,7 @@ def load_records(
     *,
     rank: int | None = None,
     all_attempts: bool = False,
+    scalars: bool = False,
 ) -> list[dict[str, Any]]:
     """Read captured step records.
 
@@ -2459,13 +2488,20 @@ def load_records(
     `schema_version`, `rank`, `attempt` or `step` is not valid raises `MalformedRecordError`,
     which names the field, the value, and the file and line, the part and row, or the place in
     the list (WAVE_AF_CONTRACT.md, section 1). Nothing is judged from such an input.
+
+    Scalar-only records (`identity.is_scalar_record`, written by `session.log(..., step=...)`: WAVE_AL_CONTRACT.md
+    section 4) are set apart here, after that check: by default they are left out, so the records
+    returned are the training records alone, as before them. `scalars=True` keeps them, in their
+    place among the training records, for a reader of series (`scalar_series`); a store's
+    `scalars-*` objects are then read beside its parts. Either way the attempts are resolved with
+    the training records' cutoffs (`resolve_attempts`).
     """
     if isinstance(source, (str, Path)):
         path = Path(source)
         if path.is_dir():
             # One rank at a time: a run of many ranks never has to fit in memory at once.
             records = [
-                r for part in _parquet_parts(path, rank) for r in _checked_part(part)
+                r for part in _parquet_parts(path, rank, scalars=scalars) for r in _checked_part(part)
                 if rank is None or r.get("rank", 0) == rank
             ]
         elif path.suffix == ".parquet":
@@ -2484,7 +2520,81 @@ def load_records(
             records.append(dict(item))
     if rank is not None:
         records = [r for r in records if r.get("rank", 0) == rank]
+    if not scalars:
+        records = [r for r in records if not is_scalar_record(r)]
     return records if all_attempts else resolve_attempts(records)
+
+
+def scalar_points_in_order(scalar_only: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Scalar-only records in the order their points stand at one step, the last standing: by
+    attempt, in the order the attempts first appear, then by `seq` (Q6 a: the highest `seq` wins).
+    `seq` counts per session, so it orders the records of one attempt only; a later attempt's
+    point stands over an earlier one's at the same step, as its training records do."""
+    listed = list(scalar_only)
+    place: dict[tuple[str, Any, Any], int] = {}
+    for record in listed:
+        place.setdefault((run_of(record), record.get("rank", 0), record.get("attempt", 0)), len(place))
+    return sorted(listed, key=lambda r: (place[(run_of(r), r.get("rank", 0), r.get("attempt", 0))], int(r["seq"])))
+
+
+def merged_scalar_points(
+    training: Iterable[Mapping[str, Any]], scalar_only: Iterable[Mapping[str, Any]]
+) -> dict[str, dict[int, Any]]:
+    """Each logged scalar's points, `{name: {step: value}}`, the steps ascending: the training
+    records' `scalars` values and the scalar-only records' points, by step (WAVE_AL_CONTRACT.md
+    section 4.6). At one step a scalar-only record's value stands over the training records' and,
+    among scalar-only records, the highest `seq` (`scalar_points_in_order`; Q6 a). Of training
+    records of one step, the later stands. A step no training record has is a point of its own; no
+    record, step or sample is made. Values are as recorded (a non-finite one as the sink's string);
+    `None` is no value. Names come in the order they first appear, the training records' first."""
+    points: dict[str, dict[int, Any]] = {}
+    for record in sorted(training, key=lambda r: int(r["step"])):
+        logged = record.get("scalars")
+        if isinstance(logged, Mapping):
+            for name, value in logged.items():
+                if value is not None:
+                    points.setdefault(str(name), {})[int(record["step"])] = value
+    for record in scalar_points_in_order(scalar_only):
+        logged = record.get("scalars")
+        if isinstance(logged, Mapping):
+            for name, value in logged.items():
+                if value is not None:
+                    points.setdefault(str(name), {})[int(record["step"])] = value
+    return {name: dict(sorted(at.items())) for name, at in points.items()}
+
+
+def scalar_series(
+    source: str | Path | Iterable[Mapping[str, Any]],
+    *,
+    rank: int | None = None,
+    all_attempts: bool = False,
+) -> dict[str, list[list[Any]]]:
+    """Each logged scalar's series of one rank, `{name: [[step, value], ...]}` in step order: the
+    training records' values and the scalar-only records' points, merged by step
+    (`merged_scalar_points`). `source` is what `load_records` reads, and the attempts are resolved
+    as it resolves them (with the training records' cutoffs), or not with `all_attempts`.
+
+    Records of several ranks with no `rank` given raise `ValueError`, as `build_evidence` refuses
+    them, and so do records of several run IDs (`check_one_run`)."""
+    records = load_records(source, rank=rank, all_attempts=all_attempts, scalars=True)
+    ranks = sorted({int(r.get("rank", 0)) for r in records})
+    if len(ranks) > 1:
+        raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
+    check_one_run(records)
+    training, scalar_only = set_apart_scalars(records)
+    return {name: [[step, value] for step, value in at.items()]
+            for name, at in merged_scalar_points(training, scalar_only).items()}
+
+
+def set_apart_scalars(records: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The training records and the scalar-only records of `records` (`identity.is_scalar_record`),
+    each in the order given (WAVE_AL_CONTRACT.md section 4.6). No engine is given a scalar-only
+    record: none of the kinds judges one (D12), and none is a step."""
+    training: list[dict[str, Any]] = []
+    scalar_only: list[dict[str, Any]] = []
+    for record in records:
+        (scalar_only if is_scalar_record(record) else training).append(record)  # type: ignore[arg-type]
+    return training, scalar_only
 
 
 def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
@@ -2513,9 +2623,10 @@ def read_jsonl(path: str | Path) -> tuple[list[dict[str, Any]], int]:
     return records, left_out
 
 
-def _load_counted(source: Any, rank: int | None, *, checked: bool = False) -> tuple[list[dict[str, Any]], int]:
-    """`load_records(source, rank=rank, all_attempts=True)`, with a `.jsonl` file read by
-    `read_jsonl`: its records and the lines left out (0 for any other source).
+def _load_counted(source: Any, rank: int | None, *, checked: bool = False,
+                  scalars: bool = False) -> tuple[list[dict[str, Any]], int]:
+    """`load_records(source, rank=rank, all_attempts=True, scalars=scalars)`, with a `.jsonl` file
+    read by `read_jsonl`: its records and the lines left out (0 for any other source).
 
     Records whose identity was checked already are copied and not checked again: `read_jsonl`'s,
     checked with their file and line, and with `checked` the records handed in, which a watcher's
@@ -2523,15 +2634,17 @@ def _load_counted(source: Any, rank: int | None, *, checked: bool = False) -> tu
     about 40 ms of a 0.5 s update, wave AF-W)."""
     if isinstance(source, (str, Path)) and not Path(source).is_dir() and Path(source).suffix not in (".parquet",):
         records, left_out = read_jsonl(source)
-        return _copies(records, rank), left_out
+        return _copies(records, rank, scalars=scalars), left_out
     if checked and not isinstance(source, (str, Path)):
-        return _copies(source, rank), 0
-    return load_records(source, rank=rank, all_attempts=True), 0
+        return _copies(source, rank, scalars=scalars), 0
+    return load_records(source, rank=rank, all_attempts=True, scalars=scalars), 0
 
 
-def _copies(records: Iterable[Mapping[str, Any]], rank: int | None) -> list[dict[str, Any]]:
-    """What `load_records(records, rank=rank, all_attempts=True)` gives for records already checked."""
-    return [dict(item) for item in records if rank is None or item.get("rank", 0) == rank]
+def _copies(records: Iterable[Mapping[str, Any]], rank: int | None, *, scalars: bool = False) -> list[dict[str, Any]]:
+    """What `load_records(records, rank=rank, all_attempts=True, scalars=scalars)` gives for records
+    already checked."""
+    return [dict(item) for item in records
+            if (rank is None or item.get("rank", 0) == rank) and (scalars or not is_scalar_record(item))]
 
 
 def lines_left_out_line(evidence: Mapping[str, Any]) -> str | None:
@@ -2567,24 +2680,35 @@ def resolve_attempts(
 
     An attempt is of one run: a later attempt of another run ID never rolls back this one's
     records (lane U7, Nov 19, 2026). A record with no `run_id` is of no named run (`_run_of`).
+
+    Scalar-only records (`identity.is_scalar_record`) are resolved with the training records'
+    cutoffs (WAVE_AL_CONTRACT.md section 4.6): one is left out where a later attempt's first
+    training step is at or below its step, as a training record of its attempt there would be.
+    Their own steps cut nothing, so an attempt whose first line is a baseline at step 0 rolls back
+    only from its first training step, and an attempt holding scalar-only records alone rolls
+    back nothing. Such an attempt still takes its place in the order of first appearance.
     """
     first_step: dict[tuple[str, Any, int], int] = {}
+    appeared_keys: dict[tuple[str, Any, int], None] = {}  # every attempt, in the order it first appears
     for record in records:
         key = (_run_of(record), record.get("rank", 0), record.get("attempt", 0))
+        appeared_keys.setdefault(key)
+        if is_scalar_record(record):
+            continue
         step = int(record["step"])
         if key not in first_step or step < first_step[key]:
             first_step[key] = step
-    if len({(run, rank) for run, rank, _ in first_step}) == len(first_step):
+    if len({(run, rank) for run, rank, _ in appeared_keys}) == len(appeared_keys):
         return records  # one attempt per rank of each run: nothing was replaced
     cutoff: dict[tuple[str, Any, int], float] = {}
-    for run, rank in {(run, rank) for run, rank, _ in first_step}:
+    for run, rank in {(run, rank) for run, rank, _ in appeared_keys}:
         cut = math.inf
-        # `first_step` holds a rank's attempts in the order they first appear.
-        appeared = [a for n, r, a in first_step if (n, r) == (run, rank)]
+        # `appeared_keys` holds a rank's attempts in the order they first appear.
+        appeared = [a for n, r, a in appeared_keys if (n, r) == (run, rank)]
         given = [a for a in (order or {}).get((run, rank), ()) if a in appeared]
         for attempt in reversed(given + [a for a in appeared if a not in given]):
             cutoff[(run, rank, attempt)] = cut
-            cut = min(cut, first_step[(run, rank, attempt)])
+            cut = min(cut, first_step.get((run, rank, attempt), math.inf))
     return [
         record for record in records
         if int(record["step"]) < cutoff[(_run_of(record), record.get("rank", 0), record.get("attempt", 0))]
@@ -2758,6 +2882,8 @@ _run_of = run_of
 
 
 _PART_NAME = re.compile(r"part-(-?\d+)-(-?\d+)\.parquet$")
+# A scalars object's name, its first and last `seq` (WAVE_AL_CONTRACT.md section 4.5).
+_SCALARS_NAME = re.compile(r"scalars-(-?\d+)-(-?\d+)\.parquet$")
 _WHOLE = re.compile(r"-?[0-9]+")  # ASCII digits only: `int("²")` raises (lane V3's note)
 ATTEMPT_ORDER_FILE = "attempts.json"
 
@@ -2811,8 +2937,12 @@ def _other_rank_folder(entry: os.DirEntry[str], rank: int) -> bool:
     return number is not None and number != rank
 
 
-def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
+def _parquet_parts(directory: Path, rank: int | None = None, *, scalars: bool = False) -> list[Path]:
     """The server's part files under `directory`, ordered by rank, attempt and first step.
+
+    With `scalars`, also the attempts' `scalars-<first_seq>-<last_seq>.parquet` objects
+    (WAVE_AL_CONTRACT.md section 4.5), each after its attempt's parts, by first `seq`. Without it
+    they are never listed, as before them: only a reader of series reads them.
 
     Attempts go in the rank's stored order (`attempts.json`, contract 1), or by number in a
     store written before that file. With `rank`, the `rank=<n>` folders of other ranks directly under `directory` are not
@@ -2823,7 +2953,7 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
 
     orders: dict[Path, list[int] | None] = {}
 
-    def order(path: Path) -> tuple[int, tuple[int, int], int, str]:
+    def order(path: Path) -> tuple[int, tuple[int, int], int, int, str]:
         numbers = {"rank": 0, "attempt": 0}
         rank_folder: Path | None = None
         relative = path.relative_to(directory.parent).parts[:-1]
@@ -2838,18 +2968,22 @@ def _parquet_parts(directory: Path, rank: int | None = None) -> list[Path]:
             rank_folder = path.parent.parent if path.parent.name.startswith("attempt=") else path.parent
         if rank_folder not in orders:
             orders[rank_folder] = stored_attempt_order(rank_folder)[0]
-        match = _PART_NAME.search(path.name)
+        family = 1 if path.name.startswith("scalars-") else 0
+        match = (_SCALARS_NAME if family else _PART_NAME).search(path.name)
         place = _attempt_place(orders[rank_folder], numbers["attempt"])
-        return numbers["rank"], place, int(match.group(1)) if match else 0, path.name
+        return numbers["rank"], place, family, int(match.group(1)) if match else 0, path.name
 
-    if rank is None:
-        found = list(directory.rglob("part-*.parquet"))
-    else:
-        found = list(directory.glob("part-*.parquet"))
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if entry.is_dir(follow_symlinks=False) and not _other_rank_folder(entry, rank):
-                    found.extend((directory / entry.name).rglob("part-*.parquet"))
+    patterns = ("part-*.parquet", "scalars-*.parquet") if scalars else ("part-*.parquet",)
+    found: list[Path] = []
+    for pattern in patterns:
+        if rank is None:
+            found.extend(directory.rglob(pattern))
+        else:
+            found.extend(directory.glob(pattern))
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False) and not _other_rank_folder(entry, rank):
+                        found.extend((directory / entry.name).rglob(pattern))
     return sorted(found, key=order)
 
 
@@ -2975,7 +3109,11 @@ class _Tail:
     first and last CHECKED_BYTES (4 KiB) of what was read, and the same modification time (or one
     that also grows the file) is not detected, and the watcher goes on reading from its offset. A
     file cut to empty is read again but holds no record, so the watcher still writes nothing for it
-    and the last evidence file stays as it was."""
+    and the last evidence file stays as it was.
+
+    `records` holds the training records read; the scalar-only records are set apart as they are
+    read, into `scalars` (WAVE_AL_CONTRACT.md section 4.6), so the watcher judges the training
+    records alone. A store's `scalars-*` objects are not listed here."""
 
     CHECKED_BYTES = 4096  # at the start of a `.jsonl` file, and before the end of what was read
 
@@ -2983,6 +3121,7 @@ class _Tail:
         self.source = source
         self.rank = rank
         self.records: list[dict[str, Any]] = []
+        self.scalars: list[dict[str, Any]] = []  # the scalar-only records read, in their order
         self._offset = 0
         self._seen: set[Path] = set()
         self._stats: dict[Path, tuple[int, int, int]] = {}  # each part read: its size, time and file
@@ -2997,6 +3136,7 @@ class _Tail:
 
     def _restart(self) -> None:
         self.records = []
+        self.scalars = []
         self._offset = 0
         self._seen = set()
         self._stats = {}
@@ -3092,7 +3232,11 @@ class _Tail:
                 self._last = (self._last + data[max(0, end - self.CHECKED_BYTES):end])[-self.CHECKED_BYTES:]
         if self.rank is not None:
             new = [r for r in new if r.get("rank", 0) == self.rank]
+        new, scalar_only = set_apart_scalars(new)
         self.records.extend(new)
+        self.scalars.extend(scalar_only)
+        # A scalar-only line changes no evidence (the watcher judges the training records), so it
+        # alone is not news to the watcher.
         return bool(new) or restarted
 
 
@@ -3341,7 +3485,8 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
 
     "Carries" means the field holds something a rule reads: an empty `layers` or
     `grad_norms` does not count, an empty `weights_unchanged` does (a weight check that
-    found every parameter changed), and a probe that failed carries no attention.
+    found every parameter changed), and a probe that failed carries no attention. A `layers`
+    whose only entries are not objects carries no layer (`layer_entries`, row S5).
     """
     counts = dict.fromkeys(INPUT_NEEDS, 0)
     for record in records:
@@ -3351,7 +3496,10 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
                 (total := _router_total(value)) is not None and total > 0 for value in moe.values()):
             counts["moe"] += 1
         total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
-        norms, layers = bool(record.get("grad_norms")), bool(record.get("layers"))
+        # A record holds a layer only through an entry that is an object (section 1.5; row S5, the
+        # owner's approved change, Nov 24): a value that is not an object, or one whose only entries
+        # are not objects, holds none, as Rust reads it.
+        norms, layers = bool(record.get("grad_norms")), bool(layer_entries(record))
         counts["grad_total"] += total
         # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
         counts["update"] += (
@@ -6587,7 +6735,7 @@ class _NonFinite:
         for record in records:
             bad_layers = [
                 name
-                for name, stats in record.get("layers", {}).items()
+                for name, stats in layer_entries(record)  # every field of each layer that is an object
                 if any(_is_non_finite(v) for v in stats.values())
             ]
             bad_grads = [] if record.get("step_skipped") else _non_finite_gradients(record)
@@ -7319,7 +7467,9 @@ class _MoeSamples:
             moe = record.get("moe")
             if not isinstance(moe, Mapping):
                 moe = {}
-            moe_stats = record.get("moe_stats", {})
+            moe_stats = record.get("moe_stats")
+            if not isinstance(moe_stats, Mapping):  # a value that is not an object holds no statistics (section 1.5)
+                moe_stats = {}
             for layer_idx, router_name in enumerate(routers, 1):
                 expected_experts = router_sizes[router_name]
                 # An entry the column cannot carry is no entry (wave AJ, A5: before, `int(c)` raised
@@ -7341,11 +7491,10 @@ class _MoeSamples:
                     dead: list[int] = []
                 else:
                     shares = [c / tokens for c in counts]
-                    diversity = (
-                        float(moe_stats[router_name]["diversity"])
-                        if router_name in moe_stats and "diversity" in moe_stats[router_name]
-                        else _diversity_from_counts(counts, n_experts)
-                    )
+                    # The recorded diversity when it is a finite number, else the counts' (section
+                    # 1.5): a bool was read as 1.0 here and as absent by Rust.
+                    recorded = _recorded_diversity(moe_stats.get(router_name))
+                    diversity = recorded if recorded is not None else _diversity_from_counts(counts, n_experts)
                     k = router_top_k.get(router_name, 1)
                     window = history[router_name]
                     if k >= 3:
@@ -7645,6 +7794,9 @@ def _build_evidence(
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
     held_ranks: list[int] | None = None
+    # The training records alone (`_load_counted` sets the scalar-only records apart, after the
+    # identity check): no engine judges a scalar-only record, and none is a step, so the evidence is
+    # the training records' (WAVE_AL_CONTRACT.md section 4.6, Q4 a).
     if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
         # A file or list is read whole either way: the ranks it holds are kept, so the evidence
         # can say it judged one of several (L21). A store's rank folder holds one rank.
@@ -9190,6 +9342,16 @@ def export_rerun(
         probe_series = False
         probe_invalid = [False]
         if records is not None:
+            # Scalar-only records are set apart: none is a training step (WAVE_AL_CONTRACT.md section 4.6).
+            # Each of their points is logged under `/logged/<name>` at its step, after the training
+            # records', and stands over a training record's value at that step (Q6 a).
+            records, scalar_only = set_apart_scalars(records)
+            standing: dict[str, dict[int, Any]] = {}
+            for point in scalar_points_in_order(scalar_only):
+                for name, val in (point.get("scalars") or {}).items() if isinstance(point.get("scalars"), Mapping) else ():
+                    if val is not None:
+                        standing.setdefault(str(name), {})[int(point["step"])] = val
+            overridden = {name: set(at) for name, at in standing.items()}
             for record in records:
                 rr.set_time("training_step", sequence=int(record["step"]))
                 grad_norm = record.get("grad_norm")
@@ -9215,6 +9377,8 @@ def export_rerun(
                     rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
                     training_paths["/training/step_skipped"] = "Update skipped (by the loss scaler or the caller)"
                 for name, val in (record.get("scalars") or {}).items():
+                    if int(record["step"]) in overridden.get(name, ()):
+                        continue  # a scalar-only record's point stands at this step (Q6 a)
                     value = _finite(val)
                     if value is not None:
                         parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
@@ -9224,13 +9388,22 @@ def export_rerun(
                 probe = record.get("probe")
                 if probe:
                     probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
-                for layer_name, stats in record.get("layers", {}).items():
+                for layer_name, stats in layer_entries(record):
                     for key, val in stats.items():
                         if isinstance(val, (int, float)) and math.isfinite(val):
                             entity = (f"/layers/{rr.escape_entity_path_part(str(layer_name))}"
                                       f"/{rr.escape_entity_path_part(str(key))}")
                             rr.log(entity, rr.Scalars(float(val)))
                             activation_paths.setdefault(key, set()).add(entity)
+            for name, at in standing.items():
+                parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
+                entity = f"/logged/{parts}"
+                for step, val in sorted(at.items()):
+                    value = _finite(val)
+                    if value is not None:
+                        rr.set_time("training_step", sequence=step)
+                        rr.log(entity, rr.Scalars(value))
+                        logged_paths[entity] = name
 
         if activation_paths:
             labels = {
@@ -9588,7 +9761,9 @@ def _main() -> None:
     # A file is read whole and its rank picked by `build_evidence`, which then says which ranks the
     # file held (L21); a directory is read a rank at a time, as before.
     whole_file = not args.input.is_dir()
-    records, left_out = _load_counted(args.input, None if whole_file else rank)
+    every, left_out = _load_counted(args.input, None if whole_file else rank, scalars=args.rerun is not None)
+    # The scalar-only records are read only for the Rerun export's series (section 4.6).
+    records, _ = set_apart_scalars(every)
     held = sorted({int(r.get("rank", 0)) for r in records})
     if whole_file and rank is None and len(held) > 1:
         parser.error(f"{args.input} holds ranks {_rank_ranges(held, 8)}: choose one with --rank N (the evidence is one "
@@ -9618,7 +9793,8 @@ def _main() -> None:
     print(run_state_line(evidence))
     print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
-        export_rerun(evidence, args.rerun, records=resolve_attempts(own))
+        export_rerun(evidence, args.rerun, records=resolve_attempts(
+            every if rank is None else [r for r in every if r.get("rank", 0) == rank]))
         print(f"wrote Rerun recording -> {args.rerun}")
 
 

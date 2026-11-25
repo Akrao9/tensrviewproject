@@ -50,7 +50,7 @@ from . import compact as _compact
 from . import compare as _compare
 from . import manifest as _manifest
 from . import runs as _runs
-from .identity import MalformedRecordError, check as check_identity, in_file
+from .identity import MalformedRecordError, check as check_identity, in_file, is_scalar_record
 from .sink import read_end_marker
 from .evidence import (
     ALL_RANKS_VIEW,
@@ -70,8 +70,10 @@ from .evidence import (
     incident_summary,
     kinds_by_value,
     load_records,
+    merged_scalar_points,
     read_watchdog,
     resolve_attempts,
+    set_apart_scalars,
 )
 
 SERVER_NAME = "tensorquill"
@@ -142,11 +144,12 @@ def _stamp(path: Path) -> tuple[int, int]:
 
 
 def _parts_stamp(folder: Path, rank: int) -> tuple[tuple[str, int | None, int | None], ...]:
-    """Every part `load_records(folder, rank=rank)` reads, with its time of change and size.
-    Not the newest part's `(attempt, last step)` alone: a late part of an older attempt, or a
-    part written again, leaves that the same (CLI-22, lane V5, Nov 19, 2026)."""
+    """Every part `load_records(folder, rank=rank, scalars=True)` reads, with its time of change
+    and size, the `scalars-*` objects among them (WAVE_AL_CONTRACT.md section 4.5). Not the newest
+    part's `(attempt, last step)` alone: a late part of an older attempt, or a part written again,
+    leaves that the same (CLI-22, lane V5, Nov 19, 2026)."""
     found = []
-    for part in _parquet_parts(folder, rank):
+    for part in _parquet_parts(folder, rank, scalars=True):
         try:
             stat = part.stat()
         except OSError:  # removed since it was listed: the listing itself has changed
@@ -295,17 +298,19 @@ class Source:
     # Captures -----------------------------------------------------------------------------
 
     def capture(self, path: Path) -> tuple[list[dict[str, Any]], int]:
-        """Every record of a `.jsonl` capture, all ranks and attempts, and the lines left out."""
+        """Every record of a `.jsonl` capture, all ranks and attempts, and the lines left out. The
+        scalar-only records are among them, in their place (WAVE_AL_CONTRACT.md section 4.6):
+        whoever reads these sets them apart (`build_evidence` does), and only a series reads them."""
 
         def read() -> tuple[list[dict[str, Any]], int]:
             try:
                 try:
-                    return load_records(path, all_attempts=True), 0
+                    return load_records(path, all_attempts=True, scalars=True), 0
                 except MalformedRecordError:
                     raise
                 except ValueError:  # a job that is still running may be in the middle of a line
                     records, skipped = _complete_lines(path)
-                    return load_records(records, all_attempts=True), skipped
+                    return load_records(records, all_attempts=True, scalars=True), skipped
             except MalformedRecordError as error:
                 # The error's own text: the field, the value and the line (section 1).
                 raise ToolError(str(error)) from None
@@ -351,9 +356,13 @@ class Source:
 
     # One rank's step records, for series ------------------------------------------------
 
-    def rank_records(self, rank: int | None) -> tuple[list[dict[str, Any]], dict[str, dict[str, None]], dict[str, Any]] | None:
-        """One rank's step records in step order, the names they carry by kind, and where they
-        came from; None when the path is an evidence file with no records beside it."""
+    def rank_records(self, rank: int | None) -> tuple[
+            list[dict[str, Any]], dict[str, dict[str, None]], dict[str, Any], list[dict[str, Any]]] | None:
+        """One rank's step records in step order, the names they carry by kind, where they came
+        from, and the rank's scalar-only records (WAVE_AL_CONTRACT.md section 4.6), resolved with
+        the step records' cutoffs and set apart from them; None when the path is an evidence file
+        with no records beside it. The scalar names are the step records' and the scalar-only
+        records'."""
         kind, where, own_rank = self.locate()
         default_rank = own_rank
         if kind == "evidence":
@@ -373,7 +382,7 @@ class Source:
             stamp: Any = self._capture_stamp(where)
 
             def read() -> list[dict[str, Any]]:
-                return load_records(every, rank=picked)
+                return load_records(every, rank=picked, scalars=True)
         else:
             ranks = sorted(_discover_rank_folders(where))
             if not ranks:
@@ -383,7 +392,7 @@ class Source:
 
             def read() -> list[dict[str, Any]]:
                 try:
-                    return load_records(where, rank=picked)
+                    return load_records(where, rank=picked, scalars=True)
                 except MalformedRecordError as error:
                     raise ToolError(str(error)) from None  # the field, the value, the part and row
                 except ImportError:
@@ -394,26 +403,35 @@ class Source:
                 except Exception as error:  # pyarrow's own errors are not built-in ones
                     raise ToolError(f"rank {picked}'s stored parts under {where} could not be read ({error}).") from None
 
-        def index() -> tuple[list[dict[str, Any]], dict[str, dict[str, None]]]:
+        def index() -> tuple[list[dict[str, Any]], dict[str, dict[str, None]], list[dict[str, Any]]]:
+            # The scalar-only records are set apart first, in the order they were read, which
+            # orders their points (`merged_scalar_points`); the step records are put in step order.
+            records, scalar_only = set_apart_scalars(read())
             try:
-                records = sorted(read(), key=lambda r: int(r["step"]))
+                records = sorted(records, key=lambda r: int(r["step"]))
             except (KeyError, TypeError, ValueError) as error:
                 raise ToolError(f"the records under {where} are not TensorQuill step records ({error!r}).") from None
             # A series is of one run: records of several run IDs are refused, as list_incidents and
             # get_incident refuse them through the detectors (lane AD5, Nov 21, 2026: the series held
             # both runs' rows, a step twice where both had it). The refusal is the readers' common
-            # answer today, not a ruling on whether one run should be picked instead.
+            # answer today, not a ruling on whether one run should be picked instead. The scalar-only
+            # records are of the run too.
             try:
-                check_one_run(records)
+                check_one_run([*records, *scalar_only])
             except ValueError as error:
                 raise ToolError(f"rank {picked}'s step records in {where} cannot give a series: {error}.") from None
-            return records, _names(records)
+            names = _names(records)
+            for record in scalar_only:
+                logged = record.get("scalars")
+                if isinstance(logged, Mapping):
+                    names["scalar"].update(dict.fromkeys(str(n) for n in logged))
+            return records, names, scalar_only
 
-        records, names = self._keep(("records", where, picked), stamp, index)
+        records, names, scalar_only = self._keep(("records", where, picked), stamp, index)
         origin = {"records": str(where), "rank": picked}
         if len(ranks) > 1:
             origin["ranks_here"] = _ranges(ranks)
-        return records, names, origin
+        return records, names, origin, scalar_only
 
     def _records_beside(self, path: Path, document: Mapping[str, Any]) -> Path | None:
         """Where an evidence file's step records are: `--records`, the capture the command line
@@ -451,7 +469,8 @@ class Source:
             # The run as it stands: what a resume rolled back is left out, as the detectors
             # leave it out (`resolve_attempts`; E2, lane V5, Nov 19, 2026: the last step was the
             # highest of every attempt). Every record written is counted apart, when that differs.
-            written = [r for r in records if _rank_of(r) == picked and _step_of(r) is not None]
+            # The training records: a scalar-only record is no step (WAVE_AL_CONTRACT.md section 4.6).
+            written = [r for r in records if _rank_of(r) == picked and _step_of(r) is not None and not is_scalar_record(r)]
             current = resolve_attempts(written)
             if current:
                 source["steps"] = _step_range(current)
@@ -1463,7 +1482,8 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
     for record in records:
         step = int(record["step"])
         if kind == "layer":
-            stats = (record.get("layers") or {}).get(name)
+            layers = record.get("layers")
+            stats = layers.get(name) if isinstance(layers, Mapping) else None  # section 1.5: no object, no point
             point = _columns(stats) if isinstance(stats, Mapping) else None
         elif kind == "parameter":
             point = {
@@ -1472,7 +1492,8 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
                 if isinstance(record.get(field), Mapping) and name in record[field]
             } or None
         elif kind == "router":
-            stats = (record.get("moe_stats") or {}).get(name)
+            moe_stats = record.get("moe_stats")
+            stats = moe_stats.get(name) if isinstance(moe_stats, Mapping) else None
             diversity = stats.get("diversity") if isinstance(stats, Mapping) else None
             point = _router_point((record.get("moe") or {}).get(name), diversity, expert)
         elif kind in PROBE_KINDS:
@@ -1484,6 +1505,18 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
         if point:
             rows.append((step, point))
     return rows
+
+
+def _merged_scalar_rows(name: str, rows: list[tuple[int, dict[str, Any]]], records: Iterable[Mapping[str, Any]],
+                        scalar_only: Iterable[Mapping[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """A logged scalar's rows with the scalar-only records' points merged in by step
+    (WAVE_AL_CONTRACT.md section 4.6, Q6 a: at a step one of them has, its point is the one row,
+    the highest `seq`'s), in step order. A scalar that no scalar-only record names keeps its rows."""
+    standing = merged_scalar_points((), scalar_only).get(name)
+    if not standing:
+        return rows
+    kept = [(step, point) for step, point in rows if step not in standing]
+    return sorted([*kept, *((step, _columns(value)) for step, value in standing.items())], key=lambda row: row[0])
 
 
 def _probe_point(kind: str, name: str, probe: Any) -> dict[str, Any] | None:
@@ -1630,7 +1663,7 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 " the run folder, or with --records."
             )
     else:
-        records, names, origin = held
+        records, names, origin, scalar_only = held
         what = f"rank {origin['rank']}'s step records"
         if (kind or "router") == "router" and name in names["router"]:
             path_kind, path, _ = source.locate()
@@ -1667,6 +1700,8 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
         rows = _sample_rows(name, evidence, expert)
     else:
         rows = _rows(kind, name, records if held is not None else (), expert)
+        if kind == "scalar" and held is not None and scalar_only:
+            rows = _merged_scalar_rows(name, rows, records, scalar_only)
         if window is not None and kind == "router":
             # The flags are the detectors' as this file has them: a rebuild from the records could
             # use other thresholds or detectors than the ones that wrote it.

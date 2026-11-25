@@ -1093,11 +1093,13 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
 
 
 def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[str, Any]], bool]:
-    """One rank's step records for part 4, as `load_records(path, rank=rank)` reads them, and
-    whether a line that is not whole was left out: a `.jsonl` file the job is still writing (or
-    one with a line torn by a killed process) is read on its whole lines, as `_open_local` reads
-    it, with the attempts resolved as `load_records` resolves them. A list is a rank's several
-    files: every attempt of each, in that order, then resolved together (lane V4, CLI-13)."""
+    """One rank's step records for part 4, as `load_records(path, rank=rank, scalars=True)` reads
+    them, and whether a line that is not whole was left out: a `.jsonl` file the job is still
+    writing (or one with a line torn by a killed process) is read on its whole lines, as
+    `_open_local` reads it, with the attempts resolved as `load_records` resolves them. A list is
+    a rank's several files: every attempt of each, in that order, then resolved together (lane
+    V4, CLI-13). The scalar-only records are among them, resolved with the training records'
+    cutoffs: `first_divergence` reads them as series points (WAVE_AL_CONTRACT.md Q8 a)."""
     from .evidence import _Tail, load_records, resolve_attempts, resolve_attempts_across
 
     if isinstance(path, (list, tuple)):
@@ -1106,7 +1108,7 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
         torn = False
         for one in path:
             try:
-                found = load_records(one, rank=rank, all_attempts=True)
+                found = load_records(one, rank=rank, all_attempts=True, scalars=True)
             except MalformedRecordError:
                 raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
             except ValueError:
@@ -1115,12 +1117,12 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
                     raise
                 tail = _Tail(source, rank)
                 tail.poll()
-                found = tail.records
+                found = [*tail.records, *tail.scalars]
                 torn = True
             per_file.append(_not_read_yet(found, seen))
         return resolve_attempts_across(per_file), torn
     try:
-        return load_records(path, rank=rank), False
+        return load_records(path, rank=rank, scalars=True), False
     except MalformedRecordError:
         raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
     except ValueError:
@@ -1129,7 +1131,7 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
             raise
         tail = _Tail(source, rank)
         tail.poll()
-        return resolve_attempts(tail.records), True
+        return resolve_attempts([*tail.records, *tail.scalars]), True
 
 
 def _left_out_text(left_out: Mapping[str, list[int]], *, of_ranks: bool) -> str:

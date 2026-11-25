@@ -136,6 +136,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import manifest as _manifest
+from .identity import is_scalar_record
 from .sink import read_end_marker
 
 DEFAULT_SOURCE = "tensorquill-out"  # where `tensorquill.init` writes without a sink
@@ -272,7 +273,9 @@ def _scan_block(block: bytes, found: dict[int, dict[Any, None]], decoded: dict[A
             end = block.index(b"\n", at) + 1
             record = _record_of(block[at:end])
             rank = _record_rank(record)
-            if record is not None and rank is not None:
+            # A scalar-only record names no attempt of its own here: the training records' attempts
+            # are the ones resolved (WAVE_AL_CONTRACT.md section 4.6).
+            if record is not None and rank is not None and not is_scalar_record(record):
                 key = (rank, (_run_of(record), record.get("attempt", 0)))
             at = end
         else:
@@ -371,7 +374,7 @@ def _hidden_attempts(path: Path, before: int, tail: list[dict[str, Any]], by_ran
     order = {rank: list(keys) for rank, keys in (scanned if scanned is not None else _attempts_in_file(path, before)).items()}
     for record in tail:
         rank = _record_rank(record)
-        if rank is None:
+        if rank is None or is_scalar_record(record):
             continue
         try:
             key = (_run_of(record), record.get("attempt", 0))
@@ -406,7 +409,7 @@ def _attempts_by_rank(tail: list[dict[str, Any]]) -> dict[int, set[Any]]:
     found: dict[int, set[Any]] = {}
     for record in tail:
         rank = _record_rank(record)
-        if rank is None:
+        if rank is None or is_scalar_record(record):  # the training records' attempts (section 4.6)
             continue
         try:
             key = (_run_of(record), record.get("attempt", 0))
@@ -418,7 +421,9 @@ def _attempts_by_rank(tail: list[dict[str, Any]]) -> dict[int, set[Any]]:
 
 
 def _last_of(lines: list[bytes]) -> dict[str, Any] | None:
-    """The last whole line, as a record."""
+    """The last whole line that is a training record, as a record: a scalar-only record after it
+    is passed over, since its step is a series point and never the run's (WAVE_AL_CONTRACT.md
+    section 4.6, case `scalar_first_and_last_line`)."""
     for line in reversed(lines):
         if not line.strip():
             continue
@@ -426,6 +431,8 @@ def _last_of(lines: list[bytes]) -> dict[str, Any] | None:
             found = json.loads(line)
         except ValueError:
             return None
+        if is_scalar_record(found):
+            continue
         return found if isinstance(found, dict) else None
     return None
 
@@ -442,6 +449,8 @@ def _steps_by_rank(tail: list[dict[str, Any]]) -> dict[int, int]:
     attempts are several is read whole (`_local_ranks`, XC4)."""
     steps: dict[int, int] = {}
     for record in reversed(tail):
+        if is_scalar_record(record):  # a series point, never the rank's step (section 4.6)
+            continue
         rank, step = _record_rank(record), record.get("step")
         if rank is not None and rank not in steps and isinstance(step, int) and not isinstance(step, bool):
             steps[rank] = step
@@ -513,7 +522,8 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
         mine: set[int] = set()
         here: dict[tuple[str, Any], dict[str, Any]] = {}
         for line, record in _file_lines(path):
-            if _record_rank(record) != rank:
+            # The training records alone: a scalar-only record is no step and cuts no attempt (section 4.6).
+            if _record_rank(record) != rank or is_scalar_record(record):
                 continue
             attempt = record.get("attempt", 0)
             try:
