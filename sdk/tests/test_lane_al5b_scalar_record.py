@@ -484,3 +484,37 @@ def test_a_run_that_logs_no_step_writes_the_same_step_lines(tmp_path, monkeypatc
     assert kept == plain_lines
     assert len(mixed_lines) - len(kept) == 8
     assert b'"record"' not in plain.read_bytes() and b'"seq"' not in plain.read_bytes()
+
+
+# ---- step= inside a compiled function ------------------------------------------------------------
+
+
+def test_step_inside_a_compiled_function_is_one_graph_break_that_never_recompiles():
+    """The record is made eagerly (`torch.compiler.disable`): a compiled evaluation that logs with
+    `step=` breaks its graph there once, and neither the step's value nor `seq` is a guard, so a new
+    step on every call compiles nothing again. Under `fullgraph=True` it cannot be traced at all (a
+    stated limit: the clock and the counter are read on the host)."""
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    model = nn.Linear(4, 1)
+    sink = MemorySink()
+    session = tensorquill.init(model, sink=sink, every=4, run_id="al5_compiled", heartbeat_seconds=None,
+                               stack_seconds=None)
+    counter = CompileCounter()
+
+    def evaluate(x, step):
+        with torch.no_grad():
+            value = model(x).pow(2).mean()
+        session.log({"eval/x": value}, step=step)
+        return value * 2
+
+    compiled = torch.compile(evaluate, backend=counter)
+    expected = [compiled(torch.full((2, 4), float(i)), 100 + i).item() / 2 for i in range(12)]
+    frames = counter.frame_count
+    session.close()
+    torch._dynamo.reset()
+    records = [r for r in sink.records if r.get("record") == "scalars"]
+    assert [(r["step"], r["seq"]) for r in records] == [(100 + i, i) for i in range(12)]
+    assert [r["scalars"]["eval/x"] for r in records] == pytest.approx(expected)
+    assert frames <= 2  # the graph before the break and the one after, each compiled once
