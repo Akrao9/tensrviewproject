@@ -44,11 +44,18 @@ Run the timings with nothing else heavy on the machine, and compare a lane's fig
 - An old `runs` does not refuse a store of protocol 5 parts. It lists the run with the evidence the protocol 5 server wrote (`incidents.json`, `watchdog.json`), as the new `runs` does.
 - The old `load_records` and the old one read refuse it, naming the part and the row.
 
-That claim was corrected on the page. Run again on Nov 25 against `4e31e2b` (step 2 joined), with rows 6 to 11 for the scalar-only records, 50 of the 51 claims held. The one that did not is row 9 b: a protocol 4 sender given a file holding scalar-only records sends each as a training step. With a scalar-only record at step 500, the protocol 5 server keeps it as the rank's last step and drops the training steps after it in the file. It is in the contract's section 5 as a finding, not decided.
+That claim was corrected on the page. Run again on Nov 25 against `4e31e2b` (step 2 joined), with rows 6 to 11 for the scalar-only records, 50 of the 51 claims held. The one that did not is row 9 b: a protocol 4 sender given a file holding scalar-only records sends each as a training step. With a scalar-only record at step 500, the protocol 5 server keeps it as the rank's last step and drops the training steps after it in the file. The owner decided it on Nov 25: under metadata 1 a version 2 row is dropped and counted (`unsupported_schema_version`), and the rest of the batch is stored. Lane AL-2′ built it (merged at `1c4440d`).
+
+Run again on Nov 25 with the new side at `0abb905` (its release server, recorded by name, commit and sha256 in the results), 57 of 57 claims held. Row 9 b now checks the owner's figures: all 30 training steps stored, last step 29, one row counted, and the value kept in the local file. Rows 9 c and 9 d measure, without judging, the protocol 5 `send_file` on the same file:
+- with the protocol 4 sender's offset file left in place, it sends nothing;
+- from byte 0, the offset file removed, it stores the scalar-only record in a `scalars-*` object and drops the 30 training rows as not newer.
 
 ```bash
 git clone <this repository> <old> && git -C <old> checkout 85a477a
 cargo build --release --manifest-path <old>/server/Cargo.toml --bin tensorquill-server
 $PY experiments/protocol-v5/cross_version.py --old-checkout <old> --old-binary <old>/server/target/release/tensorquill-server \
-    --new-binary server/target/release/tensorquill-server --out experiments/protocol-v5/results/cross_version.json
+    --new-binary server/target/release/tensorquill-server --new-binary-commit $(git rev-parse HEAD) \
+    --out experiments/protocol-v5/results/cross_version.json
 ```
+
+The results record the new side's server by its file name, the commit it was built at (as given) and its sha256.
