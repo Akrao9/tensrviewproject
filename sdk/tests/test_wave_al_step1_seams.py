@@ -9,7 +9,8 @@ owner's answers to the lanes' decisions (Nov 24, 2026).
    `fixtures/wave_al/refusal.json`: the sender recognises a protocol 4 server's and this server's.
 4. The known differences on a name Arrow cannot encode, the Python side (the Rust side is in
    `server/src/detect/lane_al3_tests.rs`).
-5. The limit of lane AL-1's row-version rule: a record of version 2 is stored and its part refused.
+5. Lane AL-1's row-version rule, its limit closed by step 2 (row S1): a scalar-only record of version 2 is
+   stored apart and read back; a version 2 record without the mark is stored and its part refused.
 6. The README's passages on the versions, an older server, a downgrade and the probe's columns.
 
 Every test here runs without pyarrow and without the server binary, but the ones that start the binary,
@@ -197,11 +198,12 @@ def test_python_names_a_non_finite_field_of_a_name_arrow_cannot_encode_where_rus
     assert found and found[0]["step"] == 1 and "bad\ud800" in json.dumps(found[0], ensure_ascii=False), found
 
 
-# --- 5. The limit of lane AL-1's row-version rule, pinned (the owner, on AL-1's decision 1) -------------
-# A record keeps its own version as its row's when no reader takes it (99 -> row 99, which a server
-# drops and counts, RS10), but the version readers take, 0 and 1, and also 2 get row version 2. So a
-# record of version 2, which step 1's package does not read (step 2 makes it the scalar-only record,
-# in the same push), is stored, and `load_records` then refuses the part holding it.
+# --- 5. Lane AL-1's row-version rule and its limit, closed by step 2 (the owner, row S1) ---------------
+# A record keeps its own version as its row's when no reader takes it (99 -> row 99, which a server drops
+# and counts, RS10); the versions readers take, 0, 1 and 2, get row version 2. Step 1 left a limit: a record
+# of version 2 was stored though no reader took it. Step 2 closes it: version 2 is the scalar-only record
+# (`identity.is_scalar_record`), which a server stores apart and `load_records` reads; a version 2 record
+# without the mark is still stored as a row, and `load_records` refuses the part holding it, naming why.
 
 try:
     import pyarrow as pa
@@ -214,12 +216,27 @@ needs_server = pytest.mark.skipif(BINARY is None or pa is None,
                                   reason="needs the server binary and pyarrow (TENSORQUILL_SERVER_BIN)")
 
 
-def test_a_record_of_version_2_gets_row_version_2_with_its_own_in_record_version():
+SCALAR = {"schema_version": 2, "record": "scalars", "run_id": "v2", "rank": 0, "attempt": 1, "step": 2, "seq": 0,
+          "ts": 0.0, "scalars": {"x": 1.0}}
+UNMARKED = 'schema version 2 is the scalar-only record, which has "record": "scalars"'
+
+
+def test_a_scalar_only_record_gets_row_version_2_with_its_own_in_record_version_and_its_seq():
+    row = flight.record_to_row(dict(SCALAR))  # identity.check takes it
+    assert (row["schema_version"], row["record_version"], row["seq"], row["extra_json"]) == (flight.ROW_VERSION, 2, 0,
+                                                                                            None) == (2, 2, 0, None)
+    assert flight.row_to_record(row) == SCALAR
+    row = flight._row({**SCALAR, "schema_version": 99})  # a version no reader takes: not a scalar-only record
+    assert (row["schema_version"], row["record_version"], row["seq"]) == (99, 99, None)
+
+
+def test_a_version_2_record_without_the_mark_is_refused_by_the_check_and_sent_as_a_row_of_version_2():
     record = {"schema_version": 2, "run_id": "v2", "rank": 0, "attempt": 1, "step": 2, "grad_norm": 1.0}
+    with pytest.raises(identity.MalformedRecordError) as raised:
+        flight.record_to_row(record)
+    assert str(raised.value) == f"schema_version is 2: {UNMARKED}"
     row = flight._row(record)  # the sender's row, which `rows_to_send` builds without the identity check
-    assert (row["schema_version"], row["record_version"]) == (flight.ROW_VERSION, 2) == (2, 2)
-    row = flight._row({**record, "schema_version": 99})
-    assert (row["schema_version"], row["record_version"]) == (99, 99)  # a version no reader takes
+    assert (row["schema_version"], row["record_version"], row["seq"]) == (2, 2, None)
 
 
 class _Server:
@@ -250,6 +267,7 @@ def _stored(store: Path, run_id: str) -> tuple[Path, list, list, dict]:
     """The run's one part, its row and record versions, and the rank's entry in `watchdog.json`."""
     [part] = sorted((store / "runs" / run_id).rglob("part-*.parquet"))
     table = pq.read_table(part, partitioning=None)
+    assert set(table.column("seq").to_pylist()) == {None}  # a part never holds a scalar-only row (D8)
     status = json.loads((store / "runs" / run_id / "watchdog.json").read_text())
     [entry] = status["ranks"] if isinstance(status["ranks"], list) else status["ranks"].values()
     return part, table.column("schema_version").to_pylist(), table.column("record_version").to_pylist(), entry
@@ -263,21 +281,52 @@ def _refusal(store: Path, run_id: str) -> str:
     return str(raised.value)
 
 
-@needs_server
-def test_this_server_stores_a_record_of_version_2_and_load_records_refuses_its_part(tmp_path):
-    store, run_id = tmp_path / "store", "v2"
+def _send(tmp_path: Path, run_id: str, records: list[dict]) -> Path:
+    """`records` as the rank's `.jsonl`, sent whole with `send_file` to a server of this tree, which then
+    stops; the store."""
+    store = tmp_path / "store"
     path = tmp_path / f"{run_id}.rank0.jsonl"
-    path.write_text("".join(json.dumps(r) + "\n" for r in _records(run_id, {2: 2})))
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
     server = _Server(store)
     try:
         assert flight.send_file(path, server.endpoint, run_id, 0, timeout=60) is True  # every byte acknowledged
         time.sleep(1.5)  # a watchdog pass writes the rank's status
     finally:
         server.close()
+    return store
+
+
+@needs_server
+def test_this_server_stores_a_scalar_only_record_apart_and_load_records_reads_it_back(tmp_path):
+    from tensorquill import evidence
+
+    run_id = "v2"
+    steps = _records(run_id, {})
+    scalar = {**SCALAR, "run_id": run_id, "step": 1000, "ts": 3.5, "scalars": {"eval/loss": 1.25}}
+    store = _send(tmp_path, run_id, [*steps[:3], scalar, *steps[3:]])
+    part, rows, records, entry = _stored(store, run_id)
+    assert (rows, records) == ([2] * 5, [1] * 5)
+    assert pq.read_table(part, partitioning=None).column("step").to_pylist() == [0, 1, 2, 3, 4]
+    [object_] = sorted((store / "runs" / run_id).rglob("scalars-*.parquet"))
+    assert object_.relative_to(store / "runs" / run_id).as_posix() == "rank=0/attempt=1/scalars-00000000-00000000.parquet"
+    table = pq.read_table(object_, partitioning=None)
+    assert (table.column("seq").to_pylist(), table.column("record_version").to_pylist(),
+            table.column("step").to_pylist()) == ([0], [2], [1000])
+    assert not {"dropped_rows", "dropped_row_keys", "scalars_not_newer"} & set(entry), entry  # nothing dropped
+    assert entry.get("last_step") in (None, 4), entry  # a scalar-only row is never progress (D8)
+    assert evidence.load_records(store / "runs" / run_id, scalars=True, all_attempts=True) == [*steps, scalar]
+    assert evidence.load_records(store / "runs" / run_id, all_attempts=True) == steps
+
+
+@needs_server
+def test_this_server_stores_a_version_2_record_without_the_mark_and_load_records_refuses_its_part(tmp_path):
+    run_id = "v2u"
+    store = _send(tmp_path, run_id, _records(run_id, {2: 2}))
     part, rows, records, entry = _stored(store, run_id)
     assert (rows, records) == ([2] * 5, [1, 1, 2, 1, 1])
+    assert not list((store / "runs" / run_id).rglob("scalars-*.parquet"))
     assert "dropped_rows" not in entry and "dropped_row_keys" not in entry, entry  # not dropped, not counted
-    assert _refusal(store, run_id) == f"schema_version is 2 at {part}, row 2: this tensorquill reads schema versions 0 and 1"
+    assert _refusal(store, run_id) == f"schema_version is 2 at {part}, row 2: {UNMARKED}"
 
 
 @needs_server
