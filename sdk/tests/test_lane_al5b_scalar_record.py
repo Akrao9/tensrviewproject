@@ -510,11 +510,13 @@ def test_step_inside_a_compiled_function_is_one_graph_break_that_never_recompile
         return value * 2
 
     compiled = torch.compile(evaluate, backend=counter)
-    expected = [compiled(torch.full((2, 4), float(i)), 100 + i).item() / 2 for i in range(12)]
+    expected = [compiled(torch.full((2, 4), float(i)), 100 + i).item() / 2 for i in range(4)]
+    settled = counter.frame_count  # the graphs on each side of the break, and the step argument made dynamic
+    expected += [compiled(torch.full((2, 4), float(i)), 100 + i).item() / 2 for i in range(4, 12)]
     frames = counter.frame_count
     session.close()
     torch._dynamo.reset()
     records = [r for r in sink.records if r.get("record") == "scalars"]
     assert [(r["step"], r["seq"]) for r in records] == [(100 + i, i) for i in range(12)]
     assert [r["scalars"]["eval/x"] for r in records] == pytest.approx(expected)
-    assert frames <= 2  # the graph before the break and the one after, each compiled once
+    assert frames == settled <= 3  # eight more calls, eight more steps: nothing compiled again
