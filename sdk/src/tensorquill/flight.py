@@ -752,7 +752,7 @@ def scalar_objects(directory: str | Path, rank: int | None = None) -> list[Path]
     `attempt=<a>` folder), ordered by the rank and attempt numbers of their folders and the first `seq` of
     their names. An object whose name does not parse by section 4.5's naming comes after the named ones of
     its rank and attempt, by name (a server reads the footer for such a name; its rows read as any
-    object's). With `rank`, the objects in another rank's `rank=<n>` folder are left out. A path that is
+    object's). With `rank`, another rank's `rank=<n>` folder is not entered. A path that is
     not a folder holds none. The stored attempt order (`attempts.json`) is not applied here: each path
     names its rank and attempt, and the caller reorders by its own rule."""
     directory = Path(directory)
@@ -774,7 +774,12 @@ def scalar_objects(directory: str | Path, rank: int | None = None) -> list[Path]
             (found := _RANK_FOLDER.fullmatch(folder)) and int(found.group(1)) != rank
             for folder in path.relative_to(directory.parent).parts[:-1])
 
-    return sorted((p for p in directory.rglob("scalars-*.parquet") if p.is_file() and not other_rank(p)), key=order)
+    found: list[Path] = []
+    for top, folders, files in os.walk(directory):
+        if rank is not None:  # another rank's folder is never entered, as `evidence._parquet_parts` does for parts
+            folders[:] = [f for f in folders if not ((m := _RANK_FOLDER.fullmatch(f)) and int(m.group(1)) != rank)]
+        found.extend(Path(top) / name for name in files if name.startswith("scalars-") and name.endswith(".parquet"))
+    return sorted((p for p in found if not other_rank(p)), key=order)
 
 
 def read_scalar_object(path: str | Path) -> list[dict[str, Any]]:
