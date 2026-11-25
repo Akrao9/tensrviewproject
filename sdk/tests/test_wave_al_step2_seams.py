@@ -423,3 +423,23 @@ def test_hugging_face_s_eval_on_start_baseline_reaches_the_store_as_a_scalar_onl
     first = next(e for e in trainer.state.log_history if "eval_loss" in e and e["step"] == 0)
     assert baseline["scalars"]["eval/loss"] == pytest.approx(first["eval_loss"])
     assert evidence.scalar_series(run)["eval/loss"][0] == [0, pytest.approx(first["eval_loss"])]
+
+
+def test_an_older_sdk_sending_a_newer_capture_s_file_loses_its_step_values_on_the_server():
+    """The owner, on the cross-version run's finding (Nov 25): a protocol 4 sender given a `.jsonl` that a
+    protocol 5 capture wrote sends each scalar-only record as a step row; the server drops and counts it, stores
+    every training step, and the values stay in the local file. Beside the passage on an older side."""
+    older = section("**An older server or an older SDK.**", "**A downgrade is not supported.**")
+    for words in ("A file that a protocol 5 capture wrote, sent by such a sender, loses its `step=` values on the server",
+                  "row version 2 in a batch of metadata version 1",
+                  "drops and counts under `unsupported_schema_version` in the rank's entry of `watchdog.json` "
+                  "(`dropped_rows`, `dropped_row_keys`), with a line on its stderr",
+                  "every training step of the file is stored",
+                  "The values stay in the local `.jsonl`, which a protocol 5 reader reads",
+                  "send the file with an SDK of the capture's version"):
+        assert words in older, words
+    table = section("**Protocol 5's versions.**", "**An older server or an older SDK.**")
+    assert "the server stores 0, 1 and 2 (0 and 1 only in a batch of metadata version 1)" in table
+    ingest = server_source("ingest.rs")
+    assert 'UNSUPPORTED_SCHEMA_VERSION: &str = "unsupported_schema_version"' in ingest
+    assert "dropped rows that cannot be stored" in ingest
