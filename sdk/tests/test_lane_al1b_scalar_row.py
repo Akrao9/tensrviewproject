@@ -5,13 +5,13 @@
 - `row_to_record(record_to_row(r)) == r` for every record of every section 4 case, scalar-only and step
   records alike, in a plain row and through a real Arrow batch; a step row's `seq` is null.
 - A store holding `scalars-<first_seq:08>-<last_seq:08>.parquet` objects beside its parts (section 4.5's
-  names; lane AL-2' writes them, so the store here is built with pyarrow) is read back record for record.
+  names; the server writes them, so the store here is built with pyarrow) is listed by the one listing,
+  `evidence._parquet_parts(..., scalars=True)`, and read back record for record by
+  `load_records(..., scalars=True)`.
+- One rule of what a scalar-only record is, `identity.is_scalar_record`, which `flight` asks too.
 
-`identity.check` takes record version 2 only with lane AL-4''s change (`identity.py`, not this lane's).
-Until the trees are joined, the tests that need it take the `reads_version_2` fixture, which widens
-`identity.SCHEMA_VERSIONS` for the test when 2 is not in it and does nothing once it is. The tests that wait
-for the joined tree are strict expected failures that name it. Tests that need pyarrow skip one by one
-without it (CI's plain jobs have none); none needs the server binary or git history."""
+Tests that need pyarrow skip one by one without it (CI's plain jobs have none); none needs the server
+binary or git history. A server's own store is step 2's seam test (`test_wave_al_step2_seams.py`)."""
 
 from __future__ import annotations
 
@@ -26,10 +26,6 @@ from tensorquill import flight, identity
 CASES = json.loads((Path(__file__).parent / "fixtures" / "wave_al" / "cases.json").read_text(encoding="utf-8"))["cases"]
 SECTION_4 = [c for c in CASES if c["section"] == 4]
 KEYS = next(c for c in SECTION_4 if c["name"] == "scalar_record_keys")
-JOINED = ("the joined tree: identity.check takes record version 2 with lane AL-4''s change to identity.py "
-          "(contract section 4.6), not in this lane's tree")
-JOINED_LOADER = ("the merge: the coordinator adds to evidence.load_records the one call that reads a store's "
-                 "scalars-* objects (flight.scalar_objects) beside its parts")
 
 
 def _scalar_record() -> dict:
@@ -38,14 +34,6 @@ def _scalar_record() -> dict:
 
 def _is_scalar(record: dict) -> bool:
     return record.get("record") == "scalars"
-
-
-@pytest.fixture
-def reads_version_2(monkeypatch):
-    """`identity.check` taking record version 2, as lane AL-4' makes it (section 4.6). A no-op on a tree
-    where it already does."""
-    if 2 not in identity.SCHEMA_VERSIONS:
-        monkeypatch.setattr(identity, "SCHEMA_VERSIONS", (*identity.SCHEMA_VERSIONS, 2))
 
 
 # --- (a) The row of `scalar_record_keys` ---------------------------------------------------------
@@ -67,17 +55,14 @@ def test_the_case_s_record_has_the_nine_keys_and_its_row_is_the_case_s():
     assert row["grad_norm"] is None and row["layers"] is None
 
 
-def test_record_to_row_gives_the_case_s_row_where_version_2_is_read(reads_version_2):
+def test_record_to_row_takes_the_scalar_only_record():
+    """`identity.check` takes record version 2 for a scalar-only record (section 4.6), so `record_to_row`
+    gives the case's row through the check."""
+    assert 2 in identity.SCHEMA_VERSIONS
     record = _scalar_record()
     row = flight.record_to_row(copy.deepcopy(record))
     assert _summary(row) == {"seq": 0, "record_version": 2, "schema_version": 2, "extra": None}
     assert flight.row_to_record(row) == record
-
-
-@pytest.mark.xfail(strict=True, raises=identity.MalformedRecordError, reason=JOINED)
-def test_record_to_row_takes_the_scalar_only_record():
-    record = _scalar_record()
-    assert _summary(flight.record_to_row(copy.deepcopy(record)))["seq"] == 0
 
 
 def test_the_schema_has_seq_as_a_nullable_int64_before_record_version():
@@ -134,7 +119,7 @@ def test_every_section_4_record_comes_back_exactly_through_an_arrow_batch(case):
 
 
 @pytest.mark.parametrize("case", SECTION_4, ids=[c["name"] for c in SECTION_4])
-def test_every_section_4_record_comes_back_through_record_to_row(case, reads_version_2):
+def test_every_section_4_record_comes_back_through_record_to_row(case):
     for record in case["records"]:
         assert flight.row_to_record(flight.record_to_row(copy.deepcopy(record))) == record
 
@@ -248,89 +233,88 @@ def _store(tmp_path: Path) -> tuple[Path, dict]:
     return run, {"steps": steps, "rank0": [first, *later], "rank1": other_scalar}
 
 
-def test_the_store_s_scalars_objects_are_listed_by_rank_attempt_and_first_seq(tmp_path):
-    run, _ = _store(tmp_path)
-    names = [p.relative_to(run).as_posix() for p in flight.scalar_objects(run)]
-    assert names == ["rank=0/attempt=1/scalars-00000000-00000000.parquet",
-                     "rank=0/attempt=1/scalars-00000001-00000002.parquet",
-                     "rank=1/attempt=1/scalars-00000000-00000000.parquet"]
-    assert [p.name for p in flight.scalar_objects(run, rank=1)] == ["scalars-00000000-00000000.parquet"]
-    assert [p.name for p in flight.scalar_objects(run / "rank=0")] == ["scalars-00000000-00000000.parquet",
-                                                                      "scalars-00000001-00000002.parquet"]
-    assert flight.scalar_objects(run / "rank=0" / "attempt=1" / "part-00000000-00000005.parquet") == []
+def _names(run: Path, paths: list[Path]) -> list[str]:
+    return [p.relative_to(run).as_posix() for p in paths]
 
 
-def _read(objects: list[Path]) -> list[dict]:
-    return [record for path in objects for record in flight.read_scalar_object(path)]
-
-
-def test_the_store_s_scalar_only_records_read_back_exactly(tmp_path):
-    run, made = _store(tmp_path)
-    assert _read(flight.scalar_objects(run, rank=0)) == made["rank0"]
-    assert _read(flight.scalar_objects(run, rank=1)) == made["rank1"]
-    assert _read(flight.scalar_objects(run)) == [*made["rank0"], *made["rank1"]]
-
-
-def test_a_scalars_object_s_rows_come_back_as_row_to_record_gives_them_and_the_check_is_the_caller_s(tmp_path, reads_version_2):
-    """`read_scalar_object` is rows through `row_to_record` only: a row whose identity is not valid comes back
-    as it is, for the caller to check and name (`identity.check` with `in_part`), as for a part."""
-    run, _ = _store(tmp_path)
-    [path] = flight.scalar_objects(run, rank=1)
-    bad = {**_scalar_record(), "rank": 1, "attempt": -4}
-    _write(path, [bad])
-    assert flight.read_scalar_object(path) == [bad]
-    with pytest.raises(identity.MalformedRecordError) as raised:
-        identity.check(bad, identity.in_part(path, 0))
-    assert str(raised.value) == (f"attempt is -4 at {identity.in_part(path, 0)}: "
-                                 "tensorquill reads an integer of 0 or more")
-
-
-def test_a_scalars_name_that_does_not_parse_is_listed_last_in_its_folder(tmp_path):
-    """Section 4.5's names give the object's first and last `seq`; a server reads the footer for a name
-    that does not parse. The listing keeps such an object, after the named ones of its rank and attempt, by
-    name, and its rows read as any object's."""
-    run, made = _store(tmp_path)
-    odd = run / "rank=0" / "attempt=1" / "scalars-recovered.parquet"
-    extra = {**_scalar_record(), "seq": 3, "step": 950}
-    _write(odd, [extra])
-    names = [p.relative_to(run).as_posix() for p in flight.scalar_objects(run)]
-    assert names == ["rank=0/attempt=1/scalars-00000000-00000000.parquet",
-                     "rank=0/attempt=1/scalars-00000001-00000002.parquet",
-                     "rank=0/attempt=1/scalars-recovered.parquet",
-                     "rank=1/attempt=1/scalars-00000000-00000000.parquet"]
-    assert _read(flight.scalar_objects(run, rank=0)) == [*made["rank0"], extra]
-    assert not hasattr(flight, "load_scalar_records")
-
-
-def test_flight_takes_nothing_from_evidence():
-    """The merge's one call is `evidence`'s; `flight` never imports it (the stored attempt order, which a
-    caller applies, is `evidence`'s rule)."""
-    source = Path(flight.__file__).read_text(encoding="utf-8")
-    assert "from .evidence" not in source and "import evidence" not in source and "tensorquill.evidence" not in source
-
-
-def test_load_records_reads_one_scalars_object_as_its_records(tmp_path, reads_version_2):
+def test_the_store_s_scalars_objects_are_listed_after_their_attempt_s_parts_by_first_seq(tmp_path):
+    """One listing, `evidence._parquet_parts`: with `scalars=True` each attempt's `scalars-*` objects follow
+    its parts, by the first `seq` of their names; without it they are never listed, as before step 2."""
     from tensorquill import evidence
 
-    run, made = _store(tmp_path)
-    path = run / "rank=0" / "attempt=1" / "scalars-00000001-00000002.parquet"
-    assert evidence.load_records(path, all_attempts=True) == made["rank0"][1:]
+    run, _ = _store(tmp_path)
+    assert _names(run, evidence._parquet_parts(run, scalars=True)) == [
+        "rank=0/attempt=1/part-00000000-00000005.parquet",
+        "rank=0/attempt=1/scalars-00000000-00000000.parquet",
+        "rank=0/attempt=1/scalars-00000001-00000002.parquet",
+        "rank=1/attempt=1/part-00000000-00000005.parquet",
+        "rank=1/attempt=1/scalars-00000000-00000000.parquet"]
+    assert _names(run, evidence._parquet_parts(run, 1, scalars=True)) == [
+        "rank=1/attempt=1/part-00000000-00000005.parquet", "rank=1/attempt=1/scalars-00000000-00000000.parquet"]
+    assert _names(run, evidence._parquet_parts(run)) == ["rank=0/attempt=1/part-00000000-00000005.parquet",
+                                                         "rank=1/attempt=1/part-00000000-00000005.parquet"]
+    assert not hasattr(flight, "scalar_objects") and not hasattr(flight, "read_scalar_object")
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=JOINED_LOADER)
 def test_load_records_reads_a_store_s_scalars_objects_beside_its_parts(tmp_path):
     from tensorquill import evidence
 
     run, made = _store(tmp_path)
-    read = evidence.load_records(run, rank=0, all_attempts=True)
-    assert [r for r in read if not _is_scalar(r)] == made["steps"]
-    assert [r for r in read if _is_scalar(r)] == made["rank0"]
+    read = evidence.load_records(run, rank=0, all_attempts=True, scalars=True)
+    assert read == [*made["steps"], *made["rank0"]]  # each record exactly as written
+    assert evidence.load_records(run, rank=1, scalars=True) == [*[{**r, "rank": 1} for r in made["steps"]],
+                                                                *made["rank1"]]
+    assert evidence.load_records(run, rank=0, all_attempts=True) == made["steps"]  # the default, as before
+
+
+def test_a_scalars_object_s_rows_are_checked_naming_the_object_and_row(tmp_path):
+    from tensorquill import evidence
+
+    run, _ = _store(tmp_path)
+    path = run / "rank=1" / "attempt=1" / "scalars-00000000-00000000.parquet"
+    _write(path, [{**_scalar_record(), "rank": 1, "attempt": -4}])
+    with pytest.raises(identity.MalformedRecordError) as raised:
+        evidence.load_records(run, rank=1, scalars=True)
+    assert str(raised.value) == (f"attempt is -4 at {identity.in_part(path, 0)}: "
+                                 "tensorquill reads an integer of 0 or more")
+    assert len(evidence.load_records(run, rank=1)) == 6  # never listed by default, so never read
+
+
+def test_a_scalars_name_that_does_not_parse_is_listed_last_in_its_attempt(tmp_path):
+    """Section 4.5's names give an object's first and last `seq`; the server reads the footer for a name that
+    does not parse. The listing keeps such an object, after the named ones of its attempt, by name, and its
+    rows read as any object's."""
+    from tensorquill import evidence
+
+    run, made = _store(tmp_path)
+    extra = {**_scalar_record(), "seq": 3, "step": 950}
+    _write(run / "rank=0" / "attempt=1" / "scalars-recovered.parquet", [extra])
+    assert _names(run, evidence._parquet_parts(run, 0, scalars=True)) == [
+        "rank=0/attempt=1/part-00000000-00000005.parquet",
+        "rank=0/attempt=1/scalars-00000000-00000000.parquet",
+        "rank=0/attempt=1/scalars-00000001-00000002.parquet",
+        "rank=0/attempt=1/scalars-recovered.parquet"]
+    read = evidence.load_records(run, rank=0, all_attempts=True, scalars=True)
+    assert [r for r in read if _is_scalar(r)] == [*made["rank0"], extra]
+
+
+def test_load_records_reads_one_scalars_object_as_its_records(tmp_path):
+    """Given one object's path, `load_records` reads it as any part: with `scalars=True` its records come
+    back exactly; by default it gives the training records alone, so none."""
+    from tensorquill import evidence
+
+    run, made = _store(tmp_path)
+    path = run / "rank=0" / "attempt=1" / "scalars-00000001-00000002.parquet"
+    assert evidence.load_records(path, all_attempts=True, scalars=True) == made["rank0"][1:]
+    assert evidence.load_records(path, all_attempts=True) == []
 
 
 def test_a_rank_s_listing_never_enters_another_rank_s_folder(tmp_path, monkeypatch):
-    """As `_parquet_parts` does for parts: with `rank`, the `rank=<n>` folders of other ranks are not read,
-    so one rank's read never costs the rest of the run's listing."""
+    """With `rank`, the `rank=<n>` folders of other ranks are not read, scalars objects included, so one
+    rank's read never costs the rest of the run's listing."""
     import os
+
+    from tensorquill import evidence
 
     run, _ = _store(tmp_path)
     opened: list[str] = []
@@ -341,8 +325,7 @@ def test_a_rank_s_listing_never_enters_another_rank_s_folder(tmp_path, monkeypat
         return scandir(path)
 
     monkeypatch.setattr(os, "scandir", watched)
-    assert [p.name for p in flight.scalar_objects(run, rank=0)] == ["scalars-00000000-00000000.parquet",
-                                                                   "scalars-00000001-00000002.parquet"]
+    assert len(evidence._parquet_parts(run, 0, scalars=True)) == 3
     assert opened and not [p for p in opened if "rank=1" in Path(p).parts], opened
 
 
