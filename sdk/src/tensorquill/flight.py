@@ -749,9 +749,12 @@ _ATTEMPT_FOLDER = re.compile(r"attempt=(-?[0-9]+)")
 
 def scalar_objects(directory: str | Path, rank: int | None = None) -> list[Path]:
     """The `scalars-*` objects under `directory` (a run's `runs/<run_id>` folder, a `rank=<r>` folder or an
-    `attempt=<a>` folder), ordered by rank, attempt number and first `seq`, then by name for a name that
-    does not parse. With `rank`, the objects in another rank's `rank=<n>` folder are left out. A path that
-    is not a folder holds none."""
+    `attempt=<a>` folder), ordered by the rank and attempt numbers of their folders and the first `seq` of
+    their names. An object whose name does not parse by section 4.5's naming comes after the named ones of
+    its rank and attempt, by name (a server reads the footer for such a name; its rows read as any
+    object's). With `rank`, the objects in another rank's `rank=<n>` folder are left out. A path that is
+    not a folder holds none. The stored attempt order (`attempts.json`) is not applied here: each path
+    names its rank and attempt, and the caller reorders by its own rule."""
     directory = Path(directory)
     if not directory.is_dir():
         return []
@@ -774,26 +777,16 @@ def scalar_objects(directory: str | Path, rank: int | None = None) -> list[Path]
     return sorted((p for p in directory.rglob("scalars-*.parquet") if p.is_file() and not other_rank(p)), key=order)
 
 
-def load_scalar_records(directory: str | Path, rank: int | None = None) -> list[dict[str, Any]]:
-    """The scalar-only records a store holds under `directory`, read from its `scalars-*` objects
-    (`scalar_objects`) through `row_to_record`, in their order, each row's identity checked
-    (`identity.check`, naming the object and its row). With `rank`, that rank's records only. Needs
-    `pyarrow`. `evidence.load_records` reads these beside the store's parts."""
+def read_scalar_object(path: str | Path) -> list[dict[str, Any]]:
+    """The scalar-only records of one `scalars-*` object, its rows through `row_to_record` in their order.
+    Nothing is checked: the caller checks each record's identity and names the object and row
+    (`identity.check` with `identity.in_part(path, row)`), as for a part. Needs `pyarrow`."""
     try:
         import pyarrow.parquet as pq
     except ImportError as error:
         raise ImportError("reading Parquet parts needs pyarrow: pip install pyarrow") from error
-    from .identity import in_part
-
-    records: list[dict[str, Any]] = []
-    for path in scalar_objects(directory, rank):
-        # `partitioning=None`: the object's own columns only, not `rank=` and `attempt=` from its folders.
-        for number, row in enumerate(pq.read_table(path, partitioning=None).to_pylist()):
-            record = row_to_record(row)
-            check(record, in_part(path, number))
-            if rank is None or record.get("rank", 0) == rank:
-                records.append(record)
-    return records
+    # `partitioning=None`: the object's own columns only, not `rank=` and `attempt=` from its folders.
+    return [row_to_record(row) for row in pq.read_table(path, partitioning=None).to_pylist()]
 
 
 # --- The local file and its offset ----------------------------------------------------
