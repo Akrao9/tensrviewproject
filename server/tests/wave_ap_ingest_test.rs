@@ -531,6 +531,7 @@ async fn ao02_a_batch_cut_at_its_scalar_rows_leaves_the_rank_at_its_last_step() 
     assert_eq!(put.reply().await.expect("the batch sent again is accepted"), 25);
     let now = status(&server, root, run).await;
     assert_eq!(progress(&now), (json!(200), json!(9), false), "{now}");
+    assert!(judged(&now), "{}", now["run_state"]);
     // L30's count is unchanged in meaning: the five step rows sent again were not newer.
     assert_eq!(entry(&now, 0)["rows_not_newer"], 5, "{now}");
     // A later batch, after the cut one.
@@ -797,7 +798,7 @@ async fn ao03_a_store_that_never_heals_keeps_the_run_only_for_a_bounded_number_o
     server.ingest.write_watchdog().await;
     server.ingest.write_watchdog().await;
     assert_eq!(server.ingest.runs_held(), 1, "kept while its report is pending");
-    // The waits are 1, 2, 4, ... 64 ms: about 130 ms of retries in all. Each pass of the status
+    // The waits after the first six failures are 1, 2, 4, ... 32 ms: about 63 ms before the 7th. Each pass of the status
     // writer comes after the retries the timed flush tried: the run is kept after every pass that
     // saw fewer than 7 failures, the bound, and let go of at the pass that sees the 7th.
     let failed = || store.incident_puts_failed.load(Ordering::SeqCst);

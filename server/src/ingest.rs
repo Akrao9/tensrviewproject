@@ -146,7 +146,9 @@ const REPLAY_CONCURRENCY: usize = 16;
 const REPLAY_BACKOFF_MAX_DOUBLINGS: u32 = 6;
 /// A finished run whose rank waits to try a rebuild or a report again is kept in memory until that
 /// retry has failed this many times in a row, the wait having stopped doubling (wave AP, AO-03):
-/// about 21 minutes of failures at the default `replay_backoff` of 10 s. Then it is let go of as any
+/// the 7th failure comes after the waits that follow the first six, 10 + 20 + ... + 320 s, about
+/// 10.5 minutes at the default `replay_backoff` of 10 s, well inside the default `evict_after` of an
+/// hour. Then it is let go of as any
 /// settled run, its status saying the rank is not judged. A store that never heals so keeps a run
 /// only for a bounded time.
 const RETRY_HOLD_FAILURES: u32 = REPLAY_BACKOFF_MAX_DOUBLINGS + 1;
