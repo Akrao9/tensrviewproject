@@ -167,3 +167,24 @@ def test_a_probe_with_attention_is_read_as_before() -> None:
     python, rust = _both(records)
     assert _verdict(rust) == _verdict(python)
     assert rust["kind_checks"]["attention_collapse"]["value"] == "checked"
+
+
+def _memory(readings: list[int], total: int) -> list[dict]:
+    return [{"run_id": "r", "rank": 0, "step": step, "system": {"cuda": {"allocated": allocated, "total": total}}}
+            for step, allocated in enumerate(readings)]
+
+
+# `memory_growth` subtracts recorded byte counts: the rise of six readings, and what is left to `total`.
+MEMORY_CASES = {
+    "a rise past i64": _memory([INT64_MIN, -(2**62), 0, 2**61, 2**62, INT64_MAX], 2**34),
+    "a total below allocated by more than i64": _memory([(1 + k) * 100 * 2**20 for k in range(6)], INT64_MIN),
+    "within i64": _memory([(1 + k) * 2**30 for k in range(6)], 2**34),
+}
+
+
+@pytest.mark.parametrize("name", list(MEMORY_CASES))
+def test_memory_growth_past_i64_is_judged_alike(name: str) -> None:
+    python, rust = _both(MEMORY_CASES[name])
+    assert _verdict(rust) == _verdict(python)
+    growth = [[i for i in e["incidents"] if i["kind"] == "memory_growth"] for e in (python, rust)]
+    assert growth[0] and growth[0] == growth[1]
