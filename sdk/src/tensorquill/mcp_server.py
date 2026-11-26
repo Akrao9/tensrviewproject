@@ -561,7 +561,7 @@ def _router_steps_changed(name: str, document: Mapping[str, Any], records: list[
     for record in records:
         moe = record.get("moe")
         counts = moe.get(name) if isinstance(moe, Mapping) else None
-        if _router_point(counts, None, None) is not None:
+        if _record_router_point(counts, None, None) is not None:
             held[int(record["step"])] = counts
     if judged == held:
         return None
@@ -1506,16 +1506,26 @@ def _columns(value: Any) -> dict[str, Any]:
     return {"value": value}
 
 
-def _router_point(counts: Any, diversity: Any, expert: int | None) -> dict[str, Any] | None:
-    """A router's point from its counts, or None where it has none. The one rule for that is the
-    detectors' (`evidence._router_total`): a list of signed 64-bit integers, no bool among them,
-    whose sum is above 0; anything else is a missing sample in the evidence. Every reader of a
-    record's counts here goes through it, so a series read from the records and the check of
-    whether they are still what an evidence file judged (`_router_steps_changed`) hold a point at
-    the steps the evidence does (wave AP, AO-05: `sum` raised on text, and a bool made a point the
-    file never judged)."""
+def _record_router_point(counts: Any, diversity: Any, expert: int | None) -> dict[str, Any] | None:
+    """A router's point from a step record's counts, or None where the record holds none. The one
+    rule for that is the detectors' (`evidence._router_total`): a list of signed 64-bit integers, no
+    bool among them, whose sum is above 0; on any other the evidence has a missing sample. Every
+    reader of a record's counts here goes through it, so a series read from the records and the
+    check of whether they are still what an evidence file judged (`_router_steps_changed`) hold a
+    point at the steps the evidence does (wave AP, AO-05: `sum` raised on text, and a bool made a
+    point the file never judged). A sample's counts, which the detectors wrote, go to
+    `_router_point` as before."""
     tokens = _router_total(counts)
     if tokens is None or tokens <= 0:
+        return None
+    return _router_point(counts, diversity, expert)
+
+
+def _router_point(counts: Any, diversity: Any, expert: int | None) -> dict[str, Any] | None:
+    if not isinstance(counts, list) or not counts:
+        return None
+    tokens = sum(counts)
+    if tokens <= 0:
         return None
     largest = max(range(len(counts)), key=lambda i: counts[i])
     point = {
@@ -1547,7 +1557,7 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
             stats = moe_stats.get(name) if isinstance(moe_stats, Mapping) else None
             diversity = stats.get("diversity") if isinstance(stats, Mapping) else None
             moe = record.get("moe")
-            point = _router_point(moe.get(name) if isinstance(moe, Mapping) else None, diversity, expert)
+            point = _record_router_point(moe.get(name) if isinstance(moe, Mapping) else None, diversity, expert)
         elif kind in PROBE_KINDS:
             point = _probe_point(kind, name, record.get("probe"))
         else:

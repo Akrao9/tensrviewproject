@@ -490,8 +490,8 @@ def full_path_of(path: str | Path) -> Path | None:
     name, mark = path.name, ".compact"
     start = name.find(mark)
     while start != -1:
-        full = path.with_name(name[:start] + name[start + len(mark):])
-        if full.name and compact_path(full) == path:
+        rest = name[:start] + name[start + len(mark):]
+        if rest and compact_path(full := path.with_name(rest)) == path:  # `.compact` alone: no name gives it
             return full
         start = name.find(mark, start + 1)
     return None

@@ -211,17 +211,15 @@ def state_path_for(evidence_path: str | Path) -> Path:
 
 
 def _names_evidence(state_path: Path, evidence: Path) -> bool:
-    """Whether the state file at `state_path` says it handed over `evidence` (its `evidence`, the
-    absolute path `_save` writes)."""
+    """Whether the state file at `state_path` says it handed over `evidence`. Its `evidence` is the
+    absolute path `_save` wrote, and the state file is beside that file, so the file's name is what
+    is compared: a run folder moved or mounted elsewhere with its files still matches."""
     try:
         document = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     named = document.get("evidence") if isinstance(document, dict) else None
-    try:
-        return isinstance(named, str) and Path(named).resolve() == evidence.resolve()
-    except (OSError, ValueError):
-        return False
+    return isinstance(named, str) and Path(named).name == evidence.name
 
 
 def state_path_handed(evidence_path: str | Path) -> Path:
