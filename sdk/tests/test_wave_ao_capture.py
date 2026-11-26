@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import numbers
+import random
 import warnings
 from pathlib import Path
 
@@ -356,6 +357,21 @@ def test_a_value_whose_transfer_fails_at_close_leaves_the_end_marker_and_stops_t
     assert path.with_name("r.rank0.end.json").exists()
 
 
+@pytest.mark.parametrize("through", ["flush", "close"])
+def test_a_block_whose_every_scalar_only_value_fails_writes_nothing_and_keeps_the_end_marker(tmp_path, through):
+    session, path = _jsonl_session(tmp_path)
+    session.log({"only/bad": 1.0}, step=2)
+    session._scalar_records[-1]["scalars"]["only/bad"] = torch.tensor(1.0).as_subclass(_Unreadable)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if through == "flush":
+            session.flush()
+        session.close()
+    assert [r for r in _lines(path) if r.get("record") == "scalars"] == []
+    assert session.writer_error is None and session._error is None and not session._worker.is_alive()
+    assert path.with_name("r.rank0.end.json").exists()
+
+
 def test_with_a_value_whose_transfer_fails_the_trainings_own_exception_comes_out(tmp_path):
     session, path = _jsonl_session(tmp_path)
     with pytest.raises(KeyError, match="the training's own failure"):
@@ -416,6 +432,14 @@ _FITTED = [("../../escaped", "..-..-escaped"), ("sweep1/trial2", "sweep1-trial2"
 
 # MLflow's ID is taken as it is; torchrun's rendezvous ID becomes `run-<id>` (`tracker._launcher_run_id`),
 # so `..` there is `run-..`, which stays in the folder.
+@pytest.mark.parametrize("run_id", [Path("../../escaped"), Path("sweep1") / "trial2"])
+def test_an_explicit_run_id_that_is_not_a_string_is_judged_by_its_text(tmp_path, monkeypatch, run_id):
+    _work_folder(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match=r"^run_id .* cannot be used: "):
+        tensorquill.init(nn.Linear(2, 2), run_id=run_id, project="p", heartbeat_seconds=None)
+    assert _files_under(tmp_path) == []
+
+
 @pytest.mark.parametrize("variable, value, found, fitted", [
     *(("MLFLOW_RUN_ID", value, value, fitted) for value, fitted in _FITTED),
     *(("TORCHELASTIC_RUN_ID", value, f"run-{value}", f"run-{fitted}") for value, fitted in _FITTED if value != ".."),
@@ -529,24 +553,36 @@ def test_a_norm_that_is_not_finite_stays_not_finite(bad):
     assert math.isnan(float(written)) == math.isnan(bad)
 
 
-def test_an_ordinary_norm_is_recorded_bit_for_bit_as_before():
-    """In float32's range nothing in a report moves: the sum of float32 squares, then the square root
-    in float64 on the host, as the float32 buffer gave."""
+@pytest.mark.parametrize("kind", ["float64_tensor", "float32_tensor", "python_float"])
+def test_an_ordinary_norm_is_recorded_bit_for_bit_as_before(kind):
+    """In float32's range nothing in a report moves: what the float32 buffer gave, the square root in
+    float64 on the host of the float32 sum of squares. A tensor was moved to float32 and squared there;
+    a Python float was squared in float64 and then rounded to float32 as it was added."""
     torch.manual_seed(1)
     model = nn.Linear(2, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
-    cases = [[1.2345678], [0.1, 0.2, 0.3], [3.0, 4.0], [1e-3, 7e5], [1.8e19]]
+    rng = random.Random(0)
+    cases = [[1.2345678], [0.1], [0.1, 0.2, 0.3], [3.0, 4.0], [1e-3, 7e5], [1.8e19]]
+    cases += [[rng.uniform(0, 100) for _ in range(rng.randint(1, 3))] for _ in range(60)]
     for norms in cases:
         sink = MemorySink()
         with tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None) as session:
             model(torch.ones(1, 2)).sum().backward()
             for norm in norms:
-                session.record_grad_norm(torch.tensor(norm, dtype=torch.float64))
+                if kind == "python_float":
+                    session.record_grad_norm(norm)
+                else:
+                    dtype = torch.float64 if kind == "float64_tensor" else torch.float32
+                    session.record_grad_norm(torch.tensor(norm, dtype=dtype))
             optimizer.step()
             optimizer.zero_grad()
         before = torch.zeros((), dtype=torch.float32)
         for norm in norms:
-            before.add_(torch.tensor(norm, dtype=torch.float64).to(before).square())
+            if kind == "python_float":
+                before.add_(float(norm) ** 2)
+            else:
+                dtype = torch.float64 if kind == "float64_tensor" else torch.float32
+                before.add_(torch.tensor(norm, dtype=dtype).to(before).square())
         assert sink.records[0]["clip_grad_norm"] == math.sqrt(float(before)), norms
 
 
