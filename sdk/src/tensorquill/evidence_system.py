@@ -54,14 +54,24 @@ _METRIC_KINDS = {"ecc_uncorrected": ["hardware_errors"], "xid": ["hardware_error
 
 
 def _count(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+    """A count, as Rust's `system::count` takes one: an integer that is an `i64` (`is_i64`). A bool
+    is not a count, and an integer outside `i64` (such as 10**400) is none either, so no rule does
+    float arithmetic on a number no float holds (wave AO)."""
+    if isinstance(value, int) and not isinstance(value, bool) and -(2**63) <= value < 2**63:
+        return value
+    return None
 
 
 def _number(value: Any) -> float | None:
-    """A finite number, else None; a bool is not a number (DET-16), as Rust's `system::number`."""
+    """A finite number, else None; a bool is not a number (DET-16), as Rust's `system::number`. An
+    integer too large for a float is None too, as `evidence._finite` reads it."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _median(values: list[float]) -> float:

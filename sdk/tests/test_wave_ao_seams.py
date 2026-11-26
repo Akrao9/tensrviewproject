@@ -736,3 +736,238 @@ def test_the_contract_turns_item_5_of_lane_al_4s_list_and_names_the_seq_drop_bes
     assert ("The offline modes read all three (sections 3, 4.5, 5). Under metadata 2, a version 2 row whose `seq` is "
             "null, which is not a whole scalar-only record, is dropped and counted the same way under the key `seq` "
             "(lane AO-3, BUG-02; accepted by the owner, Nov 26)") in text
+
+
+# --- 5. The follow-up (Nov 26) ---------------------------------------------------------------------------
+
+def _timed_run(place: str, value) -> list[dict]:
+    """A healthy run of 40 steps with `data_wait`, `step_time`, `lr`, `grad_scale` and a throttled
+    GPU's NVML reading, whose record at step 20 holds `value` in `place`."""
+    rows = []
+    for step in range(40):
+        row = {"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0,
+               "data_wait": 0.01, "step_time": 0.1, "lr": [0.001], "grad_scale": 1024.0,
+               "system": {"nvml": {"throttle": ["sw_thermal"] if step >= 30 else [], "temperature_c": 70,
+                                   "sm_clock_mhz": 1500, "power_w": 300.0, "power_limit_w": 400.0}}}
+        if step == 20:
+            if place == "lr":
+                row["lr"] = [value]
+            elif place in ("data_wait", "step_time", "grad_scale"):
+                row[place] = value
+            else:
+                row["system"]["nvml"][place] = value
+        rows.append(row)
+    return rows
+
+
+TIMED_PLACES = ["lr", "data_wait", "step_time", "grad_scale"]
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("place", TIMED_PLACES)
+def test_the_python_detectors_read_such_an_integer_in_lr_data_wait_step_time_and_grad_scale(place, sign):
+    found = evidence.build_evidence(_timed_run(place, sign * BIG), detectors="python")
+    assert _judged(found) == _judged(evidence.build_evidence(_timed_run(place, 1.0), detectors="python"))
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("place", TIMED_PLACES)
+def test_both_engines_judge_such_an_integer_in_lr_data_wait_step_time_and_grad_scale_alike(place, sign):
+    records = _timed_run(place, sign * BIG)
+    python, rust = (evidence.build_evidence(records, detectors=engine) for engine in ("python", "rust"))
+    assert _judged(python) == _judged(rust)
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_a_throttled_gpus_reading_too_large_for_a_float_is_no_value(sign):
+    """`gpu_throttled` carries the NVML reading at its step: such an integer there is no value."""
+    rows = _timed_run("lr", 0.001)
+    rows[30]["system"]["nvml"]["temperature_c"] = sign * BIG
+    [incident] = [i for i in evidence.build_evidence(rows, detectors="python")["incidents"] if i["kind"] == "gpu_throttled"]
+    assert incident["step"] == 30 and incident["temperature_c"] is None and incident["power_w"] == 300.0
+
+
+@pytest.mark.parametrize("module", ["data_checks", "evidence_system"])
+def test_each_readers_number_reads_such_an_integer_as_a_value_it_cannot_read(module):
+    import importlib
+
+    number = importlib.import_module(f"tensorquill.{module}")._number
+    assert number(BIG) is None and number(-BIG) is None
+    assert number(2**1023) == float(2**1023) and number(3) == 3.0 and number(math.inf) is None and number(True) is None
+
+
+# The sweep: ±10**400 in each of 43 fields of a full record, through every reader of records (both
+# engines, `compact`, `incident_summary`, the Rerun export, `scalar_series`, `first_divergence`,
+# `compare_runs`, `list_runs`, the MCP tools, `compare_replicas`). What it found beyond the two above.
+
+def _memory_run(place: str, value) -> list[dict]:
+    rows = []
+    for step in range(12):
+        cuda = {"allocated": 100 + step, "reserved": 200, "total": 10_000, "peak_allocated": 150,
+                "alloc_retries": 0, "ooms": 0}
+        if step == 6:
+            cuda[place] = value
+        rows.append({"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0,
+                     "system": {"cuda": cuda}})
+    return rows
+
+
+@pytest.mark.parametrize("value", [BIG, -BIG, 2**64], ids=["big", "minus_big", "past_int64"])
+@pytest.mark.parametrize("place", ["total", "reserved", "allocated"])
+def test_a_memory_count_rust_cannot_hold_is_read_as_no_count(place, value):
+    """Rust's `system::count` takes a value only when it is an `i64` (`is_i64`): one outside is no
+    count, and the memory rules raise nothing on it."""
+    from tensorquill import evidence_system
+
+    assert evidence_system._count(value) is None and evidence_system._count(2**63 - 1) == 2**63 - 1
+    found = evidence.build_evidence(_memory_run(place, value), detectors="python")
+    assert _judged(found) == _judged(evidence.build_evidence(_memory_run(place, None), detectors="python"))
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("value", [BIG, -BIG, 2**64], ids=["big", "minus_big", "past_int64"])
+@pytest.mark.parametrize("place", ["total", "reserved", "allocated"])
+def test_both_engines_judge_a_memory_count_rust_cannot_hold_alike(place, value):
+    records = _memory_run(place, value)
+    python, rust = (evidence.build_evidence(records, detectors=engine) for engine in ("python", "rust"))
+    assert _judged(python) == _judged(rust)
+
+
+def test_a_step_too_large_for_a_float_gives_no_trend_and_raises_nothing():
+    """A step is any integer of 0 or more to the readers; past a float's range no trend can place
+    it (`robust_trend`), so there is none, and the rest of the evidence is read."""
+    rows = [{"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0} for step in range(30)]
+    rows.append({"schema_version": 1, "run_id": "r", "rank": 0, "step": BIG, "grad_norm": 1.0})
+    assert evidence.robust_trend([*range(29), BIG], [1.0] * 30) is None
+    found = evidence.build_evidence(rows, detectors="python")
+    assert found["run_state"]["state"] == "healthy"
+
+
+def _replica_records(fp_of_rank_1: list) -> list[dict]:
+    case = json.loads((SDK / "tests" / "fixtures" / "replica" / "incident_cases.json").read_text())
+    records = case["cases"]["drift_on_one_of_three"]["records"]
+    records[1]["replica"]["params"]["w"]["fp"] = fp_of_rank_1
+    return records
+
+
+@pytest.mark.parametrize("at", [0, 1, 2])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_a_replica_fingerprint_too_large_for_a_float_reads_as_one_not_finite(at, sign):
+    """Rust reads such a number in the observation as text (`detect/extra_json.rs`) and a text
+    fingerprint as NaN (`replica.rs`'s `number`); Python's `_fingerprint` now gives NaN too, so the
+    comparison is the one a fingerprint of "nan" gives."""
+    big, nan = [3.6, -1.2, 0.7], [3.6, -1.2, 0.7]
+    big[at], nan[at] = sign * BIG, "nan"
+    assert evidence._fingerprint(sign * BIG) != evidence._fingerprint(sign * BIG)  # NaN
+    assert evidence.compare_replicas(_replica_records(big)) == evidence.compare_replicas(_replica_records(nan))
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("at", [0, 1, 2])
+def test_both_engines_compare_a_replica_fingerprint_too_large_for_a_float_alike(at):
+    from tensorquill.server_detect import server_run_report
+
+    fp = [3.6, -1.2, 0.7]
+    fp[at] = BIG
+    records = _replica_records(fp)
+    python, rust = evidence.compare_replicas(records), server_run_report(records, binary=BINARY)["replica"]
+    for key in ("steps", "replica_drift", "attribution"):
+        assert python.get(key) == rust.get(key), key
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("place", ["grad_norm", "layer"])
+def test_the_rerun_export_leaves_out_a_value_too_large_for_a_float(tmp_path, monkeypatch, place, sign):
+    """The export logs a finite number only (`_finite`): such an integer is left out, and nothing raises."""
+    pytest.importorskip("numpy")
+    from unittest import mock
+    import sys
+
+    logged: list[str] = []
+    rr = mock.MagicMock(name="rerun")
+    rr.escape_entity_path_part.side_effect = lambda part: part
+    rr.log.side_effect = lambda entity, *_, **__: logged.append(entity)
+    monkeypatch.setitem(sys.modules, "rerun", rr)
+    monkeypatch.setitem(sys.modules, "rerun.blueprint", mock.MagicMock(name="rerun.blueprint"))
+    rows = _plain_run(**{place: True})
+    for row in rows:
+        if row["step"] == 20 and sign < 0:
+            row["grad_norm"] = -BIG if place == "grad_norm" else row["grad_norm"]
+            row["layers"]["blk"]["abs_max"] = -BIG if place == "layer" else row["layers"]["blk"]["abs_max"]
+    built = evidence.build_evidence(rows, detectors="python")
+    evidence.export_rerun(built, tmp_path / "r.rrd", records=evidence.load_records(rows, scalars=True))
+    entity = "/training/grad_norm" if place == "grad_norm" else "/layers/blk/abs_max"
+    assert logged.count(entity) == 39  # 40 steps, the one holding the integer left out
+
+
+def _flight_recorder_hang(directory: Path) -> Path:
+    """`test_lane_u7_evidence.py`'s two-rank dump: rank 1 never entered all_reduce #2."""
+    import pickle
+
+    def entry(record_id, seq, state="completed"):
+        return {"profiling_name": "nccl:all_reduce", "state": state, "process_group": ("0", "default_pg"),
+                "input_sizes": [[4]], "output_sizes": [[4]], "input_dtypes": "float32", "output_dtypes": "float32",
+                "collective_seq_id": str(seq), "p2p_seq_id": "0", "time_created_ns": 0, "frames": [],
+                "record_id": record_id, "is_p2p": False}
+
+    directory.mkdir()
+    for rank, entries in ((0, [entry(0, 1), entry(1, 2, "started")]), (1, [entry(0, 1)])):
+        (directory / f"nccl_trace_rank_{rank}").write_bytes(pickle.dumps({
+            "entries": entries, "version": "2.8", "pg_config": {"0": {"name": "0", "desc": "default_pg", "ranks": "[0, 1]"}}}))
+    return directory
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_a_ts_too_large_for_a_float_is_no_time_when_a_dump_corroborates_a_stall(tmp_path, sign):
+    """The time of the last recorded step (`newest_ts`, read only when a complete Flight Recorder dump
+    shows a hang) leaves out a `ts` no float holds, as any other value that is not a time."""
+    pytest.importorskip("torch.distributed.flight_recorder.components.builder")  # PyTorch 2.10 or later
+    import time as clock
+
+    dumps = _flight_recorder_hang(tmp_path / "fr")
+    now = clock.time()
+    records = [{"run_id": "r", "step": s, "grad_norm": 1.0, "ts": now - 100 + s} for s in range(5)]
+    records[4]["ts"] = sign * BIG
+    silent = {"rank": 0, "attempt": 1, "last_step": 4, "seconds_since_progress": 900.0, "stream": "open",
+              "state": "silent", "phase": "train", "heartbeat_age_seconds": 2.0, "severity": "critical"}
+    status = {"schema_version": 1, "run_id": "r", "written_at_ms": 1_000, "silent_floor_seconds": 300.0,
+              "summary": "stalled", "ranks": [silent], "missing_ranks": []}
+    found = evidence.build_evidence(records, watchdog=status, flight_recorder=dumps)
+    kinds = {incident["kind"]: incident for incident in found["incidents"]}
+    assert kinds["job_stalled"]["assessment"] == "confirmed_hang"  # the other steps' times are read
+    assert evidence._newest_stamp([{"ts": BIG}, {"ts": 3}, {"ts": True}, {"ts": "x"}, {}]) == 3.0
+    assert evidence._newest_stamp([{"ts": -BIG}]) is None
+
+
+GUIDE_VERSIONS = ("`rank` and `attempt`, when present, must be integers of 0 or more, and `schema_version` 0 or 1, or "
+                  '2 for a scalar-only record alone, one with `"record": "scalars"` and a `seq` that is an integer of 0 '
+                  "or more, as `session.log(..., step=N)` writes it; a version 2 record without them, and any other "
+                  "version, is refused.")
+
+
+def test_the_guide_gives_the_schema_versions_the_readers_take():
+    text = _flat(_page("sdk/RUN_ON_YOUR_JOB.md"))
+    assert GUIDE_VERSIONS in text
+    assert "and `schema_version` 0 or 1. A Boolean" not in text
+
+
+def test_the_readers_take_the_schema_versions_the_guide_gives():
+    """The sentence above, run through `load_records`: 0, 1 and absent as step records, 2 as a whole
+    scalar-only record only, anything else refused naming `schema_version` (or `seq`)."""
+    from tensorquill import identity
+
+    step = {"run_id": "r", "rank": 0, "step": 0, "grad_norm": 1.0}
+    for version in ({}, {"schema_version": 0}, {"schema_version": 1},
+                    {"schema_version": 2, "record": "scalars", "seq": 0, "scalars": {"x": 1.0}}):
+        assert len(evidence.load_records([{**step, **version}], scalars=True)) == 1
+    for version, field in (({"schema_version": 2}, "schema_version"),
+                           ({"schema_version": 2, "record": "scalars", "scalars": {"x": 1.0}}, "seq"),
+                           ({"schema_version": 3}, "schema_version"), ({"schema_version": 1.0}, "schema_version"),
+                           ({"schema_version": True}, "schema_version"), ({"schema_version": None}, "schema_version")):
+        with pytest.raises(identity.MalformedRecordError) as refused:
+            evidence.load_records([{**step, **version}], scalars=True)
+        assert refused.value.field == field
