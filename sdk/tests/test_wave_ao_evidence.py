@@ -462,3 +462,58 @@ def test_bug11_both_engines_give_the_same_replica_comparison(name):
     for key in ("steps", "replica_drift", "attribution"):
         assert python.get(key) == rust.get(key), key
 
+
+# ---- BUG-13: a change of `moe_top_k` during a run -------------------------------------------------
+#
+# Rust judges each record with the experts per token in force when it arrives (its own value, or
+# the last one recorded before it; 1 before any); Python took the run's last value for every step.
+
+TOP_K_CHANGE = [{"run_id": "r", "rank": 0, "step": 0, "moe": {"router": [45, 45, 2, 2, 2, 2, 1, 1]}, "moe_top_k": {"router": 1}},
+                {"run_id": "r", "rank": 0, "step": 1, "moe": {"router": [12, 13, 12, 13, 12, 13, 12, 13]}, "moe_top_k": {"router": 4}}]
+
+
+def _overloaded(built: dict) -> list[tuple[int, list[int], str | None]]:
+    return [(s["step"], s["overloaded"], (s.get("overload_rule") or {}).get("rule")) for s in built["samples"]]
+
+
+def test_bug13_each_step_is_judged_with_the_experts_per_token_then_in_force():
+    built = evidence.build_evidence(TOP_K_CHANGE, detectors="python")
+    assert _overloaded(built) == [(0, [1, 2], "share"), (1, [], "diversity_drop")]
+    assert built["top_k"] == {"router": 4}  # the value in force at the end, as before
+
+
+def _changing_run() -> list[dict]:
+    """Top-1 for 30 steps, then top-4 with a collapse onto two experts from step 50."""
+    draw = random.Random(13)
+    rows = []
+    for step in range(80):
+        k = 1 if step < 30 else 4
+        counts = [draw.randrange(90, 110) for _ in range(8)]
+        if step >= 50:
+            counts = [400, 400, *[draw.randrange(0, 5) for _ in range(6)]]
+        row = {"run_id": "r", "rank": 0, "step": step, "moe": {"router": counts}}
+        if step % 10 == 0:  # recorded on some steps only: the last value stands between them
+            row["moe_top_k"] = {"router": k}
+        rows.append(row)
+    return rows
+
+
+@pytest.mark.parametrize("top_k", [None, 2, {"router": 3}], ids=["recorded", "one_for_all", "per_router"])
+def test_bug13_both_engines_give_the_same_samples_when_the_top_k_changes(top_k):
+    for rows in (TOP_K_CHANGE, _changing_run()):
+        python, rust = evidence.build_evidence(rows, detectors="python", top_k=top_k), _rust(rows, top_k=top_k)
+        assert _overloaded(python) == _overloaded(rust)
+        assert [(s["step"], s["dead"]) for s in python["samples"]] == [(s["step"], s["dead"]) for s in rust["samples"]]
+        assert _kinds(python) == _kinds(rust)
+        assert python["top_k"] == rust["top_k"]
+
+
+def test_bug13_pin_an_override_stands_over_every_recorded_value():
+    built = evidence.build_evidence(TOP_K_CHANGE, detectors="python", top_k=1)
+    assert [rule for _, _, rule in _overloaded(built)] == ["share", "share"] and built["top_k"] == {"router": 1}
+
+
+def test_bug13_pin_a_router_is_judged_top_1_before_its_first_recorded_value():
+    rows = [{**TOP_K_CHANGE[0], "moe_top_k": {}}, TOP_K_CHANGE[1]]
+    assert _overloaded(evidence.build_evidence(rows, detectors="python"))[0] == (0, [1, 2], "share")
+
