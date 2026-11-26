@@ -903,17 +903,44 @@ def _real(buf: torch.Tensor) -> bool:
     return type(buf) is torch.Tensor
 
 
+def _version_setter_takes_sequences() -> bool | None:
+    """Whether `torch._C._autograd._unsafe_set_version_counter` takes sequences of tensors and versions
+    (later releases) or one tensor and one version (PyTorch 2.6), asked once with two empty tuples:
+    a release that takes sequences sets nothing, one that does not raises a `TypeError` whose text
+    names only the two empty tuples. None when the function is not there."""
+    setter = getattr(getattr(torch._C, "_autograd", None), "_unsafe_set_version_counter", None)
+    if setter is None:
+        return None
+    try:
+        setter((), ())
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+# Chosen once, at import, with no tensor: a call in the wrong form raises a `TypeError` whose text
+# prints each tensor it was given (`Tensor.__repr__` runs inside the C call), and an exception raised
+# while it prints, such as the `SystemExit` of a job's SIGTERM handler, is lost there (SIG-26: on
+# PyTorch 2.6 the tuple form was tried first at every step with hooked buffers).
+_VERSION_SETTER_TAKES_SEQUENCES = _version_setter_takes_sequences()
+
+
 def _restore_versions(tensors: Sequence[torch.Tensor], versions: Sequence[int]) -> None:
     """Set each tensor's autograd version back, what `torch.autograd._unsafe_preserve_version_counter`
-    does on exit. Private API, so best effort: without it the version stays bumped, as before."""
+    does on exit, in the form this PyTorch takes (`_VERSION_SETTER_TAKES_SEQUENCES`), so no call fails.
+    Private API, so best effort: without it the version stays bumped, as before."""
+    form = _VERSION_SETTER_TAKES_SEQUENCES
+    if form is None:
+        return
     try:
-        torch._C._autograd._unsafe_set_version_counter(tuple(tensors), tuple(versions))
-    except Exception:  # noqa: BLE001
-        try:  # older releases take one tensor at a time
+        setter = torch._C._autograd._unsafe_set_version_counter
+        if form:
+            setter(tuple(tensors), tuple(versions))
+        else:  # PyTorch 2.6 takes one tensor at a time
             for tensor, version in zip(tensors, versions):
-                torch._C._autograd._unsafe_set_version_counter(tensor, version)
-        except Exception:  # noqa: BLE001
-            pass
+                setter(tensor, version)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class _NotRecomputed:
