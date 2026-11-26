@@ -479,6 +479,24 @@ def compact_path(path: str | Path) -> Path:
     return path.with_name(path.stem + ".compact" + path.suffix)
 
 
+def full_path_of(path: str | Path) -> Path | None:
+    """The full file whose compact file's default name (`compact_path`) is `path`, or None when no
+    name gives it. The one inverse of `compact_path`: `run.evidence.compact.json` ->
+    `run.evidence.json`, `stall.compact.compact.json` -> `stall.compact.json`, `x.compact.txt` ->
+    `x.txt`, `x.compact` -> `x`. A name in the compact form may also be a full file of its own
+    (the watcher's output named `stall.compact.json`): this says only which name it would be the
+    compact copy of (wave AP, AO-06)."""
+    path = Path(path)
+    name, mark = path.name, ".compact"
+    start = name.find(mark)
+    while start != -1:
+        rest = name[:start] + name[start + len(mark):]
+        if rest and compact_path(full := path.with_name(rest)) == path:  # `.compact` alone: no name gives it
+            return full
+        start = name.find(mark, start + 1)
+    return None
+
+
 def write_compact(evidence: Mapping[str, Any], path: str | Path, *, window: int = DEFAULT_WINDOW,
                   named: bool = False) -> Path:
     """Write the compact form of `evidence`. `path` is where the full file would go: the

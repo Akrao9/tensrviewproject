@@ -210,6 +210,48 @@ def state_path_for(evidence_path: str | Path) -> Path:
     return path.with_name(stem + ".fired.json")
 
 
+def _names_evidence(state_path: Path, evidence: Path) -> bool:
+    """Whether the state file at `state_path` says it handed over `evidence`. Its `evidence` is the
+    absolute path `_save` wrote, and the state file is beside that file, so the file's name is what
+    is compared: a run folder moved or mounted elsewhere with its files still matches."""
+    try:
+        document = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    named = document.get("evidence") if isinstance(document, dict) else None
+    return isinstance(named, str) and Path(named).name == evidence.name
+
+
+def state_path_handed(evidence_path: str | Path) -> Path:
+    """The state file of the trigger that handed over `evidence_path` in `TENSORQUILL_EVIDENCE`,
+    or of the full file that one is the compact copy of: the one `tensorquill-mcp` reads.
+
+    The trigger names its state file from the file the watcher wrote (`state_path_for`), and the
+    compact copy it hands over is `compact.compact_path` of that file. One strip of `.compact` in
+    `state_path_for` gives the same state file for every name but one ending in `.compact.json` or
+    `.compact`, or with a suffix other than `.json`: `stall.compact.json` keeps `stall.fired.json`
+    and hands `stall.compact.compact.json`, whose own name gives `stall.compact.fired.json` (wave
+    AP, AO-06). No state file is renamed: a new name would fire every past incident again. So the
+    file's own name (`state_path_for`) stands, unless the full file it is the compact copy of
+    (`compact.full_path_of`) has another state file, and that state file says it handed over this
+    file or that full one while the file's own does not say it handed this one. A state file
+    records the evidence it handed (`_save`), so the two are told apart by what they say, never by
+    which of them exists."""
+    from .compact import full_path_of
+
+    path = Path(evidence_path)
+    own = state_path_for(path)
+    full = full_path_of(path)
+    if full is None:
+        return own
+    beside = state_path_for(full)
+    if beside == own or _names_evidence(own, path):
+        return own
+    if _names_evidence(beside, path) or _names_evidence(beside, full):
+        return beside
+    return own
+
+
 def _strict(value: Any) -> Any:
     """`value` with every NaN and Inf as the string the capture writes for it (`json_safe`), for a
     body any JSON parser reads."""
