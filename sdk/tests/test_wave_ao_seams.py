@@ -823,7 +823,7 @@ def test_a_memory_count_rust_cannot_hold_is_read_as_no_count(place, value):
 
     assert evidence_system._count(value) is None and evidence_system._count(2**63 - 1) == 2**63 - 1
     found = evidence.build_evidence(_memory_run(place, value), detectors="python")
-    assert _judged(found) == _judged(evidence.build_evidence(_memory_run(place, 1), detectors="python"))
+    assert _judged(found) == _judged(evidence.build_evidence(_memory_run(place, None), detectors="python"))
 
 
 @needs_pyarrow

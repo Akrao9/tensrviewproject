@@ -1259,8 +1259,11 @@ def robust_trend(steps: list[int], values: list[float]) -> dict[str, Any] | None
     if n < TREND_MIN_POINTS:
         return None
     k = max(1, n // 3)
-    left_step, left = _median([float(v) for v in steps[:k]]), _median(values[:k])
-    right_step, right = _median([float(v) for v in steps[-k:]]), _median(values[-k:])
+    try:  # a step is any integer of 0 or more; one past a float's range has no place on a line
+        left_step, right_step = _median([float(v) for v in steps[:k]]), _median([float(v) for v in steps[-k:]])
+    except OverflowError:
+        return None
+    left, right = _median(values[:k]), _median(values[-k:])
     if right_step - left_step <= 0:
         return None
     slope = (right - left) / (right_step - left_step)
@@ -6919,7 +6922,10 @@ def _fingerprint(value: Any) -> float:
     if isinstance(value, bool):
         return math.nan
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            return float(value)
+        except OverflowError:  # Rust reads it as text (`detect/extra_json.rs`), and text as NaN
+            return math.nan
     if isinstance(value, str):
         try:
             return float(value)
@@ -9533,9 +9539,9 @@ def export_rerun(
             overridden = {name: set(at) for name, at in standing.items()}
             for record in records:
                 rr.set_time("training_step", sequence=int(record["step"]))
-                grad_norm = record.get("grad_norm")
-                if isinstance(grad_norm, (int, float)) and math.isfinite(grad_norm):
-                    rr.log("/training/grad_norm", rr.Scalars(float(grad_norm)))
+                grad_norm = _finite(record.get("grad_norm"))
+                if grad_norm is not None:
+                    rr.log("/training/grad_norm", rr.Scalars(grad_norm))
                     training_paths["/training/grad_norm"] = "Gradient norm"
                 clip_norm = _finite(record.get("clip_grad_norm"))
                 if clip_norm is not None:
@@ -9569,10 +9575,11 @@ def export_rerun(
                     probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
                 for layer_name, stats in layer_entries(record):
                     for key, val in stats.items():
-                        if isinstance(val, (int, float)) and math.isfinite(val):
+                        val = _finite(val)  # a bool is no value, as the column refuses one (DET-16)
+                        if val is not None:
                             entity = (f"/layers/{rr.escape_entity_path_part(str(layer_name))}"
                                       f"/{rr.escape_entity_path_part(str(key))}")
-                            rr.log(entity, rr.Scalars(float(val)))
+                            rr.log(entity, rr.Scalars(val))
                             activation_paths.setdefault(key, set()).add(entity)
             for name, at in standing.items():
                 entity = _logged_entity(rr, name)
