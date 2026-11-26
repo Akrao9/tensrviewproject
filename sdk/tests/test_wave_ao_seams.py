@@ -796,3 +796,109 @@ def test_each_readers_number_reads_such_an_integer_as_a_value_it_cannot_read(mod
     number = importlib.import_module(f"tensorquill.{module}")._number
     assert number(BIG) is None and number(-BIG) is None
     assert number(2**1023) == float(2**1023) and number(3) == 3.0 and number(math.inf) is None and number(True) is None
+
+
+# The sweep: ±10**400 in each of 43 fields of a full record, through every reader of records (both
+# engines, `compact`, `incident_summary`, the Rerun export, `scalar_series`, `first_divergence`,
+# `compare_runs`, `list_runs`, the MCP tools, `compare_replicas`). What it found beyond the two above.
+
+def _memory_run(place: str, value) -> list[dict]:
+    rows = []
+    for step in range(12):
+        cuda = {"allocated": 100 + step, "reserved": 200, "total": 10_000, "peak_allocated": 150,
+                "alloc_retries": 0, "ooms": 0}
+        if step == 6:
+            cuda[place] = value
+        rows.append({"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0,
+                     "system": {"cuda": cuda}})
+    return rows
+
+
+@pytest.mark.parametrize("value", [BIG, -BIG, 2**64], ids=["big", "minus_big", "past_int64"])
+@pytest.mark.parametrize("place", ["total", "reserved", "allocated"])
+def test_a_memory_count_rust_cannot_hold_is_read_as_no_count(place, value):
+    """Rust's `system::count` takes a value only when it is an `i64` (`is_i64`): one outside is no
+    count, and the memory rules raise nothing on it."""
+    from tensorquill import evidence_system
+
+    assert evidence_system._count(value) is None and evidence_system._count(2**63 - 1) == 2**63 - 1
+    found = evidence.build_evidence(_memory_run(place, value), detectors="python")
+    assert _judged(found) == _judged(evidence.build_evidence(_memory_run(place, 1), detectors="python"))
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("value", [BIG, -BIG, 2**64], ids=["big", "minus_big", "past_int64"])
+@pytest.mark.parametrize("place", ["total", "reserved", "allocated"])
+def test_both_engines_judge_a_memory_count_rust_cannot_hold_alike(place, value):
+    records = _memory_run(place, value)
+    python, rust = (evidence.build_evidence(records, detectors=engine) for engine in ("python", "rust"))
+    assert _judged(python) == _judged(rust)
+
+
+def test_a_step_too_large_for_a_float_gives_no_trend_and_raises_nothing():
+    """A step is any integer of 0 or more to the readers; past a float's range no trend can place
+    it (`robust_trend`), so there is none, and the rest of the evidence is read."""
+    rows = [{"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0} for step in range(30)]
+    rows.append({"schema_version": 1, "run_id": "r", "rank": 0, "step": BIG, "grad_norm": 1.0})
+    assert evidence.robust_trend([*range(29), BIG], [1.0] * 30) is None
+    found = evidence.build_evidence(rows, detectors="python")
+    assert found["run_state"]["state"] == "healthy"
+
+
+def _replica_records(fp_of_rank_1: list) -> list[dict]:
+    case = json.loads((SDK / "tests" / "fixtures" / "replica" / "incident_cases.json").read_text())
+    records = case["cases"]["drift_on_one_of_three"]["records"]
+    records[1]["replica"]["params"]["w"]["fp"] = fp_of_rank_1
+    return records
+
+
+@pytest.mark.parametrize("at", [0, 1, 2])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_a_replica_fingerprint_too_large_for_a_float_reads_as_one_not_finite(at, sign):
+    """Rust reads such a number in the observation as text (`detect/extra_json.rs`) and a text
+    fingerprint as NaN (`replica.rs`'s `number`); Python's `_fingerprint` now gives NaN too, so the
+    comparison is the one a fingerprint of "nan" gives."""
+    big, nan = [3.6, -1.2, 0.7], [3.6, -1.2, 0.7]
+    big[at], nan[at] = sign * BIG, "nan"
+    assert evidence._fingerprint(sign * BIG) != evidence._fingerprint(sign * BIG)  # NaN
+    assert evidence.compare_replicas(_replica_records(big)) == evidence.compare_replicas(_replica_records(nan))
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("at", [0, 1, 2])
+def test_both_engines_compare_a_replica_fingerprint_too_large_for_a_float_alike(at):
+    from tensorquill.server_detect import server_run_report
+
+    fp = [3.6, -1.2, 0.7]
+    fp[at] = BIG
+    records = _replica_records(fp)
+    python, rust = evidence.compare_replicas(records), server_run_report(records, binary=BINARY)["replica"]
+    for key in ("steps", "replica_drift", "attribution"):
+        assert python.get(key) == rust.get(key), key
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("place", ["grad_norm", "layer"])
+def test_the_rerun_export_leaves_out_a_value_too_large_for_a_float(tmp_path, monkeypatch, place, sign):
+    """The export logs a finite number only (`_finite`): such an integer is left out, and nothing raises."""
+    pytest.importorskip("numpy")
+    from unittest import mock
+    import sys
+
+    logged: list[str] = []
+    rr = mock.MagicMock(name="rerun")
+    rr.escape_entity_path_part.side_effect = lambda part: part
+    rr.log.side_effect = lambda entity, *_, **__: logged.append(entity)
+    monkeypatch.setitem(sys.modules, "rerun", rr)
+    monkeypatch.setitem(sys.modules, "rerun.blueprint", mock.MagicMock(name="rerun.blueprint"))
+    rows = _plain_run(**{place: True})
+    for row in rows:
+        if row["step"] == 20 and sign < 0:
+            row["grad_norm"] = -BIG if place == "grad_norm" else row["grad_norm"]
+            row["layers"]["blk"]["abs_max"] = -BIG if place == "layer" else row["layers"]["blk"]["abs_max"]
+    built = evidence.build_evidence(rows, detectors="python")
+    evidence.export_rerun(built, tmp_path / "r.rrd", records=evidence.load_records(rows, scalars=True))
+    entity = "/training/grad_norm" if place == "grad_norm" else "/layers/blk/abs_max"
+    assert logged.count(entity) == 39  # 40 steps, the one holding the integer left out
