@@ -254,7 +254,7 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
             blocks.append([])
         blocks[-1].append(message)
     # The sequence number too is matched whole, so #1 is not taken for #12.
-    numbered = re.compile(rf"sequence number: {re.escape(str(first.collective_seq_id))}(?!\S)")
+    numbered = re.compile(rf"sequence number: {re.escape(str(first.collective_seq_id))}(?!\d)")
     named = f"group info: {first.pg_desc}"
     detail = next(("\n".join(block) for block in blocks if numbered.search(block[0]) and named in block), None)
     culprit = None

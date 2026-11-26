@@ -615,3 +615,39 @@ def test_the_mirror_s_integers_make_the_same_arrow_row_as_plain_integers(monkeyp
              for r in records]
     assert any(type(v) is not int and isinstance(v, int) for r in records for v in r["scalars"].values())
     assert records_to_batch(records).equals(records_to_batch(plain))
+
+
+@pytest.mark.parametrize("fullgraph", [False, True])
+def test_a_compiled_step_that_logs_beside_the_mirror_records_each_value_and_compiles_once(monkeypatch, fullgraph):
+    """`session.log` traced inside a compiled step updates the dictionary the mirror's integers sit
+    in; the values are those logged and the function is not compiled again at every step."""
+    wandb, _ = _stand_in_trackers(monkeypatch)
+    torch._dynamo.reset()
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    compiled = []
+
+    def count(gm, inputs):
+        compiled.append(gm)
+        return gm.forward
+
+    @torch.compile(backend=count, fullgraph=fullgraph)
+    def train_step(x):
+        loss = model(x).sum()
+        session.log({"loss": loss, "k": 1})
+        return loss
+
+    warmed = None
+    with session:
+        for step in range(12):
+            wandb.log({"k": 1, "epoch": step % 3})
+            train_step(torch.full((1, 1), float(step))).backward()
+            wandb.log({"k": 9})
+            session.step()
+            if step == 3:
+                warmed = len(compiled)
+    torch._dynamo.reset()
+    scalars = [r["scalars"] for r in sink.records]
+    assert [s["k"] for s in scalars] == [1] * 12
+    assert [s["epoch"] for s in scalars] == [0, 1, 2] * 4
+    assert len(compiled) == warmed  # nothing compiled again after the first steps
