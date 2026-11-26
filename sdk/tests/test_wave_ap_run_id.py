@@ -85,11 +85,14 @@ def test_a_path_run_id_and_the_equal_string_give_the_same_capture(tmp_path, monk
         _work(work, monkeypatch)
         session = _capture(run_id)
         out = work / "work" / "tensorquill-out"
+        end = json.loads((out / "same.rank0.end.json").read_text())
+        # The file's size, which follows the length of the time fields' text: checked against the file, not compared.
+        assert end.pop("records_bytes") == (out / "same.rank0.jsonl").stat().st_size
         captured[kind] = (
             _files(out),
             _untimed(json.loads((out / "same.run.json").read_text())),
             _untimed(_records(out / "same.rank0.jsonl")),
-            _untimed(json.loads((out / "same.rank0.end.json").read_text())),
+            _untimed(end),
             (session.run.run_id, type(session.run.run_id), session.run.source),
         )
     assert captured["path"] == captured["text"]
@@ -187,10 +190,19 @@ from pathlib import Path
 import torch.distributed as dist
 from torch import nn
 
-rank, world, store_path, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+rank, world, store_path, out, mode = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 dist.init_process_group("gloo", store=dist.FileStore(store_path, world), rank=rank, world_size=world,
                         timeout=datetime.timedelta(seconds=15))
 import tensorquill
+if mode == "older" and rank == 0:
+    # A rank 0 on an older TensorQuill given run_id=123: it set today's key alone, no mark, and the
+    # integer in the JSON entry, as `json.dumps([run_id, source])` gave it.
+    dist.distributed_c10d._get_default_store().set("tensorquill/run_id/0", json.dumps([123, "explicit"]))
+    with open(out, "w") as file:
+        json.dump({"rank": 0}, file)
+    dist.barrier()
+    dist.destroy_process_group()
+    sys.exit(0)
 with warnings.catch_warnings(record=True) as said:
     warnings.simplefilter("always")
     # Rank 0 alone is given the run ID, as a Path; the other rank takes rank 0's.
@@ -205,11 +217,13 @@ found = {"run_id": session.run.run_id, "type": type(session.run.run_id).__name__
          "warnings": [str(w.message) for w in said if "run ID" in str(w.message)]}
 with open(out, "w") as file:
     json.dump(found, file)
+dist.barrier()
 dist.destroy_process_group()
 """
 
 
-def test_on_a_second_rank_the_shared_id_is_the_string(tmp_path):
+def _two_ranks(tmp_path, mode):
+    """Two gloo processes running `_RANK_SCRIPT`; every wait has a deadline (the group's 15 s, 90 s a process)."""
     script = tmp_path / "rank.py"
     script.write_text(_RANK_SCRIPT)
     env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED}
@@ -219,7 +233,7 @@ def test_on_a_second_rank_the_shared_id_is_the_string(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     procs = [subprocess.Popen([sys.executable, str(script), str(rank), "2", str(tmp_path / "store"),
-                               str(tmp_path / f"rank{rank}.json")],
+                               str(tmp_path / f"rank{rank}.json"), mode],
                               cwd=work, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
              for rank in range(2)]
     logs = []
@@ -236,6 +250,11 @@ def test_on_a_second_rank_the_shared_id_is_the_string(tmp_path):
         result = tmp_path / f"rank{rank}.json"
         assert result.exists(), f"rank {rank} wrote nothing:\n{logs[rank][-3000:]}"
         found.append(json.loads(result.read_text()))
+    return work, found
+
+
+def test_on_a_second_rank_the_shared_id_is_the_string(tmp_path):
+    work, found = _two_ranks(tmp_path, "path")
     for rank, one in enumerate(found):
         assert (one["run_id"], one["type"], one["source"]) == ("shared", "str", "explicit"), (rank, one)
         assert one["record_ids"] == ["'shared'"], (rank, one)
@@ -245,6 +264,50 @@ def test_on_a_second_rank_the_shared_id_is_the_string(tmp_path):
     assert sorted(p.name for p in out.iterdir()) == [
         "shared.rank0.end.json", "shared.rank0.jsonl", "shared.rank1.end.json", "shared.rank1.jsonl",
         "shared.run.json"]
+
+
+def test_a_second_rank_given_the_integer_by_an_older_rank_0_records_its_text(tmp_path):
+    work, found = _two_ranks(tmp_path, "older")
+    one = found[1]
+    assert (one["run_id"], one["type"], one["source"]) == ("123", "str", "explicit"), one
+    assert one["record_ids"] == ["'123'"], one
+    assert one["error"] == "None", one
+    assert one["warnings"] == ["rank 0's run_id gives a run ID that is not a string (int); the run is recorded "
+                               "under its text, '123'. Pass run_id= to choose the ID."], one
+    assert sorted(p.name for p in (work / "tensorquill-out").iterdir()) == ["123.rank1.end.json", "123.rank1.jsonl"]
+
+
+# ---- a tracker object that is not the real one --------------------------------------------------
+
+class _Text:
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+    def __repr__(self):
+        return "<stand-in id>"
+
+
+@pytest.mark.parametrize("given, text, fitted", [(123, "123", "123"), (_Text("abc/def"), "abc/def", "abc-def")])
+def test_a_tracker_run_id_that_is_not_a_string_is_recorded_under_its_text(tmp_path, monkeypatch, given, text, fitted):
+    import types
+    work = _work(tmp_path, monkeypatch)
+    monkeypatch.delitem(sys.modules, "mlflow", raising=False)
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=types.SimpleNamespace(id=given)))
+    with pytest.warns(RuntimeWarning) as said:
+        session = _capture(None)
+    messages = [str(w.message) for w in said if "run ID" in str(w.message)]
+    assert messages[0] == (f"the W&B run gives a run ID that is not a string ({type(given).__name__}); the run is "
+                           f"recorded under its text, {text!r}. Pass run_id= to choose the ID.")
+    if fitted != text:  # its text is then fitted as any tracker's would be
+        assert f"is recorded under {fitted!r}" in messages[1]
+    assert (session.run.run_id, session.run.source) == (fitted, "wandb") and type(session.run.run_id) is str
+    out = work / "tensorquill-out"
+    assert _files(out) == [f"{fitted}.rank0.end.json", f"{fitted}.rank0.jsonl", f"{fitted}.run.json"]
+    assert {r["run_id"] for r in _records(out / f"{fitted}.rank0.jsonl")} == {fitted}
+    assert json.loads((out / f"{fitted}.run.json").read_text())["run_id"] == fitted
 
 
 # ---- streamed: a Path run ID reaches the store under its text -----------------------------------
