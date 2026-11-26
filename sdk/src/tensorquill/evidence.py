@@ -2525,28 +2525,57 @@ def load_records(
     return records if all_attempts else resolve_attempts(records)
 
 
-def scalar_points_in_order(scalar_only: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+def attempts_first_seen(records: Iterable[Mapping[str, Any]]) -> dict[tuple[str, Any], list[Any]]:
+    """Each rank's attempts in the order they first appear in `records`, oldest first, by
+    `(run_id, rank)`: the order `resolve_attempts` reads from the records themselves, in the shape
+    its `order` takes. Give the whole stream, training and scalar-only records together and before
+    any is resolved away: a rollback can leave out an older attempt's first records, and the
+    scalar-only records alone can show a newer attempt first (BUG-20)."""
+    order: dict[tuple[str, Any], dict[Any, None]] = {}
+    for record in records:
+        order.setdefault((_run_of(record), record.get("rank", 0)), {}).setdefault(record.get("attempt", 0))
+    return {key: list(attempts) for key, attempts in order.items()}
+
+
+def scalar_points_in_order(
+    scalar_only: Iterable[Mapping[str, Any]], *, order: Mapping[tuple[str, Any], Iterable[Any]] | None = None
+) -> list[Mapping[str, Any]]:
     """Scalar-only records in the order their points stand at one step, the last standing: by
-    attempt, in the order the attempts first appear, then by `seq` (Q6 a: the highest `seq` wins).
-    `seq` counts per session, so it orders the records of one attempt only; a later attempt's
-    point stands over an earlier one's at the same step, as its training records do."""
+    attempt, the later attempt last, then by `seq` (Q6 a: the highest `seq` wins). `seq` counts per
+    session, so it orders the records of one attempt only; a later attempt's point stands over an
+    earlier one's at the same step, as its training records do.
+
+    "Later" is the order the attempts first appear in the whole record stream (WAVE_AL_CONTRACT.md,
+    lane AL-4′'s decision 2), which `order` gives as `resolve_attempts` takes it: each rank's
+    attempts oldest first by `(run_id, rank)` (`attempts_first_seen` of every record read, or
+    `attempt_order_across` for a rank's several files). An attempt `order` does not list keeps its
+    place of first appearance among these records, after those it lists. Without `order` the
+    records' own first appearance is taken, as before: it is the stream's only when no training
+    record came between them, so a caller that has the stream should give its order (BUG-20)."""
     listed = list(scalar_only)
-    place: dict[tuple[str, Any, Any], int] = {}
+    places: dict[tuple[str, Any], dict[Any, int]] = {}
+    for key, attempts in (order or {}).items():
+        known = places.setdefault(key, {})
+        for attempt in attempts:
+            known.setdefault(attempt, len(known))
     for record in listed:
-        place.setdefault((run_of(record), record.get("rank", 0), record.get("attempt", 0)), len(place))
-    return sorted(listed, key=lambda r: (place[(run_of(r), r.get("rank", 0), r.get("attempt", 0))], int(r["seq"])))
+        known = places.setdefault((run_of(record), record.get("rank", 0)), {})
+        known.setdefault(record.get("attempt", 0), len(known))
+    return sorted(listed, key=lambda r: (places[(run_of(r), r.get("rank", 0))][r.get("attempt", 0)], int(r["seq"])))
 
 
 def merged_scalar_points(
-    training: Iterable[Mapping[str, Any]], scalar_only: Iterable[Mapping[str, Any]]
+    training: Iterable[Mapping[str, Any]], scalar_only: Iterable[Mapping[str, Any]],
+    *, order: Mapping[tuple[str, Any], Iterable[Any]] | None = None,
 ) -> dict[str, dict[int, Any]]:
     """Each logged scalar's points, `{name: {step: value}}`, the steps ascending: the training
     records' `scalars` values and the scalar-only records' points, by step (WAVE_AL_CONTRACT.md
     section 4.6). At one step a scalar-only record's value stands over the training records' and,
-    among scalar-only records, the highest `seq` (`scalar_points_in_order`; Q6 a). Of training
-    records of one step, the later stands. A step no training record has is a point of its own; no
-    record, step or sample is made. Values are as recorded (a non-finite one as the sink's string);
-    `None` is no value. Names come in the order they first appear, the training records' first."""
+    among scalar-only records, the later attempt's, then the highest `seq` (`scalar_points_in_order`,
+    which `order` is given to; Q6 a). Of training records of one step, the later stands. A step no
+    training record has is a point of its own; no record, step or sample is made. Values are as
+    recorded (a non-finite one as the sink's string); `None` is no value. Names come in the order
+    they first appear, the training records' first."""
     points: dict[str, dict[int, Any]] = {}
     for record in sorted(training, key=lambda r: int(r["step"])):
         logged = record.get("scalars")
@@ -2554,7 +2583,7 @@ def merged_scalar_points(
             for name, value in logged.items():
                 if value is not None:
                     points.setdefault(str(name), {})[int(record["step"])] = value
-    for record in scalar_points_in_order(scalar_only):
+    for record in scalar_points_in_order(scalar_only, order=order):
         logged = record.get("scalars")
         if isinstance(logged, Mapping):
             for name, value in logged.items():
@@ -2575,15 +2604,20 @@ def scalar_series(
     as it resolves them (with the training records' cutoffs), or not with `all_attempts`.
 
     Records of several ranks with no `rank` given raise `ValueError`, as `build_evidence` refuses
-    them, and so do records of several run IDs (`check_one_run`)."""
-    records = load_records(source, rank=rank, all_attempts=all_attempts, scalars=True)
+    them, and so do records of several run IDs (`check_one_run`).
+
+    At one step, of two attempts' scalar-only points the later attempt's stands, "later" as the
+    attempts first appear in every record read, before any is resolved away (`attempts_first_seen`)."""
+    every = load_records(source, rank=rank, all_attempts=True, scalars=True)
+    order = attempts_first_seen(every)
+    records = every if all_attempts else resolve_attempts(every)
     ranks = sorted({int(r.get("rank", 0)) for r in records})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
     check_one_run(records)
     training, scalar_only = set_apart_scalars(records)
     return {name: [[step, value] for step, value in at.items()]
-            for name, at in merged_scalar_points(training, scalar_only).items()}
+            for name, at in merged_scalar_points(training, scalar_only, order=order).items()}
 
 
 def set_apart_scalars(records: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -9225,8 +9259,14 @@ def export_rerun(
     path: str | Path,
     *,
     records: Iterable[Mapping[str, Any]] | None = None,
+    attempt_order: Mapping[tuple[str, Any], Iterable[Any]] | None = None,
 ) -> Path:
     """Write `evidence` (and optional Tier 0 `records`) to a Rerun `.rrd` with blueprint.
+
+    At one step, of two attempts' scalar-only points the later attempt's is logged
+    (`scalar_points_in_order`): later as `attempt_order` gives each rank's attempts (oldest first,
+    by `(run_id, rank)`; `attempts_first_seen` of every record read, before any was resolved away),
+    else as the attempts first appear in `records`, training records among them.
 
     Raises `compact.SamplesOmitted` for compact evidence that left steps out: the recording
     would show the kept windows as if they were the run."""
@@ -9349,9 +9389,11 @@ def export_rerun(
             # Scalar-only records are set apart: none is a training step (WAVE_AL_CONTRACT.md section 4.6).
             # Each of their points is logged under `/logged/<name>` at its step, after the training
             # records', and stands over a training record's value at that step (Q6 a).
+            records = list(records)
+            order = attempt_order if attempt_order is not None else attempts_first_seen(records)
             records, scalar_only = set_apart_scalars(records)
             standing: dict[str, dict[int, Any]] = {}
-            for point in scalar_points_in_order(scalar_only):
+            for point in scalar_points_in_order(scalar_only, order=order):
                 for name, val in (point.get("scalars") or {}).items() if isinstance(point.get("scalars"), Mapping) else ():
                     if val is not None:
                         standing.setdefault(str(name), {})[int(point["step"])] = val
@@ -9797,8 +9839,8 @@ def _main() -> None:
     print(run_state_line(evidence))
     print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
-        export_rerun(evidence, args.rerun, records=resolve_attempts(
-            every if rank is None else [r for r in every if r.get("rank", 0) == rank]))
+        exported = every if rank is None else [r for r in every if r.get("rank", 0) == rank]
+        export_rerun(evidence, args.rerun, records=resolve_attempts(exported), attempt_order=attempts_first_seen(exported))
         print(f"wrote Rerun recording -> {args.rerun}")
 
 

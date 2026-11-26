@@ -122,3 +122,26 @@ def test_bug20_pin_all_attempts_keeps_the_rolled_back_point_and_the_later_attemp
     # Without attempt 2's point, attempt 1's at 3 is rolled back by attempt 2's first training step, 2.
     assert "val" not in evidence.scalar_series(records[:6])
     assert evidence.scalar_series(records[:6], all_attempts=True)["val"] == [[3, 1.0]]
+
+
+FLIPPED = [*[_step(100, s) for s in (10, 11, 12)], _point(200, 2, 0, val=2.0), _step(200, 5),
+           _point(100, 2, 0, val=999.0)]
+
+
+def test_bug20_the_command_lines_rerun_export_takes_the_order_from_before_the_rollback(tmp_path, monkeypatch):
+    """`python -m tensorquill <file> --rerun`: the records it exports are resolved, which here puts
+    attempt 200 first; the order is taken from every record it read."""
+    logged = _rerun_recorder(monkeypatch)
+    path = _write(tmp_path / "r.rank0.jsonl", FLIPPED)
+    monkeypatch.setattr(sys, "argv", ["tensorquill", str(path), "--detectors", "python", "--rerun",
+                                      str(tmp_path / "r.rrd"), "--output", str(tmp_path / "e.json")])
+    evidence.main()
+    assert [(step, value[1]) for step, entity, value in logged if entity == "/logged/val"] == [(2, 2.0)]
+
+
+def test_bug20_the_export_takes_an_order_given_for_records_already_resolved(tmp_path, monkeypatch):
+    logged = _rerun_recorder(monkeypatch)
+    built = evidence.build_evidence(LATE, detectors="python")
+    evidence.export_rerun(built, tmp_path / "r.rrd", records=evidence.resolve_attempts(FLIPPED),
+                          attempt_order=evidence.attempts_first_seen(FLIPPED))
+    assert [(step, value[1]) for step, entity, value in logged if entity == "/logged/val"] == [(2, 2.0)]
