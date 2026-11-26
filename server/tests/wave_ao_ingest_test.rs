@@ -362,7 +362,7 @@ async fn bug07_an_attempt_that_appears_again_later_in_the_batch_keeps_its_first_
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let server = start(root).await;
-        let rows = vec![
+        let rows = [
             step_row(&run, B, 0),
             scalar_row(&run, A, 50, 0, 99.0),
             step_row(&run, B, 1),
@@ -429,7 +429,11 @@ async fn put_part(storage: &Storage, run: &str, attempt: i64, grad_norm: f64) {
 /// list goes just before the newest, by number among such, whatever placed the newest; with no
 /// entry at all, by number). The same table is asserted against Python in
 /// `sdk/tests/test_wave_ao_ingest.py`.
-fn bug08_table() -> Vec<(&'static str, Vec<(i64, &'static str)>, Vec<i64>, Vec<i64>)> {
+/// One row of the table: the case, the file's entries (attempt, by), the attempts stored but not
+/// listed, and the order read.
+type Bug08Case = (&'static str, Vec<(i64, &'static str)>, Vec<i64>, Vec<i64>);
+
+fn bug08_table() -> Vec<Bug08Case> {
     vec![
         // (case, the file's entries, the attempts stored but not listed, the order read)
         (
