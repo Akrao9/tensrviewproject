@@ -235,6 +235,22 @@ def _wire_float(value: Any) -> Any:
     return _UNCARRIED
 
 
+def _carried(value: Any) -> bool:
+    """Whether a `float64` column carries `value` (`_wire_float`): a number, or the sink's "nan",
+    "inf" or "-inf". A null is no value, and so is anything the column cannot carry (a bool, other
+    text), which Rust never sees (its column is null): such a field is absent to every rule."""
+    found = _wire_float(value)
+    return found is not None and found is not _UNCARRIED
+
+
+def _gradient_key(records: Iterable[Mapping[str, Any]]) -> str:
+    """The run's total gradient norm series: the pre-clipping `clip_grad_norm` once any record holds
+    one the column carries (`_carried`), else `grad_norm`, as Rust switches (`Gradients::row`,
+    `measure.rs`). A record with `clip_grad_norm` that holds no value does not say the run clips: an
+    explicit null switched the whole run off `grad_norm` here and not in Rust (BUG-09)."""
+    return "clip_grad_norm" if any(_carried(r.get("clip_grad_norm")) for r in records) else "grad_norm"
+
+
 def _spread_values(value: Any) -> list[float] | None:
     """One parameter's gathered spread as the `replica_spread` column carries it (WAVE_AJ_CONTRACT.md,
     section 1), a list of floats, a null read as NaN as Rust reads it; else None, and the entry is
@@ -256,6 +272,23 @@ def _held_spread_table(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
     if table is None or (table and all(_spread_values(v) is None for v in table.values())):
         return None
     return table
+
+
+def _object(record: Mapping[str, Any], field: str) -> Mapping[str, Any]:
+    """`record[field]` when it is an object, else an empty one. A field outside the identity fields
+    that is not what its column holds is absent to the rules that read it, and never raised on
+    (WAVE_AF_CONTRACT.md section 1; BUG-12): Rust's column is null for it."""
+    value = record.get(field)
+    return value if isinstance(value, Mapping) else {}
+
+
+def _unchanged_names(record: Mapping[str, Any]) -> list[str] | None:
+    """A record's `weights_unchanged` as its column holds it, a list of names, or None: a value that
+    is not a list of strings (`true`, `[1]`) is no weight check, as Rust reads it (BUG-12)."""
+    names = record.get("weights_unchanged")
+    if isinstance(names, list) and all(isinstance(name, str) for name in names):
+        return names
+    return None
 
 
 def _weight_check(record: Mapping[str, Any]) -> bool:
@@ -387,21 +420,38 @@ class _StarvedFirsts:
         return {"kind": "starved_experts", "step": min(e["step"] for e in experts), "experts": experts}
 
 
+def _top_k_entries(record: Mapping[str, Any]) -> Iterable[tuple[Any, int]]:
+    """A record's `moe_top_k` entries the column carries: an integer that is not a bool and fits int32
+    (WAVE_AJ_CONTRACT.md, section 1). Any other entry, and a value that is not an object, is absent."""
+    given = record.get("moe_top_k")
+    if not isinstance(given, Mapping):
+        return ()
+    return [(name, k) for name, k in given.items() if isinstance(k, int) and not isinstance(k, bool) and -(2**31) <= k < 2**31]
+
+
+def _fixed_top_k(routers: Iterable[str], override: int | Mapping[str, int] | None) -> dict[str, int]:
+    """The routers whose experts per token `override` fixes, with the value: every router for one
+    value, the named ones for a value per router. A fixed router's recorded values are not read."""
+    if override is None:
+        return {}
+    if isinstance(override, int):
+        return {name: override for name in routers}
+    return {str(name): int(k) for name, k in override.items()}
+
+
 def _router_top_k(
     records: list[dict[str, Any]], routers: list[str], override: int | Mapping[str, int] | None
 ) -> dict[str, int]:
-    """Each router's experts per token: the last `moe_top_k` recorded for it, or `override`, else 1.
+    """Each router's experts per token at the end of the run: the last `moe_top_k` recorded for it,
+    or `override`, else 1 (the evidence's `top_k`). Each step is judged with the value in force at
+    that step (`_MoeSamples`), as Rust judges it (BUG-13).
     An entry the `moe_top_k` column cannot carry (anything but an integer that is not a bool and fits
     int32, WAVE_AJ_CONTRACT.md, section 1) is absent on its record, as Rust never sees it (wave AJ:
     before, `int(k)` raised on text and read 2.0 as 2)."""
     found: dict[str, int] = {}
     for record in records:
-        given = record.get("moe_top_k")
-        if not isinstance(given, Mapping):
-            continue
-        for name, k in given.items():
-            if isinstance(k, int) and not isinstance(k, bool) and -(2**31) <= k < 2**31:
-                found[name] = k
+        for name, k in _top_k_entries(record):
+            found[name] = k
     if isinstance(override, int):
         found = {name: override for name in routers}
     elif override is not None:
@@ -534,11 +584,11 @@ def scalar_context(
     if index is None:
         return {}
     context = {}
-    for name, value in (records[index].get("scalars") or {}).items():
+    for name, value in _object(records[index], "scalars").items():
         if isinstance(value, bool):
             continue
         before = [
-            v for v in (_finite((r.get("scalars") or {}).get(name)) for r in records[max(0, index - window) : index])
+            v for v in (_finite(_object(r, "scalars").get(name)) for r in records[max(0, index - window) : index])
             if v is not None
         ]
         context[name] = {"value": value, "median_before": _median(before) if before else None}
@@ -603,7 +653,7 @@ def detect_grad_spikes(
     """
     # One series for the whole run. When the run clips, the pre-clipping norm is used:
     # the per-parameter norms are read after clipping, so a clipped spike stays flat there.
-    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+    key = _gradient_key(records)
     state = _GradSpikes(key, factor=factor, window=window, min_history=min_history, sustain=sustain)
     state.feed(records)
     return state.result()
@@ -667,7 +717,7 @@ class _GradSpikes:
             self.total_count += 1
             totals.append(total)
             lasted: list[dict[str, Any]] = []
-            for name, value in record.get("grad_norms", {}).items():
+            for name, value in _object(record, "grad_norms").items():
                 norm = _finite(value)
                 if norm is None:
                     continue
@@ -810,7 +860,7 @@ def _update_spikes_judged(
     """`detect_update_spikes`'s incident, and the pairs it did not compare because a split total
     met more than one clip call: `{"comparisons", "step", "compared"}`, with `compared` the pairs
     it did compare, or None when every pair was compared."""
-    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+    key = _gradient_key(records)
     # attempt, total, each parameter's update size, each parameter's gradient norm (or None), the
     # learning rates the record carries (or None), its clip calls above 1 (or None)
     before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None, int | None] | None = None
@@ -1110,7 +1160,7 @@ def _spiking_parameters(
     window: int,
 ) -> list[dict[str, Any]]:
     found = []
-    for name, value in record.get("grad_norms", {}).items():
+    for name, value in _object(record, "grad_norms").items():
         norm = _finite(value)
         past = list(per_param.get(name, ()))[-window:]
         if norm is None or len(past) < 2:
@@ -1152,7 +1202,9 @@ def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     are grouped by name into embeddings, norms, biases and matrices. Returns None with
     fewer than two weight checks.
     """
-    checked = [r for r in sorted(records, key=lambda r: r["step"]) if r.get("weight_norms")]
+    # A weight check as `weight_jumps` counts one (`_weight_check`): a `weight_norms` that is not an
+    # object, or holds no norm the column carries, is none, so the last check is the last that holds one.
+    checked = [r for r in sorted(records, key=lambda r: r["step"]) if _weight_check(r)]
     if len(checked) < 2:
         return None
     first, last = checked[0], checked[-1]
@@ -1213,7 +1265,7 @@ def gradient_trend(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     run clips, `grad_norm` otherwise, as `grad_spike` reads it; a skipped step and a value that
     is not finite are left out. `series` names the norm read. None under TREND_MIN_POINTS."""
     rows = sorted(records, key=lambda r: r["step"])
-    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in rows) else "grad_norm"
+    key = _gradient_key(rows)
     pairs = [(int(r["step"]), value) for r in rows if not r.get("step_skipped")
              and (value := _finite(r.get(key))) is not None]
     found = robust_trend([step for step, _ in pairs], [value for _, value in pairs])
@@ -1879,12 +1931,12 @@ def detect_stalled_weights(
             for name in streak:
                 streak[name] = 0
         attempt_before = attempt
-        unchanged = record.get("weights_unchanged")
+        unchanged = _unchanged_names(record)
         if unchanged is None:
             continue
         evidence = (_finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None) \
             and skipped_by(record) is None
-        grads = record.get("grad_norms", {})
+        grads = _object(record, "grad_norms")
         unchanged_set = set(unchanged)
         for name in streak:
             if name not in unchanged_set:
@@ -2340,11 +2392,8 @@ RESUME_LR_TOLERANCE = 1e-6  # relative; the same scheduler restored gives the sa
 
 
 def _lr_values(record: Mapping[str, Any]) -> list[float] | None:
-    lr = record.get("lr")
-    if not lr:
-        return None
-    values = [_finite(v) for v in lr]
-    return None if any(v is None for v in values) else [float(v) for v in values]  # type: ignore[arg-type]
+    """A record's learning rates, `_lr_list`'s: an `lr` that is not a list (`0.001`) is none (BUG-12)."""
+    return _lr_list(record)
 
 
 def detect_resume_lr_changes(
@@ -2525,28 +2574,57 @@ def load_records(
     return records if all_attempts else resolve_attempts(records)
 
 
-def scalar_points_in_order(scalar_only: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+def attempts_first_seen(records: Iterable[Mapping[str, Any]]) -> dict[tuple[str, Any], list[Any]]:
+    """Each rank's attempts in the order they first appear in `records`, oldest first, by
+    `(run_id, rank)`: the order `resolve_attempts` reads from the records themselves, in the shape
+    its `order` takes. Give the whole stream, training and scalar-only records together and before
+    any is resolved away: a rollback can leave out an older attempt's first records, and the
+    scalar-only records alone can show a newer attempt first (BUG-20)."""
+    order: dict[tuple[str, Any], dict[Any, None]] = {}
+    for record in records:
+        order.setdefault((_run_of(record), record.get("rank", 0)), {}).setdefault(record.get("attempt", 0))
+    return {key: list(attempts) for key, attempts in order.items()}
+
+
+def scalar_points_in_order(
+    scalar_only: Iterable[Mapping[str, Any]], *, order: Mapping[tuple[str, Any], Iterable[Any]] | None = None
+) -> list[Mapping[str, Any]]:
     """Scalar-only records in the order their points stand at one step, the last standing: by
-    attempt, in the order the attempts first appear, then by `seq` (Q6 a: the highest `seq` wins).
-    `seq` counts per session, so it orders the records of one attempt only; a later attempt's
-    point stands over an earlier one's at the same step, as its training records do."""
+    attempt, the later attempt last, then by `seq` (Q6 a: the highest `seq` wins). `seq` counts per
+    session, so it orders the records of one attempt only; a later attempt's point stands over an
+    earlier one's at the same step, as its training records do.
+
+    "Later" is the order the attempts first appear in the whole record stream (WAVE_AL_CONTRACT.md,
+    lane AL-4′'s decision 2), which `order` gives as `resolve_attempts` takes it: each rank's
+    attempts oldest first by `(run_id, rank)` (`attempts_first_seen` of every record read, or
+    `attempt_order_across` for a rank's several files). An attempt `order` does not list keeps its
+    place of first appearance among these records, after those it lists. Without `order` the
+    records' own first appearance is taken, as before: it is the stream's only when no training
+    record came between them, so a caller that has the stream should give its order (BUG-20)."""
     listed = list(scalar_only)
-    place: dict[tuple[str, Any, Any], int] = {}
+    places: dict[tuple[str, Any], dict[Any, int]] = {}
+    for key, attempts in (order or {}).items():
+        known = places.setdefault(key, {})
+        for attempt in attempts:
+            known.setdefault(attempt, len(known))
     for record in listed:
-        place.setdefault((run_of(record), record.get("rank", 0), record.get("attempt", 0)), len(place))
-    return sorted(listed, key=lambda r: (place[(run_of(r), r.get("rank", 0), r.get("attempt", 0))], int(r["seq"])))
+        known = places.setdefault((run_of(record), record.get("rank", 0)), {})
+        known.setdefault(record.get("attempt", 0), len(known))
+    return sorted(listed, key=lambda r: (places[(run_of(r), r.get("rank", 0))][r.get("attempt", 0)], int(r["seq"])))
 
 
 def merged_scalar_points(
-    training: Iterable[Mapping[str, Any]], scalar_only: Iterable[Mapping[str, Any]]
+    training: Iterable[Mapping[str, Any]], scalar_only: Iterable[Mapping[str, Any]],
+    *, order: Mapping[tuple[str, Any], Iterable[Any]] | None = None,
 ) -> dict[str, dict[int, Any]]:
     """Each logged scalar's points, `{name: {step: value}}`, the steps ascending: the training
     records' `scalars` values and the scalar-only records' points, by step (WAVE_AL_CONTRACT.md
     section 4.6). At one step a scalar-only record's value stands over the training records' and,
-    among scalar-only records, the highest `seq` (`scalar_points_in_order`; Q6 a). Of training
-    records of one step, the later stands. A step no training record has is a point of its own; no
-    record, step or sample is made. Values are as recorded (a non-finite one as the sink's string);
-    `None` is no value. Names come in the order they first appear, the training records' first."""
+    among scalar-only records, the later attempt's, then the highest `seq` (`scalar_points_in_order`,
+    which `order` is given to; Q6 a). Of training records of one step, the later stands. A step no
+    training record has is a point of its own; no record, step or sample is made. Values are as
+    recorded (a non-finite one as the sink's string); `None` is no value. Names come in the order
+    they first appear, the training records' first."""
     points: dict[str, dict[int, Any]] = {}
     for record in sorted(training, key=lambda r: int(r["step"])):
         logged = record.get("scalars")
@@ -2554,7 +2632,7 @@ def merged_scalar_points(
             for name, value in logged.items():
                 if value is not None:
                     points.setdefault(str(name), {})[int(record["step"])] = value
-    for record in scalar_points_in_order(scalar_only):
+    for record in scalar_points_in_order(scalar_only, order=order):
         logged = record.get("scalars")
         if isinstance(logged, Mapping):
             for name, value in logged.items():
@@ -2575,15 +2653,20 @@ def scalar_series(
     as it resolves them (with the training records' cutoffs), or not with `all_attempts`.
 
     Records of several ranks with no `rank` given raise `ValueError`, as `build_evidence` refuses
-    them, and so do records of several run IDs (`check_one_run`)."""
-    records = load_records(source, rank=rank, all_attempts=all_attempts, scalars=True)
+    them, and so do records of several run IDs (`check_one_run`).
+
+    At one step, of two attempts' scalar-only points the later attempt's stands, "later" as the
+    attempts first appear in every record read, before any is resolved away (`attempts_first_seen`)."""
+    every = load_records(source, rank=rank, all_attempts=True, scalars=True)
+    order = attempts_first_seen(every)
+    records = every if all_attempts else resolve_attempts(every)
     ranks = sorted({int(r.get("rank", 0)) for r in records})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
     check_one_run(records)
     training, scalar_only = set_apart_scalars(records)
     return {name: [[step, value] for step, value in at.items()]
-            for name, at in merged_scalar_points(training, scalar_only).items()}
+            for name, at in merged_scalar_points(training, scalar_only, order=order).items()}
 
 
 def set_apart_scalars(records: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2848,10 +2931,14 @@ def in_attempt_order(
 
 def resolve_attempts_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
     """`resolve_attempts` over a rank's several files, with the attempts in `attempt_order_across`
-    order: the records of every file, in the order given, with those a later attempt replaced
-    left out."""
+    order: the records of every file with those a later attempt replaced left out, each rank's
+    attempts in that order (`in_attempt_order`) and one attempt's records in the order the files
+    give them. The order the files are given in never decides (contract 1): a reader that takes
+    the later record at a step, or first appearance as the attempts' order (`scalar_points_in_order`),
+    reads the later attempt last (BUG-21)."""
     listed = [list(records) for records in files]
-    return resolve_attempts([r for records in listed for r in records], order=attempt_order_across(listed))  # type: ignore[misc]
+    order = attempt_order_across(listed)
+    return resolve_attempts(in_attempt_order([r for records in listed for r in records], order), order=order)
 
 
 def check_one_run(records: Iterable[Mapping[str, Any]]) -> None:
@@ -3499,18 +3586,19 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         if isinstance(moe, Mapping) and any(
                 (total := _router_total(value)) is not None and total > 0 for value in moe.values()):
             counts["moe"] += 1
-        total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
+        # A total the column carries (`_carried`), as Rust counts it: a `grad_norm` of true is none (BUG-09).
+        total = _carried(record.get("grad_norm")) or _carried(record.get("clip_grad_norm"))
         # A record holds a layer only through an entry that is an object (section 1.5; row S5, the
         # owner's approved change, Nov 24): a value that is not an object, or one whose only entries
         # are not objects, holds none, as Rust reads it.
-        norms, layers = bool(record.get("grad_norms")), bool(layer_entries(record))
+        norms, layers = bool(_object(record, "grad_norms")), bool(layer_entries(record))
         counts["grad_total"] += total
         # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
         counts["update"] += (
             total and isinstance(record.get("update_rms"), Mapping) and bool(record["update_rms"])
             and not record.get("step_skipped")
         )
-        counts["weight_check"] += record.get("weights_unchanged") is not None and norms
+        counts["weight_check"] += _unchanged_names(record) is not None and norms
         # A skip only the caller reported is not the loss scale's to judge unless the scaler was seen
         # to apply that update (`detect_loss_scale_trouble`).
         counts["loss_scale"] += record.get("step_skipped") is not None and (
@@ -6664,7 +6752,7 @@ def _diversity_from_counts(counts: list[int], n_experts: int) -> float:
 def _non_finite_gradients(record: Mapping[str, Any]) -> list[str]:
     """What is not finite among a record's gradient norms, as a `non_finite` incident names it:
     each parameter, else `<total>`, and `<total before clipping>`."""
-    bad = [name for name, norm in (record.get("grad_norms") or {}).items() if _is_non_finite(norm)]
+    bad = [name for name, norm in _object(record, "grad_norms").items() if _is_non_finite(norm)]
     if _is_non_finite(record.get("grad_norm")) and not bad:
         bad.append("<total>")
     if _is_non_finite(record.get("clip_grad_norm")):
@@ -6836,6 +6924,54 @@ def _observation(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return found if isinstance(found, Mapping) else None
 
 
+def _observation_read(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """An observation as both engines compare it (REPLICA_OBSERVATION_CONTRACT.md section 1, as
+    `replica.rs`'s `observed` reads it; BUG-11):
+
+    - a record whose `v` is not the integer 1 names no group it can be compared in (`group` None:
+      the step is `not_established`, why `group`);
+    - a `launch` that is not text names no launch;
+    - an entry of `params` that is not an object, or whose `fp` is not a list of at least two
+      fingerprints (`[norm, sum]`), cannot be compared: it is read as `unread`.
+    Everything else is the record's own."""
+    version = observation.get("v")
+    launch = observation.get("launch")
+    params = observation.get("params")
+    unread = observation.get("unread")
+    held: dict[str, Any] = {}
+    not_read: dict[str, Any] = dict(unread) if isinstance(unread, Mapping) else {}
+    for name, row in (params.items() if isinstance(params, Mapping) else ()):
+        prints = row.get("fp") if isinstance(row, Mapping) else None
+        if isinstance(prints, list) and len(prints) >= 2:
+            held[name] = row
+        else:
+            not_read.setdefault(name, "fewer than two fingerprints")
+    return {**observation, "launch": launch if isinstance(launch, str) else None,
+            "group": observation.get("group") if type(version) is int and version == 1 else None,
+            "params": held, "unread": not_read}
+
+
+def _json_key(value: Any) -> Any:
+    """`value` as a key that is equal for two JSON values exactly when `serde_json` finds them
+    equal: a signature is compared as the value it is, as Rust compares it (BUG-11), so `123` and
+    `"123"`, `true` and `1`, and `1` and `1.0` differ."""
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        return ("float", value)
+    if isinstance(value, str):
+        return ("str", value)
+    if value is None:
+        return ("null",)
+    if isinstance(value, (list, tuple)):
+        return ("list", tuple(_json_key(v) for v in value))
+    if isinstance(value, Mapping):
+        return ("object", frozenset((str(k), _json_key(v)) for k, v in value.items()))
+    return ("other", repr(value))
+
+
 def _spread_table(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
     found = record.get("replica_spread")
     return found if isinstance(found, Mapping) else None
@@ -6895,7 +7031,7 @@ def _compare_one_group(seen: Mapping[int, Mapping[str, Any]], tolerance: float) 
             continue
         if signatures_comparable:
             signatures_made += 1
-            if len({str(row.get("sig")) for row in rows}) > 1:  # type: ignore[union-attr]
+            if len({_json_key(row.get("sig")) for row in rows}) > 1:  # type: ignore[union-attr]
                 differing.append(name)
         if not prints_comparable:
             continue
@@ -6966,9 +7102,9 @@ def _attributed_by_signatures(rows: Mapping[int, Mapping[str, Any]]) -> dict[str
     ranks = sorted(rows)
     if len(ranks) == 2:
         return {"verdict": "inconclusive", "why": "two_ranks"}
-    held: dict[str, list[int]] = {}
+    held: dict[Any, list[int]] = {}
     for rank in ranks:
-        held.setdefault(str(rows[rank].get("sig")), []).append(rank)
+        held.setdefault(_json_key(rows[rank].get("sig")), []).append(rank)
     most = max(held.values(), key=len)
     if 2 * len(most) <= len(ranks):
         return {"verdict": "inconclusive", "why": "no_majority"}
@@ -7032,6 +7168,7 @@ def _replica_judged(
                 legacy.append({"rank": rank, "step": step, "drift": bool(over), **({"parameters": over} if over else {})})
         if observation is None:
             continue
+        observation = _observation_read(observation)
         launch = observation.get("launch")
         if launch is not None:
             attempt = record.get("attempt", 0)
@@ -7442,21 +7579,31 @@ def _moe_samples(
     router_sizes: Mapping[str, int],
     router_top_k: Mapping[str, int],
     overload_threshold: float,
+    fixed_top_k: Mapping[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """The per-step MoE samples as the Python rules judge them: one for every record and
     router, with the experts found overloaded or dead there. `_mark_starved` adds the starved
-    ones. The Rust detectors make the same list (`tensorquill-server detect --samples`)."""
-    return _MoeSamples(router_sizes, router_top_k, overload_threshold).feed(records)
+    ones. The Rust detectors make the same list (`tensorquill-server detect --samples`).
+    `router_top_k` is each router's experts per token until a record gives one (`_MoeSamples`)."""
+    return _MoeSamples(router_sizes, router_top_k, overload_threshold, fixed_top_k).feed(records)
 
 
 class _MoeSamples:
     """`_moe_samples`'s state: each router's history and the samples made so far, fed records in step
     order (`feed`, any number of times), as `_GradSpikes` is (lane AD11). The router sizes, their
-    top-k and the threshold are the run's and fixed for the state: a record that changes any of them
-    changes every sample, so a state is not fed past such a change (`_Incremental`)."""
+    threshold are the run's and fixed for the state: a record that changes any of them changes every
+    sample, so a state is not fed past such a change (`_Incremental`).
 
-    def __init__(self, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int], overload_threshold: float) -> None:
-        self.router_sizes, self.router_top_k, self.overload_threshold = router_sizes, router_top_k, overload_threshold
+    Experts per token are judged step by step, as Rust's `Moe::row` judges them (BUG-13): a record's
+    `moe_top_k` applies to that record and the later ones, until another changes it. Before any,
+    a router's value is `router_top_k`'s (1 when it names none). A router `fixed_top_k` names keeps
+    that value whatever the records say (`top_k=`, an override)."""
+
+    def __init__(self, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int], overload_threshold: float,
+                 fixed_top_k: Mapping[str, int] | None = None) -> None:
+        self.router_sizes, self.overload_threshold = router_sizes, overload_threshold
+        self.fixed_top_k = dict(fixed_top_k or {})
+        self.router_top_k = {**router_top_k, **self.fixed_top_k}  # in force: changed by the records fed
         self.history: dict[str, list[tuple[list[int], int, float]]] = {name: [] for name in router_sizes}
         self.samples: list[dict[str, Any]] = []
 
@@ -7468,6 +7615,9 @@ class _MoeSamples:
         new: list[dict[str, Any]] = []
         for record in sorted(records, key=lambda r: r["step"]):
             step = int(record["step"])
+            for name, k in _top_k_entries(record):
+                if name not in self.fixed_top_k:
+                    router_top_k[name] = k
             moe = record.get("moe")
             if not isinstance(moe, Mapping):
                 moe = {}
@@ -7601,12 +7751,14 @@ class _Incremental:
         self.texts: list[str] = []  # each sample's JSON text, for the watcher's writer (`samples_text`)
         self.handed: list[dict[str, Any]] | None = None  # the last `samples` list given out
 
-    def _start(self, key: Any, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int],
+    def _start(self, key: Any, router_sizes: Mapping[str, int], fixed_top_k: Mapping[str, int],
                overload_threshold: float, starve_window: int, starve_ratio: float, grad_key: str) -> None:
         self.key = key
         self.records = []
         self.texts = []
-        self.moe = _MoeSamples(dict(router_sizes), dict(router_top_k), overload_threshold)
+        # Each router's experts per token is read step by step from the records (BUG-13): 1 before
+        # any, unless `top_k=` fixes it.
+        self.moe = _MoeSamples(dict(router_sizes), {}, overload_threshold, fixed_top_k)
         self.starved = _StarvedMarks(starve_window, starve_ratio)
         self.starved_firsts = _StarvedFirsts()
         self.starts = _RouterStarts()
@@ -7616,8 +7768,8 @@ class _Incremental:
 
     def judge(self, records: list[dict[str, Any]], *, router_sizes: Mapping[str, int],
               router_top_k: Mapping[str, int], overload_threshold: float, starve_window: int,
-              starve_ratio: float, options: tuple[Any, ...]) -> dict[str, Any]:
-        grad_key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+              starve_ratio: float, options: tuple[Any, ...], top_k: int | Mapping[str, int] | None = None) -> dict[str, Any]:
+        grad_key = _gradient_key(records)
         key = repr((overload_threshold, starve_window, starve_ratio, options, list(router_sizes.items()),
                     list(router_top_k.items()), grad_key))
         kept = self.records
@@ -7634,7 +7786,8 @@ class _Incremental:
             new = records[len(kept):]
             self.path = ("incremental", len(new))
         else:
-            self._start(key, router_sizes, router_top_k, overload_threshold, starve_window, starve_ratio, grad_key)
+            self._start(key, router_sizes, _fixed_top_k(router_sizes, top_k), overload_threshold, starve_window,
+                        starve_ratio, grad_key)
             new = records
             self.path = ("full", why)
         self.records = list(records)
@@ -7798,23 +7951,28 @@ def _build_evidence(
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
     held_ranks: list[int] | None = None
-    # The training records alone (`_load_counted` sets the scalar-only records apart, after the
-    # identity check): no engine judges a scalar-only record, and none is a step, so the evidence is
-    # the training records' (WAVE_AL_CONTRACT.md section 4.6, Q4 a).
-    if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
+    # The training records alone are judged: no engine judges a scalar-only record, and none is a
+    # step, so the evidence is the training records' (WAVE_AL_CONTRACT.md section 4.6, Q4 a). A file's
+    # or a list's scalar-only records are read too, and set apart only once the records are known to
+    # be of one run, theirs included, as `scalar_series` and the MCP series check them (BUG-29). A
+    # store's `scalars-*` objects are not read for it: a store's rank folder is of one run.
+    whole = not (isinstance(source, (str, Path)) and Path(source).is_dir())
+    if rank is not None and whole:
         # A file or list is read whole either way: the ranks it holds are kept, so the evidence
         # can say it judged one of several (L21). A store's rank folder holds one rank.
-        everything, left_out = _load_counted(source, None, checked=identity_checked)
-        held_ranks = sorted({int(r.get("rank", 0)) for r in everything})
-        every_attempt = [r for r in everything if r.get("rank", 0) == rank]
+        everything, left_out = _load_counted(source, None, checked=identity_checked, scalars=True)
+        held_ranks = sorted({int(r.get("rank", 0)) for r in everything if not is_scalar_record(r)})
+        own = [r for r in everything if r.get("rank", 0) == rank]
     else:
-        every_attempt, left_out = _load_counted(source, rank, checked=identity_checked)
+        own, left_out = _load_counted(source, rank, checked=identity_checked, scalars=whole)
+    every_attempt, scalar_only = set_apart_scalars(own)
     if attempt_order:
         every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
-    check_one_run(every_attempt)
+    # The judged rank's scalar-only records: another rank's are that rank's.
+    check_one_run([*every_attempt, *(r for r in scalar_only if not ranks or r.get("rank", 0) == ranks[0])])
     # Lane W3's step-order rule: the effective run is judged in step order, rows of one step in
     # the order they arrived (a stable sort). Arrival order stays in `every_attempt`, for the
     # analyses that are about arrival (which attempt came first, repeats, resumes).
@@ -7896,7 +8054,7 @@ def _build_evidence(
         judged = (memo if memo is not None else _Incremental()).judge(
             records, router_sizes=router_sizes, router_top_k=router_top_k, overload_threshold=overload_threshold,
             starve_window=starve_window, starve_ratio=starve_ratio,
-            options=(drift_tolerance, _top_k_option(top_k), update_window))
+            options=(drift_tolerance, _top_k_option(top_k), update_window), top_k=top_k)
         samples = judged["samples"]
         incidents = []
         moe_hit = judged["moe_hit"]
@@ -9225,8 +9383,14 @@ def export_rerun(
     path: str | Path,
     *,
     records: Iterable[Mapping[str, Any]] | None = None,
+    attempt_order: Mapping[tuple[str, Any], Iterable[Any]] | None = None,
 ) -> Path:
     """Write `evidence` (and optional Tier 0 `records`) to a Rerun `.rrd` with blueprint.
+
+    At one step, of two attempts' scalar-only points the later attempt's is logged
+    (`scalar_points_in_order`): later as `attempt_order` gives each rank's attempts (oldest first,
+    by `(run_id, rank)`; `attempts_first_seen` of every record read, before any was resolved away),
+    else as the attempts first appear in `records`, training records among them.
 
     Raises `compact.SamplesOmitted` for compact evidence that left steps out: the recording
     would show the kept windows as if they were the run."""
@@ -9349,9 +9513,11 @@ def export_rerun(
             # Scalar-only records are set apart: none is a training step (WAVE_AL_CONTRACT.md section 4.6).
             # Each of their points is logged under `/logged/<name>` at its step, after the training
             # records', and stands over a training record's value at that step (Q6 a).
+            records = list(records)
+            order = attempt_order if attempt_order is not None else attempts_first_seen(records)
             records, scalar_only = set_apart_scalars(records)
             standing: dict[str, dict[int, Any]] = {}
-            for point in scalar_points_in_order(scalar_only):
+            for point in scalar_points_in_order(scalar_only, order=order):
                 for name, val in (point.get("scalars") or {}).items() if isinstance(point.get("scalars"), Mapping) else ():
                     if val is not None:
                         standing.setdefault(str(name), {})[int(point["step"])] = val
@@ -9366,12 +9532,13 @@ def export_rerun(
                 if clip_norm is not None:
                     rr.log("/training/clip_grad_norm", rr.Scalars(clip_norm))
                     training_paths["/training/clip_grad_norm"] = "Pre-clipping gradient norm"
-                weights = [v for v in record.get("weight_norms", {}).values() if _finite(v) is not None]
+                weights = [v for v in _object(record, "weight_norms").values() if _finite(v) is not None]
                 if weights:
                     rr.log("/training/weight_norm", rr.Scalars(math.sqrt(sum(v * v for v in weights))))
                     training_paths["/training/weight_norm"] = "Weight norm"
-                if record.get("lr"):
-                    rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
+                lr = record.get("lr")
+                if isinstance(lr, list) and lr and _carried(lr[0]):
+                    rr.log("/training/lr", rr.Scalars(float(_wire_float(lr[0]))))
                     training_paths["/training/lr"] = "Learning rate"
                 scale = _finite(record.get("grad_scale"))
                 if scale is not None:
@@ -9380,17 +9547,16 @@ def export_rerun(
                 if "step_skipped" in record:
                     rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
                     training_paths["/training/step_skipped"] = "Update skipped (by the loss scaler or the caller)"
-                for name, val in (record.get("scalars") or {}).items():
+                for name, val in _object(record, "scalars").items():
                     if int(record["step"]) in overridden.get(name, ()):
                         continue  # a scalar-only record's point stands at this step (Q6 a)
                     value = _finite(val)
                     if value is not None:
-                        parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
-                        entity = f"/logged/{parts}"
+                        entity = _logged_entity(rr, str(name))
                         rr.log(entity, rr.Scalars(value))
                         logged_paths[entity] = name
                 probe = record.get("probe")
-                if probe:
+                if probe and isinstance(probe, Mapping):
                     probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
                 for layer_name, stats in layer_entries(record):
                     for key, val in stats.items():
@@ -9400,8 +9566,7 @@ def export_rerun(
                             rr.log(entity, rr.Scalars(float(val)))
                             activation_paths.setdefault(key, set()).add(entity)
             for name, at in standing.items():
-                parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
-                entity = f"/logged/{parts}"
+                entity = _logged_entity(rr, name)
                 for step, val in sorted(at.items()):
                     value = _finite(val)
                     if value is not None:
@@ -9457,10 +9622,15 @@ def _log_probe(
     logit and entropy series. Returns whether any series was logged."""
     import numpy as np
 
-    for layer, hist in probe.get("histograms", {}).items():
-        counts = hist.get("counts") or []
+    # A part of the probe that is not what it should be is not logged, and never raised on (BUG-12).
+    for layer, hist in _object(probe, "histograms").items():
+        if not isinstance(hist, Mapping):
+            continue
+        counts = hist.get("counts")
         lo, hi = _finite(hist.get("lo")), _finite(hist.get("hi"))
-        if not counts or lo is None or hi is None:
+        if not isinstance(counts, list) or not counts or lo is None or hi is None:
+            continue
+        if any(_finite(count) is None for count in counts):
             continue
         width = (hi - lo) / len(counts)
         entity = f"/probe/histograms/{rr.escape_entity_path_part(layer)}"
@@ -9471,29 +9641,55 @@ def _log_probe(
         ))
         hist_paths[entity] = layer
     series = False
-    for layer, att in probe.get("attention", {}).items():
-        part = rr.escape_entity_path_part(layer)
-        logits = [v for v in (_finite(x) for x in att.get("max_logit", [])) if v is not None]
+    for layer, att in _object(probe, "attention").items():
+        if not isinstance(att, Mapping):
+            continue
+        part = rr.escape_entity_path_part(str(layer))
+        logits = [v for v in (_finite(x) for x in _listed(att.get("max_logit"))) if v is not None]
         if logits:
             rr.log(f"/probe/max_logit/{part}", rr.Scalars(max(logits)))
             series = True
-        shares = [v for v in (_finite(x) for x in att.get("entropy_share", [])) if v is not None]
+        shares = [v for v in (_finite(x) for x in _listed(att.get("entropy_share"))) if v is not None]
         if not shares and _finite(att.get("max_entropy")):
             # Probe records from before `entropy_share`: entropy over the log of all keys.
             top = float(att["max_entropy"])
-            shares = [v / top for v in (_finite(x) for x in att.get("entropy", [])) if v is not None]
+            shares = [v / top for v in (_finite(x) for x in _listed(att.get("entropy"))) if v is not None]
         if shares:
             rr.log(f"/probe/entropy/{part}", rr.Scalars(sum(shares) / len(shares)))
             series = True
-        if att.get("invalid_rows"):
+        invalid_rows = _finite(att.get("invalid_rows"))
+        if invalid_rows:
             # NaN or Inf attention scores: a numerical failure, kept apart from entropy.
-            rr.log(f"/probe/invalid_rows/{part}", rr.Scalars(float(att["invalid_rows"])))
+            rr.log(f"/probe/invalid_rows/{part}", rr.Scalars(invalid_rows))
             invalid_series[0] = True
         if att.get("map"):
+            try:
+                values = np.asarray(att["map"], dtype=np.float32)
+            except (TypeError, ValueError):
+                continue  # not a table of numbers
+            if values.ndim != 2:
+                continue
             entity = f"/probe/attention/{part}"
-            rr.log(entity, rr.Tensor(np.asarray(att["map"], dtype=np.float32), dim_names=("query", "key")))
+            rr.log(entity, rr.Tensor(values, dim_names=("query", "key")))
             map_paths[entity] = layer
     return series
+
+
+def _logged_entity(rr: Any, name: str) -> str:
+    """The `/logged/...` entity of a logged scalar's name: one entity for each name (BUG-28). A name
+    whose `/`-separated parts are all non-empty is that path, each part escaped, as before
+    (`train/loss` is `/logged/train/loss`). A name with an empty part (`/loss`, `a//b`, `loss/`) is
+    one escaped part, its `/` kept inside it, so it never meets another name's path: before, the
+    empty parts were dropped and `/loss` was `loss`'s entity."""
+    parts = name.split("/")
+    if all(parts):
+        return "/logged/" + "/".join(rr.escape_entity_path_part(part) for part in parts)
+    return "/logged/" + rr.escape_entity_path_part(name)
+
+
+def _listed(value: Any) -> list[Any]:
+    """`value` when it is a list, else an empty one."""
+    return value if isinstance(value, list) else []
 
 
 def _rank_argument(value: str) -> int | str:
@@ -9765,16 +9961,19 @@ def _main() -> None:
     # A file is read whole and its rank picked by `build_evidence`, which then says which ranks the
     # file held (L21); a directory is read a rank at a time, as before.
     whole_file = not args.input.is_dir()
-    every, left_out = _load_counted(args.input, None if whole_file else rank, scalars=args.rerun is not None)
-    # The scalar-only records are read only for the Rerun export's series (section 4.6).
-    records, _ = set_apart_scalars(every)
+    # The scalar-only records are read for the Rerun export's series (section 4.6) and, in a file,
+    # for the check that the rank's records are of one run, theirs included (BUG-29).
+    every, left_out = _load_counted(args.input, None if whole_file else rank, scalars=whole_file or args.rerun is not None)
+    records, scalar_only = set_apart_scalars(every)
     held = sorted({int(r.get("rank", 0)) for r in records})
     if whole_file and rank is None and len(held) > 1:
         parser.error(f"{args.input} holds ranks {_rank_ranges(held, 8)}: choose one with --rank N (the evidence is one "
                      "rank's), or compare every rank with python -m tensorquill compare")
+    judged = rank if rank is not None else held[0] if len(held) == 1 else None
     own = records if rank is None else [r for r in records if r.get("rank", 0) == rank]
     try:
-        check_one_run(own)  # a usage error with either detectors, as the Rust path gives it
+        # A usage error with either detectors, as the Rust path gives it.
+        check_one_run([*own, *(r for r in scalar_only if judged is None or r.get("rank", 0) == judged)])
     except ValueError as error:
         parser.error(str(error))
     try:
@@ -9797,8 +9996,9 @@ def _main() -> None:
     print(run_state_line(evidence))
     print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
-        export_rerun(evidence, args.rerun, records=resolve_attempts(
-            every if rank is None else [r for r in every if r.get("rank", 0) == rank]))
+        # The judged rank's records: another rank's scalar-only points are not this recording's.
+        exported = [r for r in every if judged is None or r.get("rank", 0) == judged]
+        export_rerun(evidence, args.rerun, records=resolve_attempts(exported), attempt_order=attempts_first_seen(exported))
         print(f"wrote Rerun recording -> {args.rerun}")
 
 
