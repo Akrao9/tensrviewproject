@@ -1795,6 +1795,7 @@ class Session:
         # Scalar-only records (`log(..., step=N)`) not yet handed to the writer, their values as
         # logged (a tensor still on its device), and the next one's `seq`, counted from 0 per session.
         self._scalar_records: list[dict[str, Any]] = []
+        self._scalars_unread_said = False  # a scalar-only record's value left out (`_scalar_rows_one_by_one`)
         self._scalar_seq = 0
         self._ring_probe: list[dict[str, Any] | None] = []
         self._probe_off_written = False
@@ -2937,6 +2938,9 @@ class Session:
                 tensor = value.detach()
                 if type(tensor) is not torch.Tensor:
                     tensor = unwrap_local(tensor)
+                unread = _value_unread(tensor)
+                if unread is not None:
+                    raise ValueError(f"{name}: {unread}")
                 if tensor.numel() != 1:
                     raise ValueError(f"{name}: expected one value, got shape {tuple(tensor.shape)}")
                 # A copy, so the value neither keeps a larger tensor alive nor changes later.
@@ -3773,9 +3777,14 @@ class Session:
 
     def _put_scalar_records(self) -> None:
         """Queue the scalar-only records no block of steps took, in a block with no steps (`_decode`).
-        Nothing when none is pending: one test of a list."""
+        Nothing when none is pending: one test of a list. Never raises (BUG-03: it ran outside the
+        guard `_flush` keeps, in `flush()` and `close()`): a value that fails as it is moved is left out
+        by `_put`, and anything else that raises here stops capture, as a flush that raises does."""
         if self._scalar_records and not self._stopped:
-            self._put(([],))
+            try:
+                self._put(([],))
+            except Exception as error:  # noqa: BLE001
+                self._stop(error, f"queuing the scalar-only records raised {_short(error)}", reason="flush_error")
 
     def _clear_ring_lists(self) -> None:
         self._steps = []
@@ -4147,8 +4156,13 @@ class Session:
             pending, self._scalar_records = self._scalar_records, []
             rows = [record["scalars"] for record in pending]
             if any(isinstance(value, torch.Tensor) for row in rows for value in row.values()):
-                rows = _scalars_to_cpu(rows)
-            ready = [{**record, "scalars": row} for record, row in zip(pending, rows)]
+                try:
+                    rows = _scalars_to_cpu(rows)
+                except Exception:  # noqa: BLE001  never into training, `flush()` or `close()` (BUG-03)
+                    rows = self._scalar_rows_one_by_one(pending)
+            # A record left with no value is not written (as `log` writes none for no values); its
+            # `seq` is not reused, and a reader needs none to follow another.
+            ready = [{**record, "scalars": row} for record, row in zip(pending, rows) if row]
             block = tuple(block) + (None,) * (len(_BLOCK_FIELDS) - len(block)) + (ready,)
         try:
             if self._close_by is None:
@@ -4170,6 +4184,39 @@ class Session:
                 f"the writer fell {blocks} blocks ({_queue_rings(self.every) * self.every} steps) behind training, "
                 f"{cause}"
             ), reason="writer_behind")
+
+    def _scalar_rows_one_by_one(self, pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The scalar-only records' values when moving them off the device together raised: each tensor
+        moved on its own, and one whose move raises left out of its record, the others kept, as a gradient
+        whose norm raised is left out on its own (`record_grads`). Said once per session in a warning
+        that names the first value left out. Capture goes on: a value of a scalar-only record is not a
+        block of steps, so neither the steps after it nor the end marker at `close()` is lost (BUG-03:
+        the move raised out of `flush()` and `close()`, which then wrote no end marker and left the
+        writer thread running). A value `log` cannot read at all (on `meta`, nested, sparse) is refused
+        at the call (`_value_unread`); this is for one that fails as it is moved."""
+        rows: list[dict[str, Any]] = []
+        left_out: list[tuple[Any, str, BaseException]] = []
+        for record in pending:
+            row: dict[str, Any] = {}
+            for name, value in record["scalars"].items():
+                if isinstance(value, torch.Tensor):
+                    try:
+                        value = _scalars_to_cpu([{name: value}])[0][name]
+                    except Exception as error:  # noqa: BLE001
+                        left_out.append((record.get("step"), name, error))
+                        continue
+                row[name] = value
+            rows.append(row)
+        if left_out and not self._scalars_unread_said:
+            self._scalars_unread_said = True
+            step, name, error = left_out[0]
+            more = f", and {len(left_out) - 1} more" if len(left_out) > 1 else ""
+            _warn(
+                f"TensorQuill left out the value {name!r} logged at step {step} ({_short(error)} as it was moved off "
+                f"the device){more}: the rest of each record is written, and capture goes on. Said once per session.",
+                stacklevel=4,
+            )
+        return rows
 
     def _stop(self, cause: BaseException, what: str | None = None, reason: str | None = None) -> None:
         """Stop capture for the rest of the session, on the training thread, and say so once.
@@ -4757,6 +4804,19 @@ def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for (i, name, _), value in zip(entries, values):
             out[i][name] = value
     return out
+
+
+def _value_unread(tensor: torch.Tensor) -> str | None:
+    """Why `session.log` cannot take a tensor, from its device and layout alone (no values read, so
+    no sync, and the same under `torch.compile`), as `_grad_unread` judges a gradient; None when it
+    can. A tensor on `meta` was taken before (BUG-03) and its transfer then raised at `close()`."""
+    if tensor.device.type == "meta":
+        return "the tensor is on meta, which holds no values"
+    if tensor.is_nested:
+        return "the tensor is a nested tensor"
+    if tensor.layout != torch.strided:
+        return f"the tensor is a {str(tensor.layout).removeprefix('torch.')} tensor, not a dense one"
+    return None
 
 
 def _grad_unread(grad: torch.Tensor) -> str | None:
