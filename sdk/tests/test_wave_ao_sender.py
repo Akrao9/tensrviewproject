@@ -364,3 +364,112 @@ def test_bug24c_pins_a_whole_file_and_lines_that_are_not_this_runs(tmp_path):
     finally:
         running.close()
 
+
+# --- BUG-24 (d): the stop's step when the local file's close fails --------------------------
+#
+# `StreamingSink.close()` tells the heartbeat `sink_error` before it ends, so its last beat carries
+# the stop; it gave no step, so `capture_stopped_step` was None although step 0 (or more) was
+# committed, and the session's own stop, after it, does nothing once a stop is set. Step 0 and
+# null are different (detector rules contract, part 7). The sink now names the last training step
+# it wrote: at a close, every step the session committed has been written through it.
+
+
+class _Beat:
+    def __init__(self) -> None:
+        self.stops: list = []
+        self.closed = False
+
+    def stop_capture(self, reason: str, step: int | None = None) -> None:
+        self.stops.append((reason, step))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Sender:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self, timeout: float = 0.0) -> bool:
+        self.closed = True
+        return True
+
+
+class _FailingSink:
+    def __init__(self, path: Path, fail_write_at: int | None = None) -> None:
+        self.path = path
+        self.writes = 0
+        self.fail_write_at = fail_write_at
+
+    def write(self, records: list) -> None:
+        self.writes += 1
+        if self.writes == self.fail_write_at:
+            raise OSError("disk full")
+
+    def close(self) -> None:
+        raise OSError("disk error")
+
+
+def _closed_with(sink, writes: list[list[dict]]) -> list:
+    beat, sender = _Beat(), _Sender()
+    streaming = flight.StreamingSink(sink, sender, beat)
+    for records in writes:
+        try:
+            streaming.write(records)
+        except OSError:
+            pass
+    with pytest.raises(OSError, match="disk error"):
+        streaming.close()
+    assert beat.closed and sender.closed
+    return beat.stops
+
+
+@pytest.mark.parametrize("steps, wanted", [([0], 0), ([0, 1, 2], 2), ([5, 9], 9)])
+def test_bug24d_the_stop_names_the_last_step_written(tmp_path, steps, wanted):
+    writes = [[step_record("d", s)] for s in steps] + [[scalar_record("d", 500, 0, {"x": 1.0})]]
+    assert _closed_with(_FailingSink(tmp_path / "d.jsonl"), writes) == [("sink_error", wanted)]
+
+
+def test_bug24d_no_step_written_is_null(tmp_path):
+    assert _closed_with(_FailingSink(tmp_path / "d.jsonl"), []) == [("sink_error", None)]
+    only_scalars = [[scalar_record("d", 3, 0, {"x": 1.0})]]
+    assert _closed_with(_FailingSink(tmp_path / "e.jsonl"), only_scalars) == [("sink_error", None)]
+
+
+def test_bug24d_a_write_that_raised_is_not_counted(tmp_path):
+    writes = [[step_record("d", 0)], [step_record("d", 1)]]
+    assert _closed_with(_FailingSink(tmp_path / "d.jsonl", fail_write_at=2), writes) == [("sink_error", 0)]
+
+
+def test_bug24d_through_init_and_a_real_server_step_0_is_kept(tmp_path):
+    skip_without_server()
+    import warnings
+
+    import torch
+
+    import tensorquill as tq
+    from tensorquill.sink import JsonlSink
+
+    class FailClose(JsonlSink):
+        def close(self) -> None:
+            super().close()
+            raise OSError("disk error")
+
+    running = Server(tmp_path / "store")
+    try:
+        for steps, wanted in ((1, 0), (3, 2)):
+            model = torch.nn.Linear(2, 2)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                session = tq.init(model, run_id=f"sc{steps}", sink=FailClose(tmp_path / f"sc{steps}.jsonl"),
+                                  endpoint=running.endpoint, every=1, heartbeat_seconds=60.0, mirror_scalars=False)
+                for _ in range(steps):
+                    model(torch.ones(1, 2)).sum().backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                session.close()
+            beat = session._sink.heartbeat
+            assert (beat.capture_stopped, beat.capture_stopped_step) == ("sink_error", wanted)
+    finally:
+        running.close()
