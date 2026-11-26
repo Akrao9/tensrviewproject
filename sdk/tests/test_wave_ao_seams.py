@@ -670,12 +670,22 @@ def test_the_mirror_section_states_no_limit_on_a_small_integer():
 
 
 def test_the_lightning_and_hugging_face_rows_say_the_loss_and_the_baseline_phase():
+    """The callback reads the datasets from the `Trainer` it holds (`huggingface._more_datasets_follow`),
+    so a dictionary given to `evaluate()` alone is not among them: the page says so."""
+    from tensorquill.huggingface import _more_datasets_follow
+
+    trainer = SimpleNamespace(eval_dataset={"a": [0], "b": [1]})
+    assert _more_datasets_follow(trainer, {"eval_a_runtime": 0.1}) is True
+    assert _more_datasets_follow(trainer, {"eval_b_runtime": 0.1}) is False
+    assert _more_datasets_follow(SimpleNamespace(eval_dataset=[0]), {"eval_a_runtime": 0.1}) is False
     text = _readme(*WHAT_IS_BUILT)
     for words in ("the back-propagated loss per optimizer step (under a `GradScaler`, as with `16-mixed`, the loss before "
                   "the scaler multiplied it; since Nov 26, 2026), and the `16-mixed` scaler",
                   "During `eval_on_start`'s evaluation the callback sets the phase `\"baseline\"`, a pause as `\"eval\"` "
-                  "is, so its loader time is not step 0's `data_wait`; with several evaluation datasets the phase stays "
-                  "`\"eval\"` until the last one ends, so no dataset's loader time is training's (Nov 26, 2026)."):
+                  "is, so its loader time is not step 0's `data_wait`; with several evaluation datasets given to the "
+                  "`Trainer` (`eval_dataset={...}`) the phase stays `\"eval\"` until the last one ends, so no dataset's "
+                  "loader time is training's; a dictionary passed to `trainer.evaluate()` itself is not covered (Nov 26, "
+                  "2026)."):
         assert words in text, words
 
 
