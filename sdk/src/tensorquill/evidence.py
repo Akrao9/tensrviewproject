@@ -6891,6 +6891,54 @@ def _observation(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return found if isinstance(found, Mapping) else None
 
 
+def _observation_read(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """An observation as both engines compare it (REPLICA_OBSERVATION_CONTRACT.md section 1, as
+    `replica.rs`'s `observed` reads it; BUG-11):
+
+    - a record whose `v` is not the integer 1 names no group it can be compared in (`group` None:
+      the step is `not_established`, why `group`);
+    - a `launch` that is not text names no launch;
+    - an entry of `params` that is not an object, or whose `fp` is not a list of at least two
+      fingerprints (`[norm, sum]`), cannot be compared: it is read as `unread`.
+    Everything else is the record's own."""
+    version = observation.get("v")
+    launch = observation.get("launch")
+    params = observation.get("params")
+    unread = observation.get("unread")
+    held: dict[str, Any] = {}
+    not_read: dict[str, Any] = dict(unread) if isinstance(unread, Mapping) else {}
+    for name, row in (params.items() if isinstance(params, Mapping) else ()):
+        prints = row.get("fp") if isinstance(row, Mapping) else None
+        if isinstance(prints, list) and len(prints) >= 2:
+            held[name] = row
+        else:
+            not_read.setdefault(name, "fewer than two fingerprints")
+    return {**observation, "launch": launch if isinstance(launch, str) else None,
+            "group": observation.get("group") if type(version) is int and version == 1 else None,
+            "params": held, "unread": not_read}
+
+
+def _json_key(value: Any) -> Any:
+    """`value` as a key that is equal for two JSON values exactly when `serde_json` finds them
+    equal: a signature is compared as the value it is, as Rust compares it (BUG-11), so `123` and
+    `"123"`, `true` and `1`, and `1` and `1.0` differ."""
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        return ("float", value)
+    if isinstance(value, str):
+        return ("str", value)
+    if value is None:
+        return ("null",)
+    if isinstance(value, (list, tuple)):
+        return ("list", tuple(_json_key(v) for v in value))
+    if isinstance(value, Mapping):
+        return ("object", frozenset((str(k), _json_key(v)) for k, v in value.items()))
+    return ("other", repr(value))
+
+
 def _spread_table(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
     found = record.get("replica_spread")
     return found if isinstance(found, Mapping) else None
@@ -6950,7 +6998,7 @@ def _compare_one_group(seen: Mapping[int, Mapping[str, Any]], tolerance: float) 
             continue
         if signatures_comparable:
             signatures_made += 1
-            if len({str(row.get("sig")) for row in rows}) > 1:  # type: ignore[union-attr]
+            if len({_json_key(row.get("sig")) for row in rows}) > 1:  # type: ignore[union-attr]
                 differing.append(name)
         if not prints_comparable:
             continue
@@ -7021,9 +7069,9 @@ def _attributed_by_signatures(rows: Mapping[int, Mapping[str, Any]]) -> dict[str
     ranks = sorted(rows)
     if len(ranks) == 2:
         return {"verdict": "inconclusive", "why": "two_ranks"}
-    held: dict[str, list[int]] = {}
+    held: dict[Any, list[int]] = {}
     for rank in ranks:
-        held.setdefault(str(rows[rank].get("sig")), []).append(rank)
+        held.setdefault(_json_key(rows[rank].get("sig")), []).append(rank)
     most = max(held.values(), key=len)
     if 2 * len(most) <= len(ranks):
         return {"verdict": "inconclusive", "why": "no_majority"}
@@ -7087,6 +7135,7 @@ def _replica_judged(
                 legacy.append({"rank": rank, "step": step, "drift": bool(over), **({"parameters": over} if over else {})})
         if observation is None:
             continue
+        observation = _observation_read(observation)
         launch = observation.get("launch")
         if launch is not None:
             attempt = record.get("attempt", 0)
