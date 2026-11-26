@@ -1,23 +1,23 @@
 {
- "started": "2026-11-26 10:40:22",
+ "started": "2026-11-26 15:18:46",
  "old_commit": "85a477aaae5ee8070277e62b57bca3db59754814",
- "new_commit": "d56658b495cd856517ffd0f1309383ea15254acb",
+ "new_commit": "964148ae8d623bfb0b9119ca74274b6d303465bb",
  "old_protocol": 4,
  "new_protocol": 5,
  "old_binary": "the old checkout's own release build (server/target/release/tensorquill-server)",
  "new_binary": {
-  "name": "tensorquill-server-d56658b",
-  "built_at": "d56658b495cd856517ffd0f1309383ea15254acb",
-  "sha256": "c645f23da1f6819544d94ac081260631bca88c8935d8407edfcaffbfcd1bb7e1"
+  "name": "tensorquill-server-964148a",
+  "built_at": "964148ae8d623bfb0b9119ca74274b6d303465bb",
+  "sha256": "823b59723f77dbbaa7bd9e8a44a0a898ef352edab8e94b0d99e82937f9413df7"
  },
  "row_1": {
   "fresh": {
    "old_server": {
-    "ready": "tensorquill-server listening on 127.0.0.1:62682",
+    "ready": "tensorquill-server listening on 127.0.0.1:64441",
     "sender": {
      "phase": "refused",
      "last_error_type": "OlderServer",
-     "last_error": "the server at grpc://127.0.0.1:62682 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-fresh.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
+     "last_error": "the server at grpc://127.0.0.1:64441 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-fresh.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
      "unacked_bytes": 24960,
      "offset_file": 0
     },
@@ -26,12 +26,12 @@
     "lines_in_file": 40,
     "lines_before": 40,
     "stderr": [
-     "tensorquill-server: store ID d7d6731d7357f233ed7193f7bee3b3e0",
+     "tensorquill-server: store ID 799d0755a1aa598ddbce0402b45b8ca9",
      "tensorquill-server: the stream of xv-fresh rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 40 rows, 28199 bytes; nothing acknowledged; the request had not ended first; the response was open; open 2.1 s"
     ]
    },
    "new_server": {
-    "ready": "tensorquill-server listening on 127.0.0.1:62682",
+    "ready": "tensorquill-server listening on 127.0.0.1:64441",
     "sender": {
      "returned": true,
      "returned_means": "the whole file confirmed and no line of the run left out (wave AO)",
@@ -56,7 +56,7 @@
     },
     "stderr": [
      "tensorquill-server: watching 1 unfinished runs from the last server's status",
-     "tensorquill-server: store ID d7d6731d7357f233ed7193f7bee3b3e0",
+     "tensorquill-server: store ID 799d0755a1aa598ddbce0402b45b8ca9",
      "tensorquill-server: the stream of xv-fresh rank 0 ended (code Ok); received 1 batches, 40 rows, 28199 bytes; acknowledged to offset 24960; the request had ended first; the response was open; open 0.0 s"
     ],
     "parts": [
@@ -126,7 +126,7 @@
     }
    },
    "sender_stderr": [
-    "tensorquill: the server at grpc://127.0.0.1:62682 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-fresh.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
+    "tensorquill: the server at grpc://127.0.0.1:64441 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-fresh.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
    ],
    "older_message_said": 1
   },
@@ -143,11 +143,11 @@
     "stderr": []
    },
    "old_server": {
-    "ready": "tensorquill-server listening on 127.0.0.1:62701",
+    "ready": "tensorquill-server listening on 127.0.0.1:64449",
     "sender": {
      "phase": "refused",
      "last_error_type": "OlderServer",
-     "last_error": "the server at grpc://127.0.0.1:62701 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-resumed.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
+     "last_error": "the server at grpc://127.0.0.1:64449 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-resumed.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
      "unacked_bytes": 25040,
      "offset_file": 12510
     },
@@ -226,12 +226,12 @@
     "lines_in_file": 40,
     "lines_before": 40,
     "stderr": [
-     "tensorquill-server: store ID 74d151bc32a7da2ea30fde87fb42e7d3",
+     "tensorquill-server: store ID 38fe9c38d30b65d837ce1e9571a39795",
      "tensorquill-server: the stream of xv-resumed rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8850 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s"
     ]
    },
    "new_server": {
-    "ready": "tensorquill-server listening on 127.0.0.1:62701",
+    "ready": "tensorquill-server listening on 127.0.0.1:64449",
     "sender": {
      "returned": true,
      "returned_means": "the whole file confirmed and no line of the run left out (wave AO)",
@@ -256,8 +256,8 @@
     },
     "stderr": [
      "tensorquill-server: watching 1 unfinished runs from the last server's status",
-     "tensorquill-server: store ID 74d151bc32a7da2ea30fde87fb42e7d3",
-     "tensorquill-server: the stream of xv-resumed rank 0 ended (code Ok); received 2 batches, 20 rows, 23360 bytes; acknowledged to offset 25040; the request had ended first; the response was open; open 0.0 s"
+     "tensorquill-server: store ID 38fe9c38d30b65d837ce1e9571a39795",
+     "tensorquill-server: the stream of xv-resumed rank 0 ended (code Ok); received 2 batches, 20 rows, 23360 bytes; acknowledged to offset 25040; the request had ended first; the response was open; open 0.1 s"
     ],
     "parts": [
      {
@@ -340,7 +340,7 @@
     }
    },
    "sender_stderr": [
-    "tensorquill: the server at grpc://127.0.0.1:62701 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-resumed.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
+    "tensorquill: the server at grpc://127.0.0.1:64449 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-resumed.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
    ],
    "older_message_said": 1
   }
@@ -441,7 +441,7 @@
     }
    ],
    "server_stderr": [
-    "tensorquill-server: store ID 179d6f6b8659d04da5fdc7646b39c4f4",
+    "tensorquill-server: store ID 2b72f69364a9ff40ed51ceb8d01ebae4",
     "tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 2 batches, 60 rows, 45651 bytes; acknowledged to offset 37456; the request had ended first; the response was open; open 0.0 s"
    ]
   },
@@ -467,8 +467,8 @@
     "activation_spike": "checked"
    },
    "server_stderr": [
-    "tensorquill-server: store ID 179d6f6b8659d04da5fdc7646b39c4f4",
-    "tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 3 batches, 60 rows, 47355 bytes; acknowledged to offset 74972; the request had ended first; the response was open; open 0.0 s"
+    "tensorquill-server: store ID 2b72f69364a9ff40ed51ceb8d01ebae4",
+    "tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 3 batches, 60 rows, 47355 bytes; acknowledged to offset 74972; the request had ended first; the response was open; open 0.1 s"
    ]
   },
   "parts": [
@@ -1129,7 +1129,7 @@
     ]
    }
   ],
-  "ready": "tensorquill-server listening on 127.0.0.1:63504",
+  "ready": "tensorquill-server listening on 127.0.0.1:64468",
   "old_sender": {
    "returned": true,
    "returned_means": "the whole file confirmed (an SDK before wave AO)",
@@ -1156,14 +1156,14 @@
    "phase": "train",
    "phase_seconds": 0.4,
    "rank": 0,
-   "seconds_since_progress": 0.4,
+   "seconds_since_progress": 0.3,
    "severity": null,
    "state": "finished",
    "stream": "finished",
    "work": null
   },
   "server_stderr": [
-   "tensorquill-server: store ID 179d6f6b8659d04da5fdc7646b39c4f4",
+   "tensorquill-server: store ID 2b72f69364a9ff40ed51ceb8d01ebae4",
    "tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 2 batches, 20 rows, 21262 bytes; acknowledged to offset 87502; the request had ended first; the response was open; open 0.0 s"
   ],
   "parts_after": [
@@ -1353,11 +1353,11 @@
  },
  "row_6": {
   "old_server": {
-   "ready": "tensorquill-server listening on 127.0.0.1:63507",
+   "ready": "tensorquill-server listening on 127.0.0.1:64471",
    "sender": {
     "phase": "refused",
     "last_error_type": "OlderServer",
-    "last_error": "the server at grpc://127.0.0.1:63507 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-scal.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
+    "last_error": "the server at grpc://127.0.0.1:64471 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-scal.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
     "unacked_bytes": 25389,
     "offset_file": 0
    },
@@ -1367,12 +1367,12 @@
    "lines_in_file": 43,
    "lines_before": 43,
    "stderr": [
-    "tensorquill-server: store ID 8b167c24f3f8bd78431e891e134cdca0",
-    "tensorquill-server: the stream of xv-scal rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 43 rows, 28702 bytes; nothing acknowledged; the request had not ended first; the response was open; open 2.1 s"
+    "tensorquill-server: store ID a6b51311348411ff3652c32835c7684b",
+    "tensorquill-server: the stream of xv-scal rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 43 rows, 28702 bytes; nothing acknowledged; the request had not ended first; the response was open; open 2.2 s"
    ]
   },
   "new_server": {
-   "ready": "tensorquill-server listening on 127.0.0.1:63507",
+   "ready": "tensorquill-server listening on 127.0.0.1:64471",
    "sender": {
     "returned": true,
     "returned_means": "the whole file confirmed and no line of the run left out (wave AO)",
@@ -1397,7 +1397,7 @@
    },
    "stderr": [
     "tensorquill-server: watching 1 unfinished runs from the last server's status",
-    "tensorquill-server: store ID 8b167c24f3f8bd78431e891e134cdca0",
+    "tensorquill-server: store ID a6b51311348411ff3652c32835c7684b",
     "tensorquill-server: the stream of xv-scal rank 0 ended (code Ok); received 1 batches, 43 rows, 28702 bytes; acknowledged to offset 25389; the request had ended first; the response was open; open 0.0 s"
    ],
    "parts": [
@@ -1476,9 +1476,9 @@
     "heartbeat_age_seconds": null,
     "last_step": 39,
     "phase": "train",
-    "phase_seconds": 3.9,
+    "phase_seconds": 3.8,
     "rank": 0,
-    "seconds_since_progress": 0.4,
+    "seconds_since_progress": 0.3,
     "severity": null,
     "state": "finished",
     "stream": "finished",
@@ -1486,7 +1486,7 @@
    }
   },
   "sender_stderr": [
-   "tensorquill: the server at grpc://127.0.0.1:63507 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-scal.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
+   "tensorquill: the server at grpc://127.0.0.1:64471 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-scal.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
   ],
   "older_message_said": 1,
   "new_load_records": {
@@ -1793,7 +1793,7 @@
     "activation_spike": "checked"
    },
    "server_stderr": [
-    "tensorquill-server: store ID 47c6762c9b22124c0d2ba4350c7b1fb0",
+    "tensorquill-server: store ID 139bd3febc4ef529543a2212272ef185",
     "tensorquill-server: the stream of xv-old-a rank 0 ended (code Ok); received 1 batches, 30 rows, 24159 bytes; acknowledged to offset 18718; the request had ended first; the response was open; open 0.0 s"
    ],
    "parts": [
@@ -1978,12 +1978,12 @@
     "binding": {
      "version": 2,
      "offset": 18876,
-     "endpoint": "grpc://127.0.0.1:63520",
+     "endpoint": "grpc://127.0.0.1:64480",
      "run_id": "xv-old-b",
      "rank": 0,
      "head": "10159762fcb122218fe6ddedb412935e0f7d644abe126c1c77e25905e9d39923",
      "tail": "3a33f9fe9bde58fe717faf17b97e0cfd00775c8fc23cf97260e1f36c8a80781d",
-     "store_id": "bafeab5d0811e429887b4a91e8dc842d"
+     "store_id": "3b7dbb36f6f903c5f3de4148a9a60b7a"
     },
     "stderr": []
    },
@@ -2089,12 +2089,12 @@
     "binding": {
      "version": 2,
      "offset": 18876,
-     "endpoint": "grpc://127.0.0.1:63520",
+     "endpoint": "grpc://127.0.0.1:64480",
      "run_id": "xv-old-b",
      "rank": 0,
      "head": "10159762fcb122218fe6ddedb412935e0f7d644abe126c1c77e25905e9d39923",
      "tail": "3a33f9fe9bde58fe717faf17b97e0cfd00775c8fc23cf97260e1f36c8a80781d",
-     "store_id": "bafeab5d0811e429887b4a91e8dc842d"
+     "store_id": "3b7dbb36f6f903c5f3de4148a9a60b7a"
     },
     "stderr": []
    }
@@ -2126,10 +2126,10 @@
     "heartbeat_age_seconds": null,
     "last_step": 29,
     "phase": "train",
-    "phase_seconds": 19.5,
+    "phase_seconds": 20.5,
     "rank": 0,
     "rows_not_newer": 30,
-    "seconds_since_progress": 19.5,
+    "seconds_since_progress": 20.5,
     "severity": null,
     "state": "finished",
     "stream": "finished",
@@ -2216,18 +2216,18 @@
     "binding": {
      "version": 2,
      "offset": 18876,
-     "endpoint": "grpc://127.0.0.1:63520",
+     "endpoint": "grpc://127.0.0.1:64480",
      "run_id": "xv-old-b",
      "rank": 0,
      "head": "10159762fcb122218fe6ddedb412935e0f7d644abe126c1c77e25905e9d39923",
      "tail": "3a33f9fe9bde58fe717faf17b97e0cfd00775c8fc23cf97260e1f36c8a80781d",
-     "store_id": "bafeab5d0811e429887b4a91e8dc842d"
+     "store_id": "3b7dbb36f6f903c5f3de4148a9a60b7a"
     },
     "stderr": []
    }
   },
   "b_server_stderr": [
-   "tensorquill-server: store ID bafeab5d0811e429887b4a91e8dc842d",
+   "tensorquill-server: store ID 3b7dbb36f6f903c5f3de4148a9a60b7a",
    "tensorquill-server: xv-old-b rank 0: dropped rows that cannot be stored: 1 of a schema_version this server does not read (1 such rows since the server started)",
    "tensorquill-server: the stream of xv-old-b rank 0 ended (code Ok); received 1 batches, 31 rows, 24328 bytes; acknowledged to offset 18876; the request had ended first; the response was open; open 0.0 s",
    "tensorquill-server: the stream of xv-old-b rank 0 ended (code Ok); received 1 batches, 0 rows, 8848 bytes; acknowledged to offset 0; the request had ended first; the response was open; open 0.0 s"
@@ -2252,11 +2252,11 @@
     }
    },
    "old_server": {
-    "ready": "tensorquill-server listening on 127.0.0.1:63527",
+    "ready": "tensorquill-server listening on 127.0.0.1:64487",
     "sender": {
      "phase": "refused",
      "last_error_type": "OlderServer",
-     "last_error": "the server at grpc://127.0.0.1:63527 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-null.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
+     "last_error": "the server at grpc://127.0.0.1:64487 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-null.rank0.jsonl keeps every line, and they are sent once the server is upgraded",
      "unacked_bytes": 12763,
      "offset_file": 12450
     },
@@ -2336,12 +2336,12 @@
     "lines_in_file": 22,
     "lines_before": 22,
     "stderr": [
-     "tensorquill-server: store ID 49a7e178d43a7e21b51713ccb12aff05",
+     "tensorquill-server: store ID db28b96e4b81c4f979cdda36d298ba4b",
      "tensorquill-server: the stream of xv-null rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8847 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s"
     ]
    },
    "new_server": {
-    "ready": "tensorquill-server listening on 127.0.0.1:63527",
+    "ready": "tensorquill-server listening on 127.0.0.1:64487",
     "sender": {
      "returned": true,
      "returned_means": "the whole file confirmed and no line of the run left out (wave AO)",
@@ -2360,7 +2360,7 @@
     },
     "stderr": [
      "tensorquill-server: watching 1 unfinished runs from the last server's status",
-     "tensorquill-server: store ID 49a7e178d43a7e21b51713ccb12aff05",
+     "tensorquill-server: store ID db28b96e4b81c4f979cdda36d298ba4b",
      "tensorquill-server: the stream of xv-null rank 0 ended (code Ok); received 2 batches, 2 rows, 14158 bytes; acknowledged to offset 12763; the request had ended first; the response was open; open 0.0 s"
     ],
     "parts": [
@@ -2418,9 +2418,9 @@
      "heartbeat_age_seconds": null,
      "last_step": null,
      "phase": "train",
-     "phase_seconds": 1.7,
+     "phase_seconds": 1.6,
      "rank": 0,
-     "seconds_since_progress": 1.7,
+     "seconds_since_progress": 1.6,
      "severity": null,
      "state": "finished",
      "stream": "finished",
@@ -2428,7 +2428,7 @@
     }
    },
    "sender_stderr": [
-    "tensorquill: the server at grpc://127.0.0.1:63527 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-null.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
+    "tensorquill: the server at grpc://127.0.0.1:64487 speaks an older protocol: upgrade tensorquill-server (pip install -U tensorquill-server). It reads batch schema_version 1 and this tensorquill sends version 2, so it acknowledges nothing; <tmp>/xv-null.rank0.jsonl keeps every line, and they are sent once the server is upgraded. Training continues; said once."
    ],
    "older_message_said": 1
   },
@@ -2467,7 +2467,7 @@
     "activation_spike": "checked"
    },
    "server_stderr": [
-    "tensorquill-server: store ID 25651bc3a9b0add6a1f1f985ebd96aad",
+    "tensorquill-server: store ID af05dfa40758f835501f9cfda4b3a2f9",
     "tensorquill-server: the stream of xv-null-old rank 0 ended (code Ok); received 1 batches, 20 rows, 18178 bytes; acknowledged to offset 12530; the request had ended first; the response was open; open 0.0 s"
    ],
    "parts": [
@@ -2615,7 +2615,7 @@
     ]
    }
   ],
-  "ready": "tensorquill-server listening on 127.0.0.1:63541",
+  "ready": "tensorquill-server listening on 127.0.0.1:64501",
   "old_sender": {
    "returned": true,
    "returned_means": "the whole file confirmed (an SDK before wave AO)",
@@ -2633,7 +2633,7 @@
    "activation_spike": "checked"
   },
   "server_stderr": [
-   "tensorquill-server: store ID 8b167c24f3f8bd78431e891e134cdca0",
+   "tensorquill-server: store ID a6b51311348411ff3652c32835c7684b",
    "tensorquill-server: the stream of xv-scal rank 0 ended (code Ok); received 1 batches, 20 rows, 18095 bytes; acknowledged to offset 12476; the request had ended first; the response was open; open 0.0 s"
   ],
   "parts_after": [
@@ -2853,7 +2853,7 @@
    "row": "1 resumed",
    "claim": "the stream's first batch is the empty one that asks for the store, and that is what is refused",
    "holds": true,
-   "seen": "tensorquill-server: store ID 74d151bc32a7da2ea30fde87fb42e7d3 | tensorquill-server: the stream of xv-resumed rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8850 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s"
+   "seen": "tensorquill-server: store ID 38fe9c38d30b65d837ce1e9571a39795 | tensorquill-server: the stream of xv-resumed rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8850 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s"
   },
   {
    "row": "1 resumed",
@@ -2991,7 +2991,7 @@
    "row": "5",
    "claim": "the old server reads the protocol 5 parts without a word (nothing on its stderr about them)",
    "holds": true,
-   "seen": "['tensorquill-server: store ID 179d6f6b8659d04da5fdc7646b39c4f4', 'tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 2 batches, 20 rows, 21262 bytes; acknowledged to offset 87502; the request had ended first; the response was open; open 0.0 s']"
+   "seen": "['tensorquill-server: store ID 2b72f69364a9ff40ed51ceb8d01ebae4', 'tensorquill-server: the stream of xv-mixed rank 0 ended (code Ok); received 2 batches, 20 rows, 21262 bytes; acknowledged to offset 87502; the request had ended first; the response was open; open 0.0 s']"
   },
   {
    "row": "5",
@@ -3003,7 +3003,7 @@
    "row": "6",
    "claim": "the old server refuses the new sender's stream on its metadata version, before any row: nothing stored",
    "holds": true,
-   "seen": "tensorquill-server: store ID 8b167c24f3f8bd78431e891e134cdca0 | tensorquill-server: the stream of xv-scal rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 43 rows, 28702 bytes; nothing acknowledged; the request had not ended first; the response was open; open 2.1 s"
+   "seen": "tensorquill-server: store ID a6b51311348411ff3652c32835c7684b | tensorquill-server: the stream of xv-scal rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 43 rows, 28702 bytes; nothing acknowledged; the request had not ended first; the response was open; open 2.2 s"
   },
   {
    "row": "6",
@@ -3129,13 +3129,13 @@
    "row": "10 a",
    "claim": "the old server refuses the resumed stream's first batch, the one with no steps (null min_step and max_step), on its metadata version: nothing acknowledged",
    "holds": true,
-   "seen": "tensorquill-server: store ID 49a7e178d43a7e21b51713ccb12aff05 | tensorquill-server: the stream of xv-null rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8847 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s; offset 12450"
+   "seen": "tensorquill-server: store ID db28b96e4b81c4f979cdda36d298ba4b | tensorquill-server: the stream of xv-null rank 0 ended in an error (code InvalidArgument): schema_version 2 is not supported; this server reads version 1; received 1 batches, 0 rows, 8847 bytes; nothing acknowledged; the request had not ended first; the response was open; open 0.0 s; offset 12450"
   },
   {
    "row": "10 a",
    "claim": "the new server in its place takes the batch of scalar-only rows alone: confirmed, one scalars-* object of 2 rows, no new part, the last step still 19",
    "holds": true,
-   "seen": "whole file confirmed True, returned True; objects [{'object': 'rank=0/attempt=1/scalars-00000000-00000001.parquet', 'rows': 2, 'seq': [0, 1], 'steps': [19, 500]}]; parts [{'part': 'part-00000000-00000019.parquet', 'layout': 'protocol 5', 'steps': [0, 19], 'row_versions': [2], 'rows': 20, 'step_list': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]}]; report {'last_step': 19, 'incidents': [], 'activation_spike': 'checked'}; watchdog.json rank 0 {'attempt': 1, 'heartbeat_age_seconds': None, 'last_step': None, 'phase': 'train', 'phase_seconds': 1.7, 'rank': 0, 'seconds_since_progress': 1.7, 'severity': None, 'state': 'finished', 'stream': 'finished', 'work': None}"
+   "seen": "whole file confirmed True, returned True; objects [{'object': 'rank=0/attempt=1/scalars-00000000-00000001.parquet', 'rows': 2, 'seq': [0, 1], 'steps': [19, 500]}]; parts [{'part': 'part-00000000-00000019.parquet', 'layout': 'protocol 5', 'steps': [0, 19], 'row_versions': [2], 'rows': 20, 'step_list': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]}]; report {'last_step': 19, 'incidents': [], 'activation_spike': 'checked'}; watchdog.json rank 0 {'attempt': 1, 'heartbeat_age_seconds': None, 'last_step': None, 'phase': 'train', 'phase_seconds': 1.6, 'rank': 0, 'seconds_since_progress': 1.6, 'severity': None, 'state': 'finished', 'stream': 'finished', 'work': None}"
   },
   {
    "row": "10 b",
@@ -3153,7 +3153,7 @@
    "row": "11",
    "claim": "it says nothing about them, and leaves them as they were",
    "holds": true,
-   "seen": "['tensorquill-server: store ID 8b167c24f3f8bd78431e891e134cdca0', 'tensorquill-server: the stream of xv-scal rank 0 ended (code Ok); received 1 batches, 20 rows, 18095 bytes; acknowledged to offset 12476; the request had ended first; the response was open; open 0.0 s']; objects [{'object': 'rank=0/attempt=1/scalars-00000000-00000002.parquet', 'rows': 3, 'seq': [0, 2], 'steps': [500, 19, 39]}]"
+   "seen": "['tensorquill-server: store ID a6b51311348411ff3652c32835c7684b', 'tensorquill-server: the stream of xv-scal rank 0 ended (code Ok); received 1 batches, 20 rows, 18095 bytes; acknowledged to offset 12476; the request had ended first; the response was open; open 0.0 s']; objects [{'object': 'rank=0/attempt=1/scalars-00000000-00000002.parquet', 'rows': 3, 'seq': [0, 2], 'steps': [500, 19, 39]}]"
   }
  ]
 }
