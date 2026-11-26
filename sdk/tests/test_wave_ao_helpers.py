@@ -416,3 +416,160 @@ def test_an_analyzer_that_keys_its_groups_otherwise_still_gives_the_size_when_on
     monkeypatch.setattr(builder, "build_db", keyed_otherwise)
     directory = _fr_dumps(tmp_path / "fr", {"0": ("undefined", (0, 1))}, _desync("0", "undefined"))
     assert analyze(directory)["problem"]["group"] == {"id": "0", "desc": "0", "size": 2}
+
+
+# ---- BUG-18: a tracker's mirrored integer and an explicit `session.log` of the same integer -------
+#
+# Stand-ins for W&B and MLflow carry only the names the mirror wraps (`wandb.log(data)`,
+# `mlflow.log_metric(key, value)`), each passing the caller's own objects, as the real ones do
+# (`wandb/sdk/wandb_run.py` `Run.log`, `mlflow/tracking/fluent.py` `log_metric`). The real packages
+# follow, where installed, offline.
+
+
+def _stand_in_trackers(monkeypatch):
+    import sys
+    import types
+
+    wandb = types.ModuleType("wandb")
+    wandb.log = lambda data, step=None, commit=None: None
+    mlflow = types.ModuleType("mlflow")
+    mlflow.log_metric = lambda key, value, step=None, **kwargs: None
+    mlflow.log_metrics = lambda metrics, step=None, **kwargs: None
+    monkeypatch.setitem(sys.modules, "wandb", wandb)
+    monkeypatch.setitem(sys.modules, "mlflow", mlflow)
+    return wandb, mlflow
+
+
+def _step_once(model, session):
+    model(torch.ones(1, 1)).sum().backward()
+    session.step()
+
+
+_SHARED = int("500")  # one object, beyond the integers CPython keeps one of each
+
+
+@pytest.mark.parametrize("value", [1, 0, -3, 256, _SHARED, 1.0], ids=["1", "0", "-3", "256", "500-shared", "1.0"])
+def test_an_explicit_integer_is_kept_when_the_tracker_logs_the_key_again(monkeypatch, value):
+    wandb, _ = _stand_in_trackers(monkeypatch)
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    with session:
+        wandb.log({"k": value})
+        session.log({"k": value})
+        wandb.log({"k": 999})
+        _step_once(model, session)
+    assert [r["scalars"] for r in sink.records] == [{"k": value}]
+
+
+@pytest.mark.parametrize("value", [1, _SHARED, 1.0], ids=["1", "500-shared", "1.0"])
+def test_under_eval_an_explicit_integer_on_the_newest_step_is_kept(monkeypatch, value):
+    wandb, _ = _stand_in_trackers(monkeypatch)
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    with session:
+        _step_once(model, session)
+        with session.phase("eval"):
+            wandb.log({"eval/k": value})
+            session.log({"eval/k": value})
+            wandb.log({"eval/k": 999})
+    assert [r.get("scalars") for r in sink.records] == [{"eval/k": value}]
+
+
+def test_an_explicit_integer_after_the_step_ended_beats_the_mirror_s_carried_value(monkeypatch):
+    wandb, _ = _stand_in_trackers(monkeypatch)
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    with session:
+        wandb.log({"k": 1})  # the mirror's, on the step in progress
+        _step_once(model, session)
+        with session.phase("eval"):
+            session.log({"k": 1})  # explicit, on the step that just ended
+            wandb.log({"k": 999})
+    assert [r["scalars"] for r in sink.records] == [{"k": 1}]
+
+
+def test_mlflow_log_metric_does_not_replace_an_explicit_integer(monkeypatch):
+    _, mlflow = _stand_in_trackers(monkeypatch)
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    with session:
+        mlflow.log_metric("epoch", 3)
+        session.log({"epoch": 3})
+        mlflow.log_metric("epoch", 4)
+        mlflow.log_metrics({"epoch": 5})
+        _step_once(model, session)
+    assert [r["scalars"] for r in sink.records] == [{"epoch": 3}]
+
+
+@pytest.mark.parametrize("mode", ["offline", "disabled"])
+def test_real_wandb_does_not_replace_an_explicit_integer(tmp_path, monkeypatch, mode):
+    wandb = pytest.importorskip("wandb")
+    monkeypatch.setenv("WANDB_MODE", mode)
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    monkeypatch.setenv("WANDB_SILENT", "true")
+    run = wandb.init(project="ao8", mode=mode, dir=str(tmp_path))
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    try:
+        run.log({"k": 1, "f": 1.0}, commit=False)
+        session.log({"k": 1, "f": 1.0})
+        wandb.log({"k": 2, "f": 2.0})
+        _step_once(model, session)
+    finally:
+        session.close()
+        run.finish()
+    assert [r["scalars"] for r in sink.records] == [{"k": 1, "f": 1.0}]
+
+
+def test_real_mlflow_does_not_replace_an_explicit_integer(tmp_path, monkeypatch):
+    mlflow = pytest.importorskip("mlflow")
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    try:
+        with mlflow.start_run():
+            mlflow.log_metric("epoch", 3)
+            session.log({"epoch": 3})
+            mlflow.log_metric("epoch", 4)
+            _step_once(model, session)
+    finally:
+        session.close()
+    assert [r["scalars"] for r in sink.records] == [{"epoch": 3}]
+
+
+# Pinned beside the fix: what the mirror did and still does.
+
+
+def test_a_key_only_the_tracker_logged_keeps_its_last_value(monkeypatch):
+    wandb, _ = _stand_in_trackers(monkeypatch)
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True)
+    with session:
+        wandb.log({"k": 1, "n": 7})
+        wandb.log({"k": 2})
+        _step_once(model, session)
+        wandb.log({"k": 1})  # the mirror's, on the next step in progress
+        _step_once(model, session)
+        wandb.log({"k": 3})
+        _step_once(model, session)
+        with session.phase("eval"):
+            wandb.log({"k": 4})  # the mirror's own value from the step: replaced, as before
+    assert [r["scalars"] for r in sink.records] == [{"k": 2, "n": 7}, {"k": 1}, {"k": 4}]
+
+
+def test_a_mirrored_integer_is_written_as_a_plain_integer(monkeypatch, tmp_path):
+    import json
+
+    from tensorquill.sink import JsonlSink
+
+    wandb, _ = _stand_in_trackers(monkeypatch)
+    model = _model()
+    path = tmp_path / "run.jsonl"
+    session, _ = _open(model, auto_step=False, mirror_scalars=True, sink=JsonlSink(path))
+    with session:
+        wandb.log({"k": 1, "big": 2**40, "f": 0.5})
+        _step_once(model, session)
+    [line] = [json.loads(text) for text in path.read_text().splitlines() if '"scalars"' in text]
+    assert line["scalars"] == {"k": 1, "big": 2**40, "f": 0.5}
+    assert '"k":1,' in path.read_text() and '"big":1099511627776,' in path.read_text()
