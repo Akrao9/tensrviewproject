@@ -135,7 +135,7 @@ def test_a_compact_file_beside_the_records_reads_them_by_the_same_rule(tmp_path,
     _check(_ask(mcp_server.Source(report, records=capture)), _judged_steps(document), every=len(at) == STEPS)
 
 
-@pytest.mark.parametrize("bad, at", [pytest.param(bad, POSITIONS["first"], id=label) for label, bad in REFUSED.items()])
+@pytest.mark.parametrize("bad, at", CASES)
 def test_records_nothing_judges_here_read_by_the_same_rule(tmp_path, monkeypatch, bad, at):
     """A run folder of a store given as --records, beside another run's file: nothing judges the
     records here, so the series is read from them with no flags (wave AO), by the same rule."""
@@ -153,8 +153,10 @@ def test_records_nothing_judges_here_read_by_the_same_rule(tmp_path, monkeypatch
     monkeypatch.setattr(source, "rank_records", lambda rank: (records, names, {**origin, "records": str(folder)}, scalar_only))
 
     result = _ask(source)
-    _check(result, judged, every=False)
-    assert "with no flags" in json.loads(result["content"][0]["text"])["evidence_file"]
+    every = len(at) == STEPS
+    _check(result, judged, every=every)
+    if not every:
+        assert "with no flags" in json.loads(result["content"][0]["text"])["evidence_file"]
 
 
 def test_a_negative_count_beside_a_larger_one_is_a_point_on_both_sides(tmp_path):
