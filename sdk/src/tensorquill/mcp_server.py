@@ -53,6 +53,7 @@ from . import runs as _runs
 from .identity import MalformedRecordError, check as check_identity, in_file, is_scalar_record
 from .sink import read_end_marker, writers_block
 from .evidence import (
+    with_writers,
     ALL_RANKS_VIEW,
     ATTN_KINDS,
     HEAD_NUMBERS,
@@ -360,8 +361,7 @@ class Source:
             return evidence
         # Another process's file of the same run ID and rank beside it (`sink.writers_block`), read at
         # every call as the marker is: this file is then one of the rank's writers, not its whole.
-        writers = writers_block(path)
-        return {**evidence, "run_end": read_end_marker(path), **({"writers": writers} if writers else {})}
+        return with_writers({**evidence, "run_end": read_end_marker(path)}, writers_block(path))
 
     # One rank's step records, for series ------------------------------------------------
 

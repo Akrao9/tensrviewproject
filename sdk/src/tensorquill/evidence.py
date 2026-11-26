@@ -8241,7 +8241,6 @@ def _build_evidence(
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
         # Another process's file of the same run ID and rank beside it (`sink.writers_block`): this
         # file holds one of the rank's writers, not the rank's whole.
-        **({"writers": writers} if ended and (writers := writers_block(ended)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         # Skipped updates by who reported them: the server's, else counted here (contract, section 1).
         **({"skipped_updates": skipped} if (skipped := (
@@ -8277,7 +8276,25 @@ def _build_evidence(
         {kind: {**rank_checks, **others}[kind] for kind in INCIDENT_CLASSES}, incidents)
     evidence["run_state"] = _per_rank_run_state(evidence, status, _status_age(status), steps_judged=bool(records),
                                                 attempt=newest_attempt(records))
-    return evidence
+    ended = _records_file(source, records_file)
+    return with_writers(evidence, writers_block(ended) if ended else None)
+
+
+def with_writers(evidence: dict[str, Any], writers: Mapping[str, Any] | None) -> dict[str, Any]:
+    """`evidence` of one local records file with `writers` (`sink.writers_block`) when another
+    process wrote the same run ID and rank in a file of its own beside it. The file then holds one
+    of the rank's writers, not the rank's whole, so a run state that would read healthy or degraded
+    reads `unknown`, with the writers as its reason (code `several_writers`); an unhealthy one
+    stays so, with the reason added. With no `writers`, `evidence` as it is."""
+    if not writers:
+        return evidence
+    found = dict(evidence.get("run_state") or {})
+    state = found.get("state") if found.get("state") in RUN_STATES else "unknown"
+    if RUN_STATES.index(state) < RUN_STATES.index("unknown"):
+        state = "unknown"
+    reason = _reason("unknown", "several_writers", str(writers.get("detail") or "two processes wrote this rank"))
+    return {**evidence, "writers": dict(writers),
+            "run_state": {**found, "state": state, "reasons": [*(found.get("reasons") or ()), reason]}}
 
 
 def _records_file(source: Any, records_file: Any) -> Path | None:

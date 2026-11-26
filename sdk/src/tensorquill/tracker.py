@@ -264,6 +264,9 @@ def _placement() -> _Placement:
     variable names the world size (1 when it has none). `SLURM_PROCID` counts only inside an
     `srun` step (`_slurm_step_tasks`): a batch script has it too (sbatch(1) lists it), and an
     `mpirun` started from that script would hand the script's value to every process it starts.
+    The same holds for an `mpirun` started inside a step's task, which inherits the step's
+    variables too, so where `OMPI_COMM_WORLD_RANK` or `PMI_RANK` names another rank, that one is
+    read.
     With none of them, `LOCAL_RANK` alone is read, as before: it is the rank within one node, so
     `init` says so when the world size is above 1 or not known (`_placement_warning`). Pure: it
     reads the environment and says nothing."""
@@ -274,6 +277,12 @@ def _placement() -> _Placement:
         if rank_name == "SLURM_PROCID":
             size = _slurm_step_tasks()
             if size is None:
+                continue
+            # An `mpirun` started from inside a step's task inherits that task's SLURM variables;
+            # an MPI rank that differs from them is the process's own. (srun's own MPI launch sets
+            # the two alike, from recall, not checked.)
+            if any(other is not None and other != rank for other in
+                   (_count("OMPI_COMM_WORLD_RANK"), _count("PMI_RANK"))):
                 continue
         else:
             size = _count(size_name, positive=True)

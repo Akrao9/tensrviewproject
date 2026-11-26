@@ -213,7 +213,7 @@ class JsonlSink:
         # Locked, the file is opened for reading too, so the torn-line checks read it through this
         # descriptor and no other is opened (`_descriptor_ends_torn`).
         self._mode = "a+" if lock and hasattr(os, "pread") else "a"
-        self._file = self.path.open(self._mode, encoding="utf-8")
+        self._file = self._open(self.path)
         self._failed = False  # the last write raised: the file may end in part of a line
         repair = True
         if lock:
@@ -221,6 +221,16 @@ class JsonlSink:
         if repair and self._ends_torn():
             self._file.write("\n")
             self._file.flush()
+
+    def _open(self, path: Path) -> Any:
+        """`path` opened for appending, and for reading too when locked; a file this process may
+        write and not read is opened for appending alone, and read by its path (`_ends_torn`)."""
+        if self._mode == "a+":
+            try:
+                return path.open("a+", encoding="utf-8")
+            except PermissionError:
+                self._mode = "a"
+        return path.open("a", encoding="utf-8")
 
     def _ends_torn(self) -> bool:
         return _descriptor_ends_torn(self._file) if self._mode == "a+" else _ends_torn(self.path)
@@ -246,7 +256,7 @@ class JsonlSink:
             second = first.with_name(first.name[: -len(RECORDS_SUFFIX)] + f".{os.getpid()}{RECORDS_SUFFIX}"
                                      if first.name.endswith(RECORDS_SUFFIX) else f"{first.name}.{os.getpid()}")
             created = not second.exists()
-            file = second.open(self._mode, encoding="utf-8")
+            file = self._open(second)
         except Exception as failure:  # noqa: BLE001  nothing here may stop a run
             _say(f"tensorquill.init could not take {self.path}'s lock or open a file of its own beside it "
                  f"({_brief(failure)}), so this session writes {self.path.name} unlocked.", stacklevel=5)
