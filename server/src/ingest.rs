@@ -2396,7 +2396,9 @@ struct Refused {
 /// Drops the rows that cannot be stored and says how many, by key (RS10): first the rows whose run,
 /// rank, step, attempt or schema version is null, by the first null key of each row in that order;
 /// then, of the rest, the rows whose `schema_version` is not one of `readable`, the versions the
-/// batch's metadata version allows (`row_versions`: 0 and 1 under metadata 1, 0, 1 and 2 under 2). The
+/// batch's metadata version allows (`row_versions`: 0 and 1 under metadata 1, 0, 1 and 2 under 2);
+/// then, of the rest, the rows of a version 2 record with no `seq`, counted under `seq`
+/// (`drop_scalar_records_without_seq`, from wave AO). The
 /// rest of the batch is kept: until Nov 19, 2026 one null key refused the whole batch, which ended
 /// the stream, and its sender, which sends from its offset again, stored nothing more for the rank;
 /// until Nov 20, 2026 a row's version was not looked at. The batch is checked whole before any of
@@ -2455,6 +2457,10 @@ fn drop_unstorable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordB
     if rows > 0 {
         dropped.push((UNSUPPORTED_SCHEMA_VERSION, rows));
     }
+    let rows = drop_scalar_records_without_seq(&batch, &mut keep);
+    if rows > 0 {
+        dropped.push((SEQ_COLUMN, rows));
+    }
     if dropped.is_empty() {
         return Ok((batch, dropped));
     }
@@ -2468,6 +2474,42 @@ fn drop_unstorable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordB
 /// The column whose non-null value marks a scalar-only row (`WAVE_AL_CONTRACT.md` sections 4.2 to
 /// 4.5): a record's `seq`, counted per session from 0. Null on a step row.
 pub const SEQ_COLUMN: &str = "seq";
+
+/// The column of protocol 5's layout that holds the record's own version (section 3, Q1 a), and the
+/// version of a scalar-only record (section 4.2), whose row carries a `seq`.
+const RECORD_VERSION_COLUMN: &str = "record_version";
+const SCALAR_RECORD_VERSION: i32 = 2;
+
+/// Marks as not kept the rows whose record is version 2, the scalar-only record, and that carry no
+/// `seq` (BUG-02, wave AO): no row of a scalar-only record lacks one, so such a row is a version 2
+/// record that is not one (a line with no `"record": "scalars"`). Stored, it would be a training
+/// step in a part, of a version every Python reader refuses, so the part could not be read; it is
+/// dropped and counted under `seq`, the key it lacks, as a row with a null key is (RS10), and the
+/// rest of the batch is stored. Returns how many rows it marked. A batch without a `record_version`
+/// column (protocol 4's layout) has nothing to mark, and one whose `record_version` is of another
+/// type than Int32 is left as it was: nothing of it says a row is a version 2 record. A `seq` of
+/// another type than Int64 refuses the batch later (`split_scalar_rows`).
+fn drop_scalar_records_without_seq(batch: &RecordBatch, keep: &mut [bool]) -> u64 {
+    let Some(versions) = batch
+        .column_by_name(RECORD_VERSION_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+    else {
+        return 0;
+    };
+    let seqs = batch.column_by_name(SEQ_COLUMN);
+    if seqs.is_some_and(|seqs| seqs.data_type() != &DataType::Int64) {
+        return 0;
+    }
+    let mut rows = 0;
+    for (row, kept) in keep.iter_mut().enumerate() {
+        let scalar_record = versions.is_valid(row) && versions.value(row) == SCALAR_RECORD_VERSION;
+        if *kept && scalar_record && seqs.is_none_or(|seqs| seqs.is_null(row)) {
+            *kept = false;
+            rows += 1;
+        }
+    }
+    rows
+}
 
 /// The rows of a batch that can be stored (`drop_unstorable_rows`), and the rows dropped, with the
 /// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, the
