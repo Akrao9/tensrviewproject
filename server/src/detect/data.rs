@@ -216,7 +216,11 @@ impl EpochOrder {
         let mut began = false;
         if self.epoch != Some(number) {
             self.previous = match self.epoch {
-                Some(epoch) if number == epoch + 1 => Some(Pass {
+                // The pass numbered just after this one, as Python's `number == epoch + 1`: past
+                // `i64::MAX` there is none, so no recorded epoch follows `i64::MAX` (AO-01, wave AP;
+                // `epoch + 1` overflowed, and a release build took `i64::MIN` for it). Of any epoch
+                // below `i64::MAX` it is the same comparison as before.
+                Some(epoch) if epoch.checked_add(1) == Some(number) => Some(Pass {
                     hashes: std::mem::take(&mut self.current),
                     count: self.count,
                     epoch,
@@ -705,13 +709,23 @@ pub(super) struct ResumePass {
 }
 
 /// The step nearest `resumed_at` (the earlier one on a tie) at which the history drew `hash`.
+///
+/// The steps after `resumed_at` are those above it, with no `resumed_at + 1` that overflows at
+/// `i64::MAX` (AO-01, wave AP: a release build then looked from `i64::MIN` on). The two distances
+/// are exact (`abs_diff`, which holds any distance between two `i64`), as Python's integers are:
+/// readers take steps of 0 or more, whose distances fit `i64`, but the store replay also reads a part
+/// with negative steps written before wave AG. Of any distance within `i64` they are what they were.
 fn lookup(known: &BTreeMap<i64, (Option<String>, i64)>, hash: &str, resumed_at: i64) -> Option<i64> {
+    use std::ops::Bound::{Excluded, Unbounded};
     let same = |(_, (known, _)): &(&i64, &(Option<String>, i64))| known.as_deref() == Some(hash);
     let before = known.range(..resumed_at).rev().find(same).map(|(step, _)| *step);
-    let after = known.range(resumed_at + 1..).find(same).map(|(step, _)| *step);
+    let after = known
+        .range((Excluded(resumed_at), Unbounded))
+        .find(same)
+        .map(|(step, _)| *step);
     match (before, after) {
         (None, after) => after,
-        (Some(before), Some(after)) if after - resumed_at < resumed_at - before => Some(after),
+        (Some(before), Some(after)) if after.abs_diff(resumed_at) < resumed_at.abs_diff(before) => Some(after),
         (before, _) => before,
     }
 }
@@ -828,7 +842,9 @@ impl ResumePass {
             "resumed_hash": new,
             "expected_hash": expected.and_then(|(hash, _)| hash.clone()),
             "matched_step": matched,
-            "batches_apart": matched.map(|step| (resumed_at - step).abs()),
+            // Exact, as Python's `abs(resumed_at - matched)`: a `u64` holds any distance between two
+            // `i64` steps, and is written as the same number as before for any within `i64`.
+            "batches_apart": matched.map(|step| resumed_at.abs_diff(step)),
             "previous_attempt": source,
         })))
     }
@@ -894,7 +910,10 @@ impl ResumePass {
                 findings.push(json!({"component": "optimizer", "finding": "empty_in_checkpoint"}));
             }
             if let Some(last_epoch) = component("scheduler").and_then(|scheduler| int(&scheduler["last_epoch"])) {
-                if (last_epoch - resumed_at).abs() > SCHEDULER_SLACK {
+                // Python's `abs(last_epoch - resumed_at) > SCHEDULER_SLACK`, exactly: a recorded
+                // `last_epoch` is any `i64`, and the subtraction or its negation overflowed (AO-01,
+                // wave AP). Of any distance within `i64` the comparison is the same as before.
+                if last_epoch.abs_diff(resumed_at) > SCHEDULER_SLACK.unsigned_abs() {
                     findings.push(json!({"component": "scheduler", "finding": "position", "last_epoch": last_epoch}));
                 }
             }
@@ -907,7 +926,11 @@ impl ResumePass {
             let step_after = number(&snapshot["step_after"]);
             if before == Some(0) && after.is_some_and(|after| after > 0) {
                 findings.push(json!({"component": "optimizer", "finding": "empty", "entries_after": after}));
-            } else if let Some(step_after) = step_after.filter(|step| *step <= 1.0 && resumed_at - run_start > 1) {
+            } else if let Some(step_after) = step_after.filter(|step| {
+                // Exact, as Python's `resumed_at - run_start > 1`: a store written before wave AG can
+                // hold a run that starts at a negative step, where the `i64` subtraction overflowed.
+                *step <= 1.0 && i128::from(resumed_at) - i128::from(run_start) > 1
+            }) {
                 findings.push(json!({"component": "optimizer", "finding": "step_reset", "step_after": step_after}));
             }
         }
