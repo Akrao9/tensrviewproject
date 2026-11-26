@@ -267,8 +267,13 @@ def worker(args: argparse.Namespace) -> int:
         recorded_names = [name for name, _ in model.named_parameters()]  # what the session will record
         names = [clean(name) for name in recorded_names]
         sizes = {clean(name): _local(p).numel() for name, p in model.named_parameters()}
-        every_sizes: list[Any] = [None] * world
-        dist.all_gather_object(every_sizes, sizes)
+        # Gathered as one int64 tensor per rank, in `names` order (the same model on every rank), not with
+        # `all_gather_object`, whose unpickling calls `tensor.numpy()` and so needs numpy, absent from a
+        # bare install of torch.
+        local = torch.tensor([sizes[n] for n in names], dtype=torch.int64, device=device)
+        gathered = [torch.zeros_like(local) for _ in range(world)]
+        dist.all_gather(gathered, local)
+        every_sizes: list[Any] = [dict(zip(names, t.tolist())) for t in gathered]
         grad_block = f"blocks.{args.grad_block}"
         planted, plant_why = choose_param(every_sizes, grad_block, args.grad_param)
         layer = _layer_name(model, act_block)
