@@ -721,6 +721,9 @@ def _differ(values: list[Any]) -> bool:
                for v in values[1:])
 
 
+_SETTING_COMPARED = ("value", "not_read", "cut_from_length")  # of an entry of `numerical_settings`
+
+
 def _compare_numerical_settings(known: list[tuple[str, Mapping[str, Any]]],
                                 differs: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     """The runs' numerical settings (`manifest.numerical_settings`) set side by side: each setting
@@ -746,15 +749,19 @@ def _compare_numerical_settings(known: list[tuple[str, Mapping[str, Any]]],
             entry = settings.get(name)
             entries.append(entry if isinstance(entry, Mapping) else
                            {"not_read": whole or "the run manifest does not list this setting"})
-        if not _differ(entries):
+        # What was read decides, not a warning given while reading it; a value cut to its first
+        # characters also carries its length, so two cut alike and of other lengths differ.
+        if not _differ([{key: entry[key] for key in _SETTING_COMPARED if key in entry} for entry in entries]):
             same.append(name)
             continue
-        unread = {label: str(entry.get("not_read")) for (label, _, _), entry in zip(recorded, entries)
-                  if "value" not in entry}
+        labelled = list(zip((label for label, _, _ in recorded), entries))
+        unread = {label: str(entry.get("not_read")) for label, entry in labelled if "value" not in entry}
+        cut = {label: entry["cut_from_length"] for label, entry in labelled if "cut_from_length" in entry}
         differs.append({
             "field": f"{_manifest.NUMERICAL_SETTINGS_KEY}.{name}",
-            "values": {label: entry.get("value") for (label, _, _), entry in zip(recorded, entries)},
+            "values": {label: entry.get("value") for label, entry in labelled},
             **({"not_read_in": unread} if unread else {}),
+            **({"cut_from_length": cut} if cut else {}),
         })
     return same, not_recorded
 
@@ -1500,9 +1507,10 @@ def summary_text(result: Mapping[str, Any]) -> str:
     setup = result["setup"]
     lines.append(f"1. Setup: {len(setup['differs'])} difference{'s' if len(setup['differs']) != 1 else ''}")
     for item in setup["differs"]:
-        unread = item.get("not_read_in") or {}
+        unread, cut = item.get("not_read_in") or {}, item.get("cut_from_length") or {}
         lines.append(f"   {item['field']}: " + ", ".join(
-            f"{label} not read ({unread[label]})" if label in unread else f"{label} {_value(value)}"
+            f"{label} not read ({unread[label]})" if label in unread else
+            f"{label} {_value(value)}" + (f" (the first characters of {cut[label]:,})" if label in cut else "")
             for label, value in item["values"].items()))
     if setup.get("config_not_known"):
         lines.append(f"   the config of {', '.join(setup['config_not_known'])} was too large to send to its server and is "
