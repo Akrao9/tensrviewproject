@@ -529,6 +529,41 @@ def _same_rank_and_run(document: Mapping[str, Any], rank: int, records: list[dic
     return _judged_rank(document) == rank and len(runs) <= 1 and own_run in (runs or {own_run})
 
 
+def _steps_said(steps: list[int]) -> str:
+    if not steps:
+        return "no step"
+    return f"step {steps[0]}" if len(steps) == 1 else f"{len(steps)} steps, steps {steps[0]} to {steps[-1]}"
+
+
+def _router_steps_changed(name: str, document: Mapping[str, Any], records: list[dict[str, Any]]) -> str | None:
+    """None when one rank's evidence file judged the router `name` at exactly the steps, with
+    exactly the counts, that `records` hold for it now; else what differs, for the answer. The
+    records may have changed after the file was written: a capture that grew, or one started again
+    (BUG-25, wave AO). Steps on which neither has a point (no counts, no routed token) are left out
+    on both sides, as a series leaves them out."""
+    judged: dict[int, Any] = {}
+    for sample in document.get("samples") or ():
+        if (isinstance(sample, dict) and sample.get("router") == name and not sample.get("missing")
+                and _router_point(sample.get("counts"), None, None) is not None):
+            judged[int(sample["step"])] = sample.get("counts")
+    held: dict[int, Any] = {}
+    for record in records:
+        moe = record.get("moe")
+        counts = moe.get(name) if isinstance(moe, Mapping) else None
+        if _router_point(counts, None, None) is not None:
+            held[int(record["step"])] = counts
+    if judged == held:
+        return None
+    at = sorted(judged)
+    now = sorted(held)
+    differ = next((step for step in at if step in held and held[step] != judged[step]), None)
+    return (
+        f"the router {name!r} at {_steps_said(at)}, and the records read here hold it at {_steps_said(now)}"
+        + (f", with other counts at step {differ}" if differ is not None and at == now else "")
+        + "; they changed after the file was written"
+    )
+
+
 def _pick_rank(asked: int | None, default: int | None, ranks: list[int], what: str) -> int:
     """The rank to read: the one asked for, else the one the path names, else the lowest."""
     wanted = asked if asked is not None else default
@@ -1671,23 +1706,30 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 evidence = source.capture_evidence(path, origin["rank"])
             elif path_kind == "evidence" and source.document(path).get("view") != ALL_RANKS_VIEW:
                 document = source.document(path)
-                if _same_rank_and_run(document, origin["rank"], records):
+                same = _same_rank_and_run(document, origin["rank"], records)
+                omits = same and _compact._omits(document) is not None
+                changed = None if not same or omits else _router_steps_changed(name, document, records)
+                if same and changed is None:
                     evidence = document
-                    if _compact._omits(evidence) is not None:
+                    if omits:
                         window, evidence = evidence, None
                 else:
                     # Another rank's or run's evidence, or one that does not say whose (lane U7,
-                    # Nov 19, 2026: rank 0's samples were answered as rank 1's). This rank is
-                    # read from its own records, and judged on them where they are a capture.
+                    # Nov 19, 2026: rank 0's samples were answered as rank 1's); or this rank's, of
+                    # records that changed after it was written (BUG-25, wave AO: the capture grew
+                    # and the file's older samples answered). This rank is read from its own
+                    # records, and judged on them where they are a capture.
                     held_in = Path(origin["records"])
                     if held_in.is_file() and held_in.suffix == ".jsonl":
                         evidence = source.capture_evidence(held_in, origin["rank"])
                     judged = _judged_rank(document)
                     other_note = (
                         f"The evidence file {source.path} judged "
-                        + (f"rank {judged}" if judged is not None else "a rank it does not name")
-                        + (f" of run {document.get('run_id')!r}" if document.get("run_id") else "")
-                        + f", not rank {origin['rank']}'s records read here, so its samples and flags are not used:"
+                        + (changed if changed is not None else
+                           (f"rank {judged}" if judged is not None else "a rank it does not name")
+                           + (f" of run {document.get('run_id')!r}" if document.get("run_id") else "")
+                           + f", not rank {origin['rank']}'s records read here")
+                        + ", so its samples and flags are not used:"
                         + (" this series and its flags are from the detectors run on those records."
                            if evidence is not None else " this series is from those records, with no flags.")
                     )
