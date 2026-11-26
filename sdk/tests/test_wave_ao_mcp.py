@@ -235,3 +235,90 @@ def test_an_incidents_score_too_large_for_a_float_has_the_words_for_no_score():
     """An evidence file is read as JSON, so a score can be any integer: it is no score, not a raise."""
     assert mcp_server.score_display({"score": BIG}) == "no score"
     assert mcp_server.score_display({"score": 31}) == "score 31.0"
+
+
+# --- 3. Every reply line within MAX_ANSWER_BYTES ----------------------------------------------
+
+ROCKET = "\U0001F680"  # twelve bytes in a reply line, which escapes every character outside ASCII
+
+
+def _within(line: bytes) -> dict:
+    """The reply line, newline included, fits the cap; the reply, parsed."""
+    assert line is not None and len(line) + 1 <= mcp_server.MAX_ANSWER_BYTES, f"a reply of {len(line)} bytes"
+    return json.loads(line)
+
+
+def _raw(source: mcp_server.Source, message) -> bytes:
+    return mcp_server.handle_line(source, json.dumps(message).encode())
+
+
+@pytest.fixture
+def capture(tmp_path) -> mcp_server.Source:
+    return mcp_server.Source(_write(tmp_path / "r.jsonl", _rows(range(4))))
+
+
+def test_a_tools_error_naming_a_long_name_outside_ascii_is_cut_to_fit(capture):
+    reply = _within(_call(capture, "get_series", {"kind": "scalar", "name": ROCKET * 4500}, request_id="x" * 5000))
+    assert reply["id"] == "x" * 5000 and reply["result"]["isError"] is True
+    assert reply["result"]["content"][0]["text"].endswith(" …")
+
+
+def test_an_unknown_tool_with_a_long_name_is_a_protocol_error_that_fits(capture):
+    reply = _within(_call(capture, "x" * 60_000, {}))
+    assert reply["id"] == 1 and reply["error"]["code"] == mcp_server.INVALID_PARAMS
+    assert reply["error"]["message"].startswith("Unknown tool: 'xxx")
+
+
+def test_an_unknown_method_with_a_long_name_is_an_error_that_fits(capture):
+    reply = _within(_raw(capture, {"jsonrpc": "2.0", "id": 7, "method": ROCKET * 5000}))
+    assert reply["id"] == 7 and reply["error"]["code"] == mcp_server.METHOD_NOT_FOUND
+
+
+def test_an_answer_that_cannot_be_cut_is_an_error_naming_the_ids_length(capture):
+    """The tool list is about 30,000 bytes and is not cut: with an id of 25,000 bytes it cannot
+    fit, and the reply, to the same id, says the id is what to shorten."""
+    request_id = "i" * 25_000
+    reply = _within(_raw(capture, {"jsonrpc": "2.0", "id": request_id, "method": "tools/list"}))
+    assert reply["id"] == request_id and reply["error"]["code"] == mcp_server.INVALID_REQUEST
+    assert "id" in reply["error"]["message"] and str(mcp_server.MAX_ANSWER_BYTES) in reply["error"]["message"]
+
+
+def test_an_id_too_long_for_any_reply_is_answered_with_no_id(capture):
+    reply = _within(_raw(capture, {"jsonrpc": "2.0", "id": "i" * 60_000, "method": "ping"}))
+    assert reply["id"] is None and reply["error"]["code"] == mcp_server.INVALID_REQUEST
+
+
+def test_a_failure_inside_a_tool_is_said_within_the_cap(capture, monkeypatch):
+    def failing(source, arguments):
+        raise RuntimeError(ROCKET * 3000)
+    monkeypatch.setitem(mcp_server._HANDLERS, "list_incidents", failing)
+    reply = _within(_call(capture, "list_incidents", {}, request_id="x" * 40_000))
+    assert reply["id"] == "x" * 40_000 and reply["result"]["isError"] is True
+    assert "failed inside the server (RuntimeError" in reply["result"]["content"][0]["text"]
+
+
+@pytest.mark.parametrize("text", ["NaN", "Infinity", "-Infinity"])
+def test_an_id_that_is_not_a_finite_number_is_refused_and_raises_nothing(capture, text):
+    """JSON has no NaN, which Python's reader takes: the reply could not be written at all."""
+    line = mcp_server.handle_line(capture, ('{"jsonrpc": "2.0", "id": %s, "method": "ping"}' % text).encode())
+    reply = _within(line)
+    assert reply["id"] is None and reply["error"]["code"] == mcp_server.INVALID_REQUEST
+
+
+def test_each_answer_of_a_batch_fits_the_cap(capture):
+    """The cap is per answer, as for a batch it always was: each of the batch's replies fits it."""
+    batch = [{"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": "get_series", "arguments": {
+        "kind": "scalar", "name": ROCKET * 4500}}} for n in range(2)] + [{"jsonrpc": "2.0", "id": 9, "method": "y" * 60_000}]
+    replies = json.loads(_raw(capture, batch))
+    assert [reply["id"] for reply in replies] == [0, 1, 9]
+    for reply in replies:
+        assert len(json.dumps(reply, separators=(",", ":"))) + 1 <= mcp_server.MAX_ANSWER_BYTES
+
+
+def test_an_error_that_fits_is_not_changed(capture):
+    """Pinned: a tool's error is cut at 4,000 characters as before, and not further when it fits."""
+    reply = _within(_call(capture, "get_series", {"kind": "scalar", "name": "a" * 5000}))
+    text = reply["result"]["content"][0]["text"]
+    with pytest.raises(mcp_server.ToolError) as raised:
+        mcp_server.get_series(capture, {"kind": "scalar", "name": "a" * 5000})
+    assert text == str(raised.value)[:4000]
