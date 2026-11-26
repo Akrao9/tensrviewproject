@@ -223,6 +223,14 @@ def test_the_generator_still_draws_what_the_known_seeds_were_found_with():
     assert {seed: _digest(seed) for seed in PINNED} == PINNED
 
 
+def test_every_seed_of_a_wide_range_makes_a_case_whose_lines_parse():
+    # Two malformations can meet on one record (an identity field made text, then a step compared): a
+    # case must still be made. Seed 1818 raised here before `_placed`.
+    for seed in range(1600, 2100):
+        case = gen.generate(seed)
+        assert len(gen.read("".join(case.files().values()))) == len(case.records), seed
+
+
 def test_the_lines_are_what_a_reader_parses_and_the_sink_spelling_is_used():
     case = gen.generate(0, base="non_finite", malformations=["non_finite_foreign"])
     text = "".join(case.files().values())
