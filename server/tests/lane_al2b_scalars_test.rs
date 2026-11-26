@@ -1112,8 +1112,11 @@ async fn the_timed_flush_tries_a_failed_scalars_write_again() {
         .await
         .expect_err("not stored");
     store.fail_scalars.store(false, Ordering::SeqCst);
+    // The object is on disk before the flush gives its bytes back (`flush_scalars` writes it, then
+    // subtracts them), so both are waited for in one loop with one deadline: reading the count as
+    // soon as the object appeared failed about 1 run in 6 alone.
     for _ in 0..200 {
-        if !files(root, run, "scalars-").is_empty() {
+        if !files(root, run, "scalars-").is_empty() && server.ingest.buffered_bytes() == 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
