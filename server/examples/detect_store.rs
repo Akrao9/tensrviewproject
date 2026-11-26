@@ -213,3 +213,46 @@ async fn main() -> Result<(), Error> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Run with `cargo test --example detect_store` (a plain `cargo test` builds the examples and
+    //! runs none of their tests).
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::record_batch::RecordBatch;
+
+    use super::decode_json;
+
+    fn text(values: &[Option<&str>]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    /// BUG-30 (wave AO): on a protocol 5 part, whose layers and MoE statistics are typed columns,
+    /// the JSON the detectors still decode is in `probe_json`, `data_json`, `checkpoint_json`,
+    /// `system_json` and `extra_json`. On `453f1e2` the benchmark decoded only `layers_json` and
+    /// `moe_stats_json`, which such a part has not, and timed nothing (0.00 ms).
+    #[test]
+    fn the_json_decoding_of_a_protocol_5_part_decodes_its_json_columns() {
+        let batch = RecordBatch::try_from_iter([
+            ("probe_json", text(&[Some(r#"{"error": null, "not_run": []}"#), None])),
+            ("data_json", text(&[None, Some(r#"{"batch_hash": "ab"}"#)])),
+            ("system_json", text(&[None, Some(r#"{"gpu": [{"util": 1.0}]}"#)])),
+            ("extra_json", text(&[Some(r#"{"custom": 1}"#), None])),
+        ])
+        .unwrap();
+        assert_eq!(decode_json(&batch), 4);
+    }
+
+    /// A pin: a protocol 4 part's two JSON columns are decoded as before.
+    #[test]
+    fn the_json_decoding_of_a_protocol_4_part_is_as_before() {
+        let batch = RecordBatch::try_from_iter([
+            ("layers_json", text(&[Some(r#"{"fc1": {"act_rms": 1.0}}"#), None])),
+            ("moe_stats_json", text(&[None, Some(r#"{"router": {"entropy": 0.5}}"#)])),
+        ])
+        .unwrap();
+        assert_eq!(decode_json(&batch), 2);
+    }
+}
