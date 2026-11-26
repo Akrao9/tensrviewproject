@@ -116,16 +116,32 @@ def conform_run_id(run_id: str) -> str:
     return "-" if cleaned in ("", ".", "..") else cleaned
 
 
-def check_run_id(run_id: Any) -> None:
-    """`init`'s check of an explicit `run_id`, before anything is opened: one that could name a file
-    outside the output folder raises `ValueError`, like any other bad argument. One that is not a
-    string (a `Path`, say) names the files by its text, so its text is judged."""
-    if run_id is not None and not isinstance(run_id, str) and run_id:
-        run_id = str(run_id)
-    if isinstance(run_id, str) and run_id:
+# Whether `init` takes an `os.PathLike` run ID (a `Path`) by its text. False refuses it like an `int`.
+RUN_ID_TAKES_PATHS = True
+
+
+def check_run_id(run_id: Any) -> str | None:
+    """`init`'s explicit `run_id`, normalised and checked before anything is opened, and the only form
+    of it `init` goes on with: None as None, a string as itself (a subclass as a plain `str`), an
+    `os.PathLike` (a `Path`) as its text, `os.fspath(run_id)` (while `RUN_ID_TAKES_PATHS`). Anything
+    else raises `ValueError`, as a `group` or `name` that is not a string does. A string that could
+    name a file outside the output folder (`run_id_problem`) raises `ValueError` too. The empty
+    string is returned as it is and, as None, means "not given"."""
+    if run_id is None:
+        return None
+    if RUN_ID_TAKES_PATHS and not isinstance(run_id, str) and isinstance(run_id, os.PathLike):
+        text = os.fspath(run_id)
+        if not isinstance(text, str):
+            raise ValueError(f"run_id must be a string or a path, not {type(run_id).__name__} of {type(text).__name__}")
+        run_id = text
+    if not isinstance(run_id, str):
+        raise ValueError(f"run_id must be a string or a path, not {type(run_id).__name__}")
+    run_id = str.__str__(run_id)
+    if run_id:
         problem = run_id_problem(run_id)
         if problem:
             raise ValueError(f"run_id {run_id!r} cannot be used: {problem}")
+    return run_id
 
 
 _RUN_ID_SOURCES = {
@@ -139,6 +155,19 @@ def fit_run_id(run_id: Any, source: str) -> Any:
     shared from an older TensorQuill) made to fit (`conform_run_id`) when `run_id_problem` refuses it,
     with a warning, as `resolve_project` fits a project name from there: an ID TensorQuill was never
     given must not stop a run from starting, nor name a file outside the output folder."""
+    if run_id is not None and not isinstance(run_id, str):
+        # Strings by construction from every source this package reads, except a rank 0 on an older
+        # TensorQuill given `run_id=123` (shared through the store as JSON) or a tracker object that is
+        # not the real one: taken by its text, which is what such a rank named its files with.
+        try:
+            text = os.fspath(run_id) if isinstance(run_id, os.PathLike) else str(run_id)
+        except Exception:  # noqa: BLE001  a value whose __str__ raises
+            text = type(run_id).__name__
+        if not isinstance(text, str):
+            text = type(run_id).__name__
+        _say(f"{_RUN_ID_SOURCES.get(source, source)} gives the run ID {run_id!r}, which is not a string; "
+             f"the run is recorded under its text. Pass run_id= to choose the ID.", stacklevel=4)
+        run_id = text or "-"
     if not isinstance(run_id, str) or not run_id:
         return run_id
     problem = run_id_problem(run_id)
