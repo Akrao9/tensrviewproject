@@ -47,6 +47,14 @@ class TensorQuillCallback(TrainerCallback):
     - **Data wait.** The host time spent fetching each step's batches from the `DataLoader`
       under Accelerate's `DataLoaderShard`, before the batch is moved to the device, is
       recorded as `data_wait` (`tensorquill.datawait`). `data_wait=False` turns it off.
+    - **Evaluations** are a pause (the "eval" phase): their loader time is not training's
+      `data_wait`, and what is logged during them is on the step they followed. With several
+      evaluation datasets (`eval_dataset={"a": ..., "b": ...}`) that holds for all of them: the
+      pause ends at the last one's `on_evaluate`. `eval_on_start`'s evaluation, before any step,
+      is the pause `"baseline"`: its loader time is not step 0's either.
+    - **Resumes.** The checkpoint folder a resumed `train()` loaded is recorded (`checkpoint_files`,
+      with the model's tensors compared): the one given to `train(resume_from_checkpoint=...)`,
+      else `TrainingArguments.resume_from_checkpoint`, else `<output_dir>/checkpoint-<global_step>`.
 
     - **A `train()` that raises.** `Trainer` has no event for it (it calls `on_train_end`
       only at the end of a finished loop), so the session stays open after the raise: the
@@ -97,14 +105,25 @@ class TensorQuillCallback(TrainerCallback):
         kwargs.setdefault("data_wait", True)
         self.session = init(model, **kwargs)
         self._watch = watch_accelerator(self.session, loss_name=self.loss_name, checkpoints=False, data_wait=False)
-        self._training, self._trainer = _training_frame(self)
+        self._training, self._trainer, given = _training_frame(self)
         self._pid = os.getpid()
         atexit.register(self._at_exit)
         if state.global_step > 0:
-            # Resumed: the Trainer loaded `checkpoint-<global_step>` (or the folder it was given).
-            folder = _checkpoint_folder(args, state, getattr(args, "resume_from_checkpoint", None))
+            # Resumed: the Trainer loaded the folder given to `train(resume_from_checkpoint=...)`,
+            # which only the training loop holds (`given`, read from the frame that called this
+            # event); else the one in `TrainingArguments`, else `checkpoint-<global_step>`.
+            if given is None:
+                given = getattr(args, "resume_from_checkpoint", None)
+            folder = _checkpoint_folder(args, state, given)
             if folder is not None:
                 self.session.checkpoint_files(folder, event="load")
+        if getattr(args, "eval_on_start", False) is True:
+            # The Trainer evaluates right after this event, with none before it: a pause, so its
+            # loader time is not step 0's `data_wait`; its `on_evaluate` ends it. Not "eval": with no
+            # step in memory a value logged under "eval" is left out, and the tracker mirror's copy
+            # of this baseline lands on step 0's own record, outside "eval", as section Q5 of the
+            # wave AL contract states. The phase is any word but "train" (`Session.set_phase`).
+            self.session.set_phase(_BASELINE)
 
     # `Trainer` has no event before an evaluation or a save, only after. But its flow callback
     # sets `control.should_evaluate` / `should_save` at the end of the step or epoch, just
@@ -131,12 +150,13 @@ class TensorQuillCallback(TrainerCallback):
     def on_step_begin(self, args: Any, state: Any, control: Any, **_: Any) -> None:
         # An "eval" phase still set when a training step begins (announced and not followed by an
         # evaluation) would send this step's loss to the step before (`Session.log`).
-        if self.session is not None and self.session._phase == "eval":
+        if self.session is not None and self.session._phase in ("eval", _BASELINE):
             self.session.set_phase("train")
 
     def on_evaluate(self, args: Any, state: Any, control: Any, metrics: Any = None, **_: Any) -> None:
         if self.session is None:
             return
+        paused = self.session._phase  # the pause this evaluation runs in: "eval", or `_BASELINE`
         # The `Trainer` logs these through `on_log` just before, which a W&B logger the mirror
         # watches also sees; recorded here, explicitly, they win over the mirrored copy. Under the
         # "eval" phase, so on the step the evaluation followed; set here too, since with several
@@ -160,6 +180,12 @@ class TensorQuillCallback(TrainerCallback):
                     self.session.log(values)
         except Exception:  # noqa: BLE001  nothing here may stop the Trainer
             pass
+        if _more_datasets_follow(self._trainer, metrics):
+            # `eval_dataset` is a dictionary: `Trainer.evaluate` evaluates its datasets one after
+            # the other, each ending with an `on_evaluate`, and the evaluation is over at the last.
+            # The next one runs in the pause this one ran in.
+            self.session.set_phase(paused if paused != "train" else "eval")
+            return
         self.session.set_phase("checkpoint" if getattr(control, "should_save", False) else "train")
 
     def on_save(self, args: Any, state: Any, control: Any, **_: Any) -> None:
@@ -267,14 +293,24 @@ class TrainEndNotReached(Exception):
     It is never raised: it says the run ended by a raise of an unknown type, not a clean end."""
 
 
+# The phase of `eval_on_start`'s evaluation, before the first step: a pause that is not "eval".
+_BASELINE = "baseline"
+
 # A train() whose frame could not be read: open all the same, and no exception is named for it.
 _UNKNOWN_FRAME: tuple[int, Any] = (0, None)
 
 
-def _training_frame(callback: TensorQuillCallback) -> tuple[tuple[int, Any], Any]:
+def _training_frame(callback: TensorQuillCallback) -> tuple[tuple[int, Any], Any, Any]:
     """The frame that called `on_train_begin` through the `Trainer`'s `CallbackHandler`
     (`Trainer._inner_training_loop`, or what called the callback directly), as (id, code),
-    or `_UNKNOWN_FRAME`; and that frame's `self` (the `Trainer`), or None. The frame itself is not
+    or `_UNKNOWN_FRAME`; that frame's `self` (the `Trainer`), or None; and its
+    `resume_from_checkpoint`, or None.
+
+    The last is the folder `Trainer.train(resume_from_checkpoint=...)` resumed from: `train()`
+    passes it to `_inner_training_loop` (with `True` already turned into the newest checkpoint
+    under `output_dir`) and nothing the callbacks are given holds it, neither `TrainingArguments`
+    (whose own `resume_from_checkpoint` the `Trainer` does not read) nor `TrainerState`. A loop
+    with no such local (one that calls the event itself) gives None. The frame itself is not
     kept, so its other locals are not held after a raise."""
     handler = CallbackHandler.call_event.__code__.co_filename
     frame = inspect.currentframe()
@@ -285,10 +321,11 @@ def _training_frame(callback: TensorQuillCallback) -> tuple[tuple[int, Any], Any
         ):
             frame = frame.f_back
         if frame is None:
-            return _UNKNOWN_FRAME, None
-        return (id(frame), frame.f_code), frame.f_locals.get("self")
+            return _UNKNOWN_FRAME, None, None
+        local = frame.f_locals
+        return (id(frame), frame.f_code), local.get("self"), local.get("resume_from_checkpoint")
     except Exception:  # noqa: BLE001  without it, an exception is not named: TrainEndNotReached
-        return _UNKNOWN_FRAME, None
+        return _UNKNOWN_FRAME, None, None
     finally:
         del frame
 
@@ -336,6 +373,27 @@ def _evaluation_scalars(metrics: Any) -> dict[str, int | float]:
             name = "train/" + key
         out[name] = value
     return out
+
+
+def _more_datasets_follow(trainer: Any, metrics: Any) -> bool:
+    """Whether the evaluation `metrics` (what `on_evaluate` was given) end is one of several datasets
+    of `trainer.eval_dataset` with another still to be evaluated. `Trainer.evaluate` loops over a
+    dictionary in its order, naming each one's metrics `eval_<name>_...`, and always with
+    `eval_<name>_runtime` (`speed_metrics`). The `Trainer` is the one the callback holds from
+    `on_train_begin`; with none, or anything not so, False: the evaluation is taken to be over."""
+    try:
+        datasets = getattr(trainer, "eval_dataset", None)
+        if not isinstance(datasets, Mapping) or len(datasets) < 2 or not isinstance(metrics, Mapping):
+            return False
+        names = [str(name) for name in datasets]
+        for key in metrics:
+            if isinstance(key, str) and key.startswith("eval_") and key.endswith("_runtime"):
+                name = key[len("eval_"):-len("_runtime")]
+                if name in names:
+                    return names.index(name) < len(names) - 1
+        return False
+    except Exception:  # noqa: BLE001  nothing here may stop the Trainer
+        return False
 
 
 def _checkpoint_folder(args: Any, state: Any, given: Any = None) -> Path | None:
