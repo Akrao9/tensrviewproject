@@ -510,3 +510,24 @@ def test_accelerate_open_watch_times_loaders_until_closed(tmp_path):
         session.step()
     assert sink.records[0]["data_wait"] >= 0.1
     assert sink.records[1].get("data_wait") is None
+
+
+def test_accelerate_watch_close_leaves_time_data_timing(tmp_path):
+    """Pin: a session that records `data_wait` through `time_data` (no `DataLoader` timer) still does after
+    a default watch, which turned the `DataLoader` timer on, closes."""
+    _accelerate()
+    from tensorquill.accelerator import watch_accelerator
+
+    class Slow:
+        def __iter__(self):
+            while True:
+                time.sleep(0.12)
+                yield 1
+
+    sink = MemorySink()
+    with tensorquill.init(nn.Linear(1, 1), sink=sink, auto_step=False, mirror_scalars=False) as session:
+        batches = iter(session.time_data(Slow()))
+        watch_accelerator(session).close()
+        next(batches)
+        session.step()
+    assert sink.records[0]["data_wait"] >= 0.1
