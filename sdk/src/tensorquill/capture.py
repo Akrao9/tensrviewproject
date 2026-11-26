@@ -1254,6 +1254,60 @@ def _skip_forward(module: nn.Module, phase: _Evaluating, held: _Held | None) -> 
     return False
 
 
+def _add_square(acc: torch.Tensor, value: torch.Tensor | float) -> None:
+    """Add the square of a norm to `acc`, in place, on `acc`'s device and with no sync. `acc` is
+    `[s, e]`, standing for the sum of squares `s * 4**e`: `e` is the largest binary exponent of the
+    norms added this step and `s` their squares scaled by it, so `s` stays near 1 whatever their size.
+
+    BUG-04: the squares were added in float32, so a finite norm above about 1.8e19 (a float64 model's,
+    or one passed by hand) became `inf` and a false `non_finite` incident fired, and a Python float
+    above about 1.3e154 raised `OverflowError` from `float(norm) ** 2`. The norm is split into its
+    mantissa and exponent (`frexp`) in its own dtype and on its own device first, so one of any float64
+    size fits, also in a session on Apple MPS, which has no float64. In float32's range the sum is the
+    one float32 squares added up gave, bit for bit: scaling by a power of two is exact. A NaN or an
+    infinite norm stays one. Called once per clipping call: a dozen element-wise operations on two
+    numbers, traced like any other under `torch.compile`."""
+    if isinstance(value, torch.Tensor) and value.dtype == torch.float64:
+        mantissa, exponent = torch.frexp(value)  # on its own device: float64 is never on MPS
+        m, e = mantissa.to(acc), exponent.to(acc)
+    elif isinstance(value, torch.Tensor):
+        # float32 or narrower (or an integer) fits float32's range, and its square needs only one split:
+        # above 2**60, scaled by 2**-66 (exact), with exponent 66; else as it is. No `frexp`, which
+        # PyTorch 2.6 does not have on MPS, and no log.
+        v = value.to(acc)
+        big = v.abs() > _SQUARE_SPLIT
+        m = torch.where(big, v * _SQUARE_SHRINK, v)
+        e = big.to(acc) * _SQUARE_SHIFT
+    else:
+        mantissa_host, exponent_host = math.frexp(value)
+        m = torch.full((), mantissa_host, dtype=acc.dtype, device=acc.device)
+        e = torch.full((), exponent_host, dtype=acc.dtype, device=acc.device)
+    s0, e0 = acc[0], acc[1]
+    # The larger exponent of the two, a zero having none; the other term is scaled down to it. A zero or
+    # a value that is not finite is left as it is (scaling it could make `0 * inf`, a NaN).
+    top = torch.where(s0 == 0, e, torch.where(m == 0, e0, torch.maximum(e0, e)))
+    plain0 = (s0 == 0) | ~torch.isfinite(s0)
+    plain = (m == 0) | ~torch.isfinite(m)
+    a = torch.where(plain0, s0, torch.ldexp(s0, 2 * (e0 - top)))
+    b = torch.where(plain, m, torch.ldexp(m, e - top))
+    acc.copy_(torch.stack((a + b * b, top)))
+
+
+_SQUARE_SPLIT, _SQUARE_SHIFT = 2.0**60, 66.0
+_SQUARE_SHRINK = 2.0 ** -_SQUARE_SHIFT
+
+
+def _norm_of_squares(s: float, e: float) -> float:
+    """The norm `_add_square`'s `[s, e]` stands for, `sqrt(s) * 2**e`, read on the host in float64."""
+    root = math.sqrt(s)
+    if root == 0 or not math.isfinite(root) or not math.isfinite(e):
+        return root
+    try:
+        return math.ldexp(root, int(e))
+    except OverflowError:  # past float64's range: the norms are finite, their total is not
+        return math.inf
+
+
 def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
     # `clip_grad_norm_` turns a generator into a list itself; do it first so the
     # parameters can also be matched against each session's model.
@@ -1682,9 +1736,10 @@ class Session:
         self._ring_grad_seen: list[bool] = []
         self._ring_weight_seen: list[Any] = []  # False, or the weight check's optimizer ownership and dtypes
         # Squared total gradient norm reported by gradient clipping this step (summed over
-        # calls, for models clipped in several groups), and its ring.
-        self._clip = torch.zeros((), **f32)
-        self._ring_clip = torch.zeros(every, **f32)
+        # calls, for models clipped in several groups), and its ring: `[s, e]` for `s * 4**e`
+        # (`_add_square`), so a finite norm of any float64 size stays finite (BUG-04).
+        self._clip = torch.zeros(2, **f32)
+        self._ring_clip = torch.zeros(every, 2, **f32)
         self._clip_recorded = False
         self._foreign_steps = 0
         # Lets an outer wrapper see that an inner one already recorded: a count, or a `_ClipCall` written
@@ -2830,9 +2885,9 @@ class Session:
                 value = unwrap_local(value)
             if value.numel() != 1:
                 return
-            self._clip.add_(value.reshape(()).to(self._clip).square())
+            _add_square(self._clip, value.reshape(()))
         else:
-            self._clip.add_(float(norm) ** 2)
+            _add_square(self._clip, float(norm))
         self._clip_recorded = True
         if torch.compiler.is_compiling():
             # Written, never read, while traced (lane AD3): `+= 1` read the count, and Dynamo guarded
@@ -4665,7 +4720,7 @@ class Session:
                         name for name, row in zip(names, grad[i]) if row[3] > 0
                     ]
             if clips is not None and clip_seen[i]:
-                record["clip_grad_norm"] = math.sqrt(float(clips[i]))
+                record["clip_grad_norm"] = _norm_of_squares(float(clips[i][0]), float(clips[i][1]))
                 if amps is not None and amps[i] and _CLIP_CALLS in amps[i]:
                     record["clip_calls"] = amps[i][_CLIP_CALLS]
             if update_rows is not None and update_seen and update_seen[i]:
