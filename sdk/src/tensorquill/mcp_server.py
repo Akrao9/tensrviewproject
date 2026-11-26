@@ -339,7 +339,8 @@ class Source:
         def build() -> dict[str, Any]:
             try:
                 return build_evidence([r for r in records if _rank_of(r) == rank], run_manifest=path)
-            except (KeyError, TypeError, ValueError) as error:
+            # OverflowError: an integer too large for a float, which a detector converts (BUG-25).
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise ToolError(f"the detectors could not read the records in {path} ({error!r}).") from None
 
         evidence = self._keep(("evidence", path, rank), self._capture_stamp(path), build)
@@ -1067,7 +1068,7 @@ def score_display(entry: Mapping[str, Any]) -> str | None:
     if "score" not in entry and "score_note" not in entry:
         return None
     score = entry.get("score")
-    if isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(score):
+    if _finite(score) is not None:
         return f"score {score:.1f}"
     return SCORE_WORDS.get(str(entry.get("score_note")), "no score")
 
@@ -1624,14 +1625,29 @@ def _strict_number(value: Any) -> Any:
     return value
 
 
+def _too_large(value: Any) -> bool:
+    """An integer no float holds (10**400: `Session.log` takes it and the capture writes it)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    try:
+        float(value)
+    except OverflowError:
+        return True
+    return False
+
+
 def _finite(value: Any) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    """A finite number as recorded, else None: a bool, anything not a number, NaN, an Inf and an
+    integer too large for a float (`_too_large`, BUG-25, wave AO: `math.isfinite` raised on it)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or _too_large(value) or not math.isfinite(value):
         return None
     return value
 
 
 def _over_range(rows: list[tuple[int, dict[str, Any]]], column: str) -> dict[str, Any]:
-    """What a column did over every recorded step in the range, sampled or not."""
+    """What a column did over every recorded step in the range, sampled or not. An integer too
+    large for a float is counted apart (`too_large_for_a_float`), out of min, max and median: it
+    is finite, and no float holds it."""
     held = [(step, point[column]) for step, point in rows if point.get(column) is not None]
     finite = [(step, number) for step, value in held if (number := _finite(value)) is not None]
     out: dict[str, Any] = {"recorded": len(held)}
@@ -1642,9 +1658,12 @@ def _over_range(rows: list[tuple[int, dict[str, Any]]], column: str) -> dict[str
             "median": _strict_number(statistics.median(number for _, number in finite)),
             "first": _strict_number(finite[0][1]), "last": _strict_number(finite[-1][1]),
         })
-    bad = [step for step, value in held if _finite(value) is None]
+    large = [step for step, value in held if _too_large(value)]
+    bad = [step for step, value in held if _finite(value) is None and not _too_large(value)]
     if bad:
         out.update({"not_finite": len(bad), "first_not_finite_step": bad[0]})
+    if large:
+        out.update({"too_large_for_a_float": len(large), "first_too_large_step": large[0]})
     return out
 
 
