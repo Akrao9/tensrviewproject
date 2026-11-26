@@ -400,3 +400,19 @@ def test_the_incident_names_the_group_as_pytorch_prints_it(tmp_path):
     text = tensorquill.incident_summary({"incidents": [incident], "samples": [], "layer_count": 0,
                                           "expert_count": 0, "router_names": []})
     assert "at all_reduce #2 in group 0: Culprit rank 1" in text
+
+
+def test_an_analyzer_that_keys_its_groups_otherwise_still_gives_the_size_when_one_group_fits(tmp_path, monkeypatch):
+    analyze = _analyzer()
+    from torch.distributed.flight_recorder.components import builder
+
+    build = builder.build_db
+
+    def keyed_otherwise(*args, **kwargs):
+        db = build(*args, **kwargs)
+        return db._replace(groups=[g._replace(id=g.id + "-v") for g in db.groups],
+                           memberships=[m._replace(group_id=m.group_id + "-v") for m in db.memberships])
+
+    monkeypatch.setattr(builder, "build_db", keyed_otherwise)
+    directory = _fr_dumps(tmp_path / "fr", {"0": ("undefined", (0, 1))}, _desync("0", "undefined"))
+    assert analyze(directory)["problem"]["group"] == {"id": "0", "desc": "0", "size": 2}
