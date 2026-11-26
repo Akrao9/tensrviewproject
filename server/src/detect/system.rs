@@ -163,8 +163,11 @@ impl System {
             }
             if self.found[0].is_none() && self.growth.len() == MEMORY_GROWTH_READINGS {
                 let (first_step, first) = self.growth[0];
-                let rise = allocated - first;
-                if rise >= MEMORY_GROWTH_BYTES && rise as f64 >= MEMORY_GROWTH_FRACTION * first as f64 {
+                // Recorded byte counts are subtracted exactly, as Python's integers are (BUG-01): in
+                // `i64` a rise or a remainder past its range panicked a debug build and wrapped in a
+                // release build. Of any difference within `i64`, `as f64` is what it was.
+                let rise = i128::from(allocated) - i128::from(first);
+                if rise >= i128::from(MEMORY_GROWTH_BYTES) && rise as f64 >= MEMORY_GROWTH_FRACTION * first as f64 {
                     // Python's `per_step`: none when every reading was at one step (rows
                     // written again), and so no steps to the total either (L7, lane V7).
                     let per_step = (step > first_step).then(|| rise as f64 / (step - first_step) as f64);
@@ -180,7 +183,7 @@ impl System {
                         "steps_to_total": or_null(
                             total
                                 .zip(per_step)
-                                .map(|(total, per_step)| (total - allocated).max(0) as f64 / per_step)
+                                .map(|(total, per_step)| (i128::from(total) - i128::from(allocated)).max(0) as f64 / per_step)
                         ),
                     }));
                 }

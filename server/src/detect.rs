@@ -114,6 +114,8 @@ mod lane_y2_tests;
 #[cfg(test)]
 mod lane_z3_tests;
 pub mod replica;
+#[cfg(test)]
+mod wave_ao_tests;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
@@ -693,9 +695,16 @@ fn fsum(values: impl Iterator<Item = f64>) -> f64 {
     hi
 }
 
+/// The sum of a router's counts, exact as Python's integer sum is (BUG-01): `i64` counts summed in
+/// `i64` passed its range on valid rows, which panicked a debug build and wrapped in a release build.
+/// Of any sum within `i64`, `as f64` is what it was.
+fn counts_sum(counts: &[i64]) -> i128 {
+    counts.iter().map(|count| i128::from(*count)).sum()
+}
+
 /// Python's `_diversity_from_counts`: the effective number of experts over their number.
 fn diversity_from_counts(counts: &[i64]) -> f64 {
-    let total: i64 = counts.iter().sum();
+    let total = counts_sum(counts);
     if total <= 0 || counts.is_empty() {
         return 0.0;
     }
@@ -706,7 +715,7 @@ fn diversity_from_counts(counts: &[i64]) -> f64 {
     entropy.exp() / counts.len() as f64
 }
 
-fn effective_overload_threshold(experts: usize, tokens: i64, base: f64) -> f64 {
+fn effective_overload_threshold(experts: usize, tokens: i128, base: f64) -> f64 {
     if experts <= 1 || tokens <= 0 {
         return 1.0;
     }
@@ -715,7 +724,7 @@ fn effective_overload_threshold(experts: usize, tokens: i64, base: f64) -> f64 {
     base.max(1.5 * mean).max(mean + 3.0 * se)
 }
 
-fn dead_experts_significant(experts: usize, tokens: i64, overloaded: bool, dead: usize, diversity: f64) -> bool {
+fn dead_experts_significant(experts: usize, tokens: i128, overloaded: bool, dead: usize, diversity: f64) -> bool {
     if experts <= 1 || tokens <= 0 || dead == 0 {
         return false;
     }
@@ -1032,16 +1041,21 @@ impl<'de: 'a, 'a, T: Deserialize<'de>> Deserialize<'de> for Members<'a, T> {
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("an object")
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut members = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some(Key(key)) = map.next_key()? {
-                    members.push((key, map.next_value()?));
-                }
-                Ok(Members(members))
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                Ok(Members(read_members(map)?))
             }
         }
         deserializer.deserialize_map(MembersVisitor(PhantomData))
     }
+}
+
+/// An object's members in document order, read from its map.
+fn read_members<'de, A: MapAccess<'de>, T: Deserialize<'de>>(mut map: A) -> Result<Vec<(Cow<'de, str>, T)>, A::Error> {
+    let mut members = Vec::with_capacity(map.size_hint().unwrap_or(0));
+    while let Some(Key(key)) = map.next_key()? {
+        members.push((key, map.next_value()?));
+    }
+    Ok(members)
 }
 
 /// A number as Python's `_finite` reads it: a JSON number (or boolean) that is finite, and
@@ -1476,14 +1490,15 @@ struct Router {
     name: String,
     top_k: i64,
     /// The baseline for a top-k router: its last `OVERLOAD_WINDOW` samples that were not
-    /// flagged, as (counts, assignments, diversity), with the counts summed per expert.
-    window: VecDeque<(Arc<[i64]>, i64, f64)>,
-    window_sums: Vec<i64>,
-    window_total: i64,
+    /// flagged, as (counts, assignments, diversity), with the counts summed per expert. Every sum
+    /// of counts is an `i128`, exact as Python's ([`counts_sum`]).
+    window: VecDeque<(Arc<[i64]>, i128, f64)>,
+    window_sums: Vec<i128>,
+    window_total: i128,
     /// The trailing `starve_window` samples, for the starved check.
-    recent: VecDeque<(Arc<[i64]>, i64)>,
-    recent_sums: Vec<i64>,
-    recent_tokens: i64,
+    recent: VecDeque<(Arc<[i64]>, i128)>,
+    recent_sums: Vec<i128>,
+    recent_tokens: i128,
     /// Where this router was last found in a row's `moe_stats`.
     stats_at: usize,
     /// The most experts any of its recorded counts had: the size of the sample it is given
@@ -1520,7 +1535,7 @@ enum Leading {
 impl Router {
     /// Python's `_jump_overloaded`: in a router whose diversity just dropped, the experts
     /// whose fraction of tokens rose by `OVERLOAD_JUMP` over their average in the baseline.
-    fn jump_overloaded(&self, counts: &[i64], tokens: i64, diversity: f64, scratch: &mut Vec<f64>) -> Vec<usize> {
+    fn jump_overloaded(&self, counts: &[i64], tokens: i128, diversity: f64, scratch: &mut Vec<f64>) -> Vec<usize> {
         if self.window.len() < OVERLOAD_MIN_HISTORY {
             return Vec::new();
         }
@@ -1550,19 +1565,19 @@ impl Router {
         overloaded
     }
 
-    fn keep_in_baseline(&mut self, counts: &Arc<[i64]>, tokens: i64, diversity: f64) {
+    fn keep_in_baseline(&mut self, counts: &Arc<[i64]>, tokens: i128, diversity: f64) {
         if self.window_sums.len() < counts.len() {
             self.window_sums.resize(counts.len(), 0);
         }
         for (sum, count) in self.window_sums.iter_mut().zip(counts.iter()) {
-            *sum += count;
+            *sum += i128::from(*count);
         }
         self.window_total += tokens;
         self.window.push_back((Arc::clone(counts), tokens, diversity));
         if self.window.len() > OVERLOAD_WINDOW {
             let (old, old_tokens, _) = self.window.pop_front().expect("the window is not empty");
             for (sum, count) in self.window_sums.iter_mut().zip(old.iter()) {
-                *sum -= count;
+                *sum -= i128::from(*count);
             }
             self.window_total -= old_tokens;
         }
@@ -1575,7 +1590,7 @@ impl Router {
     fn starved(
         &mut self,
         counts: &Arc<[i64]>,
-        tokens: i64,
+        tokens: i128,
         dead: &[usize],
         window: usize,
         ratio: f64,
@@ -1586,14 +1601,14 @@ impl Router {
             self.recent_tokens = 0;
         }
         for (sum, count) in self.recent_sums.iter_mut().zip(counts.iter()) {
-            *sum += count;
+            *sum += i128::from(*count);
         }
         self.recent_tokens += tokens;
         self.recent.push_back((Arc::clone(counts), tokens));
         if self.recent.len() > window {
             let (old, old_tokens) = self.recent.pop_front().expect("the window is not empty");
             for (sum, count) in self.recent_sums.iter_mut().zip(old.iter()) {
-                *sum -= count;
+                *sum -= i128::from(*count);
             }
             self.recent_tokens -= old_tokens;
         }
@@ -1631,7 +1646,8 @@ enum OverloadRule {
 struct Sample {
     router: usize,
     counts: Arc<[i64]>,
-    tokens: i64,
+    /// The counts' exact sum, written as Python writes it ([`counts_sum`]).
+    tokens: i128,
     /// None for counts that sum to zero: a missing sample, which no rule read.
     judged: Option<Judged>,
 }
@@ -1775,7 +1791,7 @@ impl Moe {
                     count_values.value(at)
                 }
             }));
-            let tokens: i64 = router_counts.iter().sum();
+            let tokens = counts_sum(&router_counts);
             if tokens <= 0 {
                 // A missing sample: nothing is judged and no window moves.
                 if let Some(kept) = &mut self.kept {
@@ -2036,7 +2052,7 @@ struct SampleOut<'a> {
     step: i64,
     layer: usize,
     router: &'a str,
-    routed_tokens: i64,
+    routed_tokens: i128,
     counts: &'a [i64],
     diversity: Option<f64>,
     overloaded: &'a [usize],
@@ -3267,6 +3283,50 @@ impl<'de> Deserialize<'de> for AttentionStats {
     }
 }
 
+/// A probe's `attention`: its modules in order when it is an object, and none for any other value
+/// (`null`, a list, a number, text, a bool), which is read past, as Python's `isinstance(attention,
+/// dict)` reads it (BUG-10). Before, such a value failed the whole probe's parse, and its `error` and
+/// `not_run` were lost with it.
+struct AttentionOf<'a>(Option<Members<'a, AttentionStats>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for AttentionOf<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AttentionVisitor<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for AttentionVisitor<'a> {
+            type Value = AttentionOf<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<AttentionOf<'a>, A::Error> {
+                Ok(AttentionOf(Some(Members(read_members(map)?))))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<AttentionOf<'a>, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AttentionOf(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_unit<E>(self) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+        }
+        deserializer.deserialize_any(AttentionVisitor(PhantomData))
+    }
+}
+
 /// What the attention rules read of a probe: its attention modules in order, or nothing when
 /// the probe failed (`error`, kept as it was written) or recorded no attention. Histograms and
 /// maps are skipped unread.
@@ -3292,8 +3352,9 @@ impl<'de: 'a, 'a> Deserialize<'de> for Probe<'a> {
                     match key.as_ref() {
                         "error" => probe.error = Some(map.next_value()?),
                         "not_run" => probe.not_run = Some(map.next_value()?),
-                        // Not an object: the probe is not read at all, as Python skips it.
-                        "attention" => probe.attention = Some(map.next_value()?),
+                        // Not an object: no attention, and the rest of the probe is read. A key
+                        // given twice keeps its last value, as `json.loads` does.
+                        "attention" => probe.attention = map.next_value::<AttentionOf>()?.0,
                         _ => {
                             map.next_value::<IgnoredAny>()?;
                         }
@@ -6776,8 +6837,10 @@ mod tests {
         );
         let failed: Probe = serde_json::from_str(r#"{"error":"RuntimeError: x","attention":{}}"#).unwrap();
         assert_eq!(failed.error, Some(json!("RuntimeError: x")));
-        assert!(serde_json::from_str::<Probe>(r#"{"attention":[1]}"#).is_err());
-        // skipped, as Python skips it
+        // An attention that is not an object is none, and the rest of the probe is read (BUG-10).
+        let listed: Probe = serde_json::from_str(r#"{"error":"x","attention":[1]}"#).unwrap();
+        assert!(listed.attention.is_none());
+        assert_eq!(listed.error, Some(json!("x")));
     }
 
     #[test]
