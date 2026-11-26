@@ -85,6 +85,22 @@ RECORDS_SUFFIX = ".jsonl"
 _RECORDS_NAME = re.compile(r"^(?P<run_id>.+)\.rank(?P<rank>[0-9]+)(?:\.(?P<pid>[0-9]+))?\.jsonl$")
 
 
+def _descriptor_ends_torn(file: Any) -> bool:
+    """`_ends_torn` read through `file`'s own descriptor (opened for reading too), so that no other
+    descriptor of the file is opened and closed in this process: where `flock` is a POSIX record
+    lock in disguise (Linux's NFS client emulates it as one), that close would drop the lock. Never
+    raises: a file that cannot be read is opened as before."""
+    try:
+        file.flush()
+        fd = file.fileno()
+        size = os.fstat(fd).st_size
+        if size == 0:
+            return False
+        return os.pread(fd, 1, size - 1) != b"\n"
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
 def records_file_name(run_id: str, rank: int, pid: int | None = None) -> str:
     """`<run_id>.rank<rank>.jsonl`, or `<run_id>.rank<rank>.<pid>.jsonl` for a second writer."""
     return f"{run_id}.rank{rank}" + (f".{pid}" if pid is not None else "") + RECORDS_SUFFIX
@@ -194,14 +210,20 @@ class JsonlSink:
         self.locked = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.created = not self.path.exists()
-        self._file = self.path.open("a", encoding="utf-8")
+        # Locked, the file is opened for reading too, so the torn-line checks read it through this
+        # descriptor and no other is opened (`_descriptor_ends_torn`).
+        self._mode = "a+" if lock and hasattr(os, "pread") else "a"
+        self._file = self.path.open(self._mode, encoding="utf-8")
         self._failed = False  # the last write raised: the file may end in part of a line
         repair = True
         if lock:
             repair = self._take_lock()
-        if repair and _ends_torn(self.path):
+        if repair and self._ends_torn():
             self._file.write("\n")
             self._file.flush()
+
+    def _ends_torn(self) -> bool:
+        return _descriptor_ends_torn(self._file) if self._mode == "a+" else _ends_torn(self.path)
 
     def _take_lock(self) -> bool:
         """Lock the file, or move to a second writer's file of its own (`<name>.<pid>.jsonl`) when
@@ -224,7 +246,7 @@ class JsonlSink:
             second = first.with_name(first.name[: -len(RECORDS_SUFFIX)] + f".{os.getpid()}{RECORDS_SUFFIX}"
                                      if first.name.endswith(RECORDS_SUFFIX) else f"{first.name}.{os.getpid()}")
             created = not second.exists()
-            file = second.open("a", encoding="utf-8")
+            file = second.open(self._mode, encoding="utf-8")
         except Exception as failure:  # noqa: BLE001  nothing here may stop a run
             _say(f"tensorquill.init could not take {self.path}'s lock or open a file of its own beside it "
                  f"({_brief(failure)}), so this session writes {self.path.name} unlocked.", stacklevel=5)
@@ -256,7 +278,7 @@ class JsonlSink:
         that returned, whose record no reader could read."""
         if self._failed:
             self._file.flush()
-            if _ends_torn(self.path):
+            if self._ends_torn():
                 self._file.write("\n")
             self._failed = False
         try:
