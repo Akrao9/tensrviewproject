@@ -3,6 +3,9 @@
 1. BUG-20's callers: the MCP series, `first_divergence` and `compare_runs` take the attempt order of
    the whole record stream, as `scalar_series` does, also where a rollback leaves out every training
    record of the older attempt (so the records left show the newer attempt first).
+2. The two overflow guards no lane made (lane AO-9's list): an integer too large for a float is
+   unreadable to the Python detectors, as the Rust detectors read it (`detect/extra_json.rs`), and
+   not finite to `first_divergence`; nothing raises.
 
 Records are written here by hand, in the shapes `JsonlSink` writes. Tests that need pyarrow or a
 `tensorquill-server` binary (`TENSORQUILL_SERVER_BIN`) skip one by one without them.
@@ -10,12 +13,20 @@ Records are written here by hand, in the shapes `JsonlSink` writes. Tests that n
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import math
+import os
 from pathlib import Path
 
 import pytest
 
-from tensorquill import evidence
+from tensorquill import evidence, server_detect
+
+BINARY = server_detect.find_binary()
+needs_pyarrow = pytest.mark.skipif(importlib.util.find_spec("pyarrow") is None, reason="pyarrow is not installed")
+needs_binary = pytest.mark.skipif(BINARY is None or not os.path.isfile(BINARY),
+                                  reason="tensorquill-server is not built (TENSORQUILL_SERVER_BIN)")
 
 
 def _write(path: Path, records: list[dict], tail: str = "") -> Path:
@@ -101,3 +112,76 @@ def test_bug20_compare_runs_on_one_file_a_rank_reads_the_newer_attempts_point(tm
     part = compare_runs(a, b)["divergence"]
     assert part["first_exact_difference"] is None, part["lines"]
     assert part["state"] == "no_divergence", part["lines"]
+
+
+# --- 2. An integer too large for a float ----------------------------------------------------------------
+
+BIG = 10**400
+
+
+def _plain_run(at: int = 20, steps: int = 40, **big) -> list[dict]:
+    """A healthy run whose record at `at` holds BIG in the places `big` names."""
+    rows = []
+    for step in range(steps):
+        row = {"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0,
+               "layers": {"blk": {"mean": 0.0, "std": 1.0, "abs_max": 1.0, "zero_frac": 0.0}},
+               "grad_norms": {"w": 1.0}}
+        if step == at:
+            if "grad_norm" in big:
+                row["grad_norm"] = BIG
+            if "clip_grad_norm" in big:
+                row["clip_grad_norm"] = BIG
+            if "layer" in big:
+                row["layers"]["blk"]["abs_max"] = BIG
+            if "parameter" in big:
+                row["grad_norms"]["w"] = BIG
+        rows.append(row)
+    return rows
+
+
+PLACES = ["grad_norm", "clip_grad_norm", "layer", "parameter"]
+
+
+def _judged(evidence_: dict) -> tuple:
+    return (evidence_["run_state"], sorted(i["kind"] for i in evidence_["incidents"]))
+
+
+@pytest.mark.parametrize("place", PLACES)
+def test_the_python_detectors_read_an_integer_too_large_for_a_float_as_unreadable(place):
+    """`evidence._finite` gives no value and `_is_non_finite` says no: a finite number that no float
+    holds is neither a measurement nor a NaN or an infinity, so no `non_finite` fires."""
+    found = evidence.build_evidence(_plain_run(**{place: True}), detectors="python")
+    assert _judged(found) == _judged(evidence.build_evidence(_plain_run(), detectors="python"))
+    assert evidence._finite(BIG) is None and evidence._finite(-BIG) is None
+    assert evidence._is_non_finite(BIG) is False and evidence._is_non_finite(-BIG) is False
+    assert evidence._is_non_finite(math.inf) is True and evidence._finite(2**1023) == float(2**1023)
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("place", PLACES)
+def test_both_engines_judge_a_record_holding_an_integer_too_large_for_a_float_alike(place):
+    """The Rust detectors read such a number as unreadable where a float is wanted
+    (`detect/extra_json.rs`, wave AJ); the Python detectors now read it so too."""
+    records = _plain_run(**{place: True})
+    python, rust = (evidence.build_evidence(records, detectors=engine) for engine in ("python", "rust"))
+    assert _judged(python) == _judged(rust)
+    assert "non_finite" not in _judged(rust)[1]
+
+
+def _loss_run(run_id: str, third) -> list[dict]:
+    return [{"schema_version": 1, "run_id": run_id, "rank": 0, "step": step,
+             "scalars": {"loss": third if step == 2 else 1.0 + 0.01 * step}} for step in range(60)]
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_first_divergence_reads_an_integer_too_large_for_a_float_as_an_infinity(sign):
+    """`divergence._number` keeps the point, as the infinity of its sign: the runs then compare as
+    they do with the infinity recorded, and the difference at step 2 is not lost."""
+    from tensorquill.divergence import _number, first_divergence
+
+    assert _number(sign * BIG) == sign * math.inf
+    big = first_divergence(_loss_run("a", sign * BIG), _loss_run("b", 3.0))
+    infinite = first_divergence(_loss_run("a", sign * math.inf), _loss_run("b", 3.0))
+    assert big == infinite
+    assert big["first_exact_difference"] == {"step": 2, "series": 1}
