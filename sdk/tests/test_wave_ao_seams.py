@@ -669,15 +669,19 @@ def test_the_mirror_section_states_no_limit_on_a_small_integer():
     assert "(Python shares the objects for -5 to 256)" not in text
 
 
-def test_the_lightning_and_hugging_face_rows_say_the_loss_and_the_baseline_phase():
+def test_the_hugging_face_callback_keeps_the_pause_for_the_trainers_own_datasets_only():
     """The callback reads the datasets from the `Trainer` it holds (`huggingface._more_datasets_follow`),
     so a dictionary given to `evaluate()` alone is not among them: the page says so."""
+    pytest.importorskip("transformers")
     from tensorquill.huggingface import _more_datasets_follow
 
     trainer = SimpleNamespace(eval_dataset={"a": [0], "b": [1]})
     assert _more_datasets_follow(trainer, {"eval_a_runtime": 0.1}) is True
     assert _more_datasets_follow(trainer, {"eval_b_runtime": 0.1}) is False
     assert _more_datasets_follow(SimpleNamespace(eval_dataset=[0]), {"eval_a_runtime": 0.1}) is False
+
+
+def test_the_lightning_and_hugging_face_rows_say_the_loss_and_the_baseline_phase():
     text = _readme(*WHAT_IS_BUILT)
     for words in ("the back-propagated loss per optimizer step (under a `GradScaler`, as with `16-mixed`, the loss before "
                   "the scaler multiplied it; since Nov 26, 2026), and the `16-mixed` scaler",
