@@ -2186,7 +2186,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " thinned to every nth recorded step, with the stride reported, and `over_range` gives the minimum,"
             " maximum (with their steps) and median over every recorded step in the range, so a one-step spike is"
             " not lost. Narrow `start` and `end` to see each step. Numbers have six significant digits; a NaN or"
-            ' Inf is the string "nan", "inf" or "-inf". A router\'s series from compact evidence that left steps'
+            ' Inf is the string "nan", "inf" or "-inf". An integer too large for a float is shown as recorded and'
+            " counted in `over_range` as `too_large_for_a_float`, out of its minimum, maximum and median."
+            " A router's series from compact evidence that left steps"
             " out says under `compact` which steps it covers. A rank's records that hold more than one run ID are"
             " refused with the IDs, as list_incidents refuses them: a series is of one run. A router's series carries"
             " `moe_source` and `moe_source_words` where the capture said how it read the routing: \"the dispatched"
