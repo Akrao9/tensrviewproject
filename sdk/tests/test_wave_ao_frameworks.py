@@ -234,9 +234,10 @@ def _logs_on_log(transformers, callback, prefix):
 
 
 def test_second_evaluation_dataset_is_recorded_on_the_step_the_evaluation_followed(tmp_path):
-    """`eval_dataset={"a": ..., "b": ...}` evaluated after step 1 (TensorQuill's step 1, `global_step` 2):
-    what is logged during "b"'s evaluation (here at its `on_log`, as the tracker mirror logs) is on step 1,
-    with "a"'s, and not on step 2; and "b"'s slow loader is not step 2's `data_wait`."""
+    """`eval_dataset={"a": ..., "b": ...}` evaluated after step 1 (TensorQuill's step 1, `global_step` 2) and
+    after the last, step 3: what is logged during "b"'s evaluation (here at its `on_log`, as the tracker
+    mirror logs) is on step 1, with "a"'s, and not on step 2; and "b"'s slow loader is not step 2's
+    `data_wait`."""
     transformers = _transformers()
     from tensorquill.huggingface import TensorQuillCallback
 
@@ -244,9 +245,9 @@ def test_second_evaluation_dataset_is_recorded_on_the_step_the_evaluation_follow
     callback = TensorQuillCallback(sink=sink, every=1, mirror_scalars=False)
     callbacks = [callback, _logs_on_log(transformers, callback, "eval_a"), _logs_on_log(transformers, callback, "eval_b")]
     _hf_trainer(tmp_path / "out", _Model(), callbacks, eval_dataset={"a": _Data(2, seed=1), "b": _Data(2, SLOW, seed=2)},
-                eval_strategy="steps", eval_steps=2).train()
+                eval_strategy="steps", eval_steps=2, max_steps=4).train()
     steps = _steps(sink)
-    assert [r["step"] for r in steps] == [0, 1, 2]
+    assert [r["step"] for r in steps] == [0, 1, 2, 3]
     after, next_step = steps[1]["scalars"], steps[2]["scalars"]
     assert {"eval/a_loss", "eval/b_loss", "seen/eval_a", "seen/eval_b"} <= set(after)
     assert not {name for name in next_step if name.startswith(("eval/", "seen/"))}
@@ -261,10 +262,11 @@ def test_first_of_several_evaluation_datasets_slow_is_not_the_next_steps_data_wa
     sink = MemorySink()
     _hf_trainer(tmp_path / "out", _Model(), [TensorQuillCallback(sink=sink, every=1, mirror_scalars=False)],
                 eval_dataset={"a": _Data(2, SLOW, seed=1), "b": _Data(2, seed=2)},
-                eval_strategy="steps", eval_steps=2).train()
+                eval_strategy="steps", eval_steps=2, max_steps=4).train()
     steps = _steps(sink)
     assert steps[2]["data_wait"] < FAST_ENOUGH
     assert {"eval/a_loss", "eval/b_loss"} <= set(steps[1]["scalars"])
+    assert not {name for name in steps[2]["scalars"] if name.startswith("eval/")}
 
 
 def test_one_evaluation_dataset_then_training_counts_the_next_fetch(tmp_path):
@@ -350,7 +352,7 @@ def test_resume_from_a_checkpoint_given_to_train_records_the_load(tmp_path):
     assert [r["step"] for r in steps] == [1]
     load = steps[0]["checkpoint"]["load"]
     assert {"model", "optimizer"} <= set(load["components"])
-    assert "tensors" in steps[0]["checkpoint"]
+    assert load["tensors"]["state"] == "compared"
 
 
 def test_resume_given_to_train_is_the_folder_recorded_not_the_one_under_output_dir(tmp_path):
