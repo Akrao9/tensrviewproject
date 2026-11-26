@@ -171,3 +171,23 @@ def test_the_compact_name_leads_back_to_its_full_file_and_never_is_it(name):
     assert _compact.compact_path(full).name == NAMES[name][1]
     assert _compact.full_path_of(_compact.compact_path(full)) == full
     assert _compact.full_path_of(Path("/a/y.json")) is None
+
+
+def test_a_file_named_only_by_the_mark_has_no_full_file():
+    """`.compact` is no compact copy of anything: no name gives it, and nothing raises."""
+    assert _compact.full_path_of(Path("/a/.compact")) is None
+    assert _compact.full_path_of(Path("/a/.compact.json")) is None  # `.json` would give `.json.compact`
+
+
+@pytest.mark.parametrize("name", ["x.compact.json", "x.txt", "x.compact"])
+def test_the_copy_is_found_after_the_folder_is_moved(tmp_path, name):
+    """The state file names the evidence it handed by its absolute path; the folder moved (or
+    mounted elsewhere) with both in it, the copy still leads to the trigger's state file, as the
+    names that never needed the full file's do."""
+    run = Run(tmp_path, name)
+    run.look(Trigger(run.command(), compact_window=5), 1)
+    [call] = run.calls()
+    moved = tmp_path / "moved"
+    run.folder.rename(moved)
+    copy = moved / Path(call["env"]["TENSORQUILL_EVIDENCE"]).name
+    assert _found(copy, call["env"]["TENSORQUILL_INCIDENT_MCP_ID"])["kind"] == "rank_silent"
