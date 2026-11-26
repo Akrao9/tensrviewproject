@@ -65,6 +65,7 @@ requirement, 3 not proven (cannot tell, or the baseline could not run).
 from __future__ import annotations
 
 import argparse
+import functools
 import gc
 import importlib.util
 import json
@@ -221,23 +222,30 @@ def init_kwargs(init: dict, routers: dict, *, sink: Any, run_id: str) -> dict:
 # ---- the statistics --------------------------------------------------------------------------
 
 
-def _below(k: int, n: int) -> float:
-    """P(B <= k) for B ~ Binomial(n, 1/2)."""
-    return sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
+@functools.lru_cache(maxsize=4096)
+def _order_index(n: int, confidence: float) -> tuple[int, float] | None:
+    """The largest k whose interval [x_(k), x_(n-k+1)] covers 1 - 2 P(B <= k - 1) >= confidence,
+    B ~ Binomial(n, 1/2), with that coverage; None when even k = 1 covers less."""
+    best = None
+    below, total = 0, 2 ** n  # below: the count of outcomes B <= k - 1, kept exact in integers
+    for k in range(1, n // 2 + 1):
+        below += math.comb(n, k - 1)
+        coverage = 1 - 2 * below / total
+        if coverage < confidence:
+            break
+        best = (k, coverage)
+    return best
 
 
 def median_interval(values: list[float], confidence: float = 0.95) -> tuple[float, float, float] | None:
     """The distribution-free interval for the median: [x_(k), x_(n-k+1)] for the largest k whose coverage,
     1 - 2 P(B <= k - 1), is at least `confidence`. None when even [min, max] covers less."""
     xs = sorted(values)
-    n = len(xs)
-    best = None
-    for k in range(1, n // 2 + 1):
-        coverage = 1 - 2 * _below(k - 1, n)
-        if coverage < confidence:
-            break
-        best = (xs[k - 1], xs[n - k], coverage)
-    return best
+    found = _order_index(len(xs), confidence)
+    if found is None:
+        return None
+    k, coverage = found
+    return xs[k - 1], xs[len(xs) - k], coverage
 
 
 def min_rounds(confidence: float = 0.95) -> int:
