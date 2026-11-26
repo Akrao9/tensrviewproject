@@ -60,7 +60,7 @@ from .distributed import (
 )
 from .flight import _without_traceback
 from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
-from .sink import JsonlSink, Sink, clear_end_marker, write_end_marker
+from .sink import JsonlSink, Sink, clear_end_marker, records_file_name, write_end_marker
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
 from .tracker import LaunchRead, RunInfo, _world_size, resolve_run, tracker_labels
@@ -5005,16 +5005,16 @@ def _foreach_norm(
 
 
 def _open_default_sink(path: Path, undo: list[Callable[[], Any]]) -> JsonlSink:
-    """`init`'s default `JsonlSink`, with what undoes it: closed, and the file and the folders made
-    for it removed when they did not exist before and are still empty."""
+    """`init`'s default `JsonlSink`, locked (`sink.JsonlSink`: a second writer of `path` writes a file
+    of its own, `sink.path`), with what undoes it: closed, and the file and the folders made for it
+    removed when they did not exist before and are still empty."""
     made = [folder for folder in (path.parent, *path.parent.parents) if not folder.exists()]
-    existed = path.exists()
-    sink = JsonlSink(path)
+    sink = JsonlSink(path, lock=True)
 
     def remove() -> None:
         sink.close()
-        if not existed and path.exists() and path.stat().st_size == 0:
-            path.unlink()
+        if sink.created and sink.path.exists() and sink.path.stat().st_size == 0:
+            sink.path.unlink()
         for folder in made:  # innermost first
             try:
                 folder.rmdir()
@@ -5325,7 +5325,7 @@ def init(
         if fitted != run.run_id:
             run = _replace(run, run_id=fitted)
         if sink is None:
-            sink = _open_default_sink(Path("tensorquill-out") / f"{run.run_id}.rank{run.rank}.jsonl", undo)
+            sink = _open_default_sink(Path("tensorquill-out") / records_file_name(run.run_id, run.rank), undo)
         # The project and the name are facts of the run, and a tracker's run exists on rank 0
         # only, so rank 0 alone resolves and writes them: no collective call is needed.
         run_manifest = None

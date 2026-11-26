@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import errno
+import glob
 import json
 import math
 import os
+import re
 import threading
 import time
 from pathlib import Path
 from typing import Any, Protocol
 
 from .manifest import _say
+
+try:  # POSIX only; where there is none, a records file is written unlocked
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover  Windows
+    _fcntl = None  # type: ignore[assignment]
 
 
 class Sink(Protocol):
@@ -45,6 +53,13 @@ def _finite(value: Any) -> Any:
     return value
 
 
+def _brief(error: BaseException | None) -> str:
+    try:
+        return f"{type(error).__name__}: {error}"[:200]
+    except Exception:  # noqa: BLE001  an error whose str() raises
+        return type(error).__name__
+
+
 def _ends_torn(path: Path) -> bool:
     """Whether `path` is a non-empty file whose last byte is not a newline: a line that a killed
     process left half written. Never raises: a file that cannot be read is opened as before."""
@@ -59,9 +74,109 @@ def _ends_torn(path: Path) -> bool:
         return False
 
 
+# --- The records file's name ---------------------------------------------------------------
+#
+# `init` writes `<run_id>.rank<N>.jsonl`. A process that finds that file locked by another writer
+# of the same run ID and rank writes `<run_id>.rank<N>.<pid>.jsonl` (`JsonlSink`, `lock=True`). A run
+# ID may hold dots (`run-slurm1234.0`), so the name is read from the right, and the rank and the
+# pid are ASCII digits only: `x.rank0.bak.jsonl`, a copy, is no records file of `init`'s.
+
+RECORDS_SUFFIX = ".jsonl"
+_RECORDS_NAME = re.compile(r"^(?P<run_id>.+)\.rank(?P<rank>[0-9]+)(?:\.(?P<pid>[0-9]+))?\.jsonl$")
+
+
+def records_file_name(run_id: str, rank: int, pid: int | None = None) -> str:
+    """`<run_id>.rank<rank>.jsonl`, or `<run_id>.rank<rank>.<pid>.jsonl` for a second writer."""
+    return f"{run_id}.rank{rank}" + (f".{pid}" if pid is not None else "") + RECORDS_SUFFIX
+
+
+def records_file_parts(path: str | Path) -> tuple[str, int, int | None] | None:
+    """(run ID, rank, pid) of a file named as `records_file_name` names one, the pid None for the
+    first writer's; None for any other name."""
+    found = _RECORDS_NAME.fullmatch(Path(path).name)
+    if found is None:
+        return None
+    pid = found.group("pid")
+    return found.group("run_id"), int(found.group("rank")), None if pid is None else int(pid)
+
+
+def writers_of(path: str | Path) -> list[Path]:
+    """Every file in `path`'s folder that `init` wrote for the same run ID and rank as `path`: the
+    first writer's `<run_id>.rank<N>.jsonl` first, when it is there, then each second writer's
+    `<run_id>.rank<N>.<pid>.jsonl` by pid. `[path]` for a file of another name, and for one whose
+    folder cannot be read. Never raises."""
+    path = Path(path)
+    parts = records_file_parts(path)
+    if parts is None:
+        return [path]
+    run_id, rank, _ = parts
+    try:
+        names = glob.glob(glob.escape(str(path.parent / f"{run_id}.rank{rank}")) + "*" + RECORDS_SUFFIX)
+    except Exception:  # noqa: BLE001
+        return [path]
+    found: list[tuple[int, Path]] = []
+    for name in names:
+        theirs = records_file_parts(name)
+        if theirs is not None and theirs[:2] == (run_id, rank) and Path(name).is_file():
+            found.append((-1 if theirs[2] is None else theirs[2], path.parent / Path(name).name))
+    found.sort()
+    files = [file for _, file in found]
+    return files if path in files else [path, *files]
+
+
+def writers_block(path: str | Path) -> dict[str, Any] | None:
+    """What a reader of one records file says when its rank has more than one writer's file beside
+    it (`writers_of`): `{"state": "several", "files": [...names...], "detail": ...}`; None when
+    `path` is its rank's only file. Two processes wrote the same run ID and rank at once: each file
+    holds one process's records, and neither is the rank's whole."""
+    files = writers_of(path)
+    if len(files) < 2:
+        return None
+    names = [file.name for file in files]
+    return {
+        "state": "several",
+        "files": names,
+        "detail": (f"{len(names)} processes wrote the same run ID and rank at once, each in a file of its own "
+                   f"({', '.join(names)}): {Path(path).name} holds one of them, not the rank's whole. Give each "
+                   "process its own rank (start it under torchrun or srun, or set RANK and WORLD_SIZE) or its own "
+                   "run_id="),
+    }
+
+
+def _try_lock(file: Any) -> tuple[str, BaseException | None]:
+    """An exclusive advisory lock on `file`'s descriptor, never waited for: `("held", None)`,
+    `("busy", None)` when another open of the file holds it (another process, or another
+    session here), `("none", None)` where there is no `fcntl`, and `("unavailable", error)` when
+    the lock failed for another reason (a file system without locking). `flock`, not
+    `lockf`: a POSIX record lock is dropped when any descriptor of the file in this process is
+    closed, and the torn-line check and the stream sender both open the file. Never raises."""
+    if _fcntl is None:
+        return "none", None
+    try:
+        _fcntl.flock(file.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        return "held", None
+    except OSError as error:
+        if isinstance(error, BlockingIOError) or error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            return "busy", None
+        return "unavailable", error
+    except Exception as error:  # noqa: BLE001  nothing here may stop a run
+        return "unavailable", error
+
+
 class JsonlSink:
     """One JSON object per captured step. Non-finite numbers are written as the strings
     "nan", "inf" and "-inf" so the file stays standard JSON.
+
+    With `lock=True` (`init`'s default sink) the sink holds an exclusive advisory lock (`flock`)
+    on its file until it is closed, taken without waiting. The file is opened for appending on
+    purpose, so a run started again under its run ID appends to it, and the lock is what tells a
+    second writer apart: a process (or a second session in this one) that finds the file locked
+    writes `<name>.<pid>.jsonl` beside it instead (`records_file_name`, `writers_of`), and says so
+    once. A lock that fails for another reason (a file system without locking) is no lock here:
+    the sink writes its file unlocked and says so once. Where Python has no `fcntl` (Windows) the
+    file is written unlocked and nothing is said. Opening never waits and never raises for any of
+    this. `path` is the file written; `locked` whether the lock is held; `created` whether this
+    sink made the file. A sink made with the default `lock=False` takes no lock, as before.
 
     A file whose last line was left half written (the process that wrote it was killed in the
     middle of a step) is first given the newline that line lacks, so the first new step starts a
@@ -69,19 +184,66 @@ class JsonlSink:
     fragment stays where it was, as a line that is not a whole JSON object: incomplete history
     that a reader skips. Nothing is removed or moved, so the file is only ever appended to and
     the stream sender's saved offset stays valid. A fragment that happens to be a whole object
-    (the process died just before the newline) becomes a whole line again. If another process
-    is still writing that line, the newline cuts it in two and its step is lost: two writers
-    appending to one file interleave their lines anyway, and the sink takes no lock."""
+    (the process died just before the newline) becomes a whole line again. With `lock=True` the
+    newline is written only once the lock is held, so it never cuts a line another writer is
+    still writing; a file written unlocked is repaired as before, and if another process is
+    still writing that line, the newline cuts it in two and its step is lost."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, lock: bool = False) -> None:
         self.path = Path(path)
+        self.locked = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        torn = _ends_torn(self.path)
+        self.created = not self.path.exists()
         self._file = self.path.open("a", encoding="utf-8")
         self._failed = False  # the last write raised: the file may end in part of a line
-        if torn:
+        repair = True
+        if lock:
+            repair = self._take_lock()
+        if repair and _ends_torn(self.path):
             self._file.write("\n")
             self._file.flush()
+
+    def _take_lock(self) -> bool:
+        """Lock the file, or move to a second writer's file of its own (`<name>.<pid>.jsonl`) when
+        another writer holds it, and say what was done when it is not the plain case. Whether the
+        torn-line repair may be made on the file now open: not on one another writer holds.
+        Never raises: a failure here leaves the file open unlocked."""
+        try:
+            state, error = _try_lock(self._file)
+            if state == "held":
+                self.locked = True
+                return True
+            if state == "none":
+                return True
+            if state == "unavailable":
+                _say(f"tensorquill.init could not lock {self.path} ({_brief(error)}): the file system may not "
+                     "support locks, so this session writes it unlocked, and another process writing the same run "
+                     "ID and rank into it would not be noticed.", stacklevel=5)
+                return True
+            first = self.path
+            second = first.with_name(first.name[: -len(RECORDS_SUFFIX)] + f".{os.getpid()}{RECORDS_SUFFIX}"
+                                     if first.name.endswith(RECORDS_SUFFIX) else f"{first.name}.{os.getpid()}")
+            created = not second.exists()
+            file = second.open("a", encoding="utf-8")
+        except Exception as failure:  # noqa: BLE001  nothing here may stop a run
+            _say(f"tensorquill.init could not take {self.path}'s lock or open a file of its own beside it "
+                 f"({_brief(failure)}), so this session writes {self.path.name} unlocked.", stacklevel=5)
+            return False
+        self._file.close()
+        self._file, self.path, self.created = file, second, created
+        state, error = _try_lock(file)
+        self.locked = state == "held"
+        if state == "busy":  # a third writer of this run ID and rank in this one process
+            _say(f"tensorquill.init found {first.name} and {second.name} both held by other writers of the same "
+                 f"run ID and rank (the second by another session in this process), so this session writes "
+                 f"{second.name} unlocked beside the session there. Give each session its own run_id=.",
+                 stacklevel=5)
+            return False
+        _say(f"tensorquill.init found {first} held by another writer of the same run ID and rank, so this "
+             f"process writes {second.name} beside it: two processes are writing one rank, and the readers say so. "
+             "Give each process its own rank (start it under torchrun or srun, or set RANK and WORLD_SIZE) or its "
+             "own run_id=.", stacklevel=5)
+        return True
 
     def write(self, records: list[dict[str, Any]]) -> None:
         """Write `records`, one line each, and flush. A write that raises (a full disk, a file-size
