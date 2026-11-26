@@ -215,3 +215,55 @@ def test_bug24a_through_a_real_server_the_stored_series_is_the_files(tmp_path):
     assert [r["scalars"] for r in load_records(stored, scalars=True) if "scalars" in r] == \
         [r["scalars"] for r in load_records(path, scalars=True) if "scalars" in r]
 
+
+# --- BUG-24 (b): a bool among `scalars` -----------------------------------------------------
+#
+# A bool is not a number in either engine (lane W3, DET-16): the `scalars` column leaves it out, as
+# before, so the Rust detectors read the same map. It was dropped from the row altogether, so a
+# record read back from the store lacked what the file holds; now it travels in `extra_json` and
+# comes back after the column's entries.
+
+
+@needs_arrow
+@pytest.mark.parametrize("sender", [False, True], ids=["record_to_row", "rows_to_send"])
+def test_bug24b_a_bool_scalar_comes_back_from_the_row(sender):
+    scalars = {"loss": 1.0, "ok": True, "lr": 0.5, "off": False}
+    row = _rows([step_record("r", 0, scalars=scalars)], sender)[0]
+    assert dict(row["scalars"]) == {"loss": 1.0, "lr": 0.5}  # the column, as the Rust detectors read it
+    back = flight.row_to_record(row)
+    assert back["scalars"] == scalars
+    assert back["scalars"]["ok"] is True and back["scalars"]["off"] is False
+
+
+@needs_arrow
+def test_bug24b_a_map_of_bools_alone_and_a_scalar_only_record():
+    rows = _rows([step_record("r", 0, scalars={"ok": True}), scalar_record("r", 5, 0, {"done": True, "x": 2.0})], True)
+    assert [dict(r["scalars"]) for r in rows] == [{}, {"x": 2.0}]
+    back = [flight.row_to_record(r) for r in rows]
+    assert [r["scalars"] for r in back] == [{"ok": True}, {"done": True, "x": 2.0}]
+
+
+@needs_arrow
+def test_bug24b_a_map_its_column_refuses_travels_whole_with_its_bools():
+    """Any other refusal moves the whole map to `extra_json` (lane W3's rule, unchanged): with its
+    bools now, and its exact integers."""
+    scalars = {"loss": 1.0, "note": "text", "ok": True, "n": 2**53 + 1}
+    row = _rows([step_record("r", 0, scalars=scalars)], True)[0]
+    assert row["scalars"] is None
+    assert flight.row_to_record(row)["scalars"] == scalars
+
+
+def test_bug24b_through_a_real_server_the_stored_record_is_the_files(tmp_path):
+    skip_without_server()
+    from tensorquill.evidence import load_records
+
+    path = write_lines(tmp_path / "b.jsonl", [step_record("b", 0, scalars={"loss": 1.0, "ok": True}),
+                                               scalar_record("b", 9, 0, {"flag": False, "eval": 2.0})])
+    running = Server(tmp_path / "store")
+    try:
+        assert flight.FlightSender(path, running.endpoint, "b", 0).close(20.0)
+    finally:
+        running.close()
+    stored = tmp_path / "store" / "runs" / "b"
+    assert [r["scalars"] for r in load_records(stored, scalars=True)] == \
+        [r["scalars"] for r in load_records(path, scalars=True)]
