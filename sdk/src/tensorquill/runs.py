@@ -1071,7 +1071,13 @@ def _several_run_ids_row(several: list[Mapping[str, Any]], row: dict[str, Any]) 
     """A run one of whose files holds, for a rank, the records of more than one run ID
     (WAVE_AE_CONTRACT.md, section 5): its rows are not one run's, so the row claims no run state, no
     last step and no incident, and an evidence file beside the file is not read, whatever it says.
-    `evidence.state` is `several_run_ids`, with the run IDs and the files that hold them."""
+    `evidence.state` is `several_run_ids`, with the run IDs and the files that hold them.
+
+    The run IDs are of every line, a scalar-only record's among them, as `compare` and
+    `scalar_series` read the file. The detail says what each reader does without saying which
+    kind of record named the second run, which the scan of a large file's middle does not know.
+    Before lane AO-6 it said `python -m tensorquill` refused the file, which that command did not
+    do when only a scalar-only record named the second run (BUG-29)."""
     first = several[0]
     ids = sorted({run for item in several for run in item["run_ids"]}, key=lambda run: (run is not None, run or ""))
     ranks = first["ranks"]
@@ -1081,8 +1087,9 @@ def _several_run_ids_row(several: list[Mapping[str, Any]], row: dict[str, Any]) 
         "files": [{"path": str(item["path"]), "ranks": item["ranks"], "run_ids": item["run_ids"]} for item in several],
         "detail": f"{Path(first['path']).name}{more} holds, for {_rank_list(ranks)}, the records of more than one run "
                   f"({_run_ids_text(first['run_ids'])}): they are not one run's, so no run state, last step or incident is "
-                  "claimed for it, and an evidence file beside it is not read. Read each run's records on their own; "
-                  "python -m tensorquill refuses the file for the same reason",
+                  "claimed for it, and an evidence file beside it is not read. Read each run's records on their own: "
+                  "python -m tensorquill compare gives no divergence answer for such a file, and python -m tensorquill "
+                  "refuses it when its training records are of more than one run",
     }
     return row
 
