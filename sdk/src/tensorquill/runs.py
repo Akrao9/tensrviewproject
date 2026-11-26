@@ -128,6 +128,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -506,7 +507,8 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
     (`attempt_order_report`), and the last step the highest that `resolve_attempts` keeps.
 
     What is kept is each attempt's first record in each file (all the order needs) and its
-    steps, 8 bytes each; never the records. `last_step` (None for no step), `order` (oldest
+    steps, 8 bytes each (a step at or above 2**63, which no 8 bytes hold, in a list beside them:
+    lane AO-6, BUG-29, where such a step was dropped and the last step read 0); never the records. `last_step` (None for no step), `order` (oldest
     first), `report` (`attempt_order_report`'s entry for the rank) and `holders`, the files that
     hold the newest attempt's records, in the order given."""
     from array import array
@@ -517,6 +519,7 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
     seen: set[int] = set()
     firsts: list[list[dict[str, Any]]] = []
     steps: dict[tuple[str, Any], array] = {}
+    wide: dict[tuple[str, Any], list[int]] = {}  # the steps no `array("q")` holds
     holders: dict[tuple[str, Any], list[Path]] = {}
     for path in paths:
         mine: set[int] = set()
@@ -542,8 +545,12 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
             if found not in here:
                 here[found] = {"run_id": found[0], "rank": rank, "attempt": attempt, "ts": record.get("ts")}
             step = record.get("step")
-            if isinstance(step, int) and not isinstance(step, bool) and -(1 << 63) <= step < (1 << 63):
-                steps.setdefault(found, array("q")).append(step)
+            if isinstance(step, int) and not isinstance(step, bool):
+                held = steps.setdefault(found, array("q"))
+                if -(1 << 63) <= step < (1 << 63):
+                    held.append(step)
+                else:
+                    wide.setdefault(found, []).append(step)
         seen |= mine
         firsts.append(list(here.values()))
     report = attempt_order_report(firsts, [p.name for p in paths])
@@ -560,11 +567,13 @@ def _rank_across_files(paths: list[Path], rank: int, run_id: str | None = None) 
     # The furthest step `resolve_attempts` keeps, from a few of each attempt's steps: its first
     # and last, and its last below each other attempt's first, where every cut it can make falls.
     chosen: list[dict[str, Any]] = []
+    firsts = {key: min(min(held, default=math.inf), min(wide.get(key, ()), default=math.inf))
+              for key, held in steps.items() if key[0] == picked[0]}
     for (run, attempt), held in steps.items():
         if run != picked[0]:
             continue
-        ordered = sorted(set(held))
-        cuts = {min(other) for (r, a), other in steps.items() if r == run and a != attempt}
+        ordered = sorted(set(held) | set(wide.get((run, attempt), ())))
+        cuts = {first for (r, a), first in firsts.items() if a != attempt}
         keep = {ordered[0], ordered[-1]} | {ordered[at - 1] for cut in cuts if (at := bisect_left(ordered, cut)) > 0}
         chosen += [{"run_id": run, "rank": rank, "attempt": attempt, "step": step} for step in sorted(keep)]
     kept = resolve_attempts(chosen, order={(picked[0], rank): order})
