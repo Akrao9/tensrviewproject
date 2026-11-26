@@ -1920,8 +1920,9 @@ impl Ingest {
     }
 
     /// Reads the rank's order from the store once since this server took it up: its
-    /// `attempts.json`, or, for a store written before contract 1, the attempts it holds in
-    /// numeric order with the attempt the watchdog shows for the rank last.
+    /// `attempts.json`, or, for a store written before contract 1, the attempts it holds rows of
+    /// (parts or `scalars-*` objects) in numeric order with the attempt the watchdog shows for the
+    /// rank last.
     async fn load_order(&self, key: &Key) -> Result<(), Status> {
         if self.watchdog.order_loaded(key) {
             return Ok(());
@@ -1930,7 +1931,11 @@ impl Ingest {
         let order = match self.storage.read_attempts(&key.0, key.1).await.map_err(unreadable)? {
             Some(order) => order,
             None => {
-                let stored = self.storage.stored_attempts(&key.0, key.1).await.map_err(unreadable)?;
+                let stored = self
+                    .storage
+                    .attempts_with_rows(&key.0, key.1)
+                    .await
+                    .map_err(unreadable)?;
                 AttemptOrder::legacy(&stored, self.watchdog.shown_attempt(key))
             }
         };
