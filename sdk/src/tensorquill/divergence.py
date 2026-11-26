@@ -271,6 +271,8 @@ class _Run:
             elif key in WALL_CLOCK_KEYS:
                 self.wall_clock.add(key)
             elif key in ("grad_norm", "clip_grad_norm"):
+                # `clip_grad_norm` is what `clip_grad_norm_` returned, the norm before clipping (the
+                # series id `grad_norm/clipped` is kept as it was; BUG-26: the summary said "after").
                 self._put("grad_norm", None if key == "grad_norm" else "clipped", None, step, value)
             elif key == "scalars" and isinstance(value, Mapping):
                 for name, scalar in value.items():
@@ -704,7 +706,7 @@ def first_divergence(
     what = {
         "layers": f"activation {entry['stat']} of {where}", "moe": f"router {entry['stat']} of {where}",
         "scalars": f"logged scalar {where}", "grad_norms": f"gradient norm of {where}",
-        "weight_norms": f"weight norm of {where}", "update_rms": f"update size of {where}", "grad_norm": "total gradient norm" + (" after clipping" if entry["name"] else ""),
+        "weight_norms": f"weight norm of {where}", "update_rms": f"update size of {where}", "grad_norm": "total gradient norm" + (" before clipping" if entry["name"] else ""),
     }.get(entry["kind"], series_id)
     at, before = entry["at"], entry["before"]
     if entry["non_finite"]:
