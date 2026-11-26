@@ -404,23 +404,25 @@ def _scalars(value: Mapping[str, Any], map_type: Any) -> tuple[Any, dict[str, An
     given), not by a type.
 
     - A logged bool is not a number in either engine (lane W3, DET-16): that one value is left out of
-      the column, and the rest of the map stays there for the Rust detectors.
+      the column, and the rest of the map stays there for the Rust detectors. It travels in
+      `extra_json` (wave AO, BUG-24 b; before, it was dropped from the row), so a record read back
+      from the store holds it as the file does, after the column's entries.
     - An integer a float64 holds only rounded (`_past_float`; capture keeps a logged Python integer
       as it is, and the `.jsonl` holds it exactly; wave AO, BUG-24 a) stays in the column as the
       nearest float, which the Rust detectors judge, and travels exactly in `extra_json` too, so
       `row_to_record` gives the record back as the file holds it, in its order.
-    - Any other value the column refuses moves the whole map to `extra_json` and the column is null,
-      as before (lane W3)."""
+    - Any other value the column refuses moves the whole map to `extra_json`, its bools with it, and
+      the column is null, as before (lane W3)."""
     column = {k: v for k, v in value.items() if not isinstance(v, bool)}
     try:
         converted = _map(_float)(column)
     except (TypeError, ValueError):
-        return _UNHELD, column, False
+        return _UNHELD, dict(value), False
     except Exception:  # noqa: BLE001  OverflowError and the like: the value's, not the step's
-        return _UNHELD, column, True
+        return _UNHELD, dict(value), True
     if map_type is not None and not _fits(converted, map_type):
-        return _UNHELD, column, True
-    return converted, {k: v for k, v in value.items() if _past_float(v)}, False
+        return _UNHELD, dict(value), True
+    return converted, {k: v for k, v in value.items() if isinstance(v, bool) or _past_float(v)}, False
 
 
 # The maps held entry by entry (wave AJ, A3), each with its entries' converter. `scalars` keeps
