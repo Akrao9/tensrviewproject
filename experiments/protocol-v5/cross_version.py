@@ -122,9 +122,41 @@ def child(task: str, sdk: str, args: dict) -> None:
 
     assert Path(tensorquill.__file__).resolve().is_relative_to(Path(sdk).resolve()), tensorquill.__file__
     out: dict = {}
+    # Wave AO (lane AO-2) changed what the returned value of `send_file` and `close()` means: since it,
+    # False also while a line of the run was left out of what was sent (`left_out_lines`, kept in the
+    # offset file as `left_out`). Before it (the old SDK), whether the server confirmed the whole file.
+    # So the returned value and the offset (whether the server confirmed the whole file) are kept apart.
+    counts_left_out = hasattr(flight.FlightSender, "left_out_lines")
+
+    def sent(returned, sender=None) -> dict:
+        path = Path(args["path"])
+        offset = flight.read_offset(flight.offset_path(path))
+        got = {"returned": returned,
+               "returned_means": ("the whole file confirmed and no line of the run left out (wave AO)" if counts_left_out
+                                  else "the whole file confirmed (an SDK before wave AO)"),
+               "offset": offset, "file_bytes": path.stat().st_size, "whole_file_confirmed": offset == path.stat().st_size}
+        if counts_left_out:
+            got["left_out_lines"] = None if sender is None else sender.left_out_lines
+            got["skipped_lines"] = None if sender is None else sender.skipped_lines
+            try:
+                got["offset_file_left_out"] = flight.read_binding(flight.offset_path(path)).get("left_out", 0)
+            except Exception as error:  # noqa: BLE001
+                got["offset_file_left_out"] = f"{type(error).__name__}: {error}"
+        elif sender is not None:
+            got["skipped_lines"] = getattr(sender, "skipped_lines", None)
+        return got
+
     if task == "send_file":
-        out["confirmed"] = flight.send_file(args["path"], args["endpoint"], args["run_id"], 0, timeout=args["timeout"])
-        out["offset"] = flight.read_offset(flight.offset_path(args["path"]))
+        built = []
+        if counts_left_out:  # send_file itself, with the sender it builds kept for its counts
+            class Kept(flight.FlightSender):
+                def __init__(self, *a, **k):
+                    super().__init__(*a, **k)
+                    built.append(self)
+
+            flight.FlightSender = Kept
+        returned = flight.send_file(args["path"], args["endpoint"], args["run_id"], 0, timeout=args["timeout"])
+        out.update(sent(returned, built[0] if built else None))
     elif task == "sender_swap":
         sender = flight.FlightSender(args["path"], args["endpoint"], args["run_id"], 0, backoff_cap=args["backoff_cap"])
         deadline = time.monotonic() + 30
@@ -137,9 +169,8 @@ def child(task: str, sdk: str, args: dict) -> None:
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline and not Path(args["go"]).exists():
             time.sleep(0.05)
-        out["confirmed"] = sender.close(timeout=args["timeout"])
+        out.update(sent(sender.close(timeout=args["timeout"]), sender))
         out["last_error"] = None if sender.last_error is None else f"{type(sender.last_error).__name__}: {sender.last_error}"
-        out["offset"] = flight.read_offset(flight.offset_path(args["path"]))
     elif task == "load_records":
         try:
             options = {k: args[k] for k in ("scalars", "all_attempts") if k in args}  # the old SDK has no scalars=
@@ -166,10 +197,9 @@ def child(task: str, sdk: str, args: dict) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             sender = flight.FlightSender(args["path"], args["endpoint"], args["run_id"], 0)
-            out["confirmed"] = sender.close(timeout=args["timeout"])
-        out["skipped_lines"] = getattr(sender, "skipped_lines", None)
+            returned = sender.close(timeout=args["timeout"])
+        out.update(sent(returned, sender))
         out["last_error"] = None if sender.last_error is None else f"{type(sender.last_error).__name__}: {sender.last_error}"
-        out["offset"] = flight.read_offset(flight.offset_path(args["path"]))
         out["warnings"] = [f"{w.category.__name__}: {w.message}" for w in caught]
     elif task == "evidence":
         with warnings.catch_warnings(record=True) as caught:
@@ -695,13 +725,13 @@ def checks(r: dict) -> list[dict]:
         claim(f"1 {case}", "the older-server message is said once", e["older_message_said"] == 1,
               f"said {e['older_message_said']} time(s)")
         claim(f"1 {case}", "with the new server in its place, the same sender finishes and every line is stored",
-              n["sender"].get("confirmed") is True and n["load_records"].get("equal_to_file") is True,
-              f"confirmed {n['sender'].get('confirmed')}; load_records {n['load_records'].get('records')} records, "
+              n["sender"].get("whole_file_confirmed") is True and n["load_records"].get("equal_to_file") is True,
+              f"whole file confirmed {n['sender'].get('whole_file_confirmed')}, returned {n['sender'].get('returned')}; load_records {n['load_records'].get('records')} records, "
               f"equal to the file {n['load_records'].get('equal_to_file')}")
     e = r["row_2"]
     first = e["old_sender"]
     claim("2", "the old sender's batches are stored as sent, in protocol 4's layout",
-          first.get("confirmed") is True and {p["layout"] for p in first["parts"]} == {"protocol 4"}, str(first["parts"]))
+          first.get("whole_file_confirmed") is True and {p["layout"] for p in first["parts"]} == {"protocol 4"}, str(first["parts"]))
     claim("2", "the new server's detectors judge the layers from layers_json",
           bool(first["report"]) and ("activation_spike", 35, 1) in [tuple(i) for i in first["report"]["incidents"]],
           str(first["report"]))
@@ -776,9 +806,9 @@ def checks_step_2(r: dict) -> list[dict]:
           f"offset {o['sender']['offset_file']}; {o['lines_in_file']} lines; {o['sender']['last_error_type']}; "
           f"said {e['older_message_said']} time(s)")
     claim("6", "with the new server in its place: confirmed; the training rows alone in part-* files (steps 0 to 39)",
-          n["sender"].get("confirmed") is True and n["parts"] and all(p["layout"] == "protocol 5" for p in n["parts"])
+          n["sender"].get("whole_file_confirmed") is True and n["parts"] and all(p["layout"] == "protocol 5" for p in n["parts"])
           and min(p["steps"][0] for p in n["parts"]) == 0 and max(p["steps"][1] for p in n["parts"]) == 39,
-          f"confirmed {n['sender'].get('confirmed')}; parts {n['parts']}")
+          f"whole file confirmed {n['sender'].get('whole_file_confirmed')}, returned {n['sender'].get('returned')}; parts {n['parts']}")
     claim("6", "the rows with a seq only in scalars-* objects, each once (seq 0 to 2)",
           sum(x["rows"] for x in n["scalar_objects"]) == 3
           and sorted(q for x in n["scalar_objects"] for q in range(x["seq"][0], x["seq"][1] + 1)) == [0, 1, 2],
@@ -816,7 +846,7 @@ def checks_step_2(r: dict) -> list[dict]:
         d, s_ = e["new_load_records"], e["new_load_records_scalars"]
         if case == "a_training_only":
             claim("9 a", "the old sender's store: confirmed, protocol 4 parts, no scalars-* object",
-                  e["old_sender"].get("confirmed") is True and {p["layout"] for p in e["parts"]} == {"protocol 4"}
+                  e["old_sender"].get("whole_file_confirmed") is True and {p["layout"] for p in e["parts"]} == {"protocol 4"}
                   and not e["scalar_objects"], f"{e['old_sender']}; {e['parts']}; {e['scalar_objects']}")
             claim("9 a", "the new load_records reads it as the file, with and without scalars=True",
                   d.get("equal_to_file") is True and s_.get("equal_to_file") is True,
@@ -827,7 +857,7 @@ def checks_step_2(r: dict) -> list[dict]:
     d, s_, f = e["new_load_records"], e["new_load_records_scalars"], e["local_file_scalars"]
     stderr = r["row_9"]["b_server_stderr"]
     claim("9 b", "the protocol 4 sender given a protocol 5 capture's file is acknowledged to the end of the file",
-          e["old_sender"].get("confirmed") is True and e["old_sender"].get("offset") == e["file_bytes"],
+          e["old_sender"].get("whole_file_confirmed") is True and e["old_sender"].get("offset") == e["file_bytes"],
           f"{json.dumps({k: v for k, v in e['old_sender'].items() if k != 'stderr'})}; file {e['file_bytes']} bytes")
     claim("9 b", "the parts hold exactly steps 0 to 29 and no row at step 500; no scalars-* object",
           steps == list(range(30)) and not e["scalar_objects"], f"parts {e['parts']}; objects {e['scalar_objects']}")
@@ -857,21 +887,21 @@ def checks_step_2(r: dict) -> list[dict]:
           and not o["scalar_objects_after"], f"{' | '.join(o['stderr'])}; offset {o['sender']['offset_file']}")
     claim("10 a", "the new server in its place takes the batch of scalar-only rows alone: confirmed, one scalars-* object "
           "of 2 rows, no new part, the last step still 19",
-          n["sender"].get("confirmed") is True and sum(x["rows"] for x in n["scalar_objects"]) == 2
+          n["sender"].get("whole_file_confirmed") is True and sum(x["rows"] for x in n["scalar_objects"]) == 2
           and n["parts"] == o["parts_before"] and bool(n["report"]) and n["report"]["last_step"] == 19
           and isinstance(n["watchdog_rank0"], dict) and n["watchdog_rank0"].get("last_step") != 500,
-          f"confirmed {n['sender'].get('confirmed')}; objects {n['scalar_objects']}; parts {n['parts']}; report {n['report']}; "
+          f"whole file confirmed {n['sender'].get('whole_file_confirmed')}, returned {n['sender'].get('returned')}; objects {n['scalar_objects']}; parts {n['parts']}; report {n['report']}; "
           f"watchdog.json rank 0 {n['watchdog_rank0']}")
     b = r["row_10"]["b"]
     claim("10 b", "the old server takes the old sender's batch with no steps (metadata 1, null min_step and max_step): "
           "the resumed stream is confirmed and every byte acknowledged",
-          b["resumed"].get("confirmed") is True and b["resumed"].get("offset") == b["file_bytes"]
+          b["resumed"].get("whole_file_confirmed") is True and b["resumed"].get("offset") == b["file_bytes"]
           and bool(b["report"]) and b["report"]["last_step"] == 39,
           f"{json.dumps({k: v for k, v in b['resumed'].items() if k != 'stderr'})}; file {b['file_bytes']} bytes; report {b['report']}")
     e = r["row_11"]
     claim("11", "the old server restarted on a store with scalars-* objects does not list them: the rank's later "
           "training steps (40 to 59) are stored and judged, not dropped as below step 500",
-          e["old_sender"].get("confirmed") is True and bool(e["report"]) and e["report"]["last_step"] == 59
+          e["old_sender"].get("whole_file_confirmed") is True and bool(e["report"]) and e["report"]["last_step"] == 59
           and any(p["steps"] == [40, 59] for p in e["parts_after"]),
           f"sender {json.dumps({k: v for k, v in e['old_sender'].items() if k != 'stderr'})}; report {e['report']}; "
           f"parts {e['parts_after']}")
@@ -893,7 +923,11 @@ def measured(r: dict) -> dict:
             continue
         w = e["watchdog_rank0"] if isinstance(e["watchdog_rank0"], dict) else {}
         out[name] = {
-            "send_file_returned": e["send_file"].get("confirmed"),
+            "send_file_returned": e["send_file"].get("returned"),
+            "whole_file_confirmed": e["send_file"].get("whole_file_confirmed"),
+            "left_out_lines": e["send_file"].get("left_out_lines"),
+            "skipped_lines": e["send_file"].get("skipped_lines"),
+            "offset_file_left_out": e["send_file"].get("offset_file_left_out"),
             "offset_before": (e.get("binding_before") or {}).get("binding", {}).get("offset") if key.startswith("c") else
             ("offset file removed" if e.get("offset_file_removed") else "no offset file"),
             "offset_after": e["send_file"].get("offset"),
