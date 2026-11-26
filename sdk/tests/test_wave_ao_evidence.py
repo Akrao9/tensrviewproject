@@ -593,3 +593,44 @@ def test_bug12_pin_a_weights_unchanged_list_of_names_is_still_read():
                         "weight_norms": {"w": 1.0}, "weights_unchanged": ["w"] if step else []})
     assert ("stalled_weights", 3) in _kinds(evidence.build_evidence(records, detectors="python"))
 
+
+# ---- BUG-28, the export half: one entity per logged name ------------------------------------------
+#
+# Capture takes any non-empty string as a scalar's name. The export split it on "/" and dropped the
+# empty parts, so "loss" and "/loss" (and "a/b" and "a//b") were one `/logged/...` entity, with two
+# points at one step and one series in the blueprint.
+
+def _logged(logged: list) -> dict[str, list[tuple[int, float]]]:
+    found: dict[str, list[tuple[int, float]]] = {}
+    for step, entity, value in logged:
+        if entity.startswith("/logged/"):
+            found.setdefault(entity, []).append((step, value[1]))
+    return found
+
+
+def test_bug28_names_with_empty_parts_get_their_own_entities(tmp_path, monkeypatch):
+    logged = _rerun_recorder(monkeypatch)
+    records = [_step(1, 0, scalars={"loss": 1.0, "a/b": 3.0, "a//b": 4.0, "loss/": 5.0}), _point(1, 0, 0, **{"/loss": 9.0})]
+    evidence.export_rerun(evidence.build_evidence(records[:1], detectors="python"), tmp_path / "r.rrd", records=records)
+    by_entity = _logged(logged)
+    assert len(by_entity) == 5 and all(len(points) == 1 for points in by_entity.values())
+    assert by_entity["/logged/loss"] == [(0, 1.0)]  # a scalar-only "/loss" at step 0 does not stand over "loss"
+    assert by_entity["/logged/a/b"] == [(0, 3.0)]
+    assert sorted(v for points in by_entity.values() for _, v in points) == [1.0, 3.0, 4.0, 5.0, 9.0]
+
+
+def test_bug28_pin_a_name_without_empty_parts_keeps_its_path(tmp_path, monkeypatch):
+    logged = _rerun_recorder(monkeypatch)
+    records = [_step(1, 0, scalars={"train/loss": 1.0, "eval loss": 2.0}), _point(1, 1, 0, **{"train/loss": 0.5})]
+    evidence.export_rerun(evidence.build_evidence(records[:1], detectors="python"), tmp_path / "r.rrd", records=records)
+    assert _logged(logged) == {"/logged/train/loss": [(0, 1.0), (1, 0.5)], "/logged/eval loss": [(0, 2.0)]}
+
+
+def test_bug28_the_real_rerun_keeps_them_apart(tmp_path):
+    pytest.importorskip("numpy")
+    pytest.importorskip("rerun")
+    chunk = pytest.importorskip("rerun.chunk")
+    records = [_step(1, 0, scalars={"loss": 1.0}), _point(1, 0, 0, **{"/loss": 9.0, "a//b": 4.0})]
+    out = evidence.export_rerun(evidence.build_evidence(records[:1], detectors="python"), tmp_path / "r.rrd", records=records)
+    entities = {str(c.entity_path) for c in chunk.RrdReader(out).store().stream().filter(is_static=False).to_chunks()}
+    assert {e for e in entities if e.startswith("/logged/")} == {"/logged/loss", "/logged/\\/loss", "/logged/a\\/\\/b"}
