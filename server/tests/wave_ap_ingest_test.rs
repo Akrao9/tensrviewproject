@@ -16,7 +16,7 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,6 +127,8 @@ struct FaultStore {
     fail_part_gets: AtomicBool,
     fail_scalar_puts: AtomicBool,
     fail_incident_puts: AtomicBool,
+    /// Writes of an `incidents.json` failed so far.
+    incident_puts_failed: AtomicUsize,
 }
 
 impl std::fmt::Display for FaultStore {
@@ -142,6 +144,7 @@ impl FaultStore {
             fail_part_gets: AtomicBool::new(false),
             fail_scalar_puts: AtomicBool::new(false),
             fail_incident_puts: AtomicBool::new(false),
+            incident_puts_failed: AtomicUsize::new(0),
         })
     }
 }
@@ -169,6 +172,9 @@ impl ObjectStore for FaultStore {
         if (name.starts_with("scalars-") && self.fail_scalar_puts.load(Ordering::SeqCst))
             || (name == "incidents.json" && self.fail_incident_puts.load(Ordering::SeqCst))
         {
+            if name == "incidents.json" {
+                self.incident_puts_failed.fetch_add(1, Ordering::SeqCst);
+            }
             return futures::future::err(failure()).boxed();
         }
         self.inner.put_opts(location, payload, opts)
@@ -669,10 +675,12 @@ async fn ao03_a_store_still_failing_at_the_stop_ends_promptly_and_a_restart_does
     let mut server = start(FaultStore::new(root), retry_config(), true).await;
     let blocked = three_steps_with_the_report_refused(&server, root, run).await;
     let tasks: Vec<_> = server.flusher.take().into_iter().collect();
+    let began = std::time::Instant::now();
     tokio::time::timeout(STOP_BOUND, server.ingest.stop(tasks))
         .await
         .expect("the stop ends promptly")
         .unwrap();
+    eprintln!("the stop over a store still failing took {:?}", began.elapsed());
     assert!(report(root, run, 0).is_none());
     let last = written(root, run);
     assert_eq!(last["summary"], "finished", "{last}");
@@ -789,17 +797,193 @@ async fn ao03_a_store_that_never_heals_keeps_the_run_only_for_a_bounded_number_o
     server.ingest.write_watchdog().await;
     server.ingest.write_watchdog().await;
     assert_eq!(server.ingest.runs_held(), 1, "kept while its report is pending");
-    // The waits are 1, 2, 4, ... 64 ms: about 130 ms of retries in all.
+    // The waits are 1, 2, 4, ... 64 ms: about 130 ms of retries in all. Each pass of the status
+    // writer comes after the retries the timed flush tried: the run is kept after every pass that
+    // saw fewer than 7 failures, the bound, and let go of at the pass that sees the 7th.
+    let failed = || store.incident_puts_failed.load(Ordering::SeqCst);
     let deadline = tokio::time::Instant::now() + BOUND;
+    let mut kept_at = Vec::new();
     while server.ingest.runs_held() > 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "a run that never heals is kept for ever"
         );
         server.ingest.flush_due().await;
+        let seen = failed();
         server.ingest.write_watchdog().await;
+        if server.ingest.runs_held() > 0 {
+            assert!(seen < 7, "kept after {seen} failures in a row");
+            if kept_at.last() != Some(&seen) {
+                kept_at.push(seen);
+            }
+        } else {
+            assert_eq!(seen, 7, "let go of at the 7th failure in a row");
+        }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
+    assert_eq!(kept_at.last(), Some(&6), "kept at 6 failures: {kept_at:?}");
+    // Let go of: nothing tries the report again.
+    server.ingest.flush_due().await;
+    assert_eq!(failed(), 7);
     assert!(report(root, run, 0).is_none());
     assert!(codes(&written(root, run)).contains(&"ranks_unknown".to_string()));
+}
+
+/// Rank 0's batch of three pieces, its owner attempt 200's steps 5 to 9, a backlog of attempt 100's
+/// steps 10 to 14, and attempt 200's steps 10 to 19 of 16 kB, on the reproduced setup. `cut`: rank 1
+/// holds the quota, so the third piece is refused after the first two were taken, and the batch is
+/// sent again once rank 1 has closed. Otherwise rank 1 closes first and the batch is taken at once.
+/// Returns the run's status once both ranks have closed, and the one written just after the batch
+/// was accepted, while rank 0's stream is open.
+async fn three_pieces(cut: bool) -> (Value, Value) {
+    let run = if cut { "ap2_three_cut" } else { "ap2_three_whole" };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let server = start(FaultStore::new(root), quota_config(), true).await;
+    let holder = quota_held_by_rank_1(&server, run).await;
+    let mut rows: Vec<Value> = steps(run, 0, 200, 5..10, 0);
+    rows.extend(steps(run, 0, 100, 10..15, 0));
+    rows.extend(steps(run, 0, 200, 10..20, PAD));
+    if cut {
+        let mut put = open(&server.address, run, 0).await;
+        put.send(&rows, 30).await;
+        let refused = put.reply().await.expect_err("the third piece does not fit");
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted, "{refused:?}");
+        // The error path told the watchdog of the owner's step 9 and the backlog's five rows.
+        let now = status(&server, root, run).await;
+        assert_eq!(progress(&now), (json!(200), json!(9), false), "{now}");
+        assert_eq!(entry(&now, 0)["superseded_rows"], 5, "{now}");
+    }
+    holder.finish().await;
+    let mut put = open(&server.address, run, 0).await;
+    put.send(&rows, 30).await;
+    // Taken: the batch's rows wait in the buffer (1,000 steps), so the watermark tells it.
+    let ingest = server.ingest.clone();
+    until("rank 0's batch is taken", || ingest.buffered_bytes() >= 10 * PAD).await;
+    let open_status = status(&server, root, run).await;
+    put.finish().await;
+    let closed = status(&server, root, run).await;
+    server.ingest.shutdown().await.unwrap();
+    (open_status, closed)
+}
+
+/// The fields of rank 0's entry and its carry that change with time alone, left out of a comparison.
+const CLOCKS: [&str; 7] = [
+    "heartbeat_age_seconds",
+    "phase_seconds",
+    "seconds_since_progress",
+    "age_seconds",
+    "since_change_seconds",
+    "work_still_seconds",
+    "written_at_ms",
+];
+
+fn without_clocks(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        for clock in CLOCKS {
+            object.remove(clock);
+        }
+    }
+    value
+}
+
+/// Rank 0's carry in the status's `restart` list.
+fn carry(status: &Value) -> Value {
+    status["restart"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|carry| carry["rank"] == 0)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// AO-02, what a reader of `watchdog.json` sees after a batch cut and sent again, against the same
+/// batch taken at once. The error path tells the watchdog of the owner's step 9 when it is taken,
+/// and the batch sent again of step 19; the call the batch sent again makes for the pieces it finds
+/// not newer gives no step and changes nothing. So every field a status reader keys on is the same:
+/// the run's summary and state, rank 0's state, attempt, `last_step`, `attempt_without_steps`,
+/// severity, stream and `superseded_rows`. Two differ, as they are meant to: `rows_not_newer`
+/// counts the ten rows sent again (L30: a row sent again is counted again), and rank 0's
+/// `gaps_seconds` in `restart` holds one more gap, the progress having come in two calls, at the
+/// error and at the batch sent again, whose gaps add up to the one gap at once. That list feeds the
+/// median behind the rank's silent threshold, `max(silent floor, median gap x silent factor)`.
+#[tokio::test]
+async fn ao02_a_batch_cut_and_sent_again_reads_as_taken_at_once_but_for_rows_sent_again_and_one_gap() {
+    let (cut_open, cut_closed) = three_pieces(true).await;
+    let (whole_open, whole_closed) = three_pieces(false).await;
+    for (cut, whole) in [(&cut_open, &whole_open), (&cut_closed, &whole_closed)] {
+        assert_eq!(progress(cut), (json!(200), json!(19), false), "{cut}");
+        for field in [
+            "summary",
+            "run_state",
+            "missing_ranks",
+            "incidents",
+            "abandoned",
+            "server_running",
+        ] {
+            assert_eq!(cut[field], whole[field], "{field}: {cut} against {whole}");
+        }
+        let (mut cut_rank, mut whole_rank) = (without_clocks(&entry(cut, 0)), without_clocks(&entry(whole, 0)));
+        assert_eq!(cut_rank["rows_not_newer"], 10, "{cut}");
+        assert!(
+            whole_rank.get("rows_not_newer").is_none_or(|count| *count == 0),
+            "{whole}"
+        );
+        for rank in [&mut cut_rank, &mut whole_rank] {
+            rank.as_object_mut().unwrap().remove("rows_not_newer");
+        }
+        assert_eq!(cut_rank, whole_rank, "rank 0: {cut} against {whole}");
+        assert_eq!(entry(cut, 0)["superseded_rows"], 5, "{cut}");
+    }
+    // The carry, while the run is not finished.
+    let (mut cut_carry, mut whole_carry) = (without_clocks(&carry(&cut_open)), without_clocks(&carry(&whole_open)));
+    let gaps = |carry: &mut Value| carry.as_object_mut().unwrap().remove("gaps_seconds").unwrap();
+    let (cut_gaps, whole_gaps) = (gaps(&mut cut_carry), gaps(&mut whole_carry));
+    assert_eq!(cut_carry["rows_not_newer"], 10);
+    for carry in [&mut cut_carry, &mut whole_carry] {
+        carry.as_object_mut().unwrap().remove("rows_not_newer");
+    }
+    assert_eq!(
+        cut_gaps.as_array().unwrap().len(),
+        whole_gaps.as_array().unwrap().len() + 1,
+        "{cut_gaps} against {whole_gaps}"
+    );
+    assert_eq!(cut_carry, whole_carry, "the carry: {cut_open} against {whole_open}");
+}
+
+/// The case of `an_offset_is_acknowledged_only_when_the_part_and_then_the_scalars_object_are_stored`
+/// (`lane_al2b_scalars_test.rs`), which the hand-over note of this lane first counted among AO-02's:
+/// a server that writes each batch (`flush_steps` 1) takes steps 0 to 2 and one scalar-only row
+/// whole, tells the watchdog, and only its last flush stores the part and fails at the scalars
+/// object. The status already read `last_step` 2 on `8c77d06`; pinned here with the batch sent again.
+#[tokio::test]
+async fn ao02_a_failed_scalars_write_at_the_batchs_last_flush_left_the_status_right() {
+    let run = "ap2_last_flush";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = FaultStore::new(root);
+    let server = start(store.clone(), retry_config(), false).await;
+    let mut sent: Vec<Value> = steps(run, 0, 1, 0..3, 0);
+    sent.insert(2, scalar_row(run, 0, 1, 0, 0));
+    store.fail_scalar_puts.store(true, Ordering::SeqCst);
+    let mut put = open(&server.address, run, 0).await;
+    put.send(&sent, 4).await;
+    let refused = put
+        .reply()
+        .await
+        .expect_err("nothing is acknowledged while the scalars object is not stored");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    let now = status(&server, root, run).await;
+    assert_eq!(progress(&now), (json!(1), json!(2), false), "{now}");
+    store.fail_scalar_puts.store(false, Ordering::SeqCst);
+    let mut put = open(&server.address, run, 0).await;
+    put.send(&sent, 4).await;
+    assert_eq!(put.reply().await.unwrap(), 4);
+    put.finish().await;
+    let now = status(&server, root, run).await;
+    assert_eq!(progress(&now), (json!(1), json!(2), false), "{now}");
+    assert!(judged(&now), "{}", now["run_state"]);
+    server.ingest.shutdown().await.unwrap();
 }
