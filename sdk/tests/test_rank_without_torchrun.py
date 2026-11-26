@@ -1,16 +1,16 @@
 """Ranks started without `torchrun`: two processes of one SLURM job and no process group.
 
-`srun` alone sets `SLURM_PROCID` and `SLURM_NTASKS` for each task and not `RANK` or `WORLD_SIZE`,
-which `torchrun` sets. A script that calls `tensorquill.init` before `init_process_group`, or never
-starts a group, runs here as two real processes with the SLURM variables set, `RANK`, `LOCAL_RANK`
-and `WORLD_SIZE` removed, and a temporary folder as the working directory, each training a few
-steps into the default output folder.
+`srun` alone sets `SLURM_PROCID`, `SLURM_NTASKS` and `SLURM_STEP_NUM_TASKS` for each task and not
+`RANK` or `WORLD_SIZE`, which `torchrun` sets. A script that calls `tensorquill.init` before
+`init_process_group`, or never starts a group, runs here as two real processes with the SLURM
+variables set, `RANK`, `LOCAL_RANK` and `WORLD_SIZE` removed, and a temporary folder as the working
+directory, each training a few steps into the default output folder.
 
-How a rank started this way should be known is not decided, so nothing here holds what a process
-calls its rank, its world size or its run ID, what the file holds, or what the readers say of it;
-the lane's report records each. One thing is held, as a strict expected failure: two processes of
-one job that run at the same time must not write one records file with no warning. A separate
-test checks that the children ran to their end, so a broken child cannot pass as that failure.
+With no process group, the rank is read from the launchers' variables (`tracker._rank`): `RANK`,
+then `SLURM_PROCID` inside an `srun` step, then Open MPI's and PMI's, and the world size from the
+same launcher (`SLURM_STEP_NUM_TASKS` for `srun`). So the two tasks are ranks 0 and 1 of a world
+of two, under one run ID, each in a file of its own. A separate test checks that the children ran
+to their end, so a broken child cannot pass for a result.
 
 Only torch and pytest are needed. Each child has a time limit and is killed if it is still running.
 """
@@ -103,8 +103,9 @@ def _environment(procid: int, local_rank: int | None, node: int) -> dict[str, st
     # pytest's `pythonpath` setting does not reach a child: name the package this run imports.
     src = str(Path(tensorquill.__file__).resolve().parents[1])
     env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    env.update(SLURM_JOB_ID="4242", SLURM_STEP_ID="0", SLURM_NTASKS="2", SLURM_PROCID=str(procid),
-               SLURM_NODEID=str(node))
+    # What `srun --ntasks 2` sets for each task (srun(1), OUTPUT ENVIRONMENT VARIABLES).
+    env.update(SLURM_JOB_ID="4242", SLURM_STEP_ID="0", SLURM_NTASKS="2", SLURM_STEP_NUM_TASKS="2",
+               SLURM_PROCID=str(procid), SLURM_NODEID=str(node))
     if local_rank is not None:
         env["LOCAL_RANK"] = str(local_rank)
     return env
@@ -202,19 +203,43 @@ def test_each_process_ran_to_its_end(outcomes, arrangement):
         assert child["report"]["path"] is not None
 
 
-@pytest.mark.parametrize("arrangement", SHARED_AT_ONCE)
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="Without RANK and a process group, both processes read rank 0 and world size 1, take the "
-    "same SLURM run ID and append to the same tensorquill-out/<run_id>.rank0.jsonl at the same "
-    "time, and tensorquill.init gives no warning.",
-)
-def test_two_processes_of_one_job_do_not_share_a_file_without_a_warning(outcomes, arrangement):
+@pytest.mark.parametrize("arrangement", list(ARRANGEMENTS))
+def test_the_two_tasks_are_ranks_0_and_1_of_two_each_in_a_file_of_its_own(outcomes, arrangement):
+    """`SLURM_PROCID` names the rank and `SLURM_STEP_NUM_TASKS` the world size: tasks 0 and 1 are
+    ranks 0 and 1 of 2, under the job's run ID, each writing `<run_id>.rank<N>.jsonl` with its own
+    steps once, whether `LOCAL_RANK` is there or not, and nothing is said at `init`."""
     result = outcomes(arrangement)
     reports = [child["report"] for child in result["children"]]
     assert all(r is not None for r in reports), [c["stderr"] for c in result["children"]]
-    paths = {r["path"] for r in reports}
-    # Only what TensorQuill says counts: a warning of torch's or another library's at `init` does not.
-    warned = any("tensorquill" in said.lower() for r in reports for said in r["init_said"])
-    assert len(paths) == 2 or warned, f"one file, {sorted(paths)}, and no warning at init"
+    assert [(r["rank"], r["world_size"], r["run_id"]) for r in reports] == [
+        (0, 2, "run-slurm4242.0"), (1, 2, "run-slurm4242.0")]
+    assert sorted(Path(r["path"]).name for r in reports) == [
+        "run-slurm4242.0.rank0.jsonl", "run-slurm4242.0.rank1.jsonl"]
+    assert sorted(result["files"]) == ["run-slurm4242.0.rank0.jsonl", "run-slurm4242.0.rank1.jsonl"]
+    for rank in (0, 1):
+        rows = result["files"][f"run-slurm4242.0.rank{rank}.jsonl"]
+        assert [row.get("step") for row in rows] == list(range(STEPS))
+        assert {row.get("rank") for row in rows} == {rank}
+    said = [text for r in reports for text in r["init_said"] if "tensorquill" in text.lower()]
+    assert said == []
+
+
+@pytest.mark.parametrize("arrangement", SHARED_AT_ONCE)
+def test_two_processes_of_one_job_do_not_share_a_file(outcomes, arrangement):
+    """Run at the same time, the two tasks write two files (they were one, interleaved, before)."""
+    result = outcomes(arrangement)
+    reports = [child["report"] for child in result["children"]]
+    assert all(r is not None for r in reports), [c["stderr"] for c in result["children"]]
+    assert len({r["path"] for r in reports}) == 2
+
+
+@pytest.mark.parametrize("arrangement", ["slurm_together"])
+def test_the_listing_reads_the_job_as_two_closed_ranks(outcomes, arrangement):
+    """`list_runs` reads one run of two ranks, both closed, and none missing: the manifest says
+    world size 2 and both files are there."""
+    from tensorquill.runs import list_runs
+
+    rows = list_runs(outcomes(arrangement)["out_dir"])
+    assert [(row["run_id"], row["ranks"], row["rank_count"], row["last_step"]) for row in rows] == [
+        ("run-slurm4242.0", [0, 1], 2, STEPS - 1)]
+    assert rows[0]["end"]["state"] == "closed"
