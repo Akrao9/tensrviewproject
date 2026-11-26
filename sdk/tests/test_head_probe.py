@@ -1,6 +1,8 @@
 """The probe's language-model head numbers (row K4): norm, signed mean, log Z, and the gap
 between BF16 and FP32 logits on the same hidden states. Numbers only, never an incident."""
 
+import re
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -142,7 +144,8 @@ def test_the_head_is_found_only_when_named_or_reported_and_otherwise_not_read():
     }
     assert "no language-model head" in _probe_once(_HFLike("none"), fixed)["head"]["not_read"]
     embed = _probe_once(_HFLike("embed"), fixed)["head"]
-    assert set(embed) == {"not_read"} and "is a Embedding, not an nn.Linear" in embed["not_read"]
+    # The class is named with its module (Nov 26, 2026): a bare "Linear" read as a contradiction.
+    assert set(embed) == {"not_read"} and "is a torch.nn.modules.sparse.Embedding, not an nn.Linear" in embed["not_read"]
 
     # Named but never called in the probe's forward.
     model = Toy()
@@ -154,11 +157,12 @@ def test_the_head_is_found_only_when_named_or_reported_and_otherwise_not_read():
 
     with pytest.raises(ValueError, match="no module named 'lm_head'"):
         tensorquill.init(Toy(), sink=tensorquill.MemorySink(), probe=fixed, probe_head="lm_head")
-    with pytest.raises(ValueError, match="ModuleList, not an nn.Linear"):
+    with pytest.raises(ValueError, match=re.escape("is a torch.nn.modules.container.ModuleList, not an nn.Linear")):
         tensorquill.init(Toy(), sink=tensorquill.MemorySink(), probe=fixed, probe_head="blocks")
     own = Toy()
     own.head = _OwnForward(16, 32)
-    with pytest.raises(ValueError, match="subclass of nn.Linear with its own forward"):
+    with pytest.raises(ValueError, match=re.escape(
+            f"is a {_OwnForward.__module__}._OwnForward, a subclass of nn.Linear with its own forward")):
         tensorquill.init(own, sink=tensorquill.MemorySink(), probe=fixed, probe_head="head")
 
     # Off: no `head` key, so the record is as before and the evidence has no trend.

@@ -220,7 +220,8 @@ def test_the_probe_reads_a_plain_head_through_peft(monkeypatch):
 def test_the_probe_refuses_a_head_peft_has_wrapped_and_training_goes_on(monkeypatch, wrapped):
     """`modules_to_save=["lm_head"]` puts the head in peft's `ModulesToSaveWrapper`; an adapter on
     `lm_head` makes it peft's own `Linear` layer, which is not `torch.nn.Linear`. Either is refused,
-    not guessed, and the refusal raises nothing. The reason's words are not held here."""
+    not guessed, and the refusal raises nothing. The reason names the class with its module, so
+    peft's `Linear` is not read as `nn.Linear`."""
     transformers, peft = _libraries(monkeypatch)
     lora = {"modules_to_save": ["lm_head"]} if wrapped == "modules_to_save" else {"target_modules": TARGETS + ["lm_head"]}
     model = _lora_model(transformers, peft, **lora)
@@ -230,6 +231,10 @@ def test_the_probe_refuses_a_head_peft_has_wrapped_and_training_goes_on(monkeypa
     probed = [r["probe"] for r in records if "probe" in r]
     assert len(probed) == 3
     assert all("not_read" in p["head"] for p in probed)
+    named = "peft.utils.other.ModulesToSaveWrapper" if wrapped == "modules_to_save" else "peft.tuners.lora.layer.Linear"
+    assert {p["head"]["not_read"] for p in probed} == {
+        f"'base_model.model.lm_head' from get_output_embeddings() is a {named}, not an nn.Linear;"
+        " the probe reads only a plain nn.Linear head"}
     evidence = ev.build_evidence(records)
     assert evidence["head_trends"]["read"] == 0
     assert evidence["head_trends"]["not_read"]["probes"] == 3
