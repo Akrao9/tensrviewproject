@@ -49,6 +49,12 @@ it does not. With `--toy`, `--eager` or without CUDA, the timing and CUDA-graph 
 established and are written as such (`dry_run`): exit 0 then rests on the capture checks and the
 compile counters only. On a GPU without CUDA graphs (`--mode default`) every line but the
 CUDA-graph one is judged, and a run that meets them is `not_proven`, exit 3.
+
+If capture off fails in the first round, nothing can be measured against it: the gate stops there,
+runs no other arm, and reads `not_proven`, exit 3, with capture off's error. On the A100 every arm,
+capture off too, failed in CUDA-graph recording under `reduce-overhead` (Granite's experts call
+`torch._grouped_mm`, whose path on that GPU copies to the host), and the gate used to run all twelve
+arm processes into that failure and read `fail`, as if TensorQuill had failed.
 """
 
 from __future__ import annotations
@@ -548,6 +554,25 @@ def verdict(args, arms: dict[str, Any], established: bool) -> tuple[str, list[di
     return ("pass" if all(c["ok"] for c in criteria) else "not_proven"), criteria
 
 
+def baseline_stopped(args, out: Path, device: str, results: dict[str, list[dict]], off: dict) -> int:
+    """Capture off could not run in the first round: the mode cannot be judged here, so the gate stops."""
+    error = off.get("error") or off.get("reason") or "no result"
+    detail = f"round 1: {error}; nothing can be measured against it here, so no other arm was run"
+    if "CUDA graph capture" in error:
+        detail += ("; CUDA graphs could not record the model with no tool attached, so this mode cannot be judged "
+                   "on this machine")
+    criteria = [{"name": "capture off ran in this mode on this machine", "ok": None, "detail": detail}]
+    gate = {"status": "not_proven", "criteria": criteria, "toy": args.toy, "rounds": args.rounds,
+            "warmup": args.warmup, "steps": args.steps, "torch": torch.__version__, "device": device,
+            "tensorquill_file": tensorquill.__file__, "arms": {arm: {"results": rounds} for arm, rounds in results.items()},
+            "overhead_criterion": OVERHEAD_CRITERION,
+            "claim": "not established: capture off itself could not run in this mode, so TensorQuill was not measured"}
+    (out / "gate.json").write_text(json.dumps(gate, indent=1, default=str))
+    print(f"\nNOT ESTABLISHED: {criteria[0]['name']}: {detail}")
+    print(f"\nGate: not_proven ({gate['claim']}). Result: {out / 'gate.json'}")
+    return NOT_PROVEN
+
+
 def driver_main(args) -> int:
     out = Path(args.out)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -583,6 +608,8 @@ def driver_main(args) -> int:
                      else result.get("reason") or result.get("error"))
             print(f"Round {round_index + 1} {arm:<12} {result.get('state'):<9} {shown} "
                   f"({time.time() - started:.0f} s, exit {code})", flush=True)
+            if arm == "off" and round_index == 0 and result.get("state") != "measured":
+                return baseline_stopped(args, out, device, results, result)
     summary = summarize(args, results)
     status, criteria = verdict(args, summary, established_here(args))
     gate = {"status": status, "criteria": criteria, "toy": args.toy, "rounds": args.rounds, "warmup": args.warmup,
