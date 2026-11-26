@@ -8,7 +8,10 @@
 //! it was written in (one part per rank and flush): for each flush it reads that part of
 //! every rank, then times the detectors over those batches on one thread, apart from the
 //! reading. It also times writing the same batches as Parquet parts to a scratch store, the
-//! JSON decoding alone, and rebuilding the ranks from the store. A run with no rank, or a
+//! JSON decoding alone (the JSON text columns the detectors read, `JSON_COLUMNS`: on a protocol 5
+//! part the layers and MoE statistics are typed columns and are not JSON, so that line times the
+//! probe, data, checkpoint, system and extra JSON, and the count of cells says how much there was),
+//! and rebuilding the ranks from the store. A run with no rank, or a
 //! rank with no part, has nothing to time and says so.
 
 use std::collections::BTreeMap;
@@ -70,10 +73,26 @@ fn ranks_of(store: &str, run_id: &str) -> Result<Vec<i32>, Error> {
     Ok(ranks)
 }
 
-/// Decodes the two JSON columns of a batch and nothing else, to see what the decoding costs.
+/// The JSON text columns the detectors decode: protocol 4's layers and MoE statistics, which
+/// protocol 5 holds in typed columns (`layers`, `moe_stats`) instead, and the five that both
+/// layouts keep as JSON (`detect.rs`'s `Columns`, `detect/system.rs`).
+const JSON_COLUMNS: [&str; 7] = [
+    "layers_json",
+    "moe_stats_json",
+    "probe_json",
+    "data_json",
+    "checkpoint_json",
+    "system_json",
+    "extra_json",
+];
+
+/// Decodes the JSON columns of a batch (`JSON_COLUMNS`) and nothing else, to see what the decoding
+/// costs; returns how many cells it decoded. Protocol 4's two maps are read as maps of maps, as
+/// before; the other columns whole. Until wave AO (BUG-30) only the first two were decoded, so on a
+/// protocol 5 store this timed nothing.
 fn decode_json(batch: &RecordBatch) -> usize {
-    let mut members = 0;
-    for name in ["layers_json", "moe_stats_json"] {
+    let mut cells = 0;
+    for name in JSON_COLUMNS {
         let Some(column) = batch
             .column_by_name(name)
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
@@ -81,14 +100,19 @@ fn decode_json(batch: &RecordBatch) -> usize {
             continue;
         };
         for row in 0..column.len() {
-            if column.is_valid(row) {
-                let parsed: Result<BTreeMap<&str, BTreeMap<&str, IgnoredAny>>, _> =
-                    serde_json::from_str(column.value(row));
-                members += parsed.map_or(0, |parsed| parsed.len());
+            if !column.is_valid(row) {
+                continue;
             }
+            let text = column.value(row);
+            let parsed = if matches!(name, "layers_json" | "moe_stats_json") {
+                serde_json::from_str::<BTreeMap<&str, BTreeMap<&str, IgnoredAny>>>(text).is_ok()
+            } else {
+                serde_json::from_str::<serde_json::Value>(text).is_ok()
+            };
+            cells += usize::from(parsed);
         }
     }
-    members
+    cells
 }
 
 #[tokio::main]
@@ -125,7 +149,7 @@ async fn main() -> Result<(), Error> {
     let mut detectors: Vec<RankDetectors> = ranks.iter().map(|_| RankDetectors::new(&thresholds)).collect();
     let (mut detect, mut write, mut decode, mut read, mut report) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut rows, mut steps_per_flush) = (0usize, 0usize);
+    let (mut rows, mut steps_per_flush, mut json_cells) = (0usize, 0usize, 0usize);
     for flush in 0..flushes {
         let started = Instant::now();
         let mut batches: Vec<Vec<RecordBatch>> = Vec::new();
@@ -145,12 +169,13 @@ async fn main() -> Result<(), Error> {
         detect.push(ms(started.elapsed()));
 
         let started = Instant::now();
-        let mut members = 0;
+        let mut cells = 0;
         for batch in batches.iter().flatten() {
-            members += decode_json(batch);
+            cells += decode_json(batch);
         }
-        std::hint::black_box(members);
+        std::hint::black_box(cells);
         decode.push(ms(started.elapsed()));
+        json_cells += cells;
 
         let started = Instant::now();
         for (rank, batches) in ranks.iter().zip(&batches) {
@@ -169,11 +194,16 @@ async fn main() -> Result<(), Error> {
     }
     let incidents: usize = detectors.iter().map(|detectors| detectors.incidents().len()).sum();
     let worst = |values: &[f64]| values.iter().copied().fold(0.0, f64::max);
-    println!("{rows} rows read, {steps_per_flush} steps per rank and flush, {incidents} incidents");
+    println!(
+        "{rows} rows read, {steps_per_flush} steps per rank and flush, {incidents} incidents, {json_cells} JSON cells"
+    );
     println!("per flush of {} ranks, one thread, ms (median / worst):", ranks.len());
     for (name, values) in [
         ("detectors", &mut detect),
-        ("  of which JSON decoding alone (measured apart)", &mut decode),
+        (
+            "  of which JSON decoding alone (measured apart, the JSON cells)",
+            &mut decode,
+        ),
         ("writing the Parquet parts", &mut write),
         ("writing incidents.json for every rank", &mut report),
         ("reading the parts back (not on the live path)", &mut read),
@@ -212,4 +242,47 @@ async fn main() -> Result<(), Error> {
         ms(started.elapsed())
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Run with `cargo test --example detect_store` (a plain `cargo test` builds the examples and
+    //! runs none of their tests).
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::record_batch::RecordBatch;
+
+    use super::decode_json;
+
+    fn text(values: &[Option<&str>]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    /// BUG-30 (wave AO): on a protocol 5 part, whose layers and MoE statistics are typed columns,
+    /// the JSON the detectors still decode is in `probe_json`, `data_json`, `checkpoint_json`,
+    /// `system_json` and `extra_json`. On `453f1e2` the benchmark decoded only `layers_json` and
+    /// `moe_stats_json`, which such a part has not, and timed nothing (0.00 ms).
+    #[test]
+    fn the_json_decoding_of_a_protocol_5_part_decodes_its_json_columns() {
+        let batch = RecordBatch::try_from_iter([
+            ("probe_json", text(&[Some(r#"{"error": null, "not_run": []}"#), None])),
+            ("data_json", text(&[None, Some(r#"{"batch_hash": "ab"}"#)])),
+            ("system_json", text(&[None, Some(r#"{"gpu": [{"util": 1.0}]}"#)])),
+            ("extra_json", text(&[Some(r#"{"custom": 1}"#), None])),
+        ])
+        .unwrap();
+        assert_eq!(decode_json(&batch), 4);
+    }
+
+    /// A pin: a protocol 4 part's two JSON columns are decoded as before.
+    #[test]
+    fn the_json_decoding_of_a_protocol_4_part_is_as_before() {
+        let batch = RecordBatch::try_from_iter([
+            ("layers_json", text(&[Some(r#"{"fc1": {"act_rms": 1.0}}"#), None])),
+            ("moe_stats_json", text(&[None, Some(r#"{"router": {"entropy": 0.5}}"#)])),
+        ])
+        .unwrap();
+        assert_eq!(decode_json(&batch), 2);
+    }
 }

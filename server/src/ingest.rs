@@ -38,13 +38,17 @@
 //! `attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet`, created only if no object has that
 //! name, beside the parts and never one of them; a restarted server reads the watermark from those
 //! names. A flush stores the step part, then the scalars object, and only then acknowledges the
-//! offset. A batch without a `seq` column, or whose `seq` is null on every row, is all step rows and
+//! offset. A batch's attempts, of both kinds of row, are placed in the rank's order in the order they
+//! first appear in its rows (from wave AO, BUG-07), so the order does not depend on how the sender
+//! cut its batches. A batch without a `seq` column, or whose `seq` is null on every row, is all step rows and
 //! is handled as before.
 //!
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
 //! one its batch's metadata version allows (`ROW_VERSIONS`: 0 and 1 under metadata 1, a protocol 4
-//! sender's; 0, 1 and 2 under metadata 2, from the owner's decision of Nov 25, 2026), cannot be
-//! stored: it is dropped and counted under `unsupported_schema_version`, with a line on
+//! sender's; 0, 1 and 2 under metadata 2, from the owner's decision of Nov 25, 2026), or whose
+//! record is version 2 (`record_version`, the scalar-only record) with no `seq` (from wave AO,
+//! BUG-02), cannot be stored: it is dropped and counted, under its first null key, under
+//! `unsupported_schema_version`, or under `seq`, with a line on
 //! stderr and in the rank's entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`),
 //! and the rest of its
 //! batch is kept and acknowledged (RS10). A batch whose key column is missing or of another type
@@ -975,14 +979,15 @@ impl Ingest {
         // too, counted as a refused batch though it held no row, and the refusal named no bytes of
         // the sender's, so the sender kept its offset and its rows never left (RS10).
         let question = batch.num_rows() == 0 && end_byte_offset == 0;
-        let (pieces, scalar_pieces, dropped) = if question {
-            (Vec::new(), Vec::new(), Dropped::new())
+        let (pieces, scalar_pieces, dropped, attempts) = if question {
+            (Vec::new(), Vec::new(), Dropped::new(), Vec::new())
         } else {
             // Rows that cannot be stored are dropped before anything of the batch is placed or kept,
             // and a batch none of whose rows can be read is refused and counted (RS10). Then the
             // scalar-only rows, those whose `seq` is not null, are taken out before the step
             // watermark is looked at (`WAVE_AL_CONTRACT.md` section 4.5).
-            let (batch, dropped, scalars) = match readable_rows(batch, row_versions(metadata.schema_version)) {
+            let (batch, dropped, scalars, attempts) = match readable_rows(batch, row_versions(metadata.schema_version))
+            {
                 Ok(kept) => kept,
                 Err(refused) => {
                     if let Some(column) = refused.column {
@@ -1009,16 +1014,16 @@ impl Ingest {
             } else {
                 split_by_attempt(batch)?
             };
-            (pieces, scalar_pieces, dropped)
+            (pieces, scalar_pieces, dropped, attempts)
         };
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
-        // A scalar row's attempt is placed as a step row's is.
-        let attempts: Vec<i64> = pieces
-            .iter()
-            .chain(&scalar_pieces)
-            .map(|(attempt, _)| *attempt)
-            .collect();
+        // A scalar row's attempt is placed as a step row's is, and the attempts are placed in the
+        // order they first appear in the rows as sent (`attempts_in_row_order`), so the order does
+        // not depend on how the sender cut its batches. Until wave AO (BUG-07) the step rows'
+        // attempts were placed before the scalar rows': a file whose first line was an earlier
+        // attempt's scalar-only record placed that attempt after the next one when the lines came in
+        // one batch, and a point the next attempt rolled back came back in its series.
         self.place(key, sender, &attempts).await?;
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
@@ -1919,8 +1924,9 @@ impl Ingest {
     }
 
     /// Reads the rank's order from the store once since this server took it up: its
-    /// `attempts.json`, or, for a store written before contract 1, the attempts it holds in
-    /// numeric order with the attempt the watchdog shows for the rank last.
+    /// `attempts.json`, or, for a store written before contract 1, the attempts it holds rows of
+    /// (parts or `scalars-*` objects) in numeric order with the attempt the watchdog shows for the
+    /// rank last.
     async fn load_order(&self, key: &Key) -> Result<(), Status> {
         if self.watchdog.order_loaded(key) {
             return Ok(());
@@ -1929,7 +1935,11 @@ impl Ingest {
         let order = match self.storage.read_attempts(&key.0, key.1).await.map_err(unreadable)? {
             Some(order) => order,
             None => {
-                let stored = self.storage.stored_attempts(&key.0, key.1).await.map_err(unreadable)?;
+                let stored = self
+                    .storage
+                    .attempts_with_rows(&key.0, key.1)
+                    .await
+                    .map_err(unreadable)?;
                 AttemptOrder::legacy(&stored, self.watchdog.shown_attempt(key))
             }
         };
@@ -2390,7 +2400,9 @@ struct Refused {
 /// Drops the rows that cannot be stored and says how many, by key (RS10): first the rows whose run,
 /// rank, step, attempt or schema version is null, by the first null key of each row in that order;
 /// then, of the rest, the rows whose `schema_version` is not one of `readable`, the versions the
-/// batch's metadata version allows (`row_versions`: 0 and 1 under metadata 1, 0, 1 and 2 under 2). The
+/// batch's metadata version allows (`row_versions`: 0 and 1 under metadata 1, 0, 1 and 2 under 2);
+/// then, of the rest, the rows of a version 2 record with no `seq`, counted under `seq`
+/// (`drop_scalar_records_without_seq`, from wave AO). The
 /// rest of the batch is kept: until Nov 19, 2026 one null key refused the whole batch, which ended
 /// the stream, and its sender, which sends from its offset again, stored nothing more for the rank;
 /// until Nov 20, 2026 a row's version was not looked at. The batch is checked whole before any of
@@ -2449,6 +2461,10 @@ fn drop_unstorable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordB
     if rows > 0 {
         dropped.push((UNSUPPORTED_SCHEMA_VERSION, rows));
     }
+    let rows = drop_scalar_records_without_seq(&batch, &mut keep);
+    if rows > 0 {
+        dropped.push((SEQ_COLUMN, rows));
+    }
     if dropped.is_empty() {
         return Ok((batch, dropped));
     }
@@ -2463,13 +2479,77 @@ fn drop_unstorable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordB
 /// 4.5): a record's `seq`, counted per session from 0. Null on a step row.
 pub const SEQ_COLUMN: &str = "seq";
 
+/// The column of protocol 5's layout that holds the record's own version (section 3, Q1 a), and the
+/// version of a scalar-only record (section 4.2), whose row carries a `seq`.
+const RECORD_VERSION_COLUMN: &str = "record_version";
+const SCALAR_RECORD_VERSION: i32 = 2;
+
+/// Marks as not kept the rows whose record is version 2, the scalar-only record, and that carry no
+/// `seq` (BUG-02, wave AO): no row of a scalar-only record lacks one, so such a row is a version 2
+/// record that is not one (a line with no `"record": "scalars"`). Stored, it would be a training
+/// step in a part, of a version every Python reader refuses, so the part could not be read; it is
+/// dropped and counted under `seq`, the key it lacks, as a row with a null key is (RS10), and the
+/// rest of the batch is stored. Returns how many rows it marked. A batch without a `record_version`
+/// column (protocol 4's layout) has nothing to mark, and one whose `record_version` is of another
+/// type than Int32 is left as it was: nothing of it says a row is a version 2 record. A `seq` of
+/// another type than Int64 refuses the batch later (`split_scalar_rows`).
+fn drop_scalar_records_without_seq(batch: &RecordBatch, keep: &mut [bool]) -> u64 {
+    let Some(versions) = batch
+        .column_by_name(RECORD_VERSION_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+    else {
+        return 0;
+    };
+    let seqs = batch.column_by_name(SEQ_COLUMN);
+    if seqs.is_some_and(|seqs| seqs.data_type() != &DataType::Int64) {
+        return 0;
+    }
+    let mut rows = 0;
+    for (row, kept) in keep.iter_mut().enumerate() {
+        let scalar_record = versions.is_valid(row) && versions.value(row) == SCALAR_RECORD_VERSION;
+        if *kept && scalar_record && seqs.is_none_or(|seqs| seqs.is_null(row)) {
+            *kept = false;
+            rows += 1;
+        }
+    }
+    rows
+}
+
 /// The rows of a batch that can be stored (`drop_unstorable_rows`), and the rows dropped, with the
-/// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, and the
-/// scalar-only rows if there are any.
-fn readable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordBatch, Dropped, Option<RecordBatch>), Refused> {
+/// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, the
+/// scalar-only rows if there are any, and the attempts of the rows kept, of both kinds, in the order
+/// they first appear in the batch (`attempts_in_row_order`).
+type ReadableRows = (RecordBatch, Dropped, Option<RecordBatch>, Vec<i64>);
+
+fn readable_rows(batch: RecordBatch, readable: &[i32]) -> Result<ReadableRows, Refused> {
     let (batch, dropped) = drop_unstorable_rows(batch, readable)?;
+    let attempts = attempts_in_row_order(&batch);
     let (batch, scalars) = split_scalar_rows(batch)?;
-    Ok((batch, dropped, scalars))
+    Ok((batch, dropped, scalars, attempts))
+}
+
+/// The attempts of a batch's rows, each once, in the order they first appear (BUG-07, wave AO): the
+/// order the sender's file holds them, which is how the local reader orders a file's attempts. A
+/// batch without an `attempt` column (a sender from before attempts) is attempt 0, as
+/// `split_by_attempt` takes it. The column is Int64 without nulls here (`drop_unstorable_rows`); a
+/// negative attempt is refused by `split_by_attempt` before anything is placed.
+fn attempts_in_row_order(batch: &RecordBatch) -> Vec<i64> {
+    if batch.num_rows() == 0 {
+        return Vec::new();
+    }
+    let Some(attempts) = batch
+        .column_by_name("attempt")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+    else {
+        return vec![0];
+    };
+    let mut order: Vec<i64> = Vec::new();
+    for attempt in attempts.iter().flatten() {
+        if order.last() != Some(&attempt) && !order.contains(&attempt) {
+            order.push(attempt);
+        }
+    }
+    order
 }
 
 /// Takes the scalar-only rows, those whose `seq` is not null, out of a batch (section 4.5): the step

@@ -205,6 +205,32 @@ impl AttemptOrder {
         true
     }
 
+    /// Places the attempts of `stored` that the order does not list, as a reader of the store takes
+    /// them: just before the newest listed attempt, whatever placed it, by number among such; with no
+    /// attempt listed, by number. This is the rule of Python's reader (`evidence._attempt_place`),
+    /// so both engines read one store in one order (BUG-08, wave AO). Attempt numbers order nothing
+    /// else here (contract 1). Until then the reader used `place_rows` with no sender, the live rule
+    /// for rows of a sender older than claims, which puts an attempt numbered above the newest after
+    /// it: a clock ahead then made an earlier attempt the newest for the Rust reader alone.
+    pub fn place_unlisted(&mut self, stored: &[i64]) {
+        let mut unlisted: Vec<i64> = stored
+            .iter()
+            .copied()
+            .filter(|attempt| !self.contains(*attempt))
+            .collect();
+        unlisted.sort_unstable();
+        unlisted.dedup();
+        let at = self.entries.len().saturating_sub(1);
+        self.entries.splice(
+            at..at,
+            unlisted.into_iter().map(|attempt| AttemptEntry {
+                attempt,
+                by: PlacedBy::Rows,
+                first_seen_ms: 0,
+            }),
+        );
+    }
+
     /// What reports say of the order: `first_seen` when the store's file has kept it from the
     /// start, `numeric` when the store has no file, `numeric_then_first_seen` when the file began
     /// with attempts stored before it.
@@ -561,6 +587,25 @@ impl Storage {
         Ok(distinct_attempts(&self.list_parts(run_id, rank).await?))
     }
 
+    /// The attempts a rank has rows of, in numeric order, each once: those with parts and those with
+    /// `scalars-*` objects (section 4.5), so an attempt that logged only scalar-only records is one
+    /// of the rank's attempts in its order (BUG-08, wave AO; until then a folder holding only such
+    /// objects was not, and a store read in numeric order left it out of the order the server then
+    /// wrote, where Python's reader places it by number). The parts alone are still what
+    /// `rank_parts`, `max_step` and the replay read (D8).
+    pub async fn attempts_with_rows(&self, run_id: &str, rank: i32) -> Result<Vec<i64>, Error> {
+        let dir = self.rank_dir(run_id, rank);
+        let objects: Vec<_> = self.store.list(Some(&dir)).try_collect().await?;
+        let mut attempts: Vec<i64> = objects
+            .iter()
+            .filter(|object| is_part(&object.location) || is_scalars(&object.location))
+            .map(|object| attempt_of(&dir, &object.location))
+            .collect();
+        attempts.sort_unstable();
+        attempts.dedup();
+        Ok(attempts)
+    }
+
     fn attempts_path(&self, run_id: &str, rank: i32) -> Path {
         self.rank_dir(run_id, rank).join(ATTEMPTS_FILE)
     }
@@ -597,11 +642,12 @@ impl Storage {
     }
 
     /// The order of a rank's attempts, oldest first, as every reader of the store takes it: its
-    /// `attempts.json`, with any attempt stored but not in the file placed as rows are (just before
-    /// the newest when that one was claimed). With no file, the stored attempts in numeric order
-    /// (`kind` says `numeric`).
+    /// `attempts.json`, with any attempt stored but not in the file just before the newest, by number
+    /// among such (`AttemptOrder::place_unlisted`). With no file, the stored attempts in numeric
+    /// order (`kind` says `numeric`). The stored attempts are those with parts or `scalars-*`
+    /// objects (`attempts_with_rows`).
     pub async fn attempt_order(&self, run_id: &str, rank: i32) -> Result<AttemptOrder, Error> {
-        let stored = self.stored_attempts(run_id, rank).await?;
+        let stored = self.attempts_with_rows(run_id, rank).await?;
         self.order_of(run_id, rank, stored).await
     }
 
@@ -609,9 +655,7 @@ impl Storage {
     async fn order_of(&self, run_id: &str, rank: i32, stored: Vec<i64>) -> Result<AttemptOrder, Error> {
         Ok(match self.read_attempts(run_id, rank).await? {
             Some(mut order) => {
-                for attempt in stored {
-                    order.place_rows(attempt, None, 0);
-                }
+                order.place_unlisted(&stored);
                 order
             }
             None => AttemptOrder::legacy(&stored, None),
@@ -629,16 +673,7 @@ impl Storage {
                 // The partition directly under the rank's folder, read relative to it: a folder
                 // above it (in the store's root) that looks like a partition says nothing about
                 // the part (until Nov 19, 2026 the first `attempt=` anywhere in the path was taken).
-                attempt: object
-                    .location
-                    .prefix_match(&dir)
-                    .and_then(|mut below| below.next())
-                    .and_then(|part| {
-                        part.as_ref()
-                            .strip_prefix("attempt=")
-                            .and_then(|attempt| attempt.parse().ok())
-                    })
-                    .unwrap_or(0),
+                attempt: attempt_of(&dir, &object.location),
                 first_step: name_min_step(&object.location),
                 location: object.location,
             })
@@ -959,6 +994,20 @@ impl MetadataSuffixFetch for FooterSuffixFetch<'_> {
 /// Whether `path` is a part: a `part-*.parquet` file, the only files `rank_parts`, `max_step`
 /// and Python's `_parquet_parts` read.
 /// The attempts `parts` belong to, in numeric order, each once.
+/// The attempt an object under the rank's folder `dir` belongs to: the partition directly under it,
+/// read relative to it; 0 for an object in no `attempt=` partition.
+fn attempt_of(dir: &Path, location: &Path) -> i64 {
+    location
+        .prefix_match(dir)
+        .and_then(|mut below| below.next())
+        .and_then(|part| {
+            part.as_ref()
+                .strip_prefix("attempt=")
+                .and_then(|attempt| attempt.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn distinct_attempts(parts: &[StoredPart]) -> Vec<i64> {
     let mut attempts: Vec<i64> = parts.iter().map(|part| part.attempt).collect();
     attempts.sort_unstable();

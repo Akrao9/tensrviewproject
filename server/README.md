@@ -27,9 +27,19 @@ one-shot reads. To get the program there, build it from the source with `cargo b
 in the `server` directory.
 
 The `tensorquill` package and this program must speak the same protocol number
-(`tensorquill-server protocol` prints it; 4 since Nov 21, 2026, when `detect --follow` was added;
-3 before). The package refuses a binary with another number for offline detection and says which
-to install; streaming still works across the two.
+(`tensorquill-server protocol` prints it; 5 since Nov 24, 2026, when the stored row's layout
+changed; 4 from Nov 21, 2026, when `detect --follow` was added; 3 before). The package refuses a
+binary with another number for offline detection and says which to install.
+
+Streaming across protocols 4 and 5 works in one direction only. A sender older than protocol 5
+streams to a protocol 5 server as before, and its batches are stored as sent; but in a file that a
+protocol 5 capture wrote, its scalar-only records (values logged at an explicit `step=`) reach the
+server as rows it cannot store, which it drops and counts under `unsupported_schema_version` in the
+rank's entry of `watchdog.json`; they stay in the local `.jsonl`. A server older than protocol 5
+refuses a protocol 5 sender's stream and stores nothing; the sender says so and keeps its lines
+until the server is upgraded. A protocol 4 server started on a store that holds protocol 5 parts
+reads them without their layers, MoE statistics and scalar-only records: once a store holds
+protocol 5 parts, keep the server and the package at protocol 5 or later.
 
 `detect` reads one rank's rows as an Arrow IPC stream on standard input and prints that rank's
 report; `--samples` adds the per-step MoE samples. `detect --samples --follow` is what
@@ -45,7 +55,9 @@ row. The process holds the rank's detectors and samples in memory for the life o
 at its peak during the first look and about 240 MB resident between looks. It ends when the
 watcher stops, and by itself when its input ends, so a watcher that is killed leaves none behind.
 
-Beside the Parquet parts, each rank's folder in the store holds `incidents.json` (what the
+Each attempt's folder holds its training steps as Parquet parts (`part-*.parquet`) and, since
+protocol 5, its scalar-only records as `scalars-*.parquet` objects of their own, which no detector
+reads. Beside them, each rank's folder in the store holds `incidents.json` (what the
 detectors found) and `attempts.json` (the order in which the job's attempts were first seen,
 which decides which attempt owns the rank after a restart). The run's `watchdog.json` says
 whether each rank is making progress; a rank whose capture stopped while training went on
