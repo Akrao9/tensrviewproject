@@ -216,7 +216,11 @@ impl EpochOrder {
         let mut began = false;
         if self.epoch != Some(number) {
             self.previous = match self.epoch {
-                Some(epoch) if number == epoch + 1 => Some(Pass {
+                // The pass numbered just after this one, as Python's `number == epoch + 1`: past
+                // `i64::MAX` there is none, so no recorded epoch follows `i64::MAX` (AO-01, wave AP;
+                // `epoch + 1` overflowed, and a release build took `i64::MIN` for it). Of any epoch
+                // below `i64::MAX` it is the same comparison as before.
+                Some(epoch) if epoch.checked_add(1) == Some(number) => Some(Pass {
                     hashes: std::mem::take(&mut self.current),
                     count: self.count,
                     epoch,
@@ -705,13 +709,23 @@ pub(super) struct ResumePass {
 }
 
 /// The step nearest `resumed_at` (the earlier one on a tie) at which the history drew `hash`.
+///
+/// The steps after `resumed_at` are those above it, with no `resumed_at + 1` that overflows at
+/// `i64::MAX` (AO-01, wave AP: a release build then looked from `i64::MIN` on). The two distances
+/// are exact (`abs_diff`, which holds any distance between two `i64`), as Python's integers are:
+/// readers take steps of 0 or more, whose distances fit `i64`, but the store replay also reads a part
+/// with negative steps written before wave AG. Of any distance within `i64` they are what they were.
 fn lookup(known: &BTreeMap<i64, (Option<String>, i64)>, hash: &str, resumed_at: i64) -> Option<i64> {
+    use std::ops::Bound::{Excluded, Unbounded};
     let same = |(_, (known, _)): &(&i64, &(Option<String>, i64))| known.as_deref() == Some(hash);
     let before = known.range(..resumed_at).rev().find(same).map(|(step, _)| *step);
-    let after = known.range(resumed_at + 1..).find(same).map(|(step, _)| *step);
+    let after = known
+        .range((Excluded(resumed_at), Unbounded))
+        .find(same)
+        .map(|(step, _)| *step);
     match (before, after) {
         (None, after) => after,
-        (Some(before), Some(after)) if after - resumed_at < resumed_at - before => Some(after),
+        (Some(before), Some(after)) if after.abs_diff(resumed_at) < resumed_at.abs_diff(before) => Some(after),
         (before, _) => before,
     }
 }
@@ -828,7 +842,9 @@ impl ResumePass {
             "resumed_hash": new,
             "expected_hash": expected.and_then(|(hash, _)| hash.clone()),
             "matched_step": matched,
-            "batches_apart": matched.map(|step| (resumed_at - step).abs()),
+            // Exact, as Python's `abs(resumed_at - matched)`: a `u64` holds any distance between two
+            // `i64` steps, and is written as the same number as before for any within `i64`.
+            "batches_apart": matched.map(|step| resumed_at.abs_diff(step)),
             "previous_attempt": source,
         })))
     }
@@ -894,7 +910,10 @@ impl ResumePass {
                 findings.push(json!({"component": "optimizer", "finding": "empty_in_checkpoint"}));
             }
             if let Some(last_epoch) = component("scheduler").and_then(|scheduler| int(&scheduler["last_epoch"])) {
-                if (last_epoch - resumed_at).abs() > SCHEDULER_SLACK {
+                // Python's `abs(last_epoch - resumed_at) > SCHEDULER_SLACK`, exactly: a recorded
+                // `last_epoch` is any `i64`, and the subtraction or its negation overflowed (AO-01,
+                // wave AP). Of any distance within `i64` the comparison is the same as before.
+                if last_epoch.abs_diff(resumed_at) > SCHEDULER_SLACK.unsigned_abs() {
                     findings.push(json!({"component": "scheduler", "finding": "position", "last_epoch": last_epoch}));
                 }
             }
@@ -907,7 +926,11 @@ impl ResumePass {
             let step_after = number(&snapshot["step_after"]);
             if before == Some(0) && after.is_some_and(|after| after > 0) {
                 findings.push(json!({"component": "optimizer", "finding": "empty", "entries_after": after}));
-            } else if let Some(step_after) = step_after.filter(|step| *step <= 1.0 && resumed_at - run_start > 1) {
+            } else if let Some(step_after) = step_after.filter(|step| {
+                // Exact, as Python's `resumed_at - run_start > 1`: a store written before wave AG can
+                // hold a run that starts at a negative step, where the `i64` subtraction overflowed.
+                *step <= 1.0 && i128::from(resumed_at) - i128::from(run_start) > 1
+            }) {
                 findings.push(json!({"component": "optimizer", "finding": "step_reset", "step_after": step_after}));
             }
         }
@@ -1148,5 +1171,237 @@ mod tests {
             .err()
             .unwrap()
             .contains("not an Arrow IPC stream"));
+    }
+
+    // --- wave AP, AO-01: integers from a record near the ends of `i64` ---------------------------
+    //
+    // Python's integers do not overflow; these did in `i64`, so a debug build panicked and a release
+    // build wrapped to another answer. Each expected value is Python's (`data_checks.py`) on the same
+    // records: through `build_evidence` for the steps a reader takes, and through
+    // `detect_resume_state` alone for the negative steps only a store written before wave AG holds
+    // (every reader and `detect` refuse them; the store replay still reads such a part). The cases
+    // with steps a reader takes run through both engines in `sdk/tests/test_wave_ap_detect.py`.
+
+    /// One rank's rows as (attempt, step, data, learning rate, checkpoint), each JSON or nothing.
+    type Row = (i64, i64, Option<Value>, Option<f64>, Option<Value>);
+
+    fn full_rows(rows: &[Row]) -> RecordBatch {
+        use arrow::array::{Array, Float64Builder, ListBuilder};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut lr = ListBuilder::new(Float64Builder::new());
+        for (_, _, _, value, _) in rows {
+            match value {
+                Some(value) => {
+                    lr.values().append_value(*value);
+                    lr.append(true);
+                }
+                None => lr.append(false),
+            }
+        }
+        let lr = lr.finish();
+        let text = |pick: fn(&Row) -> &Option<Value>| {
+            StringArray::from(
+                rows.iter()
+                    .map(|row| pick(row).as_ref().map(Value::to_string))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let schema = Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("rank", DataType::Int32, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("step", DataType::Int64, false),
+            Field::new("data_json", DataType::Utf8, true),
+            Field::new("lr", lr.data_type().clone(), true),
+            Field::new("checkpoint_json", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|_| "run"))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|_| 0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(text(|row| &row.2)),
+                Arc::new(lr),
+                Arc::new(text(|row| &row.4)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The incidents of one rank's rows, without their logged scalars.
+    fn incidents_of(rows: &[Row]) -> Vec<Value> {
+        let mut incidents = judge(0, &[full_rows(rows)], &usual()).unwrap().incidents();
+        for incident in &mut incidents {
+            incident.as_object_mut().unwrap().remove("scalars");
+        }
+        incidents
+    }
+
+    fn of_kind(incidents: &[Value], kind: &str) -> Vec<Value> {
+        incidents.iter().filter(|i| i["kind"] == kind).cloned().collect()
+    }
+
+    /// Six rows of one attempt from step 0, three in each epoch, with the same three hashes in both.
+    fn two_epochs(first: i64, second: i64) -> Vec<Row> {
+        (0..6)
+            .map(|step| {
+                let epoch = if step < 3 { first } else { second };
+                let data =
+                    json!({"batches": 1, "shuffle": true, "batch_hash": format!("v2:h{}", step % 3), "epoch": epoch});
+                (1, step, Some(data), None, None)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wave_ap_an_epoch_after_i64_max_is_not_the_next_one() {
+        // `epoch + 1` overflowed (data.rs:219): a debug build panicked, a release build wrapped to
+        // `i64::MIN` and found the order repeated. In Python `2**63 - 1 + 1` is not `-(2**63)`.
+        let incidents = incidents_of(&two_epochs(i64::MAX, i64::MIN));
+        assert_eq!(of_kind(&incidents, "epoch_order_repeated"), Vec::<Value>::new());
+        // Two epochs that do follow each other, at the low end, are compared as before.
+        let found = of_kind(
+            &incidents_of(&two_epochs(i64::MIN, i64::MIN + 1)),
+            "epoch_order_repeated",
+        );
+        assert_eq!(
+            found,
+            vec![json!({"kind": "epoch_order_repeated", "class": "invariant", "step": 3,
+                        "epoch": i64::MIN + 1, "previous_epoch": i64::MIN, "batches_compared": 3,
+                        "shuffle": true, "sampler_epoch": null, "previous_sampler_epoch": null,
+                        "through_step": 5})]
+        );
+    }
+
+    fn drew_json(hash: &str) -> Option<Value> {
+        Some(json!({"batches": 1, "batch_hash": hash}))
+    }
+
+    fn data_change(rows: &[Row]) -> Value {
+        let found = of_kind(&incidents_of(rows), "resume_data_mismatch");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0]["resumes"], 1);
+        found[0]["changes"][0].clone()
+    }
+
+    #[test]
+    fn wave_ap_a_resume_at_i64_max_finds_its_batch_before_it() {
+        // `resumed_at + 1` overflowed (data.rs:711): a debug build panicked, a release build looked
+        // from `i64::MIN` on and matched step 0 as the nearest. Nothing comes after `i64::MAX`.
+        let rows = [
+            (1, 0, drew_json("v2:aaaa"), None, None),
+            (1, 10, drew_json("v2:aaaa"), None, None),
+            (2, i64::MAX, drew_json("v2:aaaa"), None, None),
+        ];
+        assert_eq!(
+            data_change(&rows),
+            json!({"step": i64::MAX, "rank": 0, "attempt": 2, "basis": "lookup", "finding": "repeated",
+                   "resumed_hash": "v2:aaaa", "expected_hash": null, "matched_step": 10,
+                   "batches_apart": i64::MAX - 10, "previous_attempt": 1})
+        );
+    }
+
+    #[test]
+    fn wave_ap_a_resume_compares_distances_past_i64_as_python_does() {
+        // Only a store written before wave AG holds these negative steps. Distances past `i64`
+        // overflowed at data.rs:714 (`resumed_at - before`) and data.rs:831 (`batches_apart`).
+        let nearer_after = [
+            (1, i64::MIN, drew_json("v2:aaaa"), None, None),
+            (1, 5, drew_json("v2:aaaa"), None, None),
+            (2, 0, drew_json("v2:aaaa"), None, None),
+        ];
+        assert_eq!(
+            data_change(&nearer_after),
+            json!({"step": 0, "rank": 0, "attempt": 2, "basis": "lookup", "finding": "skipped",
+                   "resumed_hash": "v2:aaaa", "expected_hash": null, "matched_step": 5,
+                   "batches_apart": 5, "previous_attempt": 1})
+        );
+        let far = [
+            (1, i64::MIN, drew_json("v2:aaaa"), None, None),
+            (2, i64::MAX, drew_json("v2:aaaa"), None, None),
+        ];
+        assert_eq!(
+            data_change(&far),
+            json!({"step": i64::MAX, "rank": 0, "attempt": 2, "basis": "lookup", "finding": "repeated",
+                   "resumed_hash": "v2:aaaa", "expected_hash": null, "matched_step": i64::MIN,
+                   "batches_apart": u64::MAX, "previous_attempt": 1})
+        );
+        // Both sides drew the batch; the earlier one is nearer by 4, at distances near `i64::MAX`.
+        let both_sides = [
+            (1, i64::MIN, drew_json("v2:bbbb"), None, None),
+            (1, i64::MIN + 5, drew_json("v2:aaaa"), None, None),
+            (1, i64::MAX, drew_json("v2:aaaa"), None, None),
+            (2, 0, drew_json("v2:aaaa"), None, None),
+        ];
+        assert_eq!(
+            data_change(&both_sides),
+            json!({"step": 0, "rank": 0, "attempt": 2, "basis": "lookup", "finding": "repeated",
+                   "resumed_hash": "v2:aaaa", "expected_hash": null, "matched_step": i64::MIN + 5,
+                   "batches_apart": i64::MAX - 4, "previous_attempt": 1})
+        );
+    }
+
+    #[test]
+    fn wave_ap_batches_apart_is_written_as_before_within_i64() {
+        // `batches_apart` is now a `u64`. For every distance an `i64` held, the report's JSON is the
+        // same text as before: serde_json writes the same digits for the two types.
+        for distance in [0_i64, 1, 9, 10, 4096, i64::from(u32::MAX), i64::MAX - 10, i64::MAX] {
+            let now = json!({"batches_apart": distance.unsigned_abs()}).to_string();
+            assert_eq!(now, json!({"batches_apart": distance}).to_string());
+        }
+        // Past it, the digits Python writes for `abs(2**63 - 1 - -(2**63))`.
+        assert_eq!(json!(u64::MAX).to_string(), "18446744073709551615");
+    }
+
+    /// Attempt 1 at steps 0 and 1 with two learning rates (so a scheduler is expected), then attempt 2
+    /// at `resumed_at` loading every component, the scheduler at `last_epoch`.
+    fn scheduler_resume(resumed_at: i64, last_epoch: i64) -> Vec<Row> {
+        let load = json!({"load": {"components": {
+            "model": {}, "optimizer": {"entries": 1}, "rng": {}, "data": {},
+            "scheduler": {"last_epoch": last_epoch}}}});
+        vec![
+            (1, 0, None, Some(1e-3), None),
+            (1, 1, None, Some(5e-4), None),
+            (2, resumed_at, None, Some(5e-4), Some(load)),
+        ]
+    }
+
+    fn state_findings_of(rows: &[Row]) -> Vec<Value> {
+        of_kind(&incidents_of(rows), "resume_incomplete")
+            .iter()
+            .flat_map(|incident| incident["changes"][0]["findings"].as_array().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn wave_ap_a_scheduler_further_than_i64_from_the_resume_is_out_of_place() {
+        // `(last_epoch - resumed_at).abs()` (data.rs:897): the negation of `i64::MIN`, or the
+        // subtraction itself, overflowed. A debug build panicked; a release build reported nothing
+        // for (1, MIN + 1) and (MAX, MIN), where Python reports the position.
+        for (resumed_at, last_epoch) in [(1, i64::MIN + 1), (1, i64::MIN), (i64::MAX, i64::MIN), (2, i64::MAX)] {
+            assert_eq!(
+                state_findings_of(&scheduler_resume(resumed_at, last_epoch)),
+                vec![json!({"component": "scheduler", "finding": "position", "last_epoch": last_epoch})],
+                "resumed at {resumed_at}, last_epoch {last_epoch}"
+            );
+        }
+        // Within the slack, as before.
+        assert_eq!(state_findings_of(&scheduler_resume(1, 2)), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn wave_ap_a_reset_optimizer_long_after_a_negative_run_start_is_found() {
+        // `resumed_at - run_start` (data.rs:910) overflowed for a run starting at `i64::MIN` (a
+        // store written before wave AG); Python finds the reset.
+        let rows = [
+            (1, i64::MIN, None, None, None),
+            (2, 0, None, None, Some(json!({"optimizer": {"step_after": 1}}))),
+        ];
+        assert_eq!(
+            state_findings_of(&rows),
+            vec![json!({"component": "optimizer", "finding": "step_reset", "step_after": 1.0})]
+        );
     }
 }
