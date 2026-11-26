@@ -140,3 +140,78 @@ def test_bug02_through_a_real_server_the_store_stays_readable(tmp_path, capsys):
     assert [r["step"] for r in stored] == [0, 2]
     said = capsys.readouterr().err
     assert "(step 1) is not sent" in said and '"record": "scalars"' in said, said
+
+
+# --- BUG-24 (a): an integer scalar a float64 cannot hold exactly ----------------------------
+#
+# Capture keeps a logged Python integer as it is (`capture.Session._scalar_values`), and the
+# `.jsonl` file holds it exactly. The `scalars` column is Float64: the column keeps the nearest
+# float, which is what the Rust detectors judge, and the exact integer travels beside it in
+# `extra_json`, so a record read back from the store is the file's.
+
+EXACT_EDGE = 2**53
+PAST_EDGE = [2**53 + 1, -(2**53) - 1, 2**60 + 1, 2**63 + 1]
+
+
+def _rows(records: list[dict], sender: bool) -> list[dict]:
+    if sender:
+        batch, _, skipped = flight.rows_to_send(records, flight.flight_schema())
+        assert skipped == 0
+        return batch.to_pylist()
+    return flight.records_to_batch(records).to_pylist()
+
+
+@needs_arrow
+@pytest.mark.parametrize("sender", [False, True], ids=["record_to_row", "rows_to_send"])
+def test_bug24a_an_integer_scalar_past_2_53_comes_back_exact(sender):
+    scalars = {"loss": 1.5, **{f"n{i}": v for i, v in enumerate(PAST_EDGE)}}
+    record = step_record("r", 0, scalars=scalars)
+    row = _rows([record], sender)[0]
+    assert dict(row["scalars"]) == {name: float(v) for name, v in scalars.items()}  # the column: the Rust view
+    back = flight.row_to_record(row)
+    assert back["scalars"] == scalars
+    assert list(back["scalars"]) == list(scalars)  # in the record's order
+    assert all(type(back["scalars"][f"n{i}"]) is int for i in range(len(PAST_EDGE)))
+
+
+@needs_arrow
+def test_bug24a_a_scalar_only_record_keeps_its_exact_integer_too():
+    record = scalar_record("r", 3, 0, {"counter": 2**53 + 1})
+    row = _rows([record], True)[0]
+    assert row["seq"] == 0
+    back = flight.row_to_record(row)
+    assert back["scalars"] == {"counter": 2**53 + 1} and is_scalar_record(back)
+
+
+@needs_arrow
+def test_bug24a_pins_an_integer_a_float_holds_and_a_float():
+    """2**53, a small integer and a float stay in the column alone, with no `extra_json`, as before."""
+    scalars = {"edge": EXACT_EDGE, "small": 3, "loss": 0.25, "neg": -(2**53)}
+    row = _rows([step_record("r", 0, scalars=scalars)], True)[0]
+    assert row["extra_json"] is None
+    assert flight.row_to_record(row)["scalars"] == scalars
+
+
+def test_bug24a_through_a_real_server_the_stored_series_is_the_files(tmp_path):
+    skip_without_server()
+    import torch
+
+    import tensorquill as tq
+    from tensorquill.evidence import load_records, scalar_series
+
+    path = tmp_path / "metrics.jsonl"
+    with tq.init(torch.nn.Linear(1, 1), sink=tq.JsonlSink(path), run_id="metrics", mirror_scalars=False) as session:
+        session.log(counter=2**53 + 1, step=0)
+        session.log(eval_loss=1.5, step=1)
+    running = Server(tmp_path / "store")
+    try:
+        assert flight.FlightSender(path, running.endpoint, "metrics", 0).close(20.0)
+    finally:
+        running.close()
+    stored = tmp_path / "store" / "runs" / "metrics"
+    local = scalar_series(path)
+    assert local["counter"] == [[0, 2**53 + 1]]
+    assert scalar_series(stored) == local
+    assert [r["scalars"] for r in load_records(stored, scalars=True) if "scalars" in r] == \
+        [r["scalars"] for r in load_records(path, scalars=True) if "scalars" in r]
+
