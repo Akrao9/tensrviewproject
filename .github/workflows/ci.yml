@@ -63,7 +63,8 @@ jobs:
           python -c "import tomllib" 2>/dev/null || pip install tomli
           # tensorquill-server is not on PyPI before the first release, so pip cannot resolve it yet:
           # everything else tensorquill requires, then tensorquill alone (packaging/requirements.py).
-          pip install -r <(python packaging/requirements.py dev)
+          python packaging/requirements.py dev > "$RUNNER_TEMP/requirements.txt"
+          pip install -r "$RUNNER_TEMP/requirements.txt"
           pip install --no-deps -e .
           python -c "import torch; print(torch.__version__)"
       - name: Tests
@@ -92,7 +93,8 @@ jobs:
           pip install "torch==2.15.*" --index-url https://download.pytorch.org/whl/cpu
           # tensorquill-server is not on PyPI before the first release, so pip cannot resolve it yet:
           # everything else tensorquill requires, then tensorquill alone (packaging/requirements.py).
-          pip install -r <(python packaging/requirements.py dev lightning huggingface rerun flight nvml)
+          python packaging/requirements.py dev lightning huggingface rerun flight nvml > "$RUNNER_TEMP/requirements.txt"
+          pip install -r "$RUNNER_TEMP/requirements.txt"
           pip install --no-deps -e .
       - name: Tests
         run: pytest -ra
@@ -133,7 +135,8 @@ jobs:
           pip install "torch==2.15.*" --index-url https://download.pytorch.org/whl/cpu
           # tensorquill-server is not on PyPI before the first release, so pip cannot resolve it yet:
           # everything else tensorquill requires, then tensorquill alone (packaging/requirements.py).
-          pip install -r <(python packaging/requirements.py dev flight)
+          python packaging/requirements.py dev flight > "$RUNNER_TEMP/requirements.txt"
+          pip install -r "$RUNNER_TEMP/requirements.txt"
           pip install --no-deps -e .
           pip install 'moto[server]' boto3  # the S3 emulator for test_object_store_e2e.py
       - name: Sender and end-to-end tests
@@ -187,7 +190,8 @@ jobs:
           python -c "import torch; assert torch.cuda.is_available(), 'this runner has no CUDA'; print(torch.__version__)"
           # tensorquill-server is not on PyPI before the first release, so pip cannot resolve it yet:
           # everything else tensorquill requires, then tensorquill alone (packaging/requirements.py).
-          pip install -r <(python packaging/requirements.py dev)
+          python packaging/requirements.py dev > "$RUNNER_TEMP/requirements.txt"
+          pip install -r "$RUNNER_TEMP/requirements.txt"
           pip install --no-deps -e .
       - name: Tests
         run: pytest -ra
