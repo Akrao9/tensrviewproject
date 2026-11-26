@@ -2882,10 +2882,14 @@ def in_attempt_order(
 
 def resolve_attempts_across(files: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
     """`resolve_attempts` over a rank's several files, with the attempts in `attempt_order_across`
-    order: the records of every file, in the order given, with those a later attempt replaced
-    left out."""
+    order: the records of every file with those a later attempt replaced left out, each rank's
+    attempts in that order (`in_attempt_order`) and one attempt's records in the order the files
+    give them. The order the files are given in never decides (contract 1): a reader that takes
+    the later record at a step, or first appearance as the attempts' order (`scalar_points_in_order`),
+    reads the later attempt last (BUG-21)."""
     listed = [list(records) for records in files]
-    return resolve_attempts([r for records in listed for r in records], order=attempt_order_across(listed))  # type: ignore[misc]
+    order = attempt_order_across(listed)
+    return resolve_attempts(in_attempt_order([r for records in listed for r in records], order), order=order)
 
 
 def check_one_run(records: Iterable[Mapping[str, Any]]) -> None:
