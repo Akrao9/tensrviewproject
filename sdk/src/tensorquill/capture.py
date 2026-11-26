@@ -504,17 +504,20 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
-def _explicit_step(step: Any) -> int:
+def _explicit_step(step: Any, what: str = "session.log(..., step=...): step", least: int = 0) -> int:
     """`Session.log`'s `step=` as an `int`, or the refusal of contract section 4.2: a bool, a float and
     anything not an integer raise `TypeError`, a negative integer `ValueError`. Any `numbers.Integral`
-    but a bool is an integer, as `identity.check` takes a step. `None` never reaches here: it is no
-    step, the same as leaving `step=` out (the owner's decision, Nov 24)."""
+    but a bool is an integer, as `identity.check` takes a step. `None` never reaches here from `log`:
+    it is no step, the same as leaving `step=` out (the owner's decision, Nov 24).
+
+    The same rule for `init`'s `start_step` and `every` (BUG-05: a bool is an `int`, so
+    `start_step=True` was written as `"step": true`, which every reader refuses): `what` names the
+    argument in the message, and `least` is the smallest value taken."""
     if isinstance(step, bool) or not isinstance(step, numbers.Integral):
-        raise TypeError(f"session.log(..., step=...): step must be an integer of 0 or more, not "
-                        f"{type(step).__name__} {step!r}")
+        raise TypeError(f"{what} must be an integer of {least} or more, not {type(step).__name__} {step!r}")
     value = int(step)
-    if value < 0:
-        raise ValueError(f"session.log(..., step=...): step must be an integer of 0 or more, not {value}")
+    if value < least:
+        raise ValueError(f"{what} must be an integer of {least} or more, not {value}")
     return value
 
 
@@ -1371,6 +1374,7 @@ def _plan_session(
     ends_step: Any = None,
     auto_step: bool = True,
     mirror_scalars: bool = False,
+    start_step: Any = 0,
 ) -> _Plan:
     """Every check `init` and `Session` make of the model and the options, and what they work
     out from them, with nothing changed: no hook, thread, file or global. `init` runs it before
@@ -1378,8 +1382,11 @@ def _plan_session(
     A layer filter, a `replica_params` filter and `get_output_embeddings` are each called once."""
     if hasattr(model, "_orig_mod"):
         raise ValueError("call tensorquill.init(model) before torch.compile(model)")
-    if every < 1:
-        raise ValueError("every must be at least 1")
+    # `log`'s rule for `step=` (BUG-05): a bool, a float or anything not an integer raises `TypeError`.
+    if not isinstance(every, bool) and isinstance(every, numbers.Integral) and int(every) < 1:
+        raise ValueError("every must be at least 1")  # the message it had
+    _explicit_step(every, "every", least=1)
+    _explicit_step(start_step, "start_step")
     if isinstance(grads, bool):
         grad_every = 1 if grads else 0
     elif isinstance(grads, int) and grads >= 0:
@@ -1536,8 +1543,10 @@ class Session:
             model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
             replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
             replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
-            mirror_scalars=mirror_scalars,
+            mirror_scalars=mirror_scalars, start_step=start_step,
         )
+        # Checked by `_plan_session` (BUG-05); an integer that is not an `int` (NumPy's) is written as one.
+        every, start_step = int(every), int(start_step)
         # The optimizer whose step ends each step (`init(ends_step=...)`, wave AE section 3), weakly
         # held, or None for the default lead; and the steps of this model's other optimizers before it
         # first stepped, for the one warning that it has not (`_before_optimizer_step`).
@@ -5152,7 +5161,7 @@ def init(
         model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
         replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
         replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
-        mirror_scalars=mirror_scalars,
+        mirror_scalars=mirror_scalars, start_step=start_step,
     )
     # What `init` opens is undone if a later step fails (`_undo`): the default sink and its file,
     # the run manifest, the stream to a server. A sink the caller passed in is never closed here.
