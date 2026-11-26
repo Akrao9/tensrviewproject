@@ -1291,10 +1291,28 @@ def _clips_session(session: "Session", parameters: Any) -> bool:
     """Whether the parameters given to `clip_grad_norm_` (a list, or one tensor) include any
     of `session`'s trainable ones. Not the first alone: in a LoRA or PEFT model the first is a
     frozen base weight, and the Hugging Face `Trainer` clips `model.parameters()`. The walk
-    stops at the first trainable parameter, a few in for such a model."""
+    stops at the first trainable parameter, a few in for such a model.
+
+    A parameter frozen at `init` that is trainable now counts too (BUG-26): it joins the session's
+    trainable ones only at the optimizer's step (`_take_unfrozen`), after the clipping, so on the
+    step it was unfrozen it was missed and that step had no `clip_grad_norm`. Looked for only when
+    no parameter matched otherwise, through the session's weak references, so an id another tensor
+    took after a frozen parameter was freed never matches."""
     if isinstance(parameters, torch.Tensor):
-        return id(parameters) in session._param_ids
-    return not session._param_ids.isdisjoint(map(id, parameters))
+        parameters = (parameters,)
+    if not session._param_ids.isdisjoint(map(id, parameters)):
+        return True
+    return bool(session._frozen) and _clips_unfrozen(session, parameters)
+
+
+def _clips_unfrozen(session: "Session", parameters: Any) -> bool:
+    """Whether `parameters` holds one of `session`'s parameters frozen at `init` that is trainable now."""
+    trainable = {}
+    for _, ref in session._frozen:
+        param = ref()
+        if param is not None and param.requires_grad:
+            trainable[id(param)] = param
+    return bool(trainable) and any(trainable.get(id(p)) is p for p in parameters)
 
 
 def _watch_clipping(session: "Session") -> None:
