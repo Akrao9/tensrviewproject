@@ -862,6 +862,13 @@ def _store_of(document: Mapping[str, Any]) -> str | None:
     return store_id if isinstance(store_id, str) and store_id else None
 
 
+def _left_out_of(document: Mapping[str, Any]) -> int:
+    """The lines of the run left out before the offset, as an offset file keeps them
+    (`FlightSender.left_out_lines`): an integer of 0 or more, else 0 (a file written before the key)."""
+    value = document.get("left_out", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
 def read_offset(path: Path) -> int:
     return read_binding(path)["offset"]
 
@@ -1175,6 +1182,10 @@ class FlightSender:
             _say(f"tensorquill: {left_out}. The local file has all of it; the run streams as usual.", stacklevel=4)
         self.last_error: BaseException | None = None
         self.skipped_lines = 0
+        # Lines of this run the sender left out (`rows_to_send`'s count: a key it cannot send) in the
+        # part of the file the server confirmed, kept in the offset file (`left_out`) so a later
+        # sender of the same file counts them too (wave AO, BUG-24 c). See `left_out_lines`.
+        self._left_out_acked = 0
         # Fields sent in `extra_json` because their column cannot hold the value (`rows_to_send`):
         # the step is sent and the server reads that value as absent. Said once per sender.
         self.moved_fields = 0
@@ -1256,6 +1267,18 @@ class FlightSender:
         """Bytes of the local file that the server has stored."""
         return self._acked
 
+    @property
+    def left_out_lines(self) -> int:
+        """Lines of this run in the part of the file the server confirmed (`acked_offset`) that were
+        never sent: a line `rows_to_send` leaves out for a key it cannot send (a step past Int64, a
+        negative rank, a record of version 2 that is not a whole scalar-only record). The confirmed
+        offset moves past such a line, so its bytes count as acknowledged, but the server does not
+        have it. Kept in the offset file, so a later sender of the same file starts from the same
+        count; this sender's own skips are also in `skipped_lines`. A line that is not one of this
+        run's records (not JSON, another run's) is counted in `skipped_lines` alone. While this is
+        above 0, `close()` returns False."""
+        return self._left_out_acked
+
     def unacked_bytes(self) -> int | None:
         """Bytes of the local file the server has not confirmed; None when the file cannot be
         read, which is not "nothing left to send"."""
@@ -1266,8 +1289,10 @@ class FlightSender:
 
     def close(self, timeout: float = CLOSE_TIMEOUT) -> bool:
         """Send the complete lines that are left and wait up to `timeout` seconds for the
-        server to store them. Returns whether the whole file was acknowledged; if not, says
-        where the local file is. Call after the local file's writer has been closed.
+        server to store them. Returns whether the whole file was acknowledged and no line of this
+        run in it was left out (`left_out_lines`, counted across senders of the file; wave AO,
+        BUG-24 c); if not, says where the local file is. Call after the local file's writer has
+        been closed.
 
         In a forked child (a `DataLoader` worker, a `multiprocessing` process) this does
         nothing and returns False: a fork copies this object but not its thread, and the
@@ -1293,7 +1318,18 @@ class FlightSender:
                 f"{self.offset_path.name} the next time this run ID streams.",
                 file=sys.stderr,
             )
-        return left == 0
+        left_out = self._left_out_acked
+        if left_out:
+            lines = "1 line" if left_out == 1 else f"{left_out} lines"
+            print(
+                f"tensorquill: {lines} of run {self.run_id} in {self.path} {'was' if left_out == 1 else 'were'} "
+                f"not sent to {self.endpoint}, which does not have {'it' if left_out == 1 else 'them'}: "
+                f"{'its' if left_out == 1 else 'their'} identity fields cannot be sent (said when the sender skipped "
+                f"{'it' if left_out == 1 else 'the first'}). The local file keeps "
+                f"{'it' if left_out == 1 else 'them'} as written; sender.left_out_lines counts them.",
+                file=sys.stderr,
+            )
+        return left == 0 and left_out == 0
 
     # Everything below runs on the sender thread.
 
@@ -1552,6 +1588,7 @@ class FlightSender:
         store = {"store_id": self._store_id} if self._store_id is not None else {}
         write_offset(self.offset_path, end, {**self._destination, **identity, **store})
         self._acked = end
+        self._left_out_acked = identity.get("left_out", 0)
         with self._pending_lock:
             for done in [done for done in self._pending if done <= end]:
                 del self._pending[done]
@@ -1626,16 +1663,19 @@ class FlightSender:
         except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
             pass
 
-    def _sent(self, data: bytes, end: int) -> int:
+    def _sent(self, data: bytes, end: int, left_out: int = 0) -> int:
         """Move the identity windows past `data`, the bytes just sent, which end at `end`, and return
         where they begin: the start a refusal of them must name (RS10), which the batch's metadata
-        states too (`start_byte_offset`)."""
+        states too (`start_byte_offset`). `left_out` is the count of lines of this run left out from
+        byte 0 to `end` (`left_out_lines`), which the offset file keeps beside `end` once it is
+        confirmed; 0 is not written."""
         start = end - len(data)
         if len(self._head) < HEAD_BYTES:
             self._head += data[: HEAD_BYTES - len(self._head)]
         self._tail = (self._tail + data[-TAIL_BYTES:])[-TAIL_BYTES:]
         with self._pending_lock:
-            self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail)}
+            self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail),
+                                  **({"left_out": left_out} if left_out else {})}
             self._starts[end] = start  # where the batch that ends here began (RS10)
         return start
 
@@ -1663,9 +1703,13 @@ class FlightSender:
                     identity = file_identity(self.path, offset)
                 except (OSError, ValueError):
                     return  # later acks name the batches this stream sends
+            if "left_out" not in identity and self._left_out_acked:
+                # An offset this stream did not send: the count confirmed so far, never more than is known.
+                identity = {**identity, "left_out": self._left_out_acked}
             store = {"store_id": self._store_id} if self._store_id is not None else {}
             write_offset(self.offset_path, offset, {**self._destination, **identity, **store})
             self._acked = offset
+            self._left_out_acked = identity.get("left_out", 0)
             with self._pending_lock:
                 for end in [end for end in self._pending if end <= offset]:
                     del self._pending[end]
@@ -1684,6 +1728,8 @@ class FlightSender:
         # batch (L3): until then nothing past byte 0 is sent and nothing is counted as confirmed.
         probing = saved > 0
         self._acked = 0
+        self._left_out_acked = 0
+        left_out = 0  # lines of this run left out from byte 0 to `sent` (`left_out_lines`)
         self._store_id = None
         sent = 0
         schema = flight_schema()
@@ -1780,6 +1826,7 @@ class FlightSender:
                         reason = self._bound(named[0])
                         if reason is None:
                             self._acked = sent = saved
+                            self._left_out_acked = left_out = _left_out_of(self._binding)
                             life["start"] = life["sent"] = saved
                         else:
                             self._replay(reason)
@@ -1802,12 +1849,13 @@ class FlightSender:
                         refused: list[tuple[int, str, Any]] = []
                         batch, steps, unstorable = rows_to_send(records, schema, moved, refused)
                         self.skipped_lines += skipped + unstorable
+                        left_out += unstorable
                         if moved:
                             self._say_moved(moved)
                         if refused:
                             self._say_skipped(sent, lines, places, refused,
                                               [r.get("step", MalformedRecordError.ABSENT) for r in records])
-                        start = self._sent(b"".join(line + b"\n" for line in lines), end)
+                        start = self._sent(b"".join(line + b"\n" for line in lines), end, left_out)
                         metadata = metadata_for(end, steps, start=start)
                         writer.write_with_metadata(batch, pa.py_buffer(metadata))
                         sent = life["sent"] = end
@@ -1919,7 +1967,9 @@ def send_file(
     tls_root_certs: bytes | str | os.PathLike[str] | None = None,
 ) -> bool:
     """Send what a finished run's `.jsonl` file still owes the server. Returns whether the
-    server confirmed the whole file."""
+    server confirmed the whole file and holds every line of this run in it: False while a line of
+    this run was left out (`FlightSender.left_out_lines`, which the offset file keeps, so sending the
+    file again says the same)."""
     return FlightSender(
         path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs
     ).close(timeout)
