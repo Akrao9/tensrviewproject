@@ -323,6 +323,33 @@ def test_a_session_whose_init_fails_removes_the_empty_pid_file(here, monkeypatch
     assert sorted(p.name for p in (here / "tensorquill-out").glob("*.jsonl")) == ["undone.rank0.jsonl"]
 
 
+def test_a_locked_sink_never_opens_its_file_a_second_time(here, monkeypatch):
+    """Not at the torn-line check when it opens, nor after a write that raised. Where `flock` is
+    a POSIX record lock in disguise (Linux's NFS client emulates it as one), closing any other
+    descriptor of the file in this process would drop the lock."""
+    path = here / "tensorquill-out" / "once.rank0.jsonl"
+    path.parent.mkdir()
+    path.write_text('{"step": 0}\n{"cut')
+    opened: list[str] = []
+    real_open = Path.open
+
+    def counting(self, *args, **kwargs):
+        if self.name == path.name:
+            opened.append(str(args[0] if args else kwargs.get("mode", "r")))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting)
+    sink = _sink.JsonlSink(path, lock=True)
+    try:
+        assert sink.locked is True
+        sink._failed = True  # as after a write that raised
+        sink.write([{"step": 1}])
+    finally:
+        sink.close()
+    assert len(opened) == 1, opened
+    assert path.read_text() == '{"step": 0}\n{"cut\n{"step":1}\n'
+
+
 def test_a_jsonl_sink_made_by_hand_takes_no_lock(here):
     one = _sink.JsonlSink(here / "x.rank0.jsonl")
     two = _sink.JsonlSink(here / "x.rank0.jsonl")
