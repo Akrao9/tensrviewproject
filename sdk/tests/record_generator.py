@@ -368,9 +368,18 @@ def _rename(record: dict[str, Any], path: tuple[Any, ...], name: str) -> None:
     _set(record, path, renamed)
 
 
+def _placed(step: Any) -> bool:
+    """Whether a record's step is one a malformation may pick: a number of 0 or more (a step an earlier
+    malformation made `None` or text is not)."""
+    try:
+        return step >= 0
+    except TypeError:
+        return False
+
+
 def _malform(rng: random.Random, kind: str, records: list[dict[str, Any]]) -> None:
     """Put the malformation `kind` on one to three records of `records` (every rank's, in order)."""
-    training = [i for i, r in enumerate(records) if r.get("step", -1) >= 0]
+    training = [i for i, r in enumerate(records) if _placed(r.get("step", -1))]
     picked = sorted(rng.sample(training, min(len(training), rng.choice([1, 1, 2, 3]))))
     for index in picked:
         record = records[index]
