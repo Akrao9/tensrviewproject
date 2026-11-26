@@ -173,3 +173,44 @@ def test_bug20_at_the_join_first_divergence_reads_the_newer_attempts_point():
         return rows
 
     assert first_divergence(run("a", late=True), run("b", late=False))["first_exact_difference"] is None
+
+
+# ---- BUG-21: a rank's several files, resolved in file order ------------------------------------
+#
+# The newer attempt (200, its first `ts` later) is in the first file given and the older (100,
+# rolled back at step 5) in the second. 100's scalar-only point at step 0, below the cutoff, stays,
+# and so does 200's at step 0; the later attempt's must stand whatever the files' order.
+
+def _files() -> tuple[list[dict], list[dict]]:
+    new = [{**_point(200, 0, 0, val=2.0), "ts": 200.0},
+           *[_step(200, s, ts=200.0 + s, scalars={"loss": 1.0, "val": 2.0}) for s in range(5, 36)]]
+    old = [*[_step(100, s, ts=100.0 + s, scalars={"loss": 1.0, "val": 2.0}) for s in range(5)],
+           {**_point(100, 0, 0, val=999.0), "ts": 106.0},
+           _step(100, 6, ts=107.0, scalars={"loss": 9.0, "val": 9.0})]
+    return new, old
+
+
+def test_bug21_resolving_a_ranks_files_never_depends_on_their_order():
+    new, old = _files()
+    one, other = evidence.resolve_attempts_across([new, old]), evidence.resolve_attempts_across([old, new])
+    assert one == other
+    assert [r["attempt"] for r in one] == sorted((r["attempt"] for r in one), key=[100, 200].index)
+
+
+def test_bug21_first_divergence_reads_the_newer_attempts_point_across_files():
+    from tensorquill.divergence import first_divergence
+
+    new, old = _files()
+    ref = [{**_point(1, 0, 0, val=2.0), "run_id": "b"},
+           *[{**_step(1, s, scalars={"loss": 1.0, "val": 2.0}), "run_id": "b"} for s in range(36)]]
+    for files in ([new, old], [old, new]):
+        found = first_divergence(evidence.resolve_attempts_across(files), ref, resolved=True)
+        assert found["answer"] == "no_divergence", found
+
+
+def test_bug21_pin_the_records_left_out_are_the_same_and_one_attempts_records_keep_their_order():
+    new, old = _files()
+    kept = evidence.resolve_attempts_across([new, old])
+    assert len(kept) == len(new) + 5 + 1  # attempt 100's steps 0 to 4 and its point at 0; step 6 rolled back
+    assert [r["step"] for r in kept if r["attempt"] == 100] == [0, 1, 2, 3, 4, 0]
+    assert [r["step"] for r in kept if r["attempt"] == 200] == [0, *range(5, 36)]
