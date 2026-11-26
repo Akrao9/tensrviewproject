@@ -369,6 +369,28 @@ If you streamed to `tensorquill-server`, point the same command at the run's dir
 
 **A rank that went silent after its capture had stopped.** Such a rank still raises `rank_silent` or `job_stalled` if its heartbeats later stop. The incident then carries `capture_stopped` (the reason, such as `sink_error`, and how long ago) and `capture_last_step`, the last step this attempt of the rank stored, or null when it stored none. TensorQuill cannot tell from that rank whether training itself stalled, and the incident says so.
 
+### A coding agent on a cluster, through SSH
+
+If the cluster lets you in by SSH but refuses inbound HTTP, a coding agent on your own machine can still read a run. Its MCP client starts the read-only MCP server on the head node through SSH, and the protocol goes over SSH's standard input and output, as it goes over a local server's:
+
+```bash
+ssh <head> /path/to/env/bin/python -m tensorquill.mcp_server <store>/runs/<run_id>
+```
+
+The agent's MCP configuration takes the same entry as for the local server ([AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md), "Setup"), with `ssh` as the command:
+
+```json
+{"mcpServers": {"tensorquill": {"command": "ssh", "args": ["-T", "-o", "BatchMode=yes", "<head>", "/path/to/env/bin/python", "-m", "tensorquill.mcp_server", "<store>/runs/<run_id>"]}}}
+```
+
+The run folder can also be a `.jsonl` capture or an `evidence.json` on the head node, as for the local server.
+
+- **Your shell's start-up files must print nothing on standard output.** SSH runs the command through your login shell on the head node, and whatever that shell's start-up files (`.bashrc` and the like) print on standard output reaches the client ahead of the server's first reply. The client reads that output as protocol messages, one a line. A line of text first is not a message. Text with no newline is joined to the reply to `initialize`, so that reply cannot be read at all. Either way the client reports output it cannot parse or fails to start the server; how each client words it has not been checked. To check, run `ssh <head> true | wc -c`: it must print `0`. Send any `echo` in those files to standard error (`echo ... >&2`). Text on standard error is harmless: SSH passes it to the client's standard error.
+- **The run must be on a disk the head node can read.** The server reads `PATH` as a local path. No reader of `s3://` or `gs://` is in `mcp_server.py`, `runs.py`, `evidence.py` or `compare.py`: `s3://bucket/runs/<run_id>` is read as the local folder `s3:/bucket/runs/<run_id>`, which does not exist, and the tools say so. A store the ingest server keeps in S3 or GCS must be copied or mounted onto the head node first. The server reads the path again at every call, so on a disk the job is still writing it follows the run. It has not been run on a network file system.
+- **The head node's Python needs the package.** Install the SDK there as in section 1, with the `flight` extra (`pyarrow`) for `get_series` on a store's run folder, the one tool that opens its Parquet parts. SSH runs the command in a shell that is not interactive, so an environment your interactive shell activates (conda, a module) may not be active: name the interpreter by its full path, as above.
+- **SSH must not ask anything.** The client cannot type a password or accept a host key. Use a key your SSH agent holds, and connect once by hand first so that the head node's host key is known. `BatchMode=yes` makes SSH fail at once instead of waiting for an answer nobody gives. SSH joins the words after `<head>` into one command line for the remote shell, so a path with a space or a shell character needs quotes inside its string as well (`"'<store>/my runs/<run_id>'"`).
+- **What was tested, and what was not.** `tests/test_mcp_over_ssh_pipe.py` starts the server as SSH gives it to a client, on one machine: the command handed to `sh -c`, standard input and output as pipes, no terminal, the run folder as an argument. All six tools answer on a store the real ingest server wrote, the server ends when the client closes its input, and both kinds of start-up text behave as described above. The recipe has not been run on a real cluster. `ssh` itself was not run, and no MCP client was used but the test's own.
+
 ### Other tools' results
 
 If you also run TrainCheck, add `--traincheck <violations_summary.json>` (or the results directory `traincheck-check` wrote): its violated invariants appear as one `traincheck_violation` incident, with TrainCheck's own step numbers.
