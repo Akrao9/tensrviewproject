@@ -118,8 +118,11 @@ def _identity(values: Any) -> tuple[bytes | None, bool]:
     """`identity_bytes`, and whether the batch is mixed (`_mixed`)."""
     if values is None:
         return None, False
-    if isinstance(values, list) and values and type(values[0]) is int and bool not in set(map(type, values)):
-        fast = _int_bytes(values)  # the common case: a batch sampler's list of indices
+    if isinstance(values, list) and values and set(map(type, values)) == {int}:
+        # The common case: a batch sampler's list of Python ints. Only `int` itself: `array("q")`
+        # also takes anything with `__index__`, a one-element bool tensor among them, which would
+        # pack as 1. The rest are read item by item below, and an integer one packs the same.
+        fast = _int_bytes(values)
         if fast is not None:
             return fast, False
     if isinstance(values, torch.Tensor):
