@@ -482,6 +482,14 @@ def _jump_overloaded(
     return overloaded
 
 
+def _newest_stamp(records: Iterable[Mapping[str, Any]]) -> float | None:
+    """The latest `ts` of `records` that is a finite number (`_finite`), or None: the time of the
+    last recorded step that a Flight Recorder dump is compared with. A bool, text and an integer too
+    large for a float are no time (wave AO)."""
+    stamps = [stamp for stamp in (_finite(r.get("ts")) for r in records) if stamp is not None]
+    return max(stamps) if stamps else None
+
+
 def _finite(value: Any) -> float | None:
     """A finite number, else None. A bool is not a number (DET-16): an imported `true` is not a
     measurement of 1. Flags such as `step_skipped` are read as flags, not through here. An integer
@@ -4352,8 +4360,7 @@ def _report_evidence(
 
     def newest_ts() -> float | None:
         _, part, _ = _newest_part(folder)
-        stamps = [float(r["ts"]) for r in (_read_part(part) if part else ()) if isinstance(r.get("ts"), (int, float))]
-        return max(stamps) if stamps else None
+        return _newest_stamp(_read_part(part) if part else ())
 
     last_step = report["last_step"] if isinstance(report.get("last_step"), int) else 0
     traincheck_summary, recorder_summary = _check_other_sources(
@@ -6145,8 +6152,7 @@ def _all_ranks_evidence(
         if newest is None or newest[1] not in folders:
             return None
         _, part, _ = _newest_part(folders[newest[1]])
-        stamps = [float(r["ts"]) for r in (_read_part(part) if part else ()) if isinstance(r.get("ts"), (int, float))]
-        return max(stamps) if stamps else None
+        return _newest_stamp(_read_part(part) if part else ())
 
     last_step = max((look["stored"][1] for look in looks.values() if look.get("stored")), default=0)
     traincheck_summary, recorder_summary = _check_other_sources(
@@ -8154,8 +8160,7 @@ def _build_evidence(
     incidents.extend(stream_incidents)
     last_step = max((int(r["step"]) for r in records), default=0)
     def newest_ts() -> float | None:
-        stamps = [float(r["ts"]) for r in records if isinstance(r.get("ts"), (int, float))]
-        return max(stamps) if stamps else None
+        return _newest_stamp(records)
 
     traincheck_summary, recorder_summary = _check_other_sources(
         incidents, stream_incidents, not_checked, last_step=last_step, newest_ts=newest_ts,
