@@ -235,6 +235,22 @@ def _wire_float(value: Any) -> Any:
     return _UNCARRIED
 
 
+def _carried(value: Any) -> bool:
+    """Whether a `float64` column carries `value` (`_wire_float`): a number, or the sink's "nan",
+    "inf" or "-inf". A null is no value, and so is anything the column cannot carry (a bool, other
+    text), which Rust never sees (its column is null): such a field is absent to every rule."""
+    found = _wire_float(value)
+    return found is not None and found is not _UNCARRIED
+
+
+def _gradient_key(records: Iterable[Mapping[str, Any]]) -> str:
+    """The run's total gradient norm series: the pre-clipping `clip_grad_norm` once any record holds
+    one the column carries (`_carried`), else `grad_norm`, as Rust switches (`Gradients::row`,
+    `measure.rs`). A record with `clip_grad_norm` that holds no value does not say the run clips: an
+    explicit null switched the whole run off `grad_norm` here and not in Rust (BUG-09)."""
+    return "clip_grad_norm" if any(_carried(r.get("clip_grad_norm")) for r in records) else "grad_norm"
+
+
 def _spread_values(value: Any) -> list[float] | None:
     """One parameter's gathered spread as the `replica_spread` column carries it (WAVE_AJ_CONTRACT.md,
     section 1), a list of floats, a null read as NaN as Rust reads it; else None, and the entry is
@@ -603,7 +619,7 @@ def detect_grad_spikes(
     """
     # One series for the whole run. When the run clips, the pre-clipping norm is used:
     # the per-parameter norms are read after clipping, so a clipped spike stays flat there.
-    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+    key = _gradient_key(records)
     state = _GradSpikes(key, factor=factor, window=window, min_history=min_history, sustain=sustain)
     state.feed(records)
     return state.result()
@@ -810,7 +826,7 @@ def _update_spikes_judged(
     """`detect_update_spikes`'s incident, and the pairs it did not compare because a split total
     met more than one clip call: `{"comparisons", "step", "compared"}`, with `compared` the pairs
     it did compare, or None when every pair was compared."""
-    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+    key = _gradient_key(records)
     # attempt, total, each parameter's update size, each parameter's gradient norm (or None), the
     # learning rates the record carries (or None), its clip calls above 1 (or None)
     before: tuple[Any, float, dict[str, float], Mapping[str, Any] | None, list[float] | None, int | None] | None = None
@@ -1213,7 +1229,7 @@ def gradient_trend(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     run clips, `grad_norm` otherwise, as `grad_spike` reads it; a skipped step and a value that
     is not finite are left out. `series` names the norm read. None under TREND_MIN_POINTS."""
     rows = sorted(records, key=lambda r: r["step"])
-    key = "clip_grad_norm" if any("clip_grad_norm" in r for r in rows) else "grad_norm"
+    key = _gradient_key(rows)
     pairs = [(int(r["step"]), value) for r in rows if not r.get("step_skipped")
              and (value := _finite(r.get(key))) is not None]
     found = robust_trend([step for step, _ in pairs], [value for _, value in pairs])
@@ -3537,7 +3553,8 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         if isinstance(moe, Mapping) and any(
                 (total := _router_total(value)) is not None and total > 0 for value in moe.values()):
             counts["moe"] += 1
-        total = record.get("grad_norm") is not None or record.get("clip_grad_norm") is not None
+        # A total the column carries (`_carried`), as Rust counts it: a `grad_norm` of true is none (BUG-09).
+        total = _carried(record.get("grad_norm")) or _carried(record.get("clip_grad_norm"))
         # A record holds a layer only through an entry that is an object (section 1.5; row S5, the
         # owner's approved change, Nov 24): a value that is not an object, or one whose only entries
         # are not objects, holds none, as Rust reads it.
@@ -7655,7 +7672,7 @@ class _Incremental:
     def judge(self, records: list[dict[str, Any]], *, router_sizes: Mapping[str, int],
               router_top_k: Mapping[str, int], overload_threshold: float, starve_window: int,
               starve_ratio: float, options: tuple[Any, ...]) -> dict[str, Any]:
-        grad_key = "clip_grad_norm" if any("clip_grad_norm" in r for r in records) else "grad_norm"
+        grad_key = _gradient_key(records)
         key = repr((overload_threshold, starve_window, starve_ratio, options, list(router_sizes.items()),
                     list(router_top_k.items()), grad_key))
         kept = self.records
