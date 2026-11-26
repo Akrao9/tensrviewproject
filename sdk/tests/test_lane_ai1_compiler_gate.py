@@ -22,7 +22,8 @@ sys.path.insert(0, str(EXAMPLES))
 import granite_compiler_gate as gate  # noqa: E402
 
 # A NeuralDBG clone beside the project (read only), for the third arm when neuraldbg is not installed.
-for candidate in (Path(__file__).resolve().parents[n] / "NeuralDBG" for n in range(2, 7)):
+# The folders from the project's own up to four above it; a slice, as a short path has fewer (BUG-30).
+for candidate in (parent / "NeuralDBG" for parent in Path(__file__).resolve().parents[2:7]):
     if (candidate / "neuraldbg" / "__init__.py").exists():
         NEURALDBG = candidate
         break
