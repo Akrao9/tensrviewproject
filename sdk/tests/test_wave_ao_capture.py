@@ -8,6 +8,7 @@ tests that need Apple's MPS skip where it is not there.
 from __future__ import annotations
 
 import json
+import math
 import numbers
 import warnings
 from pathlib import Path
@@ -225,7 +226,7 @@ def test_a_parameter_unfrozen_just_before_clipping_has_its_norm_recorded_on_that
         norm = _one_step(model, optimizer, lambda: torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5))
         _one_step(model, optimizer, lambda: torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5))
     assert [r["step"] for r in sink.records] == [0, 1]
-    assert sink.records[0].get("clip_grad_norm") == pytest.approx(float(norm), rel=1e-6)
+    assert sink.records[0].get("clip_grad_norm") == pytest.approx(float(norm), rel=1e-6, abs=0)
     assert "clip_grad_norm" in sink.records[1]
 
 
@@ -240,7 +241,7 @@ def test_a_lora_like_model_clipping_only_its_newly_unfrozen_part_is_recorded():
         for p in model[1].parameters():
             p.requires_grad_(True)
         norm = _one_step(model, optimizer, lambda: torch.nn.utils.clip_grad_norm_(model[1].parameters(), 0.5))
-    assert sink.records[0].get("clip_grad_norm") == pytest.approx(float(norm), rel=1e-6)
+    assert sink.records[0].get("clip_grad_norm") == pytest.approx(float(norm), rel=1e-6, abs=0)
 
 
 def test_a_clip_over_parameters_still_frozen_or_of_another_model_records_nothing():
@@ -456,3 +457,128 @@ def test_the_run_id_rule_is_one_pure_function_beside_the_project_rule():
         fitted = manifest.conform_run_id(bad)
         assert manifest.run_id_problem(fitted) is None
         assert manifest.conform_run_id(bad) == fitted  # every rank makes the same ID of the same one
+
+
+# ---- BUG-04: a finite gradient norm of any float64 size is recorded finite -----------------------
+#
+# `record_grad_norm` added each norm's square into a float32 buffer, so a finite norm above about
+# 1.8e19 (a float64 model's, or one a caller passes) became `inf` and a false `non_finite` incident
+# fired; a Python float above about 1.3e154 raised `OverflowError` into training. The buffer now holds
+# the sum of squares with an exponent beside it, on the session's device with no sync, and the square
+# root is taken on the host when the record is written, as before.
+
+_HAS_MPS = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+
+
+def _clip_run(model, inputs, scale, *, max_norm=1.0, groups=1):
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    sink = MemorySink()
+    with tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None):
+        (model(inputs) * scale).sum().backward()
+        params = list(model.parameters())
+        norms = [torch.nn.utils.clip_grad_norm_(params[i::groups], max_norm=max_norm) for i in range(groups)]
+        optimizer.step()
+    return sink.records, norms
+
+
+def test_a_float64_models_norm_above_float32s_range_is_recorded_finite_and_fires_nothing():
+    torch.manual_seed(0)
+    model = nn.Linear(2, 1, bias=False, dtype=torch.float64)
+    records, (norm,) = _clip_run(model, torch.ones(1, 2, dtype=torch.float64), 2e20)
+    assert math.isfinite(float(norm)) and float(norm) > 1e20
+    assert records[0]["clip_grad_norm"] == pytest.approx(float(norm), rel=1e-6, abs=0)
+    evidence = tensorquill.build_evidence(records, detectors="python")
+    assert "non_finite" not in [incident["kind"] for incident in evidence["incidents"]]
+
+
+def test_two_clipping_calls_far_above_float32s_range_add_up_finite():
+    torch.manual_seed(0)
+    model = nn.Linear(2, 2, dtype=torch.float64)
+    records, norms = _clip_run(model, torch.ones(1, 2, dtype=torch.float64), 1e100, groups=2)
+    expected = math.hypot(*(float(n) for n in norms))
+    assert math.isfinite(expected) and expected > 1e100
+    assert records[0]["clip_grad_norm"] == pytest.approx(expected, rel=1e-6, abs=0)
+
+
+@pytest.mark.parametrize("norms", [[1e200], [1e300, 1e300], [1e-300, 2e-300], [3.0, 4.0]])
+@pytest.mark.parametrize("kind", ["float", "cpu_float64_tensor"])
+def test_a_norm_given_by_hand_of_any_float64_size_is_recorded_finite(norms, kind):
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = MemorySink()
+    with tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None) as session:
+        model(torch.ones(1, 2)).sum().backward()
+        for norm in norms:
+            session.record_grad_norm(norm if kind == "float" else torch.tensor(norm, dtype=torch.float64))
+        optimizer.step()
+    assert sink.records[0]["clip_grad_norm"] == pytest.approx(math.hypot(*norms), rel=1e-6, abs=0)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_a_norm_that_is_not_finite_stays_not_finite(bad):
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = MemorySink()
+    with tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None) as session:
+        model(torch.ones(1, 2)).sum().backward()
+        session.record_grad_norm(torch.tensor(1.0))
+        session.record_grad_norm(torch.tensor(bad))
+        optimizer.step()
+    written = sink.records[0]["clip_grad_norm"]
+    assert not math.isfinite(float(written))
+    assert math.isnan(float(written)) == math.isnan(bad)
+
+
+def test_an_ordinary_norm_is_recorded_bit_for_bit_as_before():
+    """In float32's range nothing in a report moves: the sum of float32 squares, then the square root
+    in float64 on the host, as the float32 buffer gave."""
+    torch.manual_seed(1)
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    cases = [[1.2345678], [0.1, 0.2, 0.3], [3.0, 4.0], [1e-3, 7e5], [1.8e19]]
+    for norms in cases:
+        sink = MemorySink()
+        with tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None) as session:
+            model(torch.ones(1, 2)).sum().backward()
+            for norm in norms:
+                session.record_grad_norm(torch.tensor(norm, dtype=torch.float64))
+            optimizer.step()
+            optimizer.zero_grad()
+        before = torch.zeros((), dtype=torch.float32)
+        for norm in norms:
+            before.add_(torch.tensor(norm, dtype=torch.float64).to(before).square())
+        assert sink.records[0]["clip_grad_norm"] == math.sqrt(float(before)), norms
+
+
+@pytest.mark.skipif(not _HAS_MPS, reason="needs Apple's MPS")
+@pytest.mark.parametrize("given", ["mps_tensors", "python_floats", "cpu_float64_tensors"])
+def test_on_mps_with_no_float64_a_finite_norm_of_any_float64_size_is_recorded_finite(given):
+    model = nn.Linear(2, 2).to("mps")
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = MemorySink()
+    norms = {"mps_tensors": [3e38, 3e38], "python_floats": [1e300, 1e300], "cpu_float64_tensors": [1e300, 2e-300]}[given]
+    with tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None) as session:
+        assert session.device.type == "mps"
+        model(torch.ones(1, 2, device="mps")).sum().backward()
+        for norm in norms:
+            if given == "mps_tensors":
+                session.record_grad_norm(torch.tensor(norm, device="mps"))
+            elif given == "python_floats":
+                session.record_grad_norm(norm)
+            else:
+                session.record_grad_norm(torch.tensor(norm, dtype=torch.float64))
+        optimizer.step()
+    assert sink.records[0]["clip_grad_norm"] == pytest.approx(math.hypot(*norms), rel=1e-6, abs=0)
+
+
+@pytest.mark.skipif(not _HAS_MPS, reason="needs Apple's MPS")
+def test_on_mps_three_and_four_still_make_exactly_five():
+    model = nn.Linear(2, 2).to("mps")
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = MemorySink()
+    with tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None) as session:
+        model(torch.ones(1, 2, device="mps")).sum().backward()
+        session.record_grad_norm(torch.tensor(3.0, device="mps"))
+        session.record_grad_norm(torch.tensor(4.0, device="mps"))
+        optimizer.step()
+    assert sink.records[0]["clip_grad_norm"] == 5.0
