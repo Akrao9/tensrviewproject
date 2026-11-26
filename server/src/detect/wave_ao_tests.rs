@@ -24,7 +24,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Value};
 
-use super::{detect_stream_samples, Thresholds};
+use super::{detect_stream_samples, judge, Thresholds, ATTN_KINDS};
 
 const ROUTER: &str = "router";
 
@@ -58,6 +58,28 @@ fn moe_batch(steps: &[Vec<i64>], top_k: i32) -> RecordBatch {
             Arc::new(Int64Array::from_iter_values(0..steps.len() as i64)),
             Arc::new(counts),
             Arc::new(chosen),
+        ],
+    )
+    .unwrap()
+}
+
+/// One row per step from 0, each with the probe text given (or no probe).
+fn probe_batch(probes: &[Option<&str>]) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("rank", DataType::Int32, false),
+        Field::new("attempt", DataType::Int64, false),
+        Field::new("step", DataType::Int64, false),
+        Field::new("probe_json", DataType::Utf8, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from_iter_values(probes.iter().map(|_| "run"))),
+            Arc::new(Int32Array::from_iter_values(probes.iter().map(|_| 0))),
+            Arc::new(Int64Array::from_iter_values(probes.iter().map(|_| 1))),
+            Arc::new(Int64Array::from_iter_values(0..probes.len() as i64)),
+            Arc::new(StringArray::from(probes.to_vec())),
         ],
     )
     .unwrap()
@@ -215,4 +237,75 @@ fn the_diversity_of_counts_summing_past_i64_max_is_their_evenness() {
     assert_eq!(super::diversity_from_counts(&[TWO_62, TWO_62]), 1.0);
     assert_eq!(super::diversity_from_counts(&[TWO_62; 4]), 1.0);
     assert_eq!(super::diversity_from_counts(&[i64::MIN, i64::MIN]), 0.0);
+}
+
+// --- BUG-10 ------------------------------------------------------------------------------------
+
+/// A failed probe whose `attention` is not an object: Python counts the probe and its failure
+/// (`isinstance(probe, dict)`, `"error" in probe`), and reads no attention of it.
+#[test]
+fn a_failed_probe_whose_attention_is_not_an_object_is_a_failed_probe() {
+    for attention in ["null", "[1]", "3", "\"text\"", "true", "[]"] {
+        let text = format!(r#"{{"error":"CUDA OOM","attention":{attention}}}"#);
+        let detectors = judge(0, &[probe_batch(&[Some(&text)])], &usual()).unwrap();
+        let reason = "1 of 1 probes failed, the first at step 0: CUDA OOM";
+        let entry = json!({"check": "probe", "kinds": ATTN_KINDS, "reason": reason, "step": 0});
+        assert_eq!(detectors.not_checked().last(), Some(&entry), "attention {attention}");
+        let checks = detectors.kind_checks();
+        for kind in ATTN_KINDS {
+            assert_eq!(checks[kind]["value"], "unavailable", "{kind}, attention {attention}");
+        }
+    }
+}
+
+/// The capture's note that the probe is not run, with an `attention` that is not an object: the
+/// note is read (Python reads `not_run` before anything else), and it is no probe asked.
+#[test]
+fn a_not_run_probe_whose_attention_is_not_an_object_says_it_is_not_run() {
+    let same_without = judge(0, &[probe_batch(&[Some(r#"{"not_run":"sharded model"}"#)])], &usual()).unwrap();
+    for attention in ["null", "[1]", "0"] {
+        let text = format!(r#"{{"not_run":"sharded model","attention":{attention}}}"#);
+        let detectors = judge(0, &[probe_batch(&[Some(&text)])], &usual()).unwrap();
+        assert_eq!(
+            detectors.not_checked(),
+            same_without.not_checked(),
+            "attention {attention}"
+        );
+        assert_eq!(
+            detectors.kind_checks(),
+            same_without.kind_checks(),
+            "attention {attention}"
+        );
+    }
+    let probe = &same_without.not_checked()[2];
+    assert_eq!(probe["check"], "probe", "{probe}");
+}
+
+/// A probe that did not fail and whose `attention` is not an object is a probe asked that recorded
+/// no attention, as one with no `attention` key is.
+#[test]
+fn a_probe_whose_attention_is_not_an_object_is_one_with_no_attention() {
+    let none = judge(0, &[probe_batch(&[Some("{}")])], &usual()).unwrap();
+    for attention in ["null", "[1]", "3", "\"text\"", "false"] {
+        let text = format!(r#"{{"attention":{attention}}}"#);
+        let detectors = judge(0, &[probe_batch(&[Some(&text)])], &usual()).unwrap();
+        assert_eq!(detectors.not_checked(), none.not_checked(), "attention {attention}");
+        assert_eq!(detectors.kind_checks(), none.kind_checks(), "attention {attention}");
+    }
+}
+
+/// A key given twice keeps its last value, as `json.loads` does, whichever of the two is an object.
+#[test]
+fn an_attention_given_twice_is_its_last_value() {
+    let good = r#"{"blocks.0.attn":{"entropy_share":[0.6,0.62],"max_logit":[2.0,2.1]}}"#;
+    let once = format!(r#"{{"attention":{good}}}"#);
+    let read = judge(0, &[probe_batch(&[Some(once.as_str()); 5])], &usual()).unwrap();
+    assert_eq!(read.kind_checks()["attention_collapse"]["records"], 5);
+    let last_good = format!(r#"{{"attention":null,"attention":{good}}}"#);
+    let detectors = judge(0, &[probe_batch(&[Some(last_good.as_str()); 5])], &usual()).unwrap();
+    assert_eq!(detectors.kind_checks(), read.kind_checks());
+    let last_null = format!(r#"{{"attention":{good},"attention":null}}"#);
+    let none = judge(0, &[probe_batch(&[Some("{}"); 5])], &usual()).unwrap();
+    let detectors = judge(0, &[probe_batch(&[Some(last_null.as_str()); 5])], &usual()).unwrap();
+    assert_eq!(detectors.kind_checks(), none.kind_checks());
 }
