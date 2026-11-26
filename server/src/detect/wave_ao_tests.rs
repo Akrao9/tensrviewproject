@@ -248,7 +248,7 @@ fn a_failed_probe_whose_attention_is_not_an_object_is_a_failed_probe() {
     for attention in ["null", "[1]", "3", "\"text\"", "true", "[]"] {
         let text = format!(r#"{{"error":"CUDA OOM","attention":{attention}}}"#);
         let detectors = judge(0, &[probe_batch(&[Some(&text)])], &usual()).unwrap();
-        let reason = "1 of 1 probes failed, the first at step 0: CUDA OOM";
+        let reason = "1 of 1 probe failed, the first at step 0: CUDA OOM";
         let entry = json!({"check": "probe", "kinds": ATTN_KINDS, "reason": reason, "step": 0});
         assert_eq!(detectors.not_checked().last(), Some(&entry), "attention {attention}");
         let checks = detectors.kind_checks();

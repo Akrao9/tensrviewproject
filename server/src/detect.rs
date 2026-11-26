@@ -1041,16 +1041,21 @@ impl<'de: 'a, 'a, T: Deserialize<'de>> Deserialize<'de> for Members<'a, T> {
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("an object")
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut members = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some(Key(key)) = map.next_key()? {
-                    members.push((key, map.next_value()?));
-                }
-                Ok(Members(members))
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                Ok(Members(read_members(map)?))
             }
         }
         deserializer.deserialize_map(MembersVisitor(PhantomData))
     }
+}
+
+/// An object's members in document order, read from its map.
+fn read_members<'de, A: MapAccess<'de>, T: Deserialize<'de>>(mut map: A) -> Result<Vec<(Cow<'de, str>, T)>, A::Error> {
+    let mut members = Vec::with_capacity(map.size_hint().unwrap_or(0));
+    while let Some(Key(key)) = map.next_key()? {
+        members.push((key, map.next_value()?));
+    }
+    Ok(members)
 }
 
 /// A number as Python's `_finite` reads it: a JSON number (or boolean) that is finite, and
@@ -3278,6 +3283,50 @@ impl<'de> Deserialize<'de> for AttentionStats {
     }
 }
 
+/// A probe's `attention`: its modules in order when it is an object, and none for any other value
+/// (`null`, a list, a number, text, a bool), which is read past, as Python's `isinstance(attention,
+/// dict)` reads it (BUG-10). Before, such a value failed the whole probe's parse, and its `error` and
+/// `not_run` were lost with it.
+struct AttentionOf<'a>(Option<Members<'a, AttentionStats>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for AttentionOf<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AttentionVisitor<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for AttentionVisitor<'a> {
+            type Value = AttentionOf<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<AttentionOf<'a>, A::Error> {
+                Ok(AttentionOf(Some(Members(read_members(map)?))))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<AttentionOf<'a>, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AttentionOf(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+            fn visit_unit<E>(self) -> Result<AttentionOf<'a>, E> {
+                Ok(AttentionOf(None))
+            }
+        }
+        deserializer.deserialize_any(AttentionVisitor(PhantomData))
+    }
+}
+
 /// What the attention rules read of a probe: its attention modules in order, or nothing when
 /// the probe failed (`error`, kept as it was written) or recorded no attention. Histograms and
 /// maps are skipped unread.
@@ -3303,8 +3352,9 @@ impl<'de: 'a, 'a> Deserialize<'de> for Probe<'a> {
                     match key.as_ref() {
                         "error" => probe.error = Some(map.next_value()?),
                         "not_run" => probe.not_run = Some(map.next_value()?),
-                        // Not an object: the probe is not read at all, as Python skips it.
-                        "attention" => probe.attention = Some(map.next_value()?),
+                        // Not an object: no attention, and the rest of the probe is read. A key
+                        // given twice keeps its last value, as `json.loads` does.
+                        "attention" => probe.attention = map.next_value::<AttentionOf>()?.0,
                         _ => {
                             map.next_value::<IgnoredAny>()?;
                         }
@@ -6787,8 +6837,10 @@ mod tests {
         );
         let failed: Probe = serde_json::from_str(r#"{"error":"RuntimeError: x","attention":{}}"#).unwrap();
         assert_eq!(failed.error, Some(json!("RuntimeError: x")));
-        assert!(serde_json::from_str::<Probe>(r#"{"attention":[1]}"#).is_err());
-        // skipped, as Python skips it
+        // An attention that is not an object is none, and the rest of the probe is read (BUG-10).
+        let listed: Probe = serde_json::from_str(r#"{"error":"x","attention":[1]}"#).unwrap();
+        assert!(listed.attention.is_none());
+        assert_eq!(listed.error, Some(json!("x")));
     }
 
     #[test]
