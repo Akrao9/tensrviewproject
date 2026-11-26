@@ -806,7 +806,7 @@ def _stall_of_episode(source: "Source", opened: Mapping[str, Any], wanted: str, 
     by the trigger's own rule (`trigger.episode_ended_by`: no step beyond where it stopped, no new
     attempt). The last holds even in the moment between the watcher writing a new stall and the
     trigger looking at it, when the state file still names the earlier episode."""
-    from .trigger import episode_ended_by, state_path_for
+    from .trigger import episode_ended_by, state_path_handed
 
     stalls = [e for e in _entries(opened) if e["incident"].get("kind") in _STALL_KINDS]
     current = stalls[0] if len(stalls) == 1 else None
@@ -824,7 +824,7 @@ def _stall_of_episode(source: "Source", opened: Mapping[str, Any], wanted: str, 
         raise no(f"this server was started on {where}, which has no trigger state beside it. Which stall episode is open is"
                  " kept only beside the evidence file the trigger named (`TENSORQUILL_EVIDENCE`, `evidence` in its document):"
                  " start the server on that file to look a stall up by the id the trigger gave")
-    state_path = state_path_for(where)
+    state_path = state_path_handed(where)  # the one the trigger keeps, for any output name (wave AP, AO-06)
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
