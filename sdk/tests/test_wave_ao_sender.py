@@ -267,3 +267,100 @@ def test_bug24b_through_a_real_server_the_stored_record_is_the_files(tmp_path):
     stored = tmp_path / "store" / "runs" / "b"
     assert [r["scalars"] for r in load_records(stored, scalars=True)] == \
         [r["scalars"] for r in load_records(path, scalars=True)]
+
+
+# --- BUG-24 (c): what close() and send_file return over a line left out ----------------------
+#
+# A line of this run that the sender leaves out (a step past Int64, a refused key, BUG-02's line)
+# is passed over: the saved offset moves past it, so every byte is confirmed. close() and
+# send_file returned True, "the whole file was acknowledged", although the server never had that
+# line, and a later send_file of the same file said True again. Recommended, and built: they
+# return False while any line of this run in the confirmed part of the file was left out, and the
+# offset file keeps the count, so a later sender of the same file says the same.
+# `left_out_lines` is that count. Lines that are not this run's records (not JSON, another run's)
+# are counted in `skipped_lines` as before and do not change what close() returns.
+
+
+def _send(path: Path, endpoint: str, run_id: str) -> flight.FlightSender:
+    sender = flight.FlightSender(path, endpoint, run_id, 0)
+    sender.result = sender.close(20.0)
+    return sender
+
+
+def test_bug24c_a_line_past_int64_makes_close_and_send_file_false(tmp_path, capsys):
+    skip_without_server()
+    from tensorquill.evidence import load_records
+
+    path = write_lines(tmp_path / "bs.jsonl", [step_record("bs", 0), scalar_record("bs", 2**63, 0, {"x": 1.0}),
+                                                step_record("bs", 1)])
+    running = Server(tmp_path / "store")
+    try:
+        first = _send(path, running.endpoint, "bs")
+        assert first.acked_offset == path.stat().st_size  # every byte is confirmed
+        assert first.result is False
+        assert (first.skipped_lines, first.left_out_lines) == (1, 1)
+        assert "1 line of run bs" in capsys.readouterr().err
+        again = _send(path, running.endpoint, "bs")  # resumes at the saved offset: nothing is owed
+        assert (again.result, again.left_out_lines, again.skipped_lines) == (False, 1, 0)
+        assert flight.send_file(path, running.endpoint, "bs", timeout=20.0) is False
+    finally:
+        running.close()
+    assert [r["step"] for r in load_records(tmp_path / "store" / "runs" / "bs")] == [0, 1]
+
+
+def test_bug24c_bug02s_line_makes_close_false_and_the_count_survives_more_lines(tmp_path):
+    skip_without_server()
+    path = write_lines(tmp_path / "p.jsonl", [step_record("p", 0), bare_v2("p", 1)])
+    running = Server(tmp_path / "store")
+    try:
+        assert _send(path, running.endpoint, "p").result is False
+        with path.open("a") as file:
+            file.write(json.dumps(step_record("p", 2)) + "\n")
+        later = _send(path, running.endpoint, "p")
+        assert (later.result, later.left_out_lines) == (False, 1)
+        assert later.acked_offset == path.stat().st_size
+    finally:
+        running.close()
+
+
+def test_bug24c_sent_again_from_byte_0_counts_each_line_once(tmp_path):
+    skip_without_server()
+    path = write_lines(tmp_path / "bs.jsonl", [scalar_record("bs", 2**63, 0, {"x": 1.0}), step_record("bs", 0)])
+    running = Server(tmp_path / "store")
+    try:
+        assert _send(path, running.endpoint, "bs").result is False
+        flight.offset_path(path).unlink()
+        replayed = _send(path, running.endpoint, "bs")
+        assert (replayed.result, replayed.left_out_lines) == (False, 1)
+    finally:
+        running.close()
+
+
+def test_bug24c_the_offset_file_keeps_the_count(tmp_path):
+    skip_without_server()
+    path = write_lines(tmp_path / "bs.jsonl", [scalar_record("bs", 2**63, 0, {"x": 1.0}), step_record("bs", 0)])
+    running = Server(tmp_path / "store")
+    try:
+        _send(path, running.endpoint, "bs")
+    finally:
+        running.close()
+    document = flight.read_binding(flight.offset_path(path))
+    assert document["offset"] == path.stat().st_size and document["left_out"] == 1
+
+
+def test_bug24c_pins_a_whole_file_and_lines_that_are_not_this_runs(tmp_path):
+    """True as before for a file whose every line of this run was sent, also beside a line that is
+    not JSON and a line of another run (counted in `skipped_lines`, as before)."""
+    skip_without_server()
+    path = write_lines(tmp_path / "ok.jsonl", [step_record("ok", 0), scalar_record("ok", 5, 0, {"x": 1.0})])
+    with path.open("a") as file:
+        file.write("not json\n" + json.dumps(step_record("other", 3)) + "\n" + json.dumps(step_record("ok", 1)) + "\n")
+    running = Server(tmp_path / "store")
+    try:
+        sender = _send(path, running.endpoint, "ok")
+        assert (sender.result, sender.skipped_lines, getattr(sender, "left_out_lines", 0)) == (True, 2, 0)
+        assert _send(path, running.endpoint, "ok").result is True
+        assert flight.send_file(path, running.endpoint, "ok", timeout=20.0) is True
+    finally:
+        running.close()
+
