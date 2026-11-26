@@ -269,3 +269,99 @@ def test_bug29_the_command_lines_rerun_export_is_the_judged_ranks(tmp_path, monk
     evidence.main()
     assert [(step, value[1]) for step, entity, value in logged if entity == "/logged/loss"] == [(0, 2.0)]
 
+
+# ---- BUG-09: a clipping norm that holds no value ------------------------------------------------
+#
+# Python chose the run's gradient series by whether any record has the key `clip_grad_norm`, so
+# one explicit null switched `grad_spike`, `update_spike` and `gradient_trend` off `grad_norm` for
+# the whole run. Rust switches on a value its float64 column carries: a number, or the sink's
+# "nan", "inf" or "-inf". A null, or a value the column cannot carry (a bool, other text), is none.
+
+SERVER_BIN = os.environ.get("TENSORQUILL_SERVER_BIN")
+
+
+def _rust(records: list[dict], **options) -> dict:
+    pytest.importorskip("pyarrow")
+    if not SERVER_BIN or not Path(SERVER_BIN).exists():
+        pytest.skip("needs a tensorquill-server binary (TENSORQUILL_SERVER_BIN)")
+    return evidence.build_evidence(records, detectors="rust", server_binary=SERVER_BIN, **options)
+
+
+def _spiked(**at_12) -> list[dict]:
+    rows = [{"run_id": "r", "rank": 0, "step": i, "grad_norm": 100.0 if i == 22 else 1.0} for i in range(36)]
+    rows[12].update(at_12)
+    return rows
+
+
+def _kinds(built: dict) -> list[tuple[str, int]]:
+    return [(i["kind"], i["step"]) for i in built["incidents"]]
+
+
+@pytest.mark.parametrize("value", [None, True, "refused"], ids=["null", "bool", "text"])
+def test_bug09_a_clipping_norm_with_no_value_leaves_the_run_on_grad_norm(value):
+    built = evidence.build_evidence(_spiked(clip_grad_norm=value), detectors="python")
+    assert _kinds(built) == [("grad_spike", 22)]
+    assert built["gradient_trend"]["series"] == "grad_norm"
+
+
+def test_bug09_a_grad_norm_the_column_cannot_carry_is_no_gradient_input():
+    built = evidence.build_evidence([{"run_id": "r", "rank": 0, "step": 0, "grad_norm": True}], detectors="python")
+    assert built["kind_checks"]["grad_spike"]["value"] == "not_configured"
+    assert evidence.input_counts([{"step": 0, "grad_norm": True, "clip_grad_norm": "x"}])["grad_total"] == 0
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", 3.0], ids=["nan", "inf", "number"])
+def test_bug09_pin_a_carried_clipping_norm_still_switches_the_whole_run(value):
+    """A value the column carries, finite or not, says the run clips: every record's total is then
+    the pre-clipping norm, and the records without one have none (the spike at 22 is not seen)."""
+    built = evidence.build_evidence(_spiked(clip_grad_norm=value), detectors="python")
+    assert ("grad_spike", 22) not in _kinds(built)
+    assert evidence.input_counts([{"step": 0, "clip_grad_norm": value}])["grad_total"] == 1
+
+
+@pytest.mark.parametrize("at_12", [{}, {"clip_grad_norm": None}, {"clip_grad_norm": True}, {"clip_grad_norm": "nan"},
+                                   {"clip_grad_norm": 3.0}, {"grad_norm": True}],
+                         ids=["control", "null", "bool", "nan", "number", "grad_norm_bool"])
+def test_bug09_both_engines_give_the_same_gradient_verdict(at_12):
+    rows = _spiked(**at_12)
+    python, rust = evidence.build_evidence(rows, detectors="python"), _rust(rows)
+    assert _kinds(python) == _kinds(rust)
+    assert python["run_state"]["state"] == rust["run_state"]["state"]
+    assert python["kind_checks"]["grad_spike"]["value"] == rust["kind_checks"]["grad_spike"]["value"]
+    assert python.get("gradient_trend") == rust.get("gradient_trend")
+
+
+def _random_run(seed: int) -> list[dict]:
+    """60 steps of gradient and update sizes, with a spike, a skipped step and, in every third seed,
+    a null clipping norm somewhere; in some seeds a clipping run."""
+    draw = random.Random(seed)
+    clips = seed % 5 == 4
+    spike, null_at = draw.randrange(20, 55), draw.randrange(0, 60) if seed % 3 == 0 else None
+    rows = []
+    for step in range(60):
+        total = (25.0 if step == spike else 1.0) * (1 + draw.uniform(-0.05, 0.05))
+        row = {"run_id": "r", "rank": 0, "step": step, "grad_norms": {"w": total * 0.8, "b": total * 0.2},
+               "update_rms": {"w": 0.01 * total * (1 + draw.uniform(-0.02, 0.02)), "b": 0.001}, "lr": [0.01]}
+        if clips:
+            row.update(grad_norm=None, clip_grad_norm=total)
+        else:
+            row["grad_norm"] = total
+        if step == null_at:
+            row["clip_grad_norm"] = None
+        if step == 40 and seed % 4 == 1:
+            row["step_skipped"] = True
+        rows.append(row)
+    return rows
+
+
+GRAD_KINDS = ("grad_spike", "update_spike")
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_bug09_thirty_seeds_both_engines_agree_on_the_gradient_kinds(seed):
+    rows = _random_run(seed)
+    python, rust = evidence.build_evidence(rows, detectors="python"), _rust(rows)
+    assert ([x for x in _kinds(python) if x[0] in GRAD_KINDS] == [x for x in _kinds(rust) if x[0] in GRAD_KINDS])
+    for kind in GRAD_KINDS:
+        assert python["kind_checks"][kind]["value"] == rust["kind_checks"][kind]["value"]
+    assert python.get("gradient_trend") == pytest.approx(rust.get("gradient_trend"))
