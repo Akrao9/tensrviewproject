@@ -29,9 +29,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -579,3 +582,56 @@ def test_pid_is_the_sessions_own():
     assert session._pid == os.getpid()
     session.close()
 
+
+# ---- examples/pinned_flush_check.py, the script for the GPU run ---------------------------------------
+
+EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+
+
+def test_the_gpu_scripts_dry_run_works_on_the_cpu(tmp_path):
+    """Shows that the script runs both arms in their own processes and writes its verdict: on the CPU the
+    pinned arm falls back to the blocking copy, so it shows nothing about the pinned path itself."""
+    out = tmp_path / "dry"
+    env = {**os.environ, "PYTHONPATH": str(Path(capture.__file__).resolve().parents[1])}
+    done = subprocess.run([sys.executable, str(EXAMPLES / "pinned_flush_check.py"), "--out", str(out), "--dry-run"],
+                          env=env, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stderr[-2000:]
+    verdict = json.loads((out / "verdict.json").read_text())
+    assert verdict["state"] == "dry-run" and verdict["not_run_on_a_gpu"] and not verdict["failed_arms"]
+    (check,) = verdict["checks"]
+    assert check["records_equal"] and check["records"] > 0
+    assert not check["pinned_used_to_the_end"]  # no CUDA here
+    for arm in ("blocking", "pinned"):
+        steps = verdict["arms"][arm]
+        assert steps["flush_steps"]["n"] > 0 and steps["other_steps"]["n"] > 0
+    arm = json.loads((out / "arm-pinned-r0.json").read_text())
+    assert [w for w in arm["tensorquill_warnings"] if "pinned_flush" in w]
+
+
+def test_the_gpu_scripts_verdict(tmp_path):
+    sys.path.insert(0, str(EXAMPLES))
+    try:
+        import pinned_flush_check as check
+    finally:
+        sys.path.remove(str(EXAMPLES))
+
+    def arm(name, rnd, records, *, pinned=True, syncs=None):
+        (tmp_path / f"{name}{rnd}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+        return {"arm": name, "round": rnd, "state": "measured", "records_file": f"{name}{rnd}.jsonl",
+                "pinned_used_to_the_end": pinned, "sync_calls": {"training": syncs or {}},
+                "step_ms": [1.0] * 10, "flush_steps": {}, "other_steps": {}}
+
+    a, b = [{"step": 0, "grad_norm": 1.0, "ts": 1.0}], [{"step": 0, "grad_norm": 1.0, "ts": 2.0}]
+    passing = {"blocking": [arm("blocking", 0, a), arm("blocking", 1, a)], "pinned": [arm("pinned", 0, b), arm("pinned", 1, b)]}
+    assert check.summarize(passing, tmp_path, False, 2, 5)["state"] == "pass"  # `ts` is not compared
+    waited = {**passing, "pinned": [arm("pinned", 0, b, syncs={"flush": 3}), arm("pinned", 1, b)]}
+    assert check.summarize(waited, tmp_path, False, 2, 5)["state"] == "fail"
+    elsewhere = {**passing, "pinned": [arm("pinned", 0, b, syncs={"other": 3}), arm("pinned", 1, b)]}
+    assert check.summarize(elsewhere, tmp_path, False, 2, 5)["state"] == "pass"  # not the flush's: reported
+    fell_back = {**passing, "pinned": [arm("pinned", 0, b, pinned=False), arm("pinned", 1, b)]}
+    assert check.summarize(fell_back, tmp_path, False, 2, 5)["state"] == "fail"
+    differs = {**passing, "pinned": [arm("pinned", 0, [{"step": 0, "grad_norm": 2.0}]), arm("pinned", 1, b)]}
+    assert check.summarize(differs, tmp_path, False, 2, 5)["state"] == "fail"
+    noisy = {**passing, "blocking": [arm("blocking", 0, a), arm("blocking", 1, [{"step": 0, "grad_norm": 3.0}])]}
+    assert check.summarize(noisy, tmp_path, False, 2, 5)["state"] == "inconclusive"
+    assert check._label(4, 5) == "flush" and check._label(5, 5) == "after_flush" and check._label(6, 5) == "other"
