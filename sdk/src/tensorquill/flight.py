@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .identity import SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record
+from .identity import SCALAR_VERSION, SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 from .sink import _finite
 
@@ -897,6 +897,19 @@ def parse_lines(
 # The identity fields the sender checks before it sends a line (`WAVE_AF_CONTRACT.md` section 10).
 # Not `schema_version`: a version the server does not read is sent, for the server to count (RS10).
 SENDER_FIELDS = ("rank", "attempt", "step")
+# A line of record version 2, which this package reads as the scalar-only record alone, is checked
+# with its `schema_version` too (wave AO, BUG-02): `identity.check` then refuses one with no
+# `"record": "scalars"`, and one whose `seq` is not an integer of 0 or more. Sent, such a line was a
+# step row of `record_version` 2 with a null `seq`, which a server stored as a training step in a
+# part every Python reader then refused.
+_SCALAR_FIELDS = ("schema_version", *SENDER_FIELDS)
+
+
+def _sender_fields(record: Mapping[str, Any]) -> tuple[str, ...]:
+    """The identity fields `rows_to_send` checks on `record`: `SENDER_FIELDS`, and `schema_version`
+    too when the record says it is of the scalar-only record's version."""
+    version = record.get("schema_version") if isinstance(record, Mapping) else None
+    return _SCALAR_FIELDS if type(version) is int and version == SCALAR_VERSION else SENDER_FIELDS
 _KEY_DEFAULTS = {"schema_version": 0, "rank": 0, "attempt": 0}
 
 
@@ -924,7 +937,8 @@ def rows_to_send(
 ) -> tuple[Any, list[int], int]:
     """`records` as one record batch of `schema`, the training steps it holds, and how many records were
     left out for a key: a `rank`, `attempt` or `step` that `identity.check` does not take (negative,
-    not an integer, or a missing `step`; wave AG, `WAVE_AF_CONTRACT.md` section 10), or a key
+    not an integer, or a missing `step`; wave AG, `WAVE_AF_CONTRACT.md` section 10), a record of version 2
+    that is not a whole scalar-only record (no `"record": "scalars"`, or no valid `seq`; wave AO), or a key
     column whose value cannot be stored (a null or a string where a key column needs an integer,
     an integer too large for its column). Such a line is skipped and counted like a line that is
     not JSON, and the lines after it are sent. Were it kept, every retry would start again at it
@@ -968,7 +982,7 @@ def rows_to_send(
     skipped = 0
     for index, record in enumerate(records):
         try:
-            check(record, None, SENDER_FIELDS)
+            check(record, None, _sender_fields(record))
         except MalformedRecordError as error:
             skipped += 1
             leave_out(index, record, error.field, error.value)
@@ -1549,9 +1563,13 @@ class FlightSender:
             offset = start + sum(len(line) + 1 for line in lines[:line_index])
             step = steps[index]
             found = "absent" if value is MalformedRecordError.ABSENT else _shown(value)
-            why = ("tensorquill reads an integer of 0 or more; the server would refuse the whole batch holding it"
-                   if field in SENDER_FIELDS and isinstance(value, int) and not isinstance(value, bool)
-                   and value < 0 else "its column in the stream cannot hold it")
+            if field == "schema_version":
+                why = ('schema version 2 is the scalar-only record, which has "record": "scalars"; sent, it would '
+                       "be stored as a step no reader takes")
+            elif field in SENDER_FIELDS and isinstance(value, int) and not isinstance(value, bool) and value < 0:
+                why = "tensorquill reads an integer of 0 or more; the server would refuse the whole batch holding it"
+            else:
+                why = "its column in the stream cannot hold it"
             shown_step = "" if step is MalformedRecordError.ABSENT else f" (step {_shown(step)})"
             print(
                 f"tensorquill: the line at byte {offset} of {self.path}{shown_step} is not sent to {self.endpoint}: "

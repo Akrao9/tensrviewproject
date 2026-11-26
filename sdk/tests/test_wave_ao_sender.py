@@ -124,7 +124,7 @@ def test_bug02_pins_what_is_still_sent():
     assert [(i, f) for i, f, _ in refused] == [(4, "seq")]
 
 
-def test_bug02_through_a_real_server_the_store_stays_readable(tmp_path):
+def test_bug02_through_a_real_server_the_store_stays_readable(tmp_path, capsys):
     skip_without_server()
     from tensorquill.evidence import load_records
 
@@ -138,3 +138,5 @@ def test_bug02_through_a_real_server_the_store_stays_readable(tmp_path):
         running.close()
     stored = load_records(tmp_path / "store" / "runs" / "p")
     assert [r["step"] for r in stored] == [0, 2]
+    said = capsys.readouterr().err
+    assert "(step 1) is not sent" in said and '"record": "scalars"' in said, said

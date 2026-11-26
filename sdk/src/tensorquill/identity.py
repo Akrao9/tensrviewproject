@@ -108,7 +108,8 @@ def check(record: Mapping[str, Any], where: str | None = None, fields: tuple[str
 
     `fields` limits the check to some of `FIELDS`, in `FIELDS`' order, by the same rules: the
     sender's own file checks only `rank`, `attempt` and `step` (`flight.SENDER_FIELDS`), since a
-    `schema_version` the server does not read is sent for the server to count (RS10).
+    `schema_version` the server does not read is sent for the server to count (RS10); on a line of
+    version 2 it checks `schema_version` too, so one that is not a whole scalar-only record is not sent.
 
     With `schema_version` checked, a record of version 2 must be a scalar-only record: `record`
     `"scalars"`, else `schema_version` is named; and, after `step`, `seq` an integer of 0 or more,
