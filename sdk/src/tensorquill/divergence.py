@@ -111,10 +111,17 @@ _NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
 
 
 def _number(value: Any) -> float | None:
-    """A recorded number as a float (non-finite ones included), or None for anything else."""
+    """A recorded number as a float (non-finite ones included), or None for anything else. An
+    integer too large for a float is the infinity of its sign, so the point is kept and compared as
+    one that is not finite, and nothing raises (wave AO, BUG-25)."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        try:
+            return float(value)
+        except OverflowError:
+            return math.inf if value > 0 else -math.inf
+    if isinstance(value, float):
         return float(value)
     if isinstance(value, str):
         return _NON_FINITE.get(value)
