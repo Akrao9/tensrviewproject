@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import pickle
+import re
 import threading
 from pathlib import Path
 from typing import Any, Iterator
@@ -165,10 +166,32 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
             ) from error
 
     dumped = sorted(int(d["rank"]) for d in details.values())
-    groups = {g.id: g for g in db.groups}
     members: dict[str, set[int]] = {}
     for membership in db.memberships:
         members.setdefault(membership.group_id, set()).add(int(membership.global_rank))
+
+    groups = {g.id: g for g in db.groups}
+
+    def group_of(collective: Any, expected: list[int]) -> Any:
+        """The analyzer's group of `collective`, or None.
+
+        A collective names its group by the uid in the dump (`process_group[0]`); the analyzer keys
+        its groups by that uid followed by the hash of the group's ranks, `uid +
+        str(hash(frozenset(ranks)))` (`build_groups_memberships`, the same from PyTorch 2.5 to 2.15),
+        since split groups can share a uid; and a collective's expected ranks are its group's members.
+        The hash of a set of ints is the same in every interpreter, and the analyzer ran in this one,
+        so that id is looked up first. Should a later analyzer key its groups otherwise, the group is
+        the one whose id starts with the uid and whose members are those ranks, when exactly one is
+        (groups "1" and "10" on the same ranks are not told apart that way, and give None)."""
+        uid, ranks = str(collective.group_id), set(expected)
+        try:
+            exact = groups.get(uid + str(hash(frozenset(ranks))))
+        except TypeError:
+            exact = None
+        if exact is not None and members.get(exact.id) == ranks:
+            return exact
+        found = [g for g in db.groups if str(g.id).startswith(uid) and members.get(g.id) == ranks]
+        return found[0] if len(found) == 1 else None
 
     def seq(collective: Any) -> int | str:
         value = collective.collective_seq_id
@@ -218,29 +241,30 @@ def analyze_flight_recorder(trace_dir: str | Path, *, prefix: str | None = None)
     if not problems:
         return result
     kind, first = problems[0]
-    group = groups.get(first.group_id)
     expected = sorted(int(r) for r in first.expected_ranks)
+    group = group_of(first, expected)
     missing = sorted(int(r) for r in (first.missing_ranks or ()))
-    # Each line of a report is its own log record; a report starts at "sequence number: N".
+    # Each line of a report is its own log record; a report starts at "sequence number: N", and
+    # names its group in a line of its own, "group info: <pg_desc>" (`Op.log`): the uid, followed by
+    # ":<description>" only when the group has one other than "undefined". The whole line is
+    # matched, so group "1" is not taken for "10" or "1:tp".
     blocks: list[list[str]] = []
     for message in messages:
         if "sequence number:" in message or not blocks:
             blocks.append([])
         blocks[-1].append(message)
-    detail = next(
-        (
-            "\n".join(block)
-            for block in blocks
-            if f"sequence number: {first.collective_seq_id}" in block[0] and f"group info: {first.group_id}:" in "\n".join(block)
-        ),
-        None,
-    )
+    # The sequence number too is matched whole, so #1 is not taken for #12.
+    numbered = re.compile(rf"sequence number: {re.escape(str(first.collective_seq_id))}(?!\d)")
+    named = f"group info: {first.pg_desc}"
+    detail = next(("\n".join(block) for block in blocks if numbered.search(block[0]) and named in block), None)
     culprit = None
     if detail and "Culprit rank" in detail:
         culprit = detail[detail.index("Culprit rank"):].splitlines()[0][:300]
     result["problem"] = {
         "type": kind,
-        "group": {"id": first.group_id, "desc": group.desc if group else first.pg_desc, "size": group.size if group else None},
+        # The description as the analyzer prints it ("0", "0:default_pg"), whether or not the group
+        # was found: "undefined" is PyTorch's word for none. The size is the group's.
+        "group": {"id": first.group_id, "desc": first.pg_desc, "size": group.size if group else None},
         "collective": str(first.collective_name).split(":")[-1],
         "collective_seq_id": seq(first),
         "state": str(first.collective_state),
