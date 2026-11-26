@@ -1328,6 +1328,31 @@ mod tests {
                    "resumed_hash": "v2:aaaa", "expected_hash": null, "matched_step": i64::MIN,
                    "batches_apart": u64::MAX, "previous_attempt": 1})
         );
+        // Both sides drew the batch; the earlier one is nearer by 4, at distances near `i64::MAX`.
+        let both_sides = [
+            (1, i64::MIN, drew_json("v2:bbbb"), None, None),
+            (1, i64::MIN + 5, drew_json("v2:aaaa"), None, None),
+            (1, i64::MAX, drew_json("v2:aaaa"), None, None),
+            (2, 0, drew_json("v2:aaaa"), None, None),
+        ];
+        assert_eq!(
+            data_change(&both_sides),
+            json!({"step": 0, "rank": 0, "attempt": 2, "basis": "lookup", "finding": "repeated",
+                   "resumed_hash": "v2:aaaa", "expected_hash": null, "matched_step": i64::MIN + 5,
+                   "batches_apart": i64::MAX - 4, "previous_attempt": 1})
+        );
+    }
+
+    #[test]
+    fn wave_ap_batches_apart_is_written_as_before_within_i64() {
+        // `batches_apart` is now a `u64`. For every distance an `i64` held, the report's JSON is the
+        // same text as before: serde_json writes the same digits for the two types.
+        for distance in [0_i64, 1, 9, 10, 4096, i64::from(u32::MAX), i64::MAX - 10, i64::MAX] {
+            let now = json!({"batches_apart": distance.unsigned_abs()}).to_string();
+            assert_eq!(now, json!({"batches_apart": distance}).to_string());
+        }
+        // Past it, the digits Python writes for `abs(2**63 - 1 - -(2**63))`.
+        assert_eq!(json!(u64::MAX).to_string(), "18446744073709551615");
     }
 
     /// Attempt 1 at steps 0 and 1 with two learning rates (so a scheduler is expected), then attempt 2
