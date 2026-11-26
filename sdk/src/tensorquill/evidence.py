@@ -274,6 +274,23 @@ def _held_spread_table(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return table
 
 
+def _object(record: Mapping[str, Any], field: str) -> Mapping[str, Any]:
+    """`record[field]` when it is an object, else an empty one. A field outside the identity fields
+    that is not what its column holds is absent to the rules that read it, and never raised on
+    (WAVE_AF_CONTRACT.md section 1; BUG-12): Rust's column is null for it."""
+    value = record.get(field)
+    return value if isinstance(value, Mapping) else {}
+
+
+def _unchanged_names(record: Mapping[str, Any]) -> list[str] | None:
+    """A record's `weights_unchanged` as its column holds it, a list of names, or None: a value that
+    is not a list of strings (`true`, `[1]`) is no weight check, as Rust reads it (BUG-12)."""
+    names = record.get("weights_unchanged")
+    if isinstance(names, list) and all(isinstance(name, str) for name in names):
+        return names
+    return None
+
+
 def _weight_check(record: Mapping[str, Any]) -> bool:
     """Whether a record is a weight check as both engines count one: `weight_norms` with at least
     one norm the column carries (a null counts, as Rust counts the entry)."""
@@ -567,11 +584,11 @@ def scalar_context(
     if index is None:
         return {}
     context = {}
-    for name, value in (records[index].get("scalars") or {}).items():
+    for name, value in _object(records[index], "scalars").items():
         if isinstance(value, bool):
             continue
         before = [
-            v for v in (_finite((r.get("scalars") or {}).get(name)) for r in records[max(0, index - window) : index])
+            v for v in (_finite(_object(r, "scalars").get(name)) for r in records[max(0, index - window) : index])
             if v is not None
         ]
         context[name] = {"value": value, "median_before": _median(before) if before else None}
@@ -700,7 +717,7 @@ class _GradSpikes:
             self.total_count += 1
             totals.append(total)
             lasted: list[dict[str, Any]] = []
-            for name, value in record.get("grad_norms", {}).items():
+            for name, value in _object(record, "grad_norms").items():
                 norm = _finite(value)
                 if norm is None:
                     continue
@@ -1143,7 +1160,7 @@ def _spiking_parameters(
     window: int,
 ) -> list[dict[str, Any]]:
     found = []
-    for name, value in record.get("grad_norms", {}).items():
+    for name, value in _object(record, "grad_norms").items():
         norm = _finite(value)
         past = list(per_param.get(name, ()))[-window:]
         if norm is None or len(past) < 2:
@@ -1185,7 +1202,9 @@ def weight_norm_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     are grouped by name into embeddings, norms, biases and matrices. Returns None with
     fewer than two weight checks.
     """
-    checked = [r for r in sorted(records, key=lambda r: r["step"]) if r.get("weight_norms")]
+    # A weight check as `weight_jumps` counts one (`_weight_check`): a `weight_norms` that is not an
+    # object, or holds no norm the column carries, is none, so the last check is the last that holds one.
+    checked = [r for r in sorted(records, key=lambda r: r["step"]) if _weight_check(r)]
     if len(checked) < 2:
         return None
     first, last = checked[0], checked[-1]
@@ -1912,12 +1931,12 @@ def detect_stalled_weights(
             for name in streak:
                 streak[name] = 0
         attempt_before = attempt
-        unchanged = record.get("weights_unchanged")
+        unchanged = _unchanged_names(record)
         if unchanged is None:
             continue
         evidence = (_finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None) \
             and skipped_by(record) is None
-        grads = record.get("grad_norms", {})
+        grads = _object(record, "grad_norms")
         unchanged_set = set(unchanged)
         for name in streak:
             if name not in unchanged_set:
@@ -2373,11 +2392,8 @@ RESUME_LR_TOLERANCE = 1e-6  # relative; the same scheduler restored gives the sa
 
 
 def _lr_values(record: Mapping[str, Any]) -> list[float] | None:
-    lr = record.get("lr")
-    if not lr:
-        return None
-    values = [_finite(v) for v in lr]
-    return None if any(v is None for v in values) else [float(v) for v in values]  # type: ignore[arg-type]
+    """A record's learning rates, `_lr_list`'s: an `lr` that is not a list (`0.001`) is none (BUG-12)."""
+    return _lr_list(record)
 
 
 def detect_resume_lr_changes(
@@ -3575,14 +3591,14 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         # A record holds a layer only through an entry that is an object (section 1.5; row S5, the
         # owner's approved change, Nov 24): a value that is not an object, or one whose only entries
         # are not objects, holds none, as Rust reads it.
-        norms, layers = bool(record.get("grad_norms")), bool(layer_entries(record))
+        norms, layers = bool(_object(record, "grad_norms")), bool(layer_entries(record))
         counts["grad_total"] += total
         # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
         counts["update"] += (
             total and isinstance(record.get("update_rms"), Mapping) and bool(record["update_rms"])
             and not record.get("step_skipped")
         )
-        counts["weight_check"] += record.get("weights_unchanged") is not None and norms
+        counts["weight_check"] += _unchanged_names(record) is not None and norms
         # A skip only the caller reported is not the loss scale's to judge unless the scaler was seen
         # to apply that update (`detect_loss_scale_trouble`).
         counts["loss_scale"] += record.get("step_skipped") is not None and (
@@ -6736,7 +6752,7 @@ def _diversity_from_counts(counts: list[int], n_experts: int) -> float:
 def _non_finite_gradients(record: Mapping[str, Any]) -> list[str]:
     """What is not finite among a record's gradient norms, as a `non_finite` incident names it:
     each parameter, else `<total>`, and `<total before clipping>`."""
-    bad = [name for name, norm in (record.get("grad_norms") or {}).items() if _is_non_finite(norm)]
+    bad = [name for name, norm in _object(record, "grad_norms").items() if _is_non_finite(norm)]
     if _is_non_finite(record.get("grad_norm")) and not bad:
         bad.append("<total>")
     if _is_non_finite(record.get("clip_grad_norm")):
@@ -9516,12 +9532,13 @@ def export_rerun(
                 if clip_norm is not None:
                     rr.log("/training/clip_grad_norm", rr.Scalars(clip_norm))
                     training_paths["/training/clip_grad_norm"] = "Pre-clipping gradient norm"
-                weights = [v for v in record.get("weight_norms", {}).values() if _finite(v) is not None]
+                weights = [v for v in _object(record, "weight_norms").values() if _finite(v) is not None]
                 if weights:
                     rr.log("/training/weight_norm", rr.Scalars(math.sqrt(sum(v * v for v in weights))))
                     training_paths["/training/weight_norm"] = "Weight norm"
-                if record.get("lr"):
-                    rr.log("/training/lr", rr.Scalars(float(record["lr"][0])))
+                lr = record.get("lr")
+                if isinstance(lr, list) and lr and _carried(lr[0]):
+                    rr.log("/training/lr", rr.Scalars(float(_wire_float(lr[0]))))
                     training_paths["/training/lr"] = "Learning rate"
                 scale = _finite(record.get("grad_scale"))
                 if scale is not None:
@@ -9530,7 +9547,7 @@ def export_rerun(
                 if "step_skipped" in record:
                     rr.log("/training/step_skipped", rr.Scalars(float(bool(record["step_skipped"]))))
                     training_paths["/training/step_skipped"] = "Update skipped (by the loss scaler or the caller)"
-                for name, val in (record.get("scalars") or {}).items():
+                for name, val in _object(record, "scalars").items():
                     if int(record["step"]) in overridden.get(name, ()):
                         continue  # a scalar-only record's point stands at this step (Q6 a)
                     value = _finite(val)
@@ -9540,7 +9557,7 @@ def export_rerun(
                         rr.log(entity, rr.Scalars(value))
                         logged_paths[entity] = name
                 probe = record.get("probe")
-                if probe:
+                if probe and isinstance(probe, Mapping):
                     probe_series |= _log_probe(rr, probe, probe_hist, probe_maps, probe_invalid)
                 for layer_name, stats in layer_entries(record):
                     for key, val in stats.items():
@@ -9607,10 +9624,15 @@ def _log_probe(
     logit and entropy series. Returns whether any series was logged."""
     import numpy as np
 
-    for layer, hist in probe.get("histograms", {}).items():
-        counts = hist.get("counts") or []
+    # A part of the probe that is not what it should be is not logged, and never raised on (BUG-12).
+    for layer, hist in _object(probe, "histograms").items():
+        if not isinstance(hist, Mapping):
+            continue
+        counts = hist.get("counts")
         lo, hi = _finite(hist.get("lo")), _finite(hist.get("hi"))
-        if not counts or lo is None or hi is None:
+        if not isinstance(counts, list) or not counts or lo is None or hi is None:
+            continue
+        if any(_finite(count) is None for count in counts):
             continue
         width = (hi - lo) / len(counts)
         entity = f"/probe/histograms/{rr.escape_entity_path_part(layer)}"
@@ -9621,29 +9643,43 @@ def _log_probe(
         ))
         hist_paths[entity] = layer
     series = False
-    for layer, att in probe.get("attention", {}).items():
-        part = rr.escape_entity_path_part(layer)
-        logits = [v for v in (_finite(x) for x in att.get("max_logit", [])) if v is not None]
+    for layer, att in _object(probe, "attention").items():
+        if not isinstance(att, Mapping):
+            continue
+        part = rr.escape_entity_path_part(str(layer))
+        logits = [v for v in (_finite(x) for x in _listed(att.get("max_logit"))) if v is not None]
         if logits:
             rr.log(f"/probe/max_logit/{part}", rr.Scalars(max(logits)))
             series = True
-        shares = [v for v in (_finite(x) for x in att.get("entropy_share", [])) if v is not None]
+        shares = [v for v in (_finite(x) for x in _listed(att.get("entropy_share"))) if v is not None]
         if not shares and _finite(att.get("max_entropy")):
             # Probe records from before `entropy_share`: entropy over the log of all keys.
             top = float(att["max_entropy"])
-            shares = [v / top for v in (_finite(x) for x in att.get("entropy", [])) if v is not None]
+            shares = [v / top for v in (_finite(x) for x in _listed(att.get("entropy"))) if v is not None]
         if shares:
             rr.log(f"/probe/entropy/{part}", rr.Scalars(sum(shares) / len(shares)))
             series = True
-        if att.get("invalid_rows"):
+        invalid_rows = _finite(att.get("invalid_rows"))
+        if invalid_rows:
             # NaN or Inf attention scores: a numerical failure, kept apart from entropy.
-            rr.log(f"/probe/invalid_rows/{part}", rr.Scalars(float(att["invalid_rows"])))
+            rr.log(f"/probe/invalid_rows/{part}", rr.Scalars(invalid_rows))
             invalid_series[0] = True
         if att.get("map"):
+            try:
+                values = np.asarray(att["map"], dtype=np.float32)
+            except (TypeError, ValueError):
+                continue  # not a table of numbers
+            if values.ndim != 2:
+                continue
             entity = f"/probe/attention/{part}"
-            rr.log(entity, rr.Tensor(np.asarray(att["map"], dtype=np.float32), dim_names=("query", "key")))
+            rr.log(entity, rr.Tensor(values, dim_names=("query", "key")))
             map_paths[entity] = layer
     return series
+
+
+def _listed(value: Any) -> list[Any]:
+    """`value` when it is a list, else an empty one."""
+    return value if isinstance(value, list) else []
 
 
 def _rank_argument(value: str) -> int | str:
