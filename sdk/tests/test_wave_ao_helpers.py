@@ -296,3 +296,107 @@ def test_the_hashes_written_before_stay_the_same():
     assert batch_hash([1, 2**63]) == "v2:5cf5707f7c6801b7"  # beyond int64: typed items
     assert batch_hash(["a", 1]) == "v2:cc40eb8dfc65b276"
     assert batch_hash([1, 2.5]) == "v2:bab08894da12d9bd"
+
+
+# ---- BUG-19: PyTorch Flight Recorder groups and the analyzer's "group info" line -----------------
+#
+# The dumps below have the keys and value types PyTorch's writer gives them (`FlightRecorderDetail.hpp`,
+# `getPgConfig` and the entry dictionary, format "2.10" from PyTorch 2.10 to 2.15): `pg_config` maps each
+# group's uid to its name, its description and its ranks as a string, and each entry names the group as
+# `(uid, description)`. A group made without a description has "undefined" (`distributed_c10d.py`,
+# `_new_process_group_helper`). The analyzer is PyTorch's own, as installed.
+
+
+def _analyzer():
+    pytest.importorskip("torch.distributed.flight_recorder.components.builder")  # PyTorch 2.10 or later
+    from tensorquill.collectives import analyze_flight_recorder
+
+    return analyze_flight_recorder
+
+
+def _fr_entry(record_id, uid, desc, seq, op, state="completed", sizes=((4, 4),)):
+    shapes = [list(s) for s in sizes]
+    return {
+        "record_id": record_id, "pg_id": int(uid), "process_group": (uid, desc), "thread_name": "pt_main_thread",
+        "thread_id": "1", "collective_seq_id": seq, "p2p_seq_id": 0, "op_id": seq, "profiling_name": f"nccl:{op}",
+        "time_created_ns": 1_000 * (record_id + 1), "input_sizes": shapes, "input_dtypes": ["Float"] * len(shapes),
+        "output_sizes": shapes, "output_dtypes": ["Float"] * len(shapes), "state": state,
+        "time_discovered_started_ns": None, "time_discovered_completed_ns": None, "retired": state == "completed",
+        "timeout_ms": 600_000, "is_p2p": False, "frames": [],
+    }
+
+
+def _fr_dumps(directory, groups, entries_by_rank):
+    """`groups`: {uid: (description, ranks)}; each rank's dump lists the groups it is in."""
+    import pickle
+
+    directory.mkdir()
+    for rank, entries in entries_by_rank.items():
+        config = {uid: {"name": uid, "desc": desc, "ranks": str(list(ranks))}
+                  for uid, (desc, ranks) in groups.items() if rank in ranks}
+        document = {"version": "2.10", "comm_lib_version": "2.27.3", "pg_config": config,
+                    "pg_status": {uid: {"last_enqueued_collective": 0, "last_started_collective": 0,
+                                        "last_completed_collective": 0} for uid in config},
+                    "entries": entries}
+        (directory / f"fr_trace_rank_{rank}").write_bytes(pickle.dumps(document))
+    return directory
+
+
+def _desync(uid, desc, ranks=(0, 1), *, at=2, other="all_gather"):
+    """Every rank of `ranks` completes all_reduce #1; at #`at` the last rank issues `other`."""
+    entries = {}
+    for rank in ranks:
+        op = other if rank == ranks[-1] else "all_reduce"
+        entries[rank] = [_fr_entry(0, uid, desc, 1, "all_reduce"), _fr_entry(1, uid, desc, at, op, "scheduled")]
+    return entries
+
+
+@pytest.mark.parametrize("desc, shown", [("undefined", "0"), ("default_pg", "0:default_pg")])
+def test_a_desync_in_a_group_keeps_the_group_s_size_and_the_culprit(tmp_path, desc, shown):
+    analyze = _analyzer()
+    directory = _fr_dumps(tmp_path / "fr", {"0": (desc, (0, 1))}, _desync("0", desc))
+    problem = analyze(directory)["problem"]
+    assert problem["type"] == "desync" and (problem["collective"], problem["collective_seq_id"]) == ("all_reduce", 2)
+    assert problem["group"] == {"id": "0", "desc": shown, "size": 2}
+    assert problem["mismatch"] is not None and problem["mismatch"].startswith("Culprit rank 1")
+    assert "all_gather" in problem["mismatch"]
+
+
+def test_a_hang_in_a_subgroup_has_the_subgroup_s_size_not_the_world_s(tmp_path):
+    analyze = _analyzer()
+    world, sub = (0, 1, 2), (0, 1)
+    entries = {rank: [_fr_entry(0, "0", "default_pg", 1, "all_reduce")] for rank in world}
+    for rank in sub:
+        entries[rank].append(_fr_entry(1, "1", "undefined", 1, "all_reduce"))
+    entries[0].append(_fr_entry(2, "1", "undefined", 2, "all_reduce", "started"))  # rank 1 never entered #2
+    directory = _fr_dumps(tmp_path / "fr", {"0": ("default_pg", world), "1": ("undefined", sub)}, entries)
+    problem = analyze(directory)["problem"]
+    assert problem["type"] == "hang" and problem["missing_ranks"] == [1] and problem["expected_ranks"] == [0, 1]
+    assert problem["group"] == {"id": "1", "desc": "1", "size": 2}
+
+
+def test_two_groups_on_the_same_ranks_whose_uids_share_a_prefix_are_told_apart(tmp_path):
+    """Groups "1" and "10" hold the same ranks and both desync at #2, over different collectives:
+    the culprit sentence is the one the analyzer wrote for the group of the problem reported."""
+    analyze = _analyzer()
+    one, ten = _desync("1", "undefined", other="all_gather"), _desync("10", "undefined", other="reduce_scatter")
+    for rank, mine in ten.items():
+        for index, entry in enumerate(mine):
+            entry["record_id"] = 10 + index
+    entries = {rank: one[rank] + ten[rank] for rank in (0, 1)}
+    directory = _fr_dumps(tmp_path / "fr", {"1": ("undefined", (0, 1)), "10": ("undefined", (0, 1))}, entries)
+    problem = analyze(directory)["problem"]
+    other = {"1": "all_gather", "10": "reduce_scatter"}[problem["group"]["id"]]
+    assert problem["group"]["size"] == 2 and problem["group"]["desc"] == problem["group"]["id"]
+    assert problem["mismatch"].startswith("Culprit rank 1") and other in problem["mismatch"]
+
+
+def test_the_incident_names_the_group_as_pytorch_prints_it(tmp_path):
+    analyze = _analyzer()
+    from tensorquill.collectives import flight_recorder_incident
+
+    directory = _fr_dumps(tmp_path / "fr", {"0": ("undefined", (0, 1))}, _desync("0", "undefined"))
+    incident = flight_recorder_incident(analyze(directory), step=12)
+    text = tensorquill.incident_summary({"incidents": [incident], "samples": [], "layer_count": 0,
+                                          "expert_count": 0, "router_names": []})
+    assert "at all_reduce #2 in group 0: Culprit rank 1" in text
