@@ -10,14 +10,16 @@ from __future__ import annotations
 import json
 import numbers
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
 
 import tensorquill
-from tensorquill import capture, identity
+from tensorquill import capture, identity, manifest
 from tensorquill.evidence import load_records
+from tensorquill.manifest import find_manifest
 from tensorquill.sink import MemorySink
 
 # ---- SIG-26: the version counter's calling form ---------------------------------------------------
@@ -363,3 +365,87 @@ def test_with_a_value_whose_transfer_fails_the_trainings_own_exception_comes_out
                 raise KeyError("the training's own failure")
     assert not session._worker.is_alive()
     assert path.with_name("r.rank0.end.json").exists()
+
+
+# ---- BUG-06: a run ID never leads a file out of the output folder --------------------------------
+#
+# The run ID names the files: `tensorquill-out/<run_id>.rank<N>.jsonl` and `<run_id>.run.json` beside
+# the records file. One holding a path separator wrote outside the folder (`../../escaped`) or into a
+# subfolder whose manifest landed in a doubled one (`sweep1/trial2`). An explicit `run_id` that could
+# do that is refused at `init`, before anything is opened; one from the environment or a tracker is
+# made to fit, with a warning, as a project name from there is (`manifest.resolve_project`).
+
+_LEAVING = ["../../escaped", "sweep1/trial2", "/abs/path", "a\\b", "C:x", "a\nb", "a\x00b", "tab\there",
+            "del\x7f", ".", ".."]
+
+
+def _files_under(root):
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def _work_folder(tmp_path, monkeypatch):
+    work = tmp_path / "work" / "inner"
+    work.mkdir(parents=True)
+    monkeypatch.chdir(work)
+    for name in ("MLFLOW_RUN_ID", "TORCHELASTIC_RUN_ID", "SLURM_JOB_ID", "TENSORQUILL_PROJECT"):
+        monkeypatch.delenv(name, raising=False)
+    return work
+
+
+@pytest.mark.parametrize("run_id", _LEAVING)
+def test_an_explicit_run_id_that_could_leave_the_folder_is_refused_before_anything_is_opened(
+        tmp_path, monkeypatch, run_id):
+    _work_folder(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match=r"^run_id .* cannot be used: "):
+        tensorquill.init(nn.Linear(2, 2), run_id=run_id, project="p", heartbeat_seconds=None)
+    assert _files_under(tmp_path) == []
+
+
+@pytest.mark.parametrize("run_id", _LEAVING)
+def test_an_explicit_run_id_that_could_leave_the_folder_is_refused_with_a_sink_given_too(tmp_path, run_id):
+    path = tmp_path / "given.rank0.jsonl"
+    with pytest.raises(ValueError, match=r"^run_id .* cannot be used: "):
+        tensorquill.init(nn.Linear(2, 2), run_id=run_id, sink=tensorquill.JsonlSink(path), heartbeat_seconds=None)
+    assert [p for p in tmp_path.rglob("*") if p.is_file() and p.stat().st_size] == []
+
+
+@pytest.mark.parametrize("variable", ["MLFLOW_RUN_ID", "TORCHELASTIC_RUN_ID"])
+@pytest.mark.parametrize("found, fitted", [("../../escaped", "..-..-escaped"), ("sweep1/trial2", "sweep1-trial2"),
+                                            ("a\\b:c", "a-b-c"), ("a\nb", "a-b"), ("..", "-")])
+def test_a_run_id_from_the_environment_is_made_to_fit_with_a_warning(tmp_path, monkeypatch, variable, found,
+                                                                       fitted):
+    work = _work_folder(tmp_path, monkeypatch)
+    monkeypatch.setenv(variable, found)
+    with pytest.warns(RuntimeWarning, match=r"is recorded under") as said:
+        with tensorquill.init(nn.Linear(2, 2), project="p", heartbeat_seconds=None) as session:
+            records_file = session._sink.path
+    assert session.run.run_id == fitted
+    assert any(repr(found) in str(w.message) and repr(fitted) in str(w.message) for w in said)
+    out = work / "tensorquill-out"
+    assert records_file == Path("tensorquill-out") / f"{fitted}.rank0.jsonl"
+    assert _files_under(tmp_path) == sorted(
+        str((out / name).relative_to(tmp_path)) for name in
+        (f"{fitted}.rank0.jsonl", f"{fitted}.rank0.end.json", f"{fitted}.run.json"))
+    found_manifest = find_manifest(out / f"{fitted}.rank0.jsonl")
+    assert found_manifest is not None and found_manifest["run_id"] == fitted
+
+
+@pytest.mark.parametrize("run_id", ["run-slurm1234.0", "exp 1", "résumé_7", "a..b", "...x", "UPPER-lower_09"])
+def test_a_run_id_that_stays_in_the_folder_is_taken_as_given(tmp_path, monkeypatch, run_id):
+    work = _work_folder(tmp_path, monkeypatch)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with tensorquill.init(nn.Linear(2, 2), run_id=run_id, project="p", heartbeat_seconds=None) as session:
+            pass
+    assert session.run.run_id == run_id
+    assert (work / "tensorquill-out" / f"{run_id}.rank0.jsonl").exists()
+    assert (work / "tensorquill-out" / f"{run_id}.run.json").exists()
+
+
+def test_the_run_id_rule_is_one_pure_function_beside_the_project_rule():
+    assert manifest.run_id_problem("ok-1.2_3") is None
+    for bad in _LEAVING:
+        assert manifest.run_id_problem(bad)
+        fitted = manifest.conform_run_id(bad)
+        assert manifest.run_id_problem(fitted) is None
+        assert manifest.conform_run_id(bad) == fitted  # every rank makes the same ID of the same one
