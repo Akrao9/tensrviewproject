@@ -5112,6 +5112,9 @@ def init(
             not be `.` or `..`: a `run_id` given here that does raises `ValueError`, and one from
             the environment, a tracker or a launcher is made to fit, each such character
             replaced by `-`, with a warning (`manifest.run_id_problem`).
+            A `Path` (any `os.PathLike`) is taken by its text, and is that string everywhere;
+            anything else that is not None or a string (`123`, `0`, `False`) raises `ValueError`.
+            None or `""` means not given.
         project: the project the run is listed and compared under. Defaults to
             `TENSORQUILL_PROJECT`, then the tracker's (W&B's project, or
             `MLFLOW_EXPERIMENT_NAME`), then `uncategorized`. W&B's rule applies: at most 128
@@ -5301,7 +5304,9 @@ def init(
     if group is not None and not isinstance(group, str):
         raise ValueError(f"group must be a string, not {type(group).__name__}")
     _manifest.resolve_name(name, None)
-    _manifest.check_run_id(run_id)  # one that could name a file outside the output folder (BUG-06)
+    # From here on the run ID is None or a string: a `Path` is its text, anything else raised (AO-04),
+    # as did one that could name a file outside the output folder (BUG-06).
+    run_id = _manifest.check_run_id(run_id)
     tags, config = _manifest.clean_tags(tags), _manifest.clean_config(config)
     # Every check of the model and the options too, before the run is resolved (which tells other
     # ranks its ID) or anything is opened: an `init` that is rejected changes nothing.
