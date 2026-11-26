@@ -7,9 +7,16 @@ tests that need Apple's MPS skip where it is not there.
 
 from __future__ import annotations
 
-import torch
+import numbers
 
-from tensorquill import capture
+import pytest
+import torch
+from torch import nn
+
+import tensorquill
+from tensorquill import capture, identity
+from tensorquill.evidence import load_records
+from tensorquill.sink import MemorySink
 
 # ---- SIG-26: the version counter's calling form ---------------------------------------------------
 #
@@ -94,3 +101,87 @@ def test_an_exception_raised_while_a_step_restores_versions_comes_out(monkeypatc
         came_out = True
     assert came_out or not raised, "a SystemExit raised during the restore was lost"
     assert raised == [] and tensor._version == 0
+
+
+# ---- BUG-05: `start_step` and `every` are integers, as `log`'s `step=` is ------------------------
+#
+# A bool is an `int` in Python, so `start_step=True` was taken and step 0 was written `"step": true`,
+# which every reader refuses. `init` refuses them by `log`'s rule for `step=` (`_explicit_step`): a
+# bool, a float or anything not an integer raises `TypeError`, a number below the least `ValueError`,
+# each naming the argument, before anything is opened.
+
+
+def _init_in(tmp_path, monkeypatch, **options):
+    monkeypatch.chdir(tmp_path)
+    return tensorquill.init(nn.Linear(2, 2), run_id="r", heartbeat_seconds=None, **options)
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, 0.0, "1", None])
+def test_init_refuses_a_start_step_that_is_not_an_integer(tmp_path, monkeypatch, value):
+    with pytest.raises(TypeError, match=r"start_step must be an integer of 0 or more"):
+        _init_in(tmp_path, monkeypatch, start_step=value)
+    assert list(tmp_path.iterdir()) == []  # nothing opened, nothing written
+
+
+def test_init_refuses_a_negative_start_step(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match=r"start_step must be an integer of 0 or more, not -1"):
+        _init_in(tmp_path, monkeypatch, start_step=-1)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", [True, False, 2.0, "2", None])
+def test_init_refuses_an_every_that_is_not_an_integer(tmp_path, monkeypatch, value):
+    with pytest.raises(TypeError, match=r"every must be an integer of 1 or more"):
+        _init_in(tmp_path, monkeypatch, every=value)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", [0, -3])
+def test_init_refuses_an_every_below_one(tmp_path, monkeypatch, value):
+    with pytest.raises(ValueError, match=r"every must be at least 1"):
+        _init_in(tmp_path, monkeypatch, every=value)
+    assert list(tmp_path.iterdir()) == []
+
+
+class _Index:
+    """An integer that is not an `int`, as a NumPy integer is: `numbers.Integral`."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __int__(self):
+        return self.value
+
+    __index__ = __int__
+
+
+numbers.Integral.register(_Index)
+
+
+@pytest.mark.parametrize("start_step", [0, 3, _Index(3)])
+def test_a_start_step_that_is_an_integer_is_taken_and_written_as_an_int(start_step):
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = MemorySink()
+    with tensorquill.init(model, sink=sink, every=_Index(2), start_step=start_step, heartbeat_seconds=None):
+        for _ in range(3):
+            model(torch.ones(1, 2)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+    first = int(start_step)
+    assert [r["step"] for r in sink.records] == [first, first + 1, first + 2]
+    assert all(type(r["step"]) is int for r in sink.records)
+    for record in sink.records:
+        identity.check(record)  # every reader takes the record: raises if it does not
+    load_records(sink.records)
+
+
+def test_logs_step_rule_and_its_message_are_unchanged():
+    session = tensorquill.init(nn.Linear(2, 2), sink=MemorySink(), heartbeat_seconds=None)
+    try:
+        with pytest.raises(TypeError, match=r"^session\.log\(\.\.\., step=\.\.\.\): step must be an integer"):
+            session.log({"a": 1.0}, step=True)
+        with pytest.raises(ValueError, match=r"^session\.log\(\.\.\., step=\.\.\.\): step must be an integer"):
+            session.log({"a": 1.0}, step=-1)
+    finally:
+        session.close()
