@@ -658,3 +658,22 @@ async fn bug02_pins_training_rows_and_whole_scalar_rows_are_stored_as_before() {
     assert!(rank_entry(&server.ingest, run).get("dropped_rows").is_none());
     server.ingest.shutdown().await.unwrap();
 }
+
+// --- BUG-30, the README ----------------------------------------------------------------------------
+
+/// The package description (`server/README.md`, `pyproject.toml`'s readme) names the protocol the
+/// binary prints, and does not say streaming works across protocols both ways. Fails on `453f1e2`,
+/// whose README says 4 and that streaming still works across the two.
+#[test]
+fn bug30_the_readme_names_the_protocol_the_binary_prints() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .arg("protocol")
+        .output()
+        .unwrap();
+    let protocol = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let readme = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md")).unwrap();
+    let readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    let said = format!("(`tensorquill-server protocol` prints it; {protocol} since");
+    assert!(readme.contains(&said), "the README does not say {said:?}");
+    assert!(!readme.contains("streaming still works across the two"));
+}
