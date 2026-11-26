@@ -902,3 +902,42 @@ def test_the_rerun_export_leaves_out_a_value_too_large_for_a_float(tmp_path, mon
     evidence.export_rerun(built, tmp_path / "r.rrd", records=evidence.load_records(rows, scalars=True))
     entity = "/training/grad_norm" if place == "grad_norm" else "/layers/blk/abs_max"
     assert logged.count(entity) == 39  # 40 steps, the one holding the integer left out
+
+
+def _flight_recorder_hang(directory: Path) -> Path:
+    """`test_lane_u7_evidence.py`'s two-rank dump: rank 1 never entered all_reduce #2."""
+    import pickle
+
+    def entry(record_id, seq, state="completed"):
+        return {"profiling_name": "nccl:all_reduce", "state": state, "process_group": ("0", "default_pg"),
+                "input_sizes": [[4]], "output_sizes": [[4]], "input_dtypes": "float32", "output_dtypes": "float32",
+                "collective_seq_id": str(seq), "p2p_seq_id": "0", "time_created_ns": 0, "frames": [],
+                "record_id": record_id, "is_p2p": False}
+
+    directory.mkdir()
+    for rank, entries in ((0, [entry(0, 1), entry(1, 2, "started")]), (1, [entry(0, 1)])):
+        (directory / f"nccl_trace_rank_{rank}").write_bytes(pickle.dumps({
+            "entries": entries, "version": "2.8", "pg_config": {"0": {"name": "0", "desc": "default_pg", "ranks": "[0, 1]"}}}))
+    return directory
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_a_ts_too_large_for_a_float_is_no_time_when_a_dump_corroborates_a_stall(tmp_path, sign):
+    """The time of the last recorded step (`newest_ts`, read only when a complete Flight Recorder dump
+    shows a hang) leaves out a `ts` no float holds, as any other value that is not a time."""
+    pytest.importorskip("torch.distributed.flight_recorder.components.builder")  # PyTorch 2.10 or later
+    import time as clock
+
+    dumps = _flight_recorder_hang(tmp_path / "fr")
+    now = clock.time()
+    records = [{"run_id": "r", "step": s, "grad_norm": 1.0, "ts": now - 100 + s} for s in range(5)]
+    records[4]["ts"] = sign * BIG
+    silent = {"rank": 0, "attempt": 1, "last_step": 4, "seconds_since_progress": 900.0, "stream": "open",
+              "state": "silent", "phase": "train", "heartbeat_age_seconds": 2.0, "severity": "critical"}
+    status = {"schema_version": 1, "run_id": "r", "written_at_ms": 1_000, "silent_floor_seconds": 300.0,
+              "summary": "stalled", "ranks": [silent], "missing_ranks": []}
+    found = evidence.build_evidence(records, watchdog=status, flight_recorder=dumps)
+    kinds = {incident["kind"]: incident for incident in found["incidents"]}
+    assert kinds["job_stalled"]["assessment"] == "confirmed_hang"  # the other steps' times are read
+    assert evidence._newest_stamp([{"ts": BIG}, {"ts": 3}, {"ts": True}, {"ts": "x"}, {}]) == 3.0
+    assert evidence._newest_stamp([{"ts": -BIG}]) is None
