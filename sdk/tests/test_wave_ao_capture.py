@@ -7,6 +7,7 @@ tests that need Apple's MPS skip where it is not there.
 
 from __future__ import annotations
 
+import json
 import numbers
 import warnings
 
@@ -255,3 +256,110 @@ def test_a_clip_over_parameters_still_frozen_or_of_another_model_records_nothing
             torch.nn.utils.clip_grad_norm_(other.parameters(), 0.5)  # not this model's
         _one_step(model, optimizer, clip)
     assert "clip_grad_norm" not in sink.records[0]
+
+
+# ---- BUG-03: a logged value that cannot be read never reaches `close()` or `flush()` --------------
+#
+# A tensor on `meta` holds no values. `log` took one, and the transfer of the scalar-only records at
+# `close()` and `flush()`, made outside the guard of the ring's own transfer, raised: inside `with
+# session:` that replaced the training's own exception, no end marker was written and the writer thread
+# stayed alive. `log` now refuses such a value by the rule the session judges any tensor by (its device
+# and layout, no data read: `_grad_unread`, `_output_unread`), and a transfer that fails for another
+# reason (a stand-in here) leaves that value out on its own.
+
+
+def _jsonl_session(tmp_path, name="r"):
+    path = tmp_path / f"{name}.rank0.jsonl"
+    session = tensorquill.init(nn.Linear(2, 2), run_id=name, sink=tensorquill.JsonlSink(path),
+                               heartbeat_seconds=None)
+    return session, path
+
+
+def _lines(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("explicit_step", [True, False])
+def test_log_refuses_a_tensor_on_meta_before_anything_is_recorded(tmp_path, explicit_step):
+    session, path = _jsonl_session(tmp_path)
+    value = torch.tensor(1.5, device="meta")
+    with pytest.raises(ValueError, match=r"loss: the tensor is on meta, which holds no values"):
+        if explicit_step:
+            session.log({"loss": value, "ok": 1.0}, step=0)
+        else:
+            session.log({"loss": value, "ok": 1.0})
+    assert session._scalar_records == [] and session._pending_scalars == {}
+    session.close()
+    assert session.writer_error is None and not session._worker.is_alive()
+    assert path.with_name("r.rank0.end.json").exists()
+
+
+def test_with_a_meta_value_logged_the_trainings_own_exception_comes_out(tmp_path):
+    session, path = _jsonl_session(tmp_path)
+    with pytest.raises(ValueError, match="the training's own failure"):
+        with session:
+            try:
+                session.log({"loss": torch.tensor(1.5, device="meta")}, step=0)
+            except ValueError:
+                pass  # refused at the call
+            raise ValueError("the training's own failure")
+    assert not session._worker.is_alive()
+    assert path.with_name("r.rank0.end.json").exists()
+
+
+class _Unreadable(torch.Tensor):
+    """A tensor whose transfer to the CPU fails, for a reason other than `meta` (a stand-in: no device
+    here fails that way on purpose). Put into a pending record by hand, past `log`'s checks."""
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if func is torch.stack:
+            raise RuntimeError("stand-in: the copy off the device failed")
+        return super().__torch_function__(func, types, args, kwargs or {})
+
+
+def _log_with_an_unreadable_value(session, step=0):
+    session.log({"eval/loss": torch.tensor(0.25, dtype=torch.float64), "eval/n": 4}, step=step)
+    bad = torch.tensor(2.0, dtype=torch.float64).as_subclass(_Unreadable)
+    session._scalar_records[-1]["scalars"]["eval/bad"] = bad
+
+
+def test_a_value_whose_transfer_fails_at_flush_is_left_out_and_flush_does_not_raise(tmp_path):
+    session, path = _jsonl_session(tmp_path)
+    _log_with_an_unreadable_value(session)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        session.flush()
+    session.close()
+    told = [str(w.message) for w in said if "eval/bad" in str(w.message)]
+    assert len(told) == 1 and "stand-in: the copy off the device failed" in told[0]
+    (record,) = [r for r in _lines(path) if r.get("record") == "scalars"]
+    assert record["scalars"] == {"eval/loss": 0.25, "eval/n": 4}
+    assert session.writer_error is None and not session._worker.is_alive()
+    assert path.with_name("r.rank0.end.json").exists()
+
+
+def test_a_value_whose_transfer_fails_at_close_leaves_the_end_marker_and_stops_the_writer(tmp_path):
+    session, path = _jsonl_session(tmp_path)
+    _log_with_an_unreadable_value(session, step=3)
+    session.log({"only/bad": 1.0}, step=4)
+    session._scalar_records[-1]["scalars"]["only/bad"] = torch.tensor(1.0).as_subclass(_Unreadable)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        session.close()  # never raises
+    records = [r for r in _lines(path) if r.get("record") == "scalars"]
+    assert [(r["step"], r["scalars"]) for r in records] == [(3, {"eval/loss": 0.25, "eval/n": 4})]
+    assert session.writer_error is None and not session._worker.is_alive()
+    assert path.with_name("r.rank0.end.json").exists()
+
+
+def test_with_a_value_whose_transfer_fails_the_trainings_own_exception_comes_out(tmp_path):
+    session, path = _jsonl_session(tmp_path)
+    with pytest.raises(KeyError, match="the training's own failure"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with session:
+                _log_with_an_unreadable_value(session)
+                raise KeyError("the training's own failure")
+    assert not session._worker.is_alive()
+    assert path.with_name("r.rank0.end.json").exists()
