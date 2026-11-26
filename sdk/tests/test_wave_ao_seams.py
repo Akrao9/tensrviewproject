@@ -736,3 +736,63 @@ def test_the_contract_turns_item_5_of_lane_al_4s_list_and_names_the_seq_drop_bes
     assert ("The offline modes read all three (sections 3, 4.5, 5). Under metadata 2, a version 2 row whose `seq` is "
             "null, which is not a whole scalar-only record, is dropped and counted the same way under the key `seq` "
             "(lane AO-3, BUG-02; accepted by the owner, Nov 26)") in text
+
+
+# --- 5. The follow-up (Nov 26) ---------------------------------------------------------------------------
+
+def _timed_run(place: str, value) -> list[dict]:
+    """A healthy run of 40 steps with `data_wait`, `step_time`, `lr`, `grad_scale` and a throttled
+    GPU's NVML reading, whose record at step 20 holds `value` in `place`."""
+    rows = []
+    for step in range(40):
+        row = {"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0,
+               "data_wait": 0.01, "step_time": 0.1, "lr": [0.001], "grad_scale": 1024.0,
+               "system": {"nvml": {"throttle": ["sw_thermal"] if step >= 30 else [], "temperature_c": 70,
+                                   "sm_clock_mhz": 1500, "power_w": 300.0, "power_limit_w": 400.0}}}
+        if step == 20:
+            if place == "lr":
+                row["lr"] = [value]
+            elif place in ("data_wait", "step_time", "grad_scale"):
+                row[place] = value
+            else:
+                row["system"]["nvml"][place] = value
+        rows.append(row)
+    return rows
+
+
+TIMED_PLACES = ["lr", "data_wait", "step_time", "grad_scale"]
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("place", TIMED_PLACES)
+def test_the_python_detectors_read_such_an_integer_in_lr_data_wait_step_time_and_grad_scale(place, sign):
+    found = evidence.build_evidence(_timed_run(place, sign * BIG), detectors="python")
+    assert _judged(found) == _judged(evidence.build_evidence(_timed_run(place, 1.0), detectors="python"))
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("place", TIMED_PLACES)
+def test_both_engines_judge_such_an_integer_in_lr_data_wait_step_time_and_grad_scale_alike(place, sign):
+    records = _timed_run(place, sign * BIG)
+    python, rust = (evidence.build_evidence(records, detectors=engine) for engine in ("python", "rust"))
+    assert _judged(python) == _judged(rust)
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_a_throttled_gpus_reading_too_large_for_a_float_is_no_value(sign):
+    """`gpu_throttled` carries the NVML reading at its step: such an integer there is no value."""
+    rows = _timed_run("lr", 0.001)
+    rows[30]["system"]["nvml"]["temperature_c"] = sign * BIG
+    [incident] = [i for i in evidence.build_evidence(rows, detectors="python")["incidents"] if i["kind"] == "gpu_throttled"]
+    assert incident["step"] == 30 and incident["temperature_c"] is None and incident["power_w"] == 300.0
+
+
+@pytest.mark.parametrize("module", ["data_checks", "evidence_system"])
+def test_each_readers_number_reads_such_an_integer_as_a_value_it_cannot_read(module):
+    import importlib
+
+    number = importlib.import_module(f"tensorquill.{module}")._number
+    assert number(BIG) is None and number(-BIG) is None
+    assert number(2**1023) == float(2**1023) and number(3) == 3.0 and number(math.inf) is None and number(True) is None
