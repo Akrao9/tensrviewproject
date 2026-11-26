@@ -322,3 +322,19 @@ def test_an_error_that_fits_is_not_changed(capture):
     with pytest.raises(mcp_server.ToolError) as raised:
         mcp_server.get_series(capture, {"kind": "scalar", "name": "a" * 5000})
     assert text == str(raised.value)[:4000]
+
+
+def test_a_file_of_this_rank_and_run_with_no_sample_of_the_router_is_said_to_differ(tmp_path):
+    """A file of the same rank and run that judged the router at no step (its samples left out,
+    or written before routers were sampled): the records answer, judged by the detectors on the
+    capture, and the note says what differs without saying why."""
+    _write(tmp_path / "r.jsonl", _rows(range(6), collapse_from=3))
+    document = ev.build_evidence(_rows(range(3)))
+    document["samples"] = []
+    report = tmp_path / "r.evidence.json"
+    ev.write_evidence(document, report)
+
+    answer = _series(mcp_server.Source(report))
+    assert answer["steps"] == [0, 1, 2, 3, 4, 5] and answer["first_flagged_step"] == 3
+    note = answer["evidence_file"]
+    assert "at no step" in note and "steps 0 to 5" in note and "differ from what it judged" in note

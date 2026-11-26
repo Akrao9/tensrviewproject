@@ -28,6 +28,7 @@ SDK = TESTS.parent
 WORKFLOW = SDK.parent / ".github" / "workflows" / "ci.yml"
 BASH = shutil.which("bash")
 needs_bash = pytest.mark.skipif(BASH is None, reason="no bash here")
+pytestmark = pytest.mark.skipif(not WORKFLOW.is_file(), reason="no workflow in this checkout")
 
 # How the runner calls bash for a `run:` step: with no `shell:` (this workflow names none) and
 # with `shell: bash` (GitHub's documentation, "Default shell").

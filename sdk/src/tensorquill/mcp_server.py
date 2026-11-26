@@ -561,7 +561,7 @@ def _router_steps_changed(name: str, document: Mapping[str, Any], records: list[
     return (
         f"the router {name!r} at {_steps_said(at)}, and the records read here hold it at {_steps_said(now)}"
         + (f", with other counts at step {differ}" if differ is not None and at == now else "")
-        + "; they changed after the file was written"
+        + "; the records differ from what it judged, as when a capture grew or was started again"
     )
 
 

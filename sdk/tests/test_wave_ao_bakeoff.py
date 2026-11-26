@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 BAKEOFF = Path(__file__).resolve().parent.parent.parent / "experiments" / "moe-bakeoff"
+pytestmark = pytest.mark.skipif(not (BAKEOFF / "verify_rerun.py").is_file(), reason="no bake-off in this checkout")
 
 
 @pytest.fixture(scope="module")
