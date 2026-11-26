@@ -376,8 +376,11 @@ HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
     # Seeds 13, 210, 357, 376, 413, 542, 563, 592, 653, 674, 753, 1032, 1281, 1379.
     "AQ5-D5 a router count above 2**53": (
         "the MoE sample's diversity and starved_shares differ in the last digits: Python divides the "
-        "integers exactly, Rust divides their floats",
-        [_record(59, moe={"r1": [68, 64, 2**53 + 1, 66, 61, 65, 64, 62]})],
+        "integers exactly, Rust divides their floats. Fifty records, so that starved_shares, a division "
+        "alone, differs as well as diversity, which also goes through log and exp, whose last bits may "
+        "differ by platform",
+        [_record(step, moe={"r1": [68, 64, 70, 66, 61, 65, 64, 62]}) for step in range(49)]
+        + [_record(49, moe={"r1": [68, 64, 2**53 + 1, 66, 61, 65, 64, 62]})],
     ),
     # Seed 572.
     "AQ5-D6 a step above int64": (
