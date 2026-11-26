@@ -457,13 +457,14 @@ def test_bug24d_through_init_and_a_real_server_step_0_is_kept(tmp_path):
 
     running = Server(tmp_path / "store")
     try:
-        for steps, wanted in ((1, 0), (3, 2)):
+        for steps, every, wanted in ((1, 1, 0), (3, 1, 2), (3, 50, 2)):
             model = torch.nn.Linear(2, 2)
             optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                session = tq.init(model, run_id=f"sc{steps}", sink=FailClose(tmp_path / f"sc{steps}.jsonl"),
-                                  endpoint=running.endpoint, every=1, heartbeat_seconds=60.0, mirror_scalars=False)
+                run_id = f"sc{steps}-{every}"
+                session = tq.init(model, run_id=run_id, sink=FailClose(tmp_path / f"{run_id}.jsonl"),
+                                  endpoint=running.endpoint, every=every, heartbeat_seconds=60.0, mirror_scalars=False)
                 for _ in range(steps):
                     model(torch.ones(1, 2)).sum().backward()
                     optimizer.step()

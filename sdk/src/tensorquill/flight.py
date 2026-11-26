@@ -2229,21 +2229,36 @@ class StreamingSink:
         self.sender = sender
         self.heartbeat = heartbeat
         self.path = sink.path
+        # The step of the last training record written through this sink, or None when none was:
+        # the step a stop at `close()` names (detector rules contract, part 7; wave AO, BUG-24 d).
+        self.last_step: int | None = None
 
     def write(self, records: list[dict[str, Any]]) -> None:
         self._sink.write(records)
+        for record in records:  # once the write returned: a record whose write raised is not counted
+            if isinstance(record, Mapping) and not is_scalar_record(record):
+                step = record.get("step")
+                if isinstance(step, int) and not isinstance(step, bool) and step >= 0:
+                    self.last_step = step
 
     def close(self) -> None:
         """The local file first, then the heartbeat and the sender. A local file whose close raises
         stops capture: the heartbeat is told (`sink_error`) before it ends, so its last beat carries
-        the stop, and the error is raised after the stream is closed."""
+        the stop, and the error is raised after the stream is closed.
+
+        The stop names `last_step`, the last training step written through this sink, as the
+        session's own stop names the last step it committed: at a close, the session has handed
+        every step it committed to the writer, so the two are the same step. Before, it named none,
+        so a run that committed step 0 read as one that committed nothing, and the session's own
+        stop after it does nothing once a stop is set. None when no training record was written
+        (a scalar-only record is not a step)."""
         failure: BaseException | None = None
         try:
             self._sink.close()
         except BaseException as error:  # noqa: BLE001  raised again below, once the stream is closed
             failure = error
             if self.heartbeat is not None:
-                self.heartbeat.stop_capture("sink_error")
+                self.heartbeat.stop_capture("sink_error", step=self.last_step)
         if self.heartbeat is not None:
             self.heartbeat.close()
         self.sender.close()
