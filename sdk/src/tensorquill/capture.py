@@ -2907,7 +2907,9 @@ class Session:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
 
         `session.log({"train/loss": loss})` or `session.log(loss=loss)`. Values are
-        Python numbers or one-element tensors. A tensor is copied on its device and moved
+        Python numbers or one-element tensors. A tensor that holds no values to read, judged from
+        its device and layout alone (on `meta`, nested, sparse), raises `ValueError` before anything
+        is recorded. A tensor is copied on its device and moved
         to the CPU with the rest of the step data every `every` steps, so logging a CUDA
         loss does not stall training. Call it before `optimizer.step()`: with automatic
         step counting, the step ends there, and a value logged afterwards belongs to the
@@ -5100,7 +5102,11 @@ def init(
             and a rank given another one is warned and writes under rank 0's. So call `init`
             on every rank: a rank that has not heard from rank 0 within
             `tensorquill.tracker.RUN_ID_WAIT_SECONDS` (300 s, or the group's timeout if
-            shorter) writes under an ID of its own, with a warning.
+            shorter) writes under an ID of its own, with a warning. It names the run's files
+            in the output folder, so it may hold no `/`, `\\`, `:` or control character and may
+            not be `.` or `..`: a `run_id` given here that does raises `ValueError`, and one from
+            the environment, a tracker or a launcher is made to fit, each such character
+            replaced by `-`, with a warning (`manifest.run_id_problem`).
         project: the project the run is listed and compared under. Defaults to
             `TENSORQUILL_PROJECT`, then the tracker's (W&B's project, or
             `MLFLOW_EXPERIMENT_NAME`), then `uncategorized`. W&B's rule applies: at most 128
@@ -5113,7 +5119,8 @@ def init(
             `python -m tensorquill compare`. Nothing is read from the tracker's config.
             These five go into the run manifest, `<run_id>.run.json` beside the `.jsonl`
             file, which rank 0 writes here (see `manifest.py`); other ranks write nothing.
-        every: steps kept on the device between transfers to the CPU.
+        every: steps kept on the device between transfers to the CPU, an integer of 1 or
+            more: a bool, a float or a string raises `TypeError`, a number below 1 `ValueError`.
         capture: `"routers"` records MoE router load only: cheap enough to leave on
             (+0.02% to +0.78% on Granite on an RTX PRO 6000). `"full"` adds block
             activation statistics, gradient norms every step and a weight check every 50
@@ -5228,7 +5235,9 @@ def init(
             `tensor_model_parallel`, that is
             `lambda name, p: not getattr(p, "tensor_model_parallel", False)`.
         start_step: the first step number. Pass the step you resume from, so a resumed
-            run does not repeat step numbers already written.
+            run does not repeat step numbers already written. An integer of 0 or more, by the
+            rule `session.log`'s `step=` follows: a bool (`True` is an `int` in Python), a float
+            or a string raises `TypeError`, a negative integer `ValueError`.
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
             returns for this model's parameters, as `clip_grad_norm`, in any capture mode.
             A call counts when any parameter it is given is one of the model's trainable
