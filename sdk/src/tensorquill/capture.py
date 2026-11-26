@@ -1267,9 +1267,13 @@ def _add_square(acc: torch.Tensor, value: torch.Tensor | float) -> None:
     one float32 squares added up gave, bit for bit: scaling by a power of two is exact. A NaN or an
     infinite norm stays one. Called once per clipping call: a dozen element-wise operations on two
     numbers, traced like any other under `torch.compile`."""
+    # Each kind of value as `m2 * 4**e`, `m2` its squared mantissa in `acc`'s dtype, rounded as the
+    # float32 buffer rounded it: a tensor moved to float32 and squared there, a Python float squared in
+    # float64 and then rounded.
     if isinstance(value, torch.Tensor) and value.dtype == torch.float64:
         mantissa, exponent = torch.frexp(value)  # on its own device: float64 is never on MPS
         m, e = mantissa.to(acc), exponent.to(acc)
+        m2 = m * m
     elif isinstance(value, torch.Tensor):
         # float32 or narrower (or an integer) fits float32's range, and its square needs only one split:
         # above 2**60, scaled by 2**-66 (exact), with exponent 66; else as it is. No `frexp`, which
@@ -1278,19 +1282,20 @@ def _add_square(acc: torch.Tensor, value: torch.Tensor | float) -> None:
         big = v.abs() > _SQUARE_SPLIT
         m = torch.where(big, v * _SQUARE_SHRINK, v)
         e = big.to(acc) * _SQUARE_SHIFT
+        m2 = m * m
     else:
         mantissa_host, exponent_host = math.frexp(value)
-        m = torch.full((), mantissa_host, dtype=acc.dtype, device=acc.device)
+        m2 = torch.full((), mantissa_host * mantissa_host, dtype=acc.dtype, device=acc.device)
         e = torch.full((), exponent_host, dtype=acc.dtype, device=acc.device)
     s0, e0 = acc[0], acc[1]
     # The larger exponent of the two, a zero having none; the other term is scaled down to it. A zero or
     # a value that is not finite is left as it is (scaling it could make `0 * inf`, a NaN).
-    top = torch.where(s0 == 0, e, torch.where(m == 0, e0, torch.maximum(e0, e)))
+    top = torch.where(s0 == 0, e, torch.where(m2 == 0, e0, torch.maximum(e0, e)))
     plain0 = (s0 == 0) | ~torch.isfinite(s0)
-    plain = (m == 0) | ~torch.isfinite(m)
+    plain = (m2 == 0) | ~torch.isfinite(m2)
     a = torch.where(plain0, s0, torch.ldexp(s0, 2 * (e0 - top)))
-    b = torch.where(plain, m, torch.ldexp(m, e - top))
-    acc.copy_(torch.stack((a + b * b, top)))
+    b2 = torch.where(plain, m2, torch.ldexp(m2, 2 * (e - top)))
+    acc.copy_(torch.stack((a + b2, top)))
 
 
 _SQUARE_SPLIT, _SQUARE_SHIFT = 2.0**60, 66.0

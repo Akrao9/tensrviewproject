@@ -118,7 +118,10 @@ def conform_run_id(run_id: str) -> str:
 
 def check_run_id(run_id: Any) -> None:
     """`init`'s check of an explicit `run_id`, before anything is opened: one that could name a file
-    outside the output folder raises `ValueError`, like any other bad argument."""
+    outside the output folder raises `ValueError`, like any other bad argument. One that is not a
+    string (a `Path`, say) names the files by its text, so its text is judged."""
+    if run_id is not None and not isinstance(run_id, str) and run_id:
+        run_id = str(run_id)
     if isinstance(run_id, str) and run_id:
         problem = run_id_problem(run_id)
         if problem:
