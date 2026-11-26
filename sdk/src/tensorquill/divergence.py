@@ -140,13 +140,23 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     """One rank's step records with the rows a later attempt replaced left out, as `load_records`
     leaves them out (`evidence.resolve_attempts`), in the order given (lane AC4, Nov 20, 2026).
 
-    Only a run ID whose attempts' step ranges overlap is resolved: rows resolved already, in any
-    order of their attempts, never overlap, and are read as they are. That keeps a second
-    resolution from changing them: `compare` resolves a rank's several files in the attempts' own
-    order (`resolve_attempts_across`), which the rows alone do not show, and resolving its rows
-    again by first appearance can take the original attempt for the later one and drop the whole
-    restart. The same rule leaves raw rows whose attempts do not overlap as they are, though
-    `load_records` would drop an attempt that appears first wholly above a later one.
+    A run ID is resolved when its attempts' training step ranges overlap, or when resolving it
+    leaves out scalar-only records alone (lane AO-6, BUG-23). Otherwise its rows are read as they
+    are. Rows resolved already, in any order of their attempts, never have overlapping training
+    ranges, and that keeps a second resolution from changing them: `compare` resolves a rank's
+    several files in the attempts' own order (`resolve_attempts_across`), which the rows alone do
+    not show, and resolving its rows again by first appearance can take the original attempt for
+    the later one and drop the whole restart, training rows and all, which this never does. The
+    same rule leaves raw rows whose first attempt trained wholly above a later one as they are,
+    though `load_records` would drop that attempt.
+
+    Scalar-only records have no training range: they cut nothing (WAVE_AL_CONTRACT.md section
+    4.6). A superseded attempt's points, of an attempt that also trained below a later one's
+    first step or of one that logged only scalars, were read as the run's (BUG-23). They are left
+    out where resolving by first appearance leaves them out and no training row with them. The
+    limit: rows resolved already in which an attempt that holds scalar-only records alone, truly
+    the newer, is listed before an older one that trained at or below its points look like those
+    raw rows, and lose those points; give such rows with `resolved=True`.
 
     The guard is still needed with `first_divergence(..., resolved=True)`, which `compare`
     passes (lane AD5, Nov 21, 2026): a caller that hands rows resolved across several files
@@ -157,7 +167,9 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     from .identity import is_scalar_record
 
     ranges: dict[str, dict[Any, list[int]]] = {}
+    attempts: dict[str, set[Any]] = {}
     for row in rows:
+        attempts.setdefault(run_of(row), set()).add(row.get("attempt", 0))
         if is_scalar_record(row):  # resolved with the training rows' cutoffs, never one (section 4.6)
             continue
         step = int(row["step"])
@@ -168,10 +180,18 @@ def _resolved(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
         ordered = sorted(spans)
         return any(later[0] <= earlier[1] for earlier, later in zip(ordered, ordered[1:]))
 
-    runs = {run for run, attempts in ranges.items() if overlap(attempts.values())}
+    kept: set[int] = set()
+    runs: set[str] = set()
+    for run, held in attempts.items():
+        if len(held) < 2:
+            continue  # one attempt: nothing was replaced
+        own = [row for row in rows if run_of(row) == run]
+        left = {id(row) for row in resolve_attempts(own)}  # type: ignore[arg-type]
+        if overlap(ranges.get(run, {}).values()) or all(is_scalar_record(row) for row in own if id(row) not in left):
+            runs.add(run)
+            kept |= left
     if not runs:
         return rows
-    kept = {id(row) for row in resolve_attempts([row for row in rows if run_of(row) in runs])}  # type: ignore[arg-type]
     return [row for row in rows if run_of(row) not in runs or id(row) in kept]
 
 
@@ -476,9 +496,10 @@ def first_divergence(
     rows read as they are). One rank's records are read (`rank`, named in the result), and each
     run's attempts of that rank are resolved first as `load_records` resolves them: the rows a
     later attempt replaced (a job that resumed from an earlier checkpoint rolled them back) are
-    left out and not read as the run's (lane AC4, Nov 20, 2026). Rows resolved already are read
-    as they are: only a run ID whose attempts' step ranges overlap is resolved, so resolving
-    again changes nothing. Every row of either input, of any rank, is checked first
+    left out and not read as the run's (lane AC4, Nov 20, 2026), the scalar-only records with the
+    training records' cutoffs. Rows resolved already are read as they are: only a run ID whose
+    attempts' training step ranges overlap, or whose resolution leaves out scalar-only records
+    alone, is resolved, so resolving again drops no training row (`_resolved`, lane AO-6). Every row of either input, of any rank, is checked first
     (`identity.check`, WAVE_AF_CONTRACT.md, section 1): one whose `schema_version`, `rank`,
     `attempt` or `step` is not valid, a row with no step among them, raises `MalformedRecordError`,
     which names its place in its list and the run (`run A` or `run B`).
@@ -487,8 +508,8 @@ def first_divergence(
     files resolved in the attempts' own order, `resolve_attempts_across`): they are read as
     they are and never resolved again, so no attempt of theirs can be dropped here, and the
     result has no `replaced_records` (lane AD5, Nov 21, 2026). Without it a caller's rows go
-    through the overlap rule above, which raw rows whose first attempt sits wholly above a later
-    one do not meet: give those `load_records(rows)` and `resolved=True` to have them resolved.
+    through the rule above, which raw rows whose first attempt trained wholly above a later one do
+    not meet: give those `load_records(rows)` and `resolved=True` to have them resolved.
 
     Compared: every logged scalar that is not a wall-clock reading, the total gradient norm,
     each parameter's gradient norm and weight norm, each captured module's activation
