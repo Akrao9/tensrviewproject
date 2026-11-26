@@ -346,10 +346,15 @@ def test_a_stopped_session_writes_nothing_more_and_raises_nothing():
     session, sink, opt = _open(model, every=1, sink=Failing())
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        for _ in range(4):
+        # The stop is said on this thread, at a step after the writer thread has met the failing
+        # write. Four quick steps did not always wait for that thread on a loaded machine, so the
+        # steps go on until the session has stopped, with one deadline.
+        deadline = time.monotonic() + 10
+        while True:
             _step(session, model, opt)
-            if session._stopped:
+            if session._stopped or time.monotonic() > deadline:
                 break
+            time.sleep(0.01)
         assert session._stopped
         warnings.simplefilter("error")
         with session.phase("eval"):
