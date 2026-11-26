@@ -522,6 +522,13 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
 
 **Run again on Nov 25 with the owner's rule built** (S15): the new side at `0abb905`, its release server `tensorquill-server-0abb905`, and the old side as before. Row 9 b is now seven claims, and rows 9 c and 9 d are measured, not judged. 57 of 57 claims held.
 
+**Run again on Nov 26 with wave AO joined:** the new side at `d56658b`, its release server `tensorquill-server-d56658b`, and the old side as before. 57 of 57 claims held, the same claims as on Nov 25, rows 9 b to 9 d included.
+- **What the harness records.** Wave AO (lane AO-2) made `send_file`'s and `close()`'s returned value False also while a line of the run was left out. So the harness records the returned value apart from whether the server confirmed the whole file (the offset).
+  - With the protocol 5 SDK as the sender, it also records `left_out_lines`, `skipped_lines` and the offset file's `left_out`. They are 0 in every row, and the returned value is True wherever the whole file was confirmed.
+  - A protocol 4 SDK's returned value keeps its old meaning.
+- **No row's result changed.** The one recorded value that differs is which of row 9's stream-end lines the server printed. It comes from the server's limit of one clean-end line per rank in 10 seconds (`STREAM_ERROR_LOG_INTERVAL`), which wave AO did not change. A scratch run of three streams showed both binaries print alike.
+- **Wave AO's other changes on the wire** move no row. These are an integer in `scalars` past 2**53 and a Boolean also travelling in `extra_json`, and a version 2 row with a null `seq` under metadata 2 dropped under `seq`. No row's records hold one.
+
 | Writer or store | Reader | Result |
 |---|---|---|
 | Protocol 4 sender (metadata 1, rows 0/1, JSON columns) | Protocol 5 server | **Works.** Stored as received, in its own parts. `detect.rs` reads `layers_json` where there is no `layers`, as the base did (the cases' `rust_raw_v4`; the owner, Nov 24, S4: AL-3′'s one fix in step 2, one known difference). No conversion |

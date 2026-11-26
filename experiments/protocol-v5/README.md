@@ -50,6 +50,13 @@ Run again on Nov 25 with the new side at `0abb905` (its release server, recorded
 - with the protocol 4 sender's offset file left in place, it sends nothing;
 - from byte 0, the offset file removed, it stores the scalar-only record in a `scalars-*` object and drops the 30 training rows as not newer.
 
+Run again on Nov 26 with wave AO joined (`d56658b`), 57 of 57 claims held. Since wave AO (lane AO-2) a protocol 5 `send_file` or `close()` returns False also while a line of the run was left out. So each send now records, apart:
+- `returned`, with `returned_means`;
+- `whole_file_confirmed`, the offset against the file's size;
+- for a protocol 5 sender, also `left_out_lines`, `skipped_lines` and the offset file's `left_out`.
+
+The Nov 25 results are at commit `2c856ff`.
+
 ```bash
 git clone <this repository> <old> && git -C <old> checkout 85a477a
 cargo build --release --manifest-path <old>/server/Cargo.toml --bin tensorquill-server
