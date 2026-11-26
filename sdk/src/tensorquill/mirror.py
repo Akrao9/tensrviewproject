@@ -61,6 +61,17 @@ class _Mirrored(float):
     __slots__ = ()
 
 
+class _MirroredInt(int):
+    """An integer the mirror leaves in the row in place of the one `session.log` stored for a key it
+    brought (`_log_into`). `session.log` stores `int(value)`, which is the caller's own object for a
+    Python int and, for -5 to 256, the one object CPython keeps for each whatever is passed, so no
+    integer handed to `session.log` could be told from the same integer logged by the caller. This one
+    is equal to it, hashes and compares the same, and is written the same by every sink (`json` and
+    the sender read an `int` subclass as an `int`); only `type(value) is int` tells it apart."""
+
+    __slots__ = ()
+
+
 _INT_DTYPES = frozenset({torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64})
 
 
@@ -305,8 +316,10 @@ def _log_into(session: Any, values: list[tuple[str, Any]]) -> None:
     under the "eval" phase, the newest step still in memory (lane AK-5), each named by a key that
     changes when a step ends. The mirror remembers, for each of the last two such places, the object
     it stored under each key: a key holding anything else was logged by the caller or an adapter, or
-    was the step's own before it ended, and is kept. With nowhere to go the value is passed to
-    `session.log` all the same, which leaves it out and says so once.
+    was the step's own before it ended, and is kept. A float the mirror stored is a new object
+    (`_Mirrored`); an integer is the caller's own or CPython's shared one, so the mirror puts an equal
+    `_MirroredInt` in the row in its place. With nowhere to go the value is passed to `session.log`
+    all the same, which leaves it out and says so once.
 
     Every value goes through `session._log_mirrored`, which calls `session.log` with the mirror's mark
     set: a value left out for want of a step is then said to be the mirror's, which cannot pass a step
@@ -343,5 +356,11 @@ def _log_into(session: Any, values: list[tuple[str, Any]]) -> None:
         if now == where and row is not None:
             for key in take:
                 stored = row.get(key, _MISSING)
-                if stored is not _MISSING:
-                    mine[key] = stored
+                if stored is _MISSING:
+                    continue
+                if type(stored) is int:
+                    # An integer the caller could log as the same object (`_MirroredInt`): ours is
+                    # put in its place, so an explicit `session.log` of that integer replaces it with
+                    # another object and is kept from then on.
+                    stored = row[key] = _MirroredInt(stored)
+                mine[key] = stored

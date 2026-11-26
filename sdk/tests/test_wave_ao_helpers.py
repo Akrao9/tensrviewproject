@@ -573,3 +573,45 @@ def test_a_mirrored_integer_is_written_as_a_plain_integer(monkeypatch, tmp_path)
     [line] = [json.loads(text) for text in path.read_text().splitlines() if '"scalars"' in text]
     assert line["scalars"] == {"k": 1, "big": 2**40, "f": 0.5}
     assert '"k":1,' in path.read_text() and '"big":1099511627776,' in path.read_text()
+
+
+def _mirrored_then_explicit_records(monkeypatch, **options):
+    wandb, _ = _stand_in_trackers(monkeypatch)
+    model = _model()
+    session, sink = _open(model, auto_step=False, mirror_scalars=True, **options)
+    with pytest.warns(RuntimeWarning, match="left out the scalar 'k'"), session:
+        for step in range(5):
+            wandb.log({"k": step % 2, "only_mirrored": 7})
+            if step == 3:
+                session.log({"k": step % 2})
+                wandb.log({"k": 9})
+            _step_once(model, session)
+            if step == 2:
+                # With every=3 the third step is kept back when the ring fills, its row copied to the
+                # CPU: the mirror's integers there are still its own, an explicit one is kept.
+                with session.phase("eval"):
+                    wandb.log({"only_mirrored": 8})
+                    session.log({"k": 1})
+                    wandb.log({"k": 9})
+        session.flush()
+        wandb.log({"k": 5})  # no step in memory: left out
+    return sink.records
+
+
+def test_the_mirror_s_integers_through_held_steps_a_flush_and_the_eval_phase(monkeypatch):
+    records = _mirrored_then_explicit_records(monkeypatch, every=3)
+    assert [r["scalars"] for r in records] == [
+        {"k": 0, "only_mirrored": 7}, {"k": 1, "only_mirrored": 7}, {"k": 1, "only_mirrored": 8},
+        {"k": 1, "only_mirrored": 7}, {"k": 0, "only_mirrored": 7},
+    ]
+
+
+def test_the_mirror_s_integers_make_the_same_arrow_row_as_plain_integers(monkeypatch):
+    pytest.importorskip("pyarrow")
+    from tensorquill.flight import records_to_batch
+
+    records = _mirrored_then_explicit_records(monkeypatch)
+    plain = [{**r, "scalars": {k: (int(v) if isinstance(v, int) else v) for k, v in r["scalars"].items()}}
+             for r in records]
+    assert any(type(v) is not int and isinstance(v, int) for r in records for v in r["scalars"].values())
+    assert records_to_batch(records).equals(records_to_batch(plain))
