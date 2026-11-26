@@ -1023,16 +1023,16 @@ impl Ingest {
         // too, counted as a refused batch though it held no row, and the refusal named no bytes of
         // the sender's, so the sender kept its offset and its rows never left (RS10).
         let question = batch.num_rows() == 0 && end_byte_offset == 0;
-        let (pieces, scalar_pieces, dropped, attempts) = if question {
-            (Vec::new(), Vec::new(), Dropped::new(), Vec::new())
+        let DecodedRows {
+            pieces,
+            scalar_pieces,
+            dropped,
+            attempts,
+        } = if question {
+            DecodedRows::default()
         } else {
-            // Rows that cannot be stored are dropped before anything of the batch is placed or kept,
-            // and a batch none of whose rows can be read is refused and counted (RS10). Then the
-            // scalar-only rows, those whose `seq` is not null, are taken out before the step
-            // watermark is looked at (`WAVE_AL_CONTRACT.md` section 4.5).
-            let (batch, dropped, scalars, attempts) = match readable_rows(batch, row_versions(metadata.schema_version))
-            {
-                Ok(kept) => kept,
+            match decoded_rows(batch, metadata.schema_version) {
+                Ok(rows) => rows,
                 Err(refused) => {
                     if let Some(column) = refused.column {
                         self.batch_refused(key, column, end_byte_offset).await;
@@ -1041,24 +1041,7 @@ impl Ingest {
                     }
                     return Err(refused.status);
                 }
-            };
-            refuse_negative_steps(&batch)?;
-            let scalar_pieces = match scalars {
-                Some(scalars) => {
-                    refuse_negative_steps(&scalars)?;
-                    refuse_negative_seqs(&scalars)?;
-                    split_by_attempt(scalars)?
-                }
-                None => Vec::new(),
-            };
-            // A batch that held scalar rows only has no step rows left to look at. A batch without
-            // them is split as before, whatever it holds.
-            let pieces = if !scalar_pieces.is_empty() && batch.num_rows() == 0 {
-                Vec::new()
-            } else {
-                split_by_attempt(batch)?
-            };
-            (pieces, scalar_pieces, dropped, attempts)
+            }
         };
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
@@ -1844,10 +1827,7 @@ impl Ingest {
         let mut named = false;
         let tally = &ack.tally;
         while let Some(message) = decoder.next().await {
-            let message = message.map_err(|error| match error {
-                FlightError::Tonic(status) => *status,
-                other => Status::invalid_argument(other.to_string()),
-            })?;
+            let message = message.map_err(stream_error)?;
             let inner = &message.inner;
             let bytes = inner.data_header.len() + inner.data_body.len() + inner.app_metadata.len();
             tally.bytes.fetch_add(bytes as u64, Ordering::SeqCst);
@@ -1876,19 +1856,7 @@ impl Ingest {
             let key = key
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
-            let metadata: BatchMetadata = serde_json::from_slice(&message.inner.app_metadata)
-                .map_err(|error| Status::invalid_argument(format!("bad app_metadata: {error}")))?;
-            if !SCHEMA_VERSIONS.contains(&metadata.schema_version) {
-                return Err(Status::invalid_argument(format!(
-                    "schema_version {} is not supported; this server reads versions 1 and 2",
-                    metadata.schema_version
-                )));
-            }
-            if metadata.run_id != key.0 || metadata.rank != key.1 {
-                return Err(Status::invalid_argument(
-                    "app_metadata names another run or rank than the descriptor",
-                ));
-            }
+            let metadata = batch_metadata(key, &message.inner.app_metadata)?;
             if let (false, Some(sender)) = (named, metadata.sender_attempt) {
                 // The first batch names the attempt whose process sends the stream: a claim.
                 self.place(key, Some(sender), &[]).await?;
@@ -2748,6 +2716,141 @@ fn split_by_attempt(batch: RecordBatch) -> Result<Vec<(i64, RecordBatch)>, Statu
         }
     }
     Ok(runs)
+}
+
+/// The status a stream ends with when a message of it cannot be decoded.
+fn stream_error(error: FlightError) -> Status {
+    match error {
+        FlightError::Tonic(status) => *status,
+        other => Status::invalid_argument(other.to_string()),
+    }
+}
+
+/// A batch's `app_metadata`, read and checked against the stream's run and rank: a version this
+/// server does not read, or another run or rank than the descriptor's, refuses the stream.
+fn batch_metadata(key: &Key, app_metadata: &[u8]) -> Result<BatchMetadata, Status> {
+    let metadata: BatchMetadata = serde_json::from_slice(app_metadata)
+        .map_err(|error| Status::invalid_argument(format!("bad app_metadata: {error}")))?;
+    if !SCHEMA_VERSIONS.contains(&metadata.schema_version) {
+        return Err(Status::invalid_argument(format!(
+            "schema_version {} is not supported; this server reads versions 1 and 2",
+            metadata.schema_version
+        )));
+    }
+    if metadata.run_id != key.0 || metadata.rank != key.1 {
+        return Err(Status::invalid_argument(
+            "app_metadata names another run or rank than the descriptor",
+        ));
+    }
+    Ok(metadata)
+}
+
+/// A data batch's rows as `accept` takes them apart before anything of the batch is placed or kept:
+/// the step rows and the scalar-only rows, each cut where the attempt changes, the rows dropped, and
+/// the attempts of the rows kept in the order they first appear.
+#[derive(Default)]
+struct DecodedRows {
+    pieces: Vec<(i64, RecordBatch)>,
+    scalar_pieces: Vec<(i64, RecordBatch)>,
+    dropped: Dropped,
+    attempts: Vec<i64>,
+}
+
+/// Takes a data batch of metadata version `schema_version` apart (`accept`). Rows that cannot be
+/// stored are dropped, and a batch none of whose rows can be read is refused naming its column
+/// (RS10). Then the scalar-only rows, those whose `seq` is not null, are taken out before the step
+/// watermark is looked at (`WAVE_AL_CONTRACT.md` section 4.5). A negative step, `seq` or attempt
+/// refuses the batch whole, with no column named.
+fn decoded_rows(batch: RecordBatch, schema_version: i64) -> Result<DecodedRows, Refused> {
+    let plain = |status: Status| Refused { column: None, status };
+    let (batch, dropped, scalars, attempts) = readable_rows(batch, row_versions(schema_version))?;
+    refuse_negative_steps(&batch).map_err(plain)?;
+    let scalar_pieces = match scalars {
+        Some(scalars) => {
+            refuse_negative_steps(&scalars).map_err(plain)?;
+            refuse_negative_seqs(&scalars).map_err(plain)?;
+            split_by_attempt(scalars).map_err(plain)?
+        }
+        None => Vec::new(),
+    };
+    // A batch that held scalar rows only has no step rows left to look at. A batch without them is
+    // split as before, whatever it holds.
+    let pieces = if !scalar_pieces.is_empty() && batch.num_rows() == 0 {
+        Vec::new()
+    } else {
+        split_by_attempt(batch).map_err(plain)?
+    };
+    Ok(DecodedRows {
+        pieces,
+        scalar_pieces,
+        dropped,
+        attempts,
+    })
+}
+
+/// One data batch of a `DoPut` stream as [`decode_put`] gives it.
+#[derive(Debug)]
+pub struct DecodedBatch {
+    pub run_id: String,
+    pub rank: i32,
+    /// The batch metadata's version.
+    pub schema_version: i64,
+    pub end_byte_offset: i64,
+    /// The step rows, cut where the attempt changes: what the rank's buffer, and then its detectors,
+    /// are given.
+    pub step_rows: Vec<(i64, RecordBatch)>,
+    /// The scalar-only rows, cut the same way.
+    pub scalar_rows: Vec<(i64, RecordBatch)>,
+    /// Rows dropped and counted, by the key they lacked.
+    pub dropped: Vec<(&'static str, u64)>,
+    /// The attempts of the rows kept, in the order they first appear.
+    pub attempts: Vec<i64>,
+}
+
+/// The decode of one `DoPut` stream without a server: the messages a client sends in (a descriptor,
+/// a schema, record batches with their `app_metadata`), each data batch's rows out as the server takes
+/// them apart before placing or keeping anything. The first error ends it, with the status the
+/// stream would end with. Made for tests that drive the decode with generated bytes (lane AQ-5, SV7):
+/// it calls what `run_stream` and `accept` call, in their order (`stream_error`, `parse_descriptor`,
+/// `batch_metadata`, `decoded_rows`), and nothing of a store, a watchdog or an acknowledgement.
+pub fn decode_put(messages: Vec<FlightData>) -> Result<Vec<DecodedBatch>, Status> {
+    futures::executor::block_on(async move {
+        let mut decoder = FlightDataDecoder::new(futures::stream::iter(messages.into_iter().map(Ok)));
+        let mut key: Option<Key> = None;
+        let mut out = Vec::new();
+        while let Some(message) = decoder.next().await {
+            let message = message.map_err(stream_error)?;
+            if key.is_none() {
+                if let Some(descriptor) = &message.inner.flight_descriptor {
+                    key = Some(parse_descriptor(descriptor)?);
+                }
+            }
+            let DecodedPayload::RecordBatch(batch) = message.payload else {
+                continue;
+            };
+            let key = key
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
+            let metadata = batch_metadata(key, &message.inner.app_metadata)?;
+            let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
+            let rows = if question {
+                DecodedRows::default()
+            } else {
+                decoded_rows(batch, metadata.schema_version).map_err(|refused| refused.status)?
+            };
+            out.push(DecodedBatch {
+                run_id: key.0.clone(),
+                rank: key.1,
+                schema_version: metadata.schema_version,
+                end_byte_offset: metadata.end_byte_offset,
+                step_rows: rows.pieces,
+                scalar_rows: rows.scalar_pieces,
+                dropped: rows.dropped,
+                attempts: rows.attempts,
+            });
+        }
+        Ok(out)
+    })
 }
 
 /// The kept rows of a batch, their first and last step, and the steps of the rows not kept.
