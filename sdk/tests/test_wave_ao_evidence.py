@@ -214,3 +214,44 @@ def test_bug21_pin_the_records_left_out_are_the_same_and_one_attempts_records_ke
     assert len(kept) == len(new) + 5 + 1  # attempt 100's steps 0 to 4 and its point at 0; step 6 rolled back
     assert [r["step"] for r in kept if r["attempt"] == 100] == [0, 1, 2, 3, 4, 0]
     assert [r["step"] for r in kept if r["attempt"] == 200] == [0, *range(5, 36)]
+
+
+# ---- BUG-29, the evidence half: one run, scalar-only records included --------------------------
+#
+# `scalar_series` and MCP `get_series` refuse a rank's records of two run IDs, its scalar-only
+# records among them (`check_one_run`); `build_evidence` and the command line set the scalar-only
+# records apart first and so took a file whose training records are of run r1 and a scalar-only
+# record of run r2, and the command line's --rerun then exported r2's point in r1's recording.
+
+MIXED = [{**_step(1, 0), "run_id": "r1"}, {**_step(1, 1), "run_id": "r1"}, {**_point(1, 0, 0, loss=2.0), "run_id": "r2"}]
+
+
+def test_bug29_build_evidence_refuses_a_file_of_two_runs_whose_second_is_scalar_only(tmp_path):
+    path = _write(tmp_path / "mix.rank0.jsonl", MIXED)
+    with pytest.raises(ValueError, match="more than one run"):
+        evidence.scalar_series(path)  # as the series reader already refuses it
+    with pytest.raises(ValueError, match="more than one run"):
+        evidence.build_evidence(path, detectors="python")
+    with pytest.raises(ValueError, match="more than one run"):
+        evidence.build_evidence(MIXED, detectors="python")
+    with pytest.raises(ValueError, match="more than one run"):
+        evidence.build_evidence(path, rank=0, detectors="python")
+
+
+def test_bug29_the_command_line_refuses_it_too(tmp_path, monkeypatch, capsys):
+    path = _write(tmp_path / "mix.rank0.jsonl", MIXED)
+    for extra in ([], ["--rerun", str(tmp_path / "r.rrd")]):
+        monkeypatch.setattr(sys, "argv", ["tensorquill", str(path), "--detectors", "python", "--output",
+                                          str(tmp_path / "e.json"), *extra])
+        with pytest.raises(SystemExit) as stopped:
+            evidence.main()
+        assert stopped.value.code == 2 and "more than one run" in capsys.readouterr().err
+    assert not (tmp_path / "e.json").exists()
+
+
+def test_bug29_pin_one_runs_scalar_only_records_and_another_ranks_are_taken(tmp_path):
+    one_run = [_step(1, 0), _step(1, 1), _point(1, 0, 0, loss=2.0)]
+    assert evidence.build_evidence(_write(tmp_path / "one.jsonl", one_run), detectors="python")["run_state"]["state"]
+    # Another rank's scalar-only record of another run is that rank's, not this one's.
+    other_rank = [*one_run, {**_point(1, 0, 0, loss=2.0), "run_id": "r2", "rank": 1}]
+    assert evidence.build_evidence(other_rank, rank=0, detectors="python")["rank"] == 0
