@@ -122,20 +122,25 @@ RUN_ID_TAKES_PATHS = True
 
 def check_run_id(run_id: Any) -> str | None:
     """`init`'s explicit `run_id`, normalised and checked before anything is opened, and the only form
-    of it `init` goes on with: None as None, a string as itself (a subclass as a plain `str`), an
-    `os.PathLike` (a `Path`) as its text, `os.fspath(run_id)` (while `RUN_ID_TAKES_PATHS`). Anything
-    else raises `ValueError`, as a `group` or `name` that is not a string does. A string that could
-    name a file outside the output folder (`run_id_problem`) raises `ValueError` too. The empty
-    string is returned as it is and, as None, means "not given"."""
+    of it `init` goes on with: None as None, a string as itself (a subclass as a plain `str`), and,
+    while `RUN_ID_TAKES_PATHS`, an `os.PathLike` (a `Path`) as its text, `os.fspath(run_id)`, judged
+    as that string. Anything else raises `ValueError`, as a `group` or `name` that is not a string
+    does. A string that could name a file outside the output folder (`run_id_problem`) raises
+    `ValueError` too. The empty string is returned as it is and, as None, means "not given"."""
     if run_id is None:
         return None
+    wanted = "a string or a path" if RUN_ID_TAKES_PATHS else "a string"
     if RUN_ID_TAKES_PATHS and not isinstance(run_id, str) and isinstance(run_id, os.PathLike):
-        text = os.fspath(run_id)
+        try:
+            text = os.fspath(run_id)
+        except Exception as error:  # noqa: BLE001  a path whose __fspath__ raises or gives neither str nor bytes
+            raise ValueError(f"run_id must be {wanted}, and {type(run_id).__name__}'s path cannot be read: "
+                             f"{type(error).__name__}: {error}") from error
         if not isinstance(text, str):
-            raise ValueError(f"run_id must be a string or a path, not {type(run_id).__name__} of {type(text).__name__}")
+            raise ValueError(f"run_id must be {wanted}, not {type(run_id).__name__} of {type(text).__name__}")
         run_id = text
     if not isinstance(run_id, str):
-        raise ValueError(f"run_id must be a string or a path, not {type(run_id).__name__}")
+        raise ValueError(f"run_id must be {wanted}, not {type(run_id).__name__}")
     run_id = str.__str__(run_id)
     if run_id:
         problem = run_id_problem(run_id)
@@ -154,19 +159,24 @@ def fit_run_id(run_id: Any, source: str) -> Any:
     """A run ID TensorQuill was not given (the environment's, a tracker's, a launcher's, or one rank 0
     shared from an older TensorQuill) made to fit (`conform_run_id`) when `run_id_problem` refuses it,
     with a warning, as `resolve_project` fits a project name from there: an ID TensorQuill was never
-    given must not stop a run from starting, nor name a file outside the output folder."""
+    given must not stop a run from starting, nor name a file outside the output folder.
+
+    One that is not a string (a rank 0 on an older TensorQuill given `run_id=123` shares the integer,
+    and a stand-in tracker may give any object) is taken by its text, with a warning, and then fitted
+    the same way: what comes back is a string, unless `run_id` is None or empty."""
     if run_id is not None and not isinstance(run_id, str):
         # Strings by construction from every source this package reads, except a rank 0 on an older
         # TensorQuill given `run_id=123` (shared through the store as JSON) or a tracker object that is
         # not the real one: taken by its text, which is what such a rank named its files with.
         try:
             text = os.fspath(run_id) if isinstance(run_id, os.PathLike) else str(run_id)
-        except Exception:  # noqa: BLE001  a value whose __str__ raises
+        except Exception:  # noqa: BLE001  a value whose __str__ or __fspath__ raises
             text = type(run_id).__name__
         if not isinstance(text, str):
             text = type(run_id).__name__
-        _say(f"{_RUN_ID_SOURCES.get(source, source)} gives the run ID {run_id!r}, which is not a string; "
-             f"the run is recorded under its text. Pass run_id= to choose the ID.", stacklevel=4)
+        _say(f"{_RUN_ID_SOURCES.get(source, source)} gives a run ID that is not a string "
+             f"({type(run_id).__name__}); the run is recorded under its text, {text!r}. Pass run_id= to choose "
+             "the ID.", stacklevel=4)
         run_id = text or "-"
     if not isinstance(run_id, str) or not run_id:
         return run_id

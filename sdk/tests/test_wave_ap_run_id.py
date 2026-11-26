@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,63 @@ def test_a_path_run_id_gives_the_same_files_manifest_and_records_as_its_text(tmp
     assert type(found["run_id"]) is str and found["run_id"] == "myrun"
     assert found["run_id_source"] == "explicit"
     assert session.manifest["run_id"] == "myrun"
+
+
+_TIMES = ("ts", "attempt", "closed_at", "created_at")  # the time fields of a record, the end marker and the manifest
+
+
+def _untimed(value):
+    if isinstance(value, dict):
+        return {k: _untimed(v) for k, v in value.items() if k not in _TIMES}
+    if isinstance(value, list):
+        return [_untimed(v) for v in value]
+    return value
+
+
+def test_a_path_run_id_and_the_equal_string_give_the_same_capture(tmp_path, monkeypatch):
+    captured = {}
+    for kind, run_id in (("text", "same"), ("path", Path("same"))):
+        work = tmp_path / kind
+        work.mkdir()
+        _work(work, monkeypatch)
+        session = _capture(run_id)
+        out = work / "work" / "tensorquill-out"
+        captured[kind] = (
+            _files(out),
+            _untimed(json.loads((out / "same.run.json").read_text())),
+            _untimed(_records(out / "same.rank0.jsonl")),
+            _untimed(json.loads((out / "same.rank0.end.json").read_text())),
+            (session.run.run_id, type(session.run.run_id), session.run.source),
+        )
+    assert captured["path"] == captured["text"]
+
+
+def test_with_paths_turned_off_a_path_is_refused_like_an_integer(tmp_path, monkeypatch):
+    work = _work(tmp_path, monkeypatch)
+    monkeypatch.setattr(_manifest, "RUN_ID_TAKES_PATHS", False)
+    with pytest.raises(ValueError, match=r"^run_id must be a string, not PosixPath$|^run_id must be a string, not WindowsPath$"):
+        tensorquill.init(nn.Linear(2, 2), run_id=Path("myrun"), project="p", heartbeat_seconds=None)
+    with pytest.raises(ValueError, match=r"^run_id must be a string, not int$"):
+        tensorquill.init(nn.Linear(2, 2), run_id=123, project="p", heartbeat_seconds=None)
+    assert not (work / "tensorquill-out").exists()
+
+
+class _BadPath:
+    def __init__(self, gives):
+        self.gives = gives
+
+    def __fspath__(self):
+        if isinstance(self.gives, BaseException):
+            raise self.gives
+        return self.gives
+
+
+@pytest.mark.parametrize("gives", [b"bytes", 7, RuntimeError("no path")])
+def test_a_path_whose_text_cannot_be_read_is_refused_with_value_error(tmp_path, monkeypatch, gives):
+    work = _work(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match=r"^run_id must be a string or a path"):
+        tensorquill.init(nn.Linear(2, 2), run_id=_BadPath(gives), project="p", heartbeat_seconds=None)
+    assert not (work / "tensorquill-out").exists()
 
 
 @pytest.mark.parametrize("text", ["a/b", "../x", "..", ".", "/abs"])
@@ -200,6 +258,8 @@ def _server_binary() -> str | None:
 def test_a_streamed_capture_with_a_path_run_id_reaches_the_store_under_its_text(tmp_path, monkeypatch):
     try:
         import pyarrow.flight  # noqa: F401
+        from tensorquill import flight
+        from tensorquill.flight import offset_path, read_offset
     except ImportError:
         pytest.skip("pyarrow.flight is not installed")
     binary = _server_binary()
@@ -216,12 +276,21 @@ def test_a_streamed_capture_with_a_path_run_id_reaches_the_store_under_its_text(
         assert "listening on" in line, line
         endpoint = f"grpc://127.0.0.1:{int(line.rsplit(':', 1)[1])}"
         session = tensorquill.init(nn.Linear(2, 2), run_id=Path("streamed"), project="p", auto_step=False,
-                                   mirror_scalars=False, heartbeat_seconds=None, endpoint=endpoint)
+                                   mirror_scalars=False, heartbeat_seconds=None, endpoint=endpoint, every=1)
+        records_file = work / "tensorquill-out" / "streamed.rank0.jsonl"
         for _ in range(3):
             session.log(loss=1.0)
             session.step()
+        # The session's own stream must have stored a part before close(), whose wait is 5 s at most.
+        deadline = time.monotonic() + 60
+        while read_offset(offset_path(records_file)) <= 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert read_offset(offset_path(records_file)) > 0, "the stream stored nothing within 60 s"
         session.close()
         assert session.writer_error is None
+        # What close() had no time for under load: the rest, from the offset the stream left.
+        if read_offset(offset_path(records_file)) < records_file.stat().st_size:
+            assert flight.send_file(records_file, endpoint, "streamed", 0)
     finally:
         if server.poll() is None:
             server.send_signal(signal.SIGTERM)
