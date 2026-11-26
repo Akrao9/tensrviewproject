@@ -517,3 +517,79 @@ def test_bug13_pin_a_router_is_judged_top_1_before_its_first_recorded_value():
     rows = [{**TOP_K_CHANGE[0], "moe_top_k": {}}, TOP_K_CHANGE[1]]
     assert _overloaded(evidence.build_evidence(rows, detectors="python"))[0] == (0, [1, 2], "share")
 
+
+# ---- BUG-12: a malformed field outside the identity fields ---------------------------------------
+#
+# WAVE_AF_CONTRACT.md section 1: only the identity fields refuse a record; any other field that
+# cannot be read is unreadable to the detector that wants it, and nothing raises. Rust's `detect`
+# reads such a field as absent (its column is null; the value travels in `extra_json`).
+
+def _base(step: int) -> dict:
+    record = {"schema_version": 1, "run_id": "r", "rank": 0, "attempt": 1, "step": step, "ts": 100.0 + step,
+              "grad_norm": 1.0, "grad_norms": {"w": 0.9, "b": 0.1}, "lr": [0.01], "update_rms": {"w": 0.01, "b": 0.001},
+              "moe": {"router": [10, 12, 9, 11]}, "moe_top_k": {"router": 1}, "scalars": {"loss": 2.0 - step / 100},
+              "layers": {"block.0": {"mean": 0.0, "std": 1.0, "abs_max": 3.0, "zero_frac": 0.1}},
+              "data_wait": 0.01, "step_time": 0.1, "grad_scale": 1024.0}
+    if step % 5 == 0:
+        record.update(weight_norms={"w": 1.0 + step / 100, "b": 0.5}, weights_unchanged=[])
+    return record
+
+
+FIELDS = ("ts", "grad_norm", "clip_grad_norm", "grad_norms", "lr", "update_rms", "weight_norms", "weights_unchanged",
+          "weight_dtypes", "optimizer_ownership", "moe", "moe_top_k", "moe_stats", "moe_refused", "scalars", "layers",
+          "probe", "data", "checkpoint", "system", "data_wait", "step_time", "grad_scale", "step_skipped",
+          "step_skipped_part", "scaler_applied", "clip_calls", "replica", "replica_spread", "replica_spread_scope",
+          "update_not_read", "grads_not_read", "layers_not_read", "batch_hash")
+BAD = ([1, 2], 0.001, True, "x", {"w": "x"}, {"w": [1]}, [{"w": 1}], None, -1)
+
+
+@pytest.mark.parametrize("field", FIELDS)
+def test_bug12_no_malformed_field_outside_the_identity_fields_raises(field):
+    for bad in BAD:
+        records = [{**_base(step), field: bad} for step in range(12)]
+        built = evidence.build_evidence(records, detectors="python")
+        assert built["run_state"]["state"] in evidence.RUN_STATES, (field, bad)
+
+
+@pytest.mark.parametrize("field", FIELDS)
+def test_bug12_the_rerun_export_never_raises_on_one_either(field, tmp_path, monkeypatch):
+    _rerun_recorder(monkeypatch)
+    for bad in BAD:
+        records = [{**_base(step), field: bad} for step in range(12)]
+        evidence.export_rerun(evidence.build_evidence(records, detectors="python"), tmp_path / "r.rrd", records=records)
+
+
+AUDIT_CASES = {
+    "weight_norms_list": [{"run_id": "r", "rank": 0, "step": 0, "weight_norms": [1, 2]},
+                          {"run_id": "r", "rank": 0, "step": 50, "weight_norms": [1, 2]}],
+    "lr_number": [{"run_id": "r", "rank": 0, "step": 0, "lr": 0.001}],
+    "weights_unchanged_bool": [{"run_id": "r", "rank": 0, "step": 0, "weights_unchanged": True}],
+}
+
+
+@pytest.mark.parametrize("name", sorted(AUDIT_CASES))
+def test_bug12_the_audits_three_inputs_are_read_by_both_engines(name):
+    records = AUDIT_CASES[name]
+    python = evidence.build_evidence(records, detectors="python")
+    rust = _rust(records)
+    assert _kinds(python) == _kinds(rust)
+    assert python["run_state"]["state"] == rust["run_state"]["state"]
+
+
+def test_bug12_weight_trends_reads_the_last_check_that_holds_a_norm():
+    records = [{"run_id": "r", "rank": 0, "step": 0, "weight_norms": {"w": 1.0}},
+               {"run_id": "r", "rank": 0, "step": 50, "weight_norms": {"w": 2.0}},
+               {"run_id": "r", "rank": 0, "step": 100, "weight_norms": {"w": "refused"}}]
+    built = evidence.build_evidence(records, detectors="python")
+    assert built["weight_jumps"]["checks"] == 2
+    assert built["weight_trends"]["latest_step"] == 50
+    assert built["weight_trends"]["kinds"]["matrix"]["median_ratio"] == 2.0
+
+
+def test_bug12_pin_a_weights_unchanged_list_of_names_is_still_read():
+    records = []
+    for step in range(8):
+        records.append({"run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0, "grad_norms": {"w": 1.0},
+                        "weight_norms": {"w": 1.0}, "weights_unchanged": ["w"] if step else []})
+    assert ("stalled_weights", 3) in _kinds(evidence.build_evidence(records, detectors="python"))
+
