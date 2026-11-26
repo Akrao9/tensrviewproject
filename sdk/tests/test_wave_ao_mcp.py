@@ -229,3 +229,9 @@ def test_compare_runs_over_a_run_holding_an_integer_too_large_for_a_float_is_ans
                                                "scalars": {"loss": third if step == 2 else 1.0 + step}} for step in range(4)])
     reply = json.loads(_call(mcp_server.Source(tmp_path / "a.jsonl"), "compare_runs", {"runs": ["a", "b"]}))
     assert "failed inside the server" not in reply["result"]["content"][0]["text"]
+
+
+def test_an_incidents_score_too_large_for_a_float_has_the_words_for_no_score():
+    """An evidence file is read as JSON, so a score can be any integer: it is no score, not a raise."""
+    assert mcp_server.score_display({"score": BIG}) == "no score"
+    assert mcp_server.score_display({"score": 31}) == "score 31.0"
