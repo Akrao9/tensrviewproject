@@ -278,6 +278,125 @@ def _versions() -> tuple[str | None, str | None]:
     return getattr(package, "__version__", None), getattr(torch, "__version__", None) and str(torch.__version__)
 
 
+# --- The run's numerical settings (item OG1) -------------------------------------------------
+#
+# Whether healthy data-parallel replicas come out bit-identical depends on these settings, so a
+# replica result is only read against them. They are read as `init` finds them, on the rank that
+# writes the manifest (rank 0), and never set. OpGuard's `runtime_policy.py` records the first six
+# before and after it sets them; `CUDA_DEVICE_MAX_CONNECTIONS` is the seventh, since its value hid
+# two DeepSpeed races in their reproductions. Warn-only is its own read of the first setting.
+#
+# Each entry is named by what was read, and is `{"value": v}` (an environment variable that is not
+# set is `{"value": None}`) or `{"not_read": why}`: a setting this PyTorch lacks, or whose read
+# raised, is said, never left out or guessed. A warning given while reading is kept beside the
+# value (`"warning"`) and never shown or raised, so `python -W error` does not stop `init`. None of
+# these reads initialises CUDA: they are flags of the process and of the C++ context.
+
+NUMERICAL_SETTINGS_KEY = "numerical_settings"
+NOT_RECORDED = "the run manifest was written before TensorQuill recorded the run's numerical settings"
+SETTING_TEXT_MAX = 256  # an environment variable's value, or a value's text, kept to this many characters
+_ERROR_TEXT_MAX = 200
+_TORCH_SETTINGS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+    # (name, attribute path below `torch`, whether it is called)
+    ("torch.are_deterministic_algorithms_enabled()", ("are_deterministic_algorithms_enabled",), True),
+    ("torch.is_deterministic_algorithms_warn_only_enabled()", ("is_deterministic_algorithms_warn_only_enabled",), True),
+    ("torch.backends.cudnn.deterministic", ("backends", "cudnn", "deterministic"), False),
+    ("torch.backends.cudnn.benchmark", ("backends", "cudnn", "benchmark"), False),
+    ("torch.backends.cuda.matmul.allow_tf32", ("backends", "cuda", "matmul", "allow_tf32"), False),
+    ("torch.utils.deterministic.fill_uninitialized_memory", ("utils", "deterministic", "fill_uninitialized_memory"), False),
+)
+_ENV_SETTINGS = ("CUBLAS_WORKSPACE_CONFIG", "CUDA_DEVICE_MAX_CONNECTIONS")
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
+
+
+def _setting_value(value: Any) -> dict[str, Any]:
+    """A setting's value as the manifest keeps it: plain JSON as it is, anything else as its
+    text, and a text longer than `SETTING_TEXT_MAX` cut, with its length."""
+    if value is None or isinstance(value, (bool, int)):
+        return {"value": value}
+    if isinstance(value, float):
+        return {"value": value if math.isfinite(value) else str(value)}
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:  # noqa: BLE001  a value's own __str__
+            value = f"<{type(value).__name__}>"
+    if len(value) > SETTING_TEXT_MAX:
+        return {"value": value[:SETTING_TEXT_MAX], "cut_from_length": len(value)}
+    return {"value": value}
+
+
+class _Missing(Exception):
+    """A setting this PyTorch does not have."""
+
+
+def _read_one(read: Any) -> dict[str, Any]:
+    """`read()` as an entry: its value, or why it could not be read. Never raises."""
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            entry = _setting_value(read())
+        if caught:
+            first = caught[0]
+            entry["warning"] = _cut(f"{first.category.__name__}: {first.message}", _ERROR_TEXT_MAX)
+        return entry
+    except _Missing as missing:
+        return {"not_read": str(missing)}
+    except Exception as error:  # noqa: BLE001  a read that raises is recorded, never raised
+        return {"not_read": _cut(f"reading it raised {type(error).__name__}: {error}", _ERROR_TEXT_MAX)}
+
+
+def _torch_reader(torch: Any, path: tuple[str, ...], call: bool) -> Any:
+    def read() -> Any:
+        found = torch
+        for depth, part in enumerate(path):
+            try:
+                found = getattr(found, part)
+            except AttributeError:
+                version = getattr(torch, "__version__", None)
+                raise _Missing(f"this PyTorch{f' ({version})' if version else ''} has no "
+                               f"torch.{'.'.join(path[: depth + 1])}") from None
+        return found() if call else found
+
+    return read
+
+
+def _read_numerical_settings() -> dict[str, Any]:
+    torch = sys.modules.get("torch")  # never imported here: `init` has imported it already
+    settings: dict[str, Any] = {}
+    for name, path, call in _TORCH_SETTINGS:
+        settings[name] = ({"not_read": "torch is not imported"} if torch is None
+                          else _read_one(_torch_reader(torch, path, call)))
+    for variable in _ENV_SETTINGS:
+        settings[f"os.environ.get('{variable}')"] = _read_one(lambda variable=variable: os.environ.get(variable))
+    return {"read_at": "init", "settings": settings}
+
+
+def numerical_settings_block() -> dict[str, Any]:
+    """The manifest's `numerical_settings`: each setting as this process has it now. Never raises."""
+    try:
+        return _read_numerical_settings()
+    except Exception as error:  # noqa: BLE001  nothing here may stop a run
+        return {"read_at": "init", "not_read": _cut(f"reading them raised {type(error).__name__}: {error}",
+                                                     _ERROR_TEXT_MAX)}
+
+
+def numerical_settings(manifest: Mapping[str, Any] | None) -> dict[str, Any]:
+    """What a run manifest says of the run's numerical settings, for every reader that shows them:
+    the block with `recorded: True`, or `{"recorded": False, "why": ...}` for a run without a
+    manifest or one written before they were recorded. A run whose settings were not recorded is
+    never read as having the defaults."""
+    if not isinstance(manifest, Mapping):
+        return {"recorded": False, "why": "the run has no manifest"}
+    block = manifest.get(NUMERICAL_SETTINGS_KEY)
+    if not isinstance(block, Mapping):
+        return {"recorded": False, "why": NOT_RECORDED}
+    return {"recorded": True, **block}
+
+
 def build_manifest(
     *,
     run_id: str | None,
@@ -305,6 +424,8 @@ def build_manifest(
         # Where the run ID came from: explicit, env (MLFLOW_RUN_ID), mlflow, wandb, launcher or generated.
         "run_id_source": run_id_source,
         "config": dict(config or {}),
+        # As `init` found them on this rank, read and never set (item OG1; `numerical_settings_block`).
+        NUMERICAL_SETTINGS_KEY: numerical_settings_block(),
     }
 
 
