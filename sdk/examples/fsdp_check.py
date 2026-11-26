@@ -563,7 +563,10 @@ def _end(pids: list[int]) -> list[int]:
     return alive
 
 
-def drive(args: argparse.Namespace, forwarded: list[str]) -> int:
+def launch(script: Path, args: argparse.Namespace, forwarded: list[str]) -> tuple[int | None, list[int], str]:
+    """Start `script --worker <forwarded>` on `args.nproc` ranks under `torch.distributed.run`, wait at most
+    `args.timeout` seconds, and end whatever is left (each rank writes `pid.rank<r>` under `args.out`).
+    Returns torchrun's exit status (None when it timed out), the pids still alive after SIGKILL, and the log."""
     out: Path = args.out
     # torchrun's own parser takes `--nproc` (an abbreviation of its `--nproc-per-node`) even after the
     # script's name, so the driver's own options stay with the driver.
@@ -580,7 +583,7 @@ def drive(args: argparse.Namespace, forwarded: list[str]) -> int:
         out.mkdir(parents=True, exist_ok=attempt > 0)
         command = [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(args.nproc),
                    "--master-addr", "127.0.0.1", "--master-port", str(_free_port()),
-                   str(Path(__file__).resolve()), "--worker", *forwarded]
+                   str(Path(script).resolve()), "--worker", *forwarded]
         env = dict(os.environ)
         if args.cpu:
             env.setdefault("OMP_NUM_THREADS", "1")
@@ -603,7 +606,15 @@ def drive(args: argparse.Namespace, forwarded: list[str]) -> int:
           + (f"; still alive after SIGKILL: {left}" if left else ""), flush=True)
     if status not in (0, None):
         print(text[-3000:], flush=True)
-    code = judge(args, args.nproc)
+    return status, left, text
+
+
+def drive(args: argparse.Namespace, forwarded: list[str], script: Path | None = None, judge_fn=None) -> int:
+    """The ranks started and ended by `launch`, then judged from their files (`judge_fn`, this file's
+    `judge` by default); a job that had to be ended is a FAIL whatever the files say."""
+    status, left, _ = launch(script or Path(__file__), args, forwarded)
+    out: Path = args.out
+    code = (judge_fn or judge)(args, args.nproc)
     if status is None or left:
         verdict = json.loads((out / "verdict.json").read_text())
         verdict["failures"].append(f"the ranks did not end within {args.timeout:g} s" + (f"; left running: {left}" if left else ""))
