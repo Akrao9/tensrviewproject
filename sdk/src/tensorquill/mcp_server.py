@@ -64,6 +64,7 @@ from .evidence import (
     rank_number,  # the one reader of `rank=<n>`: ASCII digits (lane X5, DET-17: `isdecimal()` took `rank=٣`)
     all_ranks_evidence,
     all_ranks_kinds,
+    attempts_first_seen,
     build_evidence,
     check_one_run,
     incident_class,
@@ -73,6 +74,7 @@ from .evidence import (
     merged_scalar_points,
     read_watchdog,
     resolve_attempts,
+    scalar_points_in_order,
     set_apart_scalars,
 )
 
@@ -383,7 +385,7 @@ class Source:
             stamp: Any = self._capture_stamp(where)
 
             def read() -> list[dict[str, Any]]:
-                return load_records(every, rank=picked, scalars=True)
+                return load_records(every, rank=picked, all_attempts=True, scalars=True)
         else:
             ranks = sorted(_discover_rank_folders(where))
             if not ranks:
@@ -393,7 +395,7 @@ class Source:
 
             def read() -> list[dict[str, Any]]:
                 try:
-                    return load_records(where, rank=picked, scalars=True)
+                    return load_records(where, rank=picked, all_attempts=True, scalars=True)
                 except MalformedRecordError as error:
                     raise ToolError(str(error)) from None  # the field, the value, the part and row
                 except ImportError:
@@ -405,9 +407,16 @@ class Source:
                     raise ToolError(f"rank {picked}'s stored parts under {where} could not be read ({error}).") from None
 
         def index() -> tuple[list[dict[str, Any]], dict[str, dict[str, None]], list[dict[str, Any]]]:
-            # The scalar-only records are set apart first, in the order they were read, which
-            # orders their points (`merged_scalar_points`); the step records are put in step order.
-            records, scalar_only = set_apart_scalars(read())
+            # Every attempt is read, so the attempts' order is the whole stream's, taken before any
+            # record is resolved away (BUG-20: a rollback can leave out every training record of the
+            # older attempt); then the attempts are resolved as `load_records` resolves them. The
+            # scalar-only records are set apart and put in the order their points stand
+            # (`scalar_points_in_order`), which `merged_scalar_points` keeps; the step records are put
+            # in step order.
+            every = read()
+            order = attempts_first_seen(every)
+            records, scalar_only = set_apart_scalars(resolve_attempts(every))
+            scalar_only = scalar_points_in_order(scalar_only, order=order)
             try:
                 records = sorted(records, key=lambda r: int(r["step"]))
             except (KeyError, TypeError, ValueError) as error:

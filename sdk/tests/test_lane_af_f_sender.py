@@ -48,13 +48,15 @@ def test_a_negative_key_line_is_skipped_and_every_valid_line_is_stored(tmp_path,
         closed = sender.close(20.0)
     finally:
         assert server.terminate() == 0
-    assert closed is True
+    # Wave AO (BUG-24 c, lane AO-2, accepted Nov 26): `close()` says False while a line of the run
+    # was left out, counted in `left_out_lines`, and says so in one more line on stderr.
+    assert closed is False and sender.left_out_lines == 1
     assert sorted(r["step"] for r in stored_records(tmp_path / "store", run_id)) == [0, 1, 2, 3, 4, 6, 7, 8, 9]
     assert sender.skipped_lines == 1
     assert sender.acked_offset == path.stat().st_size
     said = [s for s in capfd.readouterr().err.splitlines() if s.startswith("tensorquill:")]
     offset = len("".join(line(s, run_id) for s in range(5)))
-    assert len(said) == 1, said
+    assert len(said) == 2 and f"1 line of run {run_id}" in said[1], said
     assert f"the line at byte {offset} of {path}" in said[0] and f"{field} is -3" in said[0]
 
 

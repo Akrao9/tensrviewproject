@@ -111,10 +111,17 @@ _NON_FINITE = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
 
 
 def _number(value: Any) -> float | None:
-    """A recorded number as a float (non-finite ones included), or None for anything else."""
+    """A recorded number as a float (non-finite ones included), or None for anything else. An
+    integer too large for a float is the infinity of its sign, so the point is kept and compared as
+    one that is not finite, and nothing raises (wave AO, BUG-25)."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        try:
+            return float(value)
+        except OverflowError:
+            return math.inf if value > 0 else -math.inf
+    if isinstance(value, float):
         return float(value)
     if isinstance(value, str):
         return _NON_FINITE.get(value)
@@ -200,7 +207,7 @@ class _Run:
 
     def __init__(self, records: Iterable[Mapping[str, Any]], rank: int, resolved: bool = False,
                  label: str = "A") -> None:
-        from .evidence import run_of, scalar_points_in_order, set_apart_scalars
+        from .evidence import attempts_first_seen, run_of, scalar_points_in_order, set_apart_scalars
         from .identity import check, in_list, is_scalar_record
 
         self.series: dict[str, dict[int, float]] = {}
@@ -231,7 +238,9 @@ class _Run:
         # The rank's scalar-only records are resolved with its training records' cutoffs and then
         # set apart (WAVE_AL_CONTRACT.md section 4.6): never a record or a step of the run, they are
         # read as series points after the training records (Q8 a), and stand over a training
-        # record's value at their step, the highest `seq` last (Q6 a).
+        # record's value at their step, the highest `seq` last (Q6 a). Of two attempts' points at one
+        # step the later attempt's stands, by the order the attempts first appear in the rank's rows
+        # as given, before any is resolved away (BUG-20).
         kept = own if resolved else _resolved(own)
         trained = [record for record in own if not is_scalar_record(record)]
         kept, scalar_only = set_apart_scalars(kept)
@@ -241,7 +250,7 @@ class _Run:
             if record.get("run_id") not in self.run_ids:
                 self.run_ids.append(record.get("run_id"))
             self._read(record, int(record["step"]))
-        for record in scalar_points_in_order(scalar_only):
+        for record in scalar_points_in_order(scalar_only, order=attempts_first_seen(own)):
             logged = record.get("scalars")
             for name, scalar in logged.items() if isinstance(logged, Mapping) else ():
                 if _is_wall_clock(str(name)):

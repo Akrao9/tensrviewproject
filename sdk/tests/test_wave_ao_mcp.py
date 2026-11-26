@@ -191,8 +191,6 @@ def test_values_that_are_not_finite_are_still_counted_as_before(tmp_path):
     assert over["not_finite"] == 2 and over["first_not_finite_step"] == 1 and "too_large_for_a_float" not in over
 
 
-@pytest.mark.xfail(strict=True, reason="lane AO-5: evidence._finite (evidence.py:437 at 453f1e2) calls math.isfinite"
-                   " on the integer; the attention series reads the probe through evidence._attention_values")
 def test_an_attention_series_holding_an_integer_too_large_for_a_float_is_answered(tmp_path):
     probe = lambda v: {"probe": {"attention": {"att": {"entropy_share": [v], "max_logit": [0.5]}}}}
     capture = _write(tmp_path / "r.jsonl", _with(probe, [0.5, 0.6, BIG, 0.7]))
@@ -201,28 +199,24 @@ def test_an_attention_series_holding_an_integer_too_large_for_a_float_is_answere
 
 
 def test_a_capture_the_detectors_cannot_read_for_a_large_integer_is_said_so(tmp_path):
-    """A router's series on a capture runs the detectors; where they raise on the integer (lane
-    AO-5's to fix), the answer says the detectors could not read the records, and the server does
-    not report a failure of its own."""
+    """A router's series on a capture runs the detectors; where they raised on the integer, the
+    answer said the detectors could not read the records, and the server reported no failure of its
+    own. Since the join (lane AO-S: `evidence._finite` reads the integer as unreadable) they do not
+    raise, and the series is answered."""
     rows = [{**row, "grad_norm": BIG if row["step"] == 2 else 1.0} for row in _rows(range(4))]
     capture = _write(tmp_path / "r.jsonl", rows)
     reply = json.loads(_call(mcp_server.Source(capture), "get_series", {"kind": "router", "name": ROUTER}))
     text = reply["result"]["content"][0]["text"]
     assert "failed inside the server" not in text
-    if reply["result"]["isError"]:  # until lane AO-5's fix lands
-        assert "could not read the records" in text and "OverflowError" in text
+    assert reply["result"]["isError"] is False, text
 
 
-@pytest.mark.xfail(strict=True, reason="lane AO-5: build_evidence raises OverflowError on a grad_norm of 10**400"
-                   " (evidence._finite, evidence.py:437 at 453f1e2)")
 def test_a_routers_series_on_a_capture_with_a_large_integer_is_answered(tmp_path):
     rows = [{**row, "grad_norm": BIG if row["step"] == 2 else 1.0} for row in _rows(range(4))]
     capture = _write(tmp_path / "r.jsonl", rows)
     assert _series(mcp_server.Source(capture))["steps"] == [0, 1, 2, 3]
 
 
-@pytest.mark.xfail(strict=True, reason="lane AO-6: divergence._number (divergence.py:118 at 453f1e2) calls"
-                   " float() on the integer, which first_divergence reaches through compare_runs")
 def test_compare_runs_over_a_run_holding_an_integer_too_large_for_a_float_is_answered(tmp_path):
     for run_id, third in (("a", BIG), ("b", 3.0)):
         _write(tmp_path / f"{run_id}.jsonl", [{"schema_version": 1, "run_id": run_id, "rank": 0, "step": step,

@@ -385,7 +385,10 @@ def test_sdk21_unstorable_lines_are_skipped_and_counted_and_the_sender_moves_on(
         file.write('{"schema_version":1,"run_id":"run-a","rank":0,"step":6,"layers":{"x":NaN}}\n')
     append(path, [record(7), record(8)])
     sender = fast(path, server.endpoint)
-    assert sender.close() is True
+    # Wave AO (BUG-24 c, lane AO-2, accepted Nov 26): `close()` says False while a line of the run was
+    # left out, and `left_out_lines` counts the four key-refused lines.
+    assert sender.close() is False
+    assert sender.left_out_lines == 4
     # Lane AD4 (item 4): step 5 is sent, its `moe_top_k` in `extra_json`; before, [0, 6, 7, 8] and 5 skipped.
     assert store.steps() == [0, 5, 6, 7, 8]
     assert sender.skipped_lines == 4

@@ -1132,8 +1132,13 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
     `load_records` resolves them. A list is a rank's several files: every attempt of each, in
     that order, then resolved together (lane V4, CLI-13). The scalar-only records are among them,
     in their place, resolved with the training records' cutoffs: `first_divergence` reads them as
-    series points (WAVE_AL_CONTRACT.md Q8 a)."""
-    from .evidence import load_records, resolve_attempts, resolve_attempts_across
+    series points (WAVE_AL_CONTRACT.md Q8 a).
+
+    Either way the records come with each rank's attempts oldest first (`in_attempt_order`), one
+    attempt's in the order read, so the order `first_divergence` reads from them is the whole
+    stream's: once a rollback has left out every training record of an older attempt, its late
+    scalar-only point would otherwise come after the newer attempt's records and stand (BUG-20)."""
+    from .evidence import load_records, resolve_attempts_across
 
     if isinstance(path, (list, tuple)):
         per_file: list[list[dict[str, Any]]] = []  # each file's own order kept (contract 1, lane W3)
@@ -1153,14 +1158,24 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
             per_file.append(_not_read_yet(found, seen))
         return resolve_attempts_across(per_file), torn
     try:
-        return load_records(path, rank=rank, scalars=True), False
+        return _in_stream_order(load_records(path, rank=rank, all_attempts=True, scalars=True)), False
     except MalformedRecordError:
         raise  # a record that is not valid refuses the input (WAVE_AF_CONTRACT.md, section 1)
     except ValueError:
         source = Path(path)
         if source.is_dir() or source.suffix == ".parquet":
             raise
-        return resolve_attempts(_whole_lines(source, rank)), True
+        return _in_stream_order(_whole_lines(source, rank)), True
+
+
+def _in_stream_order(every: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`resolve_attempts(every)`, the records it keeps with each rank's attempts in the order they
+    first appear in `every` (`attempts_first_seen`), oldest first: the same records `load_records`
+    keeps, in the order `resolve_attempts_across` gives a rank's several files."""
+    from .evidence import attempts_first_seen, in_attempt_order, resolve_attempts
+
+    order = attempts_first_seen(every)
+    return resolve_attempts(in_attempt_order(every, order), order=order)
 
 
 def _left_out_text(left_out: Mapping[str, list[int]], *, of_ranks: bool) -> str:

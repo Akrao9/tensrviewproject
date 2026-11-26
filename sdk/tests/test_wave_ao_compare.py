@@ -280,7 +280,6 @@ def test_a_file_whose_training_records_name_two_runs_is_refused_by_both_as_the_d
 # --- BUG-21: across a rank's several files (lane AO-5's fix in evidence.py) ----------------------
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-21: lane AO-5's fix in evidence.resolve_attempts_across turns this on")
 def test_a_ranks_several_files_give_the_same_comparison_whichever_sorts_first(tmp_path):
     """Run birch on rank 0 in two files. The older attempt 61 (ts 100) trained 0-36 and logged `val`
     far off at 31-36 after them, then trained step 37; the newer attempt 62 (ts 500) logged `val` at

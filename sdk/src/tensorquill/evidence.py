@@ -148,9 +148,12 @@ IDLE_COLOR = (150, 158, 170)
 
 
 def _is_non_finite(value: Any) -> bool:
+    """A recorded NaN or infinity (a float, or the sink's string). An integer too large for a float
+    is not one: it is finite, and unreadable where a float is wanted, as the Rust detectors read it
+    (`detect/extra_json.rs`), so it raises nothing and is no `non_finite` value (wave AO, BUG-25)."""
     if isinstance(value, str):
         return value in ("nan", "inf", "-inf")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, float):
         return not math.isfinite(value)
     return False
 
@@ -481,10 +484,16 @@ def _jump_overloaded(
 
 def _finite(value: Any) -> float | None:
     """A finite number, else None. A bool is not a number (DET-16): an imported `true` is not a
-    measurement of 1. Flags such as `step_skipped` are read as flags, not through here."""
+    measurement of 1. Flags such as `step_skipped` are read as flags, not through here. An integer
+    too large for a float is None too, as `_recorded_diversity` reads it: unreadable where a float
+    is wanted, as the Rust detectors read it (wave AO, BUG-25)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 SKIPPED_BY = ("caller", "scaler", "both")
