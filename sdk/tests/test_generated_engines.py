@@ -361,10 +361,16 @@ HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
         "as above, for true",
         _stall(True),
     ),
-    # Seed 41.
-    "AQ5-D4 an incident at a step written twice": (
-        "Rust's scalar context of the starved_experts incident takes the step's first writing as a value "
-        "before it (median_before 2.0); Python has none before it (None)",
+    # Seed 1863, two records.
+    "AQ5-D4 a MoE incident at a step written twice": (
+        "Rust's scalar context of the moe_imbalance incident takes the step's first writing as a value "
+        "before it (median_before 2.4); Python's has none before it (None), and so has repeated_steps' "
+        "in both engines",
+        [_record(26, scalars={"loss": 2.4}), _record(26, scalars={"loss": 2.4}, moe={"r0": [1, 1, 10_000, 1]})],
+    ),
+    # Seed 41, starved_experts: the same with 50 records.
+    "AQ5-D4 a MoE incident at a step written twice, starved_experts": (
+        "as above, for the starved_experts incident (median_before 2.0 in Rust, None in Python)",
         _written_twice(),
     ),
     # Seeds 13, 210, 357, 376, 413, 542, 563, 592, 653, 674, 753, 1032, 1281, 1379.
