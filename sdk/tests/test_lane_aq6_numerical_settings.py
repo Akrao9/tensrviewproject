@@ -384,3 +384,21 @@ def test_a_streamed_run_ends_with_its_settings_in_the_servers_run_json_unchanged
     assert stored[KEY]["settings"][NAMES[0]] == {"value": True}
     # Read back from the store, compare finds them.
     assert mf.numerical_settings(stored)["recorded"] is True
+
+
+def test_a_warning_given_while_reading_is_not_itself_a_difference(tmp_path):
+    folder = tmp_path / "out"
+    _local(folder, "run-1", _settings(s4={"value": False, "warning": "UserWarning: allow_tf32 is deprecated"}))
+    _local(folder, "run-2", _settings())
+    setup = tensorquill.compare_runs("run-1", "run-2", source=folder)["setup"]
+    assert setup["differs"] == [] and NAMES[4] in setup["numerical_settings_same"]
+
+
+def test_two_long_values_cut_alike_but_of_other_lengths_differ(tmp_path):
+    folder = tmp_path / "out"
+    cut = "x" * mf.SETTING_TEXT_MAX
+    _local(folder, "run-1", _settings(s6={"value": cut, "cut_from_length": 300}))
+    _local(folder, "run-2", _settings(s6={"value": cut, "cut_from_length": 400}))
+    setup = tensorquill.compare_runs("run-1", "run-2", source=folder)["setup"]
+    assert setup["differs"] == [{"field": f"{KEY}.{NAMES[6]}", "values": {"A": cut, "B": cut},
+                                 "cut_from_length": {"A": 300, "B": 400}}]
