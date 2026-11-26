@@ -941,3 +941,33 @@ def test_a_ts_too_large_for_a_float_is_no_time_when_a_dump_corroborates_a_stall(
     assert kinds["job_stalled"]["assessment"] == "confirmed_hang"  # the other steps' times are read
     assert evidence._newest_stamp([{"ts": BIG}, {"ts": 3}, {"ts": True}, {"ts": "x"}, {}]) == 3.0
     assert evidence._newest_stamp([{"ts": -BIG}]) is None
+
+
+GUIDE_VERSIONS = ("`rank` and `attempt`, when present, must be integers of 0 or more, and `schema_version` 0 or 1, or "
+                  '2 for a scalar-only record alone, one with `"record": "scalars"` and a `seq` that is an integer of 0 '
+                  "or more, as `session.log(..., step=N)` writes it; a version 2 record without them, and any other "
+                  "version, is refused.")
+
+
+def test_the_guide_gives_the_schema_versions_the_readers_take():
+    text = _flat(_page("sdk/RUN_ON_YOUR_JOB.md"))
+    assert GUIDE_VERSIONS in text
+    assert "and `schema_version` 0 or 1. A Boolean" not in text
+
+
+def test_the_readers_take_the_schema_versions_the_guide_gives():
+    """The sentence above, run through `load_records`: 0, 1 and absent as step records, 2 as a whole
+    scalar-only record only, anything else refused naming `schema_version` (or `seq`)."""
+    from tensorquill import identity
+
+    step = {"run_id": "r", "rank": 0, "step": 0, "grad_norm": 1.0}
+    for version in ({}, {"schema_version": 0}, {"schema_version": 1},
+                    {"schema_version": 2, "record": "scalars", "seq": 0, "scalars": {"x": 1.0}}):
+        assert len(evidence.load_records([{**step, **version}], scalars=True)) == 1
+    for version, field in (({"schema_version": 2}, "schema_version"),
+                           ({"schema_version": 2, "record": "scalars", "scalars": {"x": 1.0}}, "seq"),
+                           ({"schema_version": 3}, "schema_version"), ({"schema_version": 1.0}, "schema_version"),
+                           ({"schema_version": True}, "schema_version"), ({"schema_version": None}, "schema_version")):
+        with pytest.raises(identity.MalformedRecordError) as refused:
+            evidence.load_records([{**step, **version}], scalars=True)
+        assert refused.value.field == field
