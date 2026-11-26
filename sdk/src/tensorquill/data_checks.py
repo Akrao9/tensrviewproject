@@ -78,9 +78,14 @@ def _bool(value: Any) -> bool | None:
 
 
 def _number(value: Any) -> float | None:
+    """A finite number, else None; a bool is not a number. An integer too large for a float is None
+    too, as `evidence._finite` reads it and the Rust detectors read it (`detect/extra_json.rs`)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
     return value if math.isfinite(value) else None
 
 
