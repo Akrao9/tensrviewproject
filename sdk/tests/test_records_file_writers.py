@@ -448,6 +448,47 @@ def test_the_evidence_of_either_file_names_both_writers(two_writers):
         assert evidence["writers"]["files"] == [first.name, second.name]
 
 
+def test_the_evidence_of_either_file_is_not_healthy(two_writers):
+    """Each file holds one process's records whole, and the detectors find nothing in either; the
+    rank is still not one healthy writer, so the evidence says so and the summary does not open
+    with a clean bill."""
+    from tensorquill.evidence import build_evidence, incident_summary, run_state_line
+
+    out, first, second = two_writers
+    for path in (first, second):
+        evidence = build_evidence(path)
+        assert evidence["run_state"]["state"] == "unknown"
+        assert any(r.get("code") == "several_writers" for r in evidence["run_state"]["reasons"])
+        assert "Writers:" in incident_summary(evidence) and "unknown" in run_state_line(evidence)
+
+
+def test_the_mcp_servers_evidence_of_either_file_is_not_healthy(two_writers):
+    from tensorquill import mcp_server
+
+    out, first, second = two_writers
+    for path in (first, second):
+        evidence = mcp_server.Source(path).capture_evidence(path, 0)
+        assert evidence["run_state"]["state"] == "unknown"
+
+
+def test_a_records_file_that_cannot_be_read_is_still_written(here):
+    """The locked sink opens its file for reading too; a file it may write and not read is opened
+    for appending alone, as before, and the session goes on."""
+    path = here / "tensorquill-out" / "wo.rank0.jsonl"
+    path.parent.mkdir()
+    path.write_text('{"step": 0}\n')
+    path.chmod(0o200)
+    try:
+        if os.access(path, os.R_OK):
+            pytest.skip("this user can read a file of mode 0o200 (root)")
+        sink = _sink.JsonlSink(path, lock=True)
+        sink.write([{"step": 1}])
+        sink.close()
+    finally:
+        path.chmod(0o600)
+    assert path.read_text() == '{"step": 0}\n{"step":1}\n'
+
+
 def test_the_evidence_of_a_lone_writer_has_no_writers_block(here):
     from tensorquill.evidence import build_evidence
 

@@ -77,6 +77,14 @@ CASES = {
     "pmi": ({"PMI_RANK": "1", "PMI_SIZE": "2"}, 1, 2),
     "mpirun_in_a_batch_script": ({"SLURM_JOB_ID": "7", "SLURM_PROCID": "0", "SLURM_NTASKS": "4",
                                   "OMPI_COMM_WORLD_RANK": "1", "OMPI_COMM_WORLD_SIZE": "4"}, 1, 4),
+    # mpirun started from inside an srun step of one task: the step's variables are inherited, and the
+    # MPI rank, which differs, is the process's own.
+    "mpirun_in_a_step": ({"SLURM_JOB_ID": "7", "SLURM_STEP_ID": "0", "SLURM_PROCID": "0", "SLURM_STEP_NUM_TASKS": "1",
+                          "SLURM_NTASKS": "1", "OMPI_COMM_WORLD_RANK": "1", "OMPI_COMM_WORLD_SIZE": "4"}, 1, 4),
+    "pmi_in_a_step": ({"SLURM_PROCID": "0", "SLURM_STEP_NUM_TASKS": "1", "PMI_RANK": "2", "PMI_SIZE": "3"}, 2, 3),
+    # srun's own MPI launch: the two agree, and SLURM's are read.
+    "srun_with_pmi_that_agrees": ({"SLURM_PROCID": "1", "SLURM_STEP_NUM_TASKS": "2", "PMI_RANK": "1", "PMI_SIZE": "2"},
+                                  1, 2),
     "an_empty_rank_is_passed_over": ({"RANK": "", "SLURM_PROCID": "1", "SLURM_STEP_NUM_TASKS": "2"}, 1, 2),
     "a_digit_that_is_not_ascii_is_passed_over": ({"RANK": "٣", "PMI_RANK": "1", "PMI_SIZE": "2"}, 1, 2),
 }
