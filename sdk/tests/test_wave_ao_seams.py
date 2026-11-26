@@ -501,7 +501,7 @@ PLACED = ("## Records that cannot be placed, every rank's keys", "\n## Things to
 
 
 def test_the_scalars_bullet_says_what_log_refuses_and_what_is_left_out():
-    text = _readme(*WHAT_IS_BUILT)
+    text = _flat(next(line for line in _page("sdk/README.md").splitlines() if line.startswith("- **`scalars`**")))
     for words in ("**A value it cannot read (Nov 26, 2026).** `log` refuses a tensor on `meta` (it holds no values), a "
                   "nested tensor and one that is not dense, such as a sparse one, with `ValueError` naming the key, "
                   "before anything is recorded, with or without `step=`.",

@@ -19,10 +19,9 @@
 //! - *Clipping.* Python reads `clip_grad_norm` for every record once any record has it,
 //!   and so skips the records before clipping began. The first record with it resets the
 //!   gradient state here, which gives the same result.
-//! - *Experts per token.* Python applies the last `moe_top_k` recorded in the run to
-//!   every record; here a record is judged with the value known when it arrives. The SDK
-//!   writes `moe_top_k` on every record, so the two differ only for hand-made records
-//!   that change it in mid-run.
+//! - *Experts per token.* A record is judged with the `moe_top_k` known when it arrives,
+//!   here and in Python since wave AO (BUG-13), so a run that changes it in mid-run is
+//!   judged step by step alike.
 //! - *Attempts.* A resume rolls back steps that were already judged. That cannot be
 //!   undone in place, so the caller rebuilds the state from the store ([`resolve`] gives
 //!   the rows that count). `repeated_steps` and `resume_lr_change` read every attempt,

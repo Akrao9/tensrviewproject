@@ -562,7 +562,8 @@ def test_the_capture_writes_a_negative_step_as_given_and_the_file_is_then_refuse
     with pytest.raises(identity.MalformedRecordError):
         ev.load_records(path)
     for text in (NEW, flat(GUIDE)):
-        assert "writes a `step=` or `start_step=` below 0 as given" in text
+        # Wave AO (BUG-05): `init` refuses a negative `start_step`, so the page names `session.step(step=...)`.
+        assert "writes a `session.step(step=...)` below 0 as given" in text
 
 
 def test_the_sender_skips_and_counts_what_it_does_not_send_and_sends_an_unread_version():
