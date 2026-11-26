@@ -1,0 +1,34 @@
+# The fuzz targets of the server's decode (lane AQ-5, SV7), for `cargo fuzz` (cargo-fuzz, libFuzzer,
+# a nightly toolchain). A package of its own with its own workspace, so the server's manifest and lock
+# file do not change and no build of the server reads this folder. See README.md.
+[package]
+name = "tensorquill-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The same version as the server's, so the decode under test is the one the server runs.
+arrow-flight = "60.1.0"
+tensorquill-server = { path = "..", default-features = false }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_put"
+path = "fuzz_targets/decode_put.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detect_stream"
+path = "fuzz_targets/detect_stream.rs"
+test = false
+doc = false
+bench = false
