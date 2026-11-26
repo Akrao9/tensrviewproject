@@ -338,9 +338,14 @@ def _row(
             row["probe_json"], row["probe_maps"], row["probe_histograms"] = _split_probe(value)
             continue
         if key == "scalars" and isinstance(value, dict):
-            # A logged bool is not a number in either engine (lane W3, DET-16): that one value is left
-            # out of the row, and the rest of the map stays in its column for the Rust detectors.
-            value = {k: v for k, v in value.items() if not isinstance(v, bool)}
+            held, aside, counted = _scalars(value, None if schema is None else schema.field(spec[0]).type)
+            if held is not _UNHELD:
+                row[spec[0]] = held
+            if aside:
+                extra[key] = aside
+            if counted and moved is not None:
+                moved.append(key)
+            continue
         counted = False  # refused by an overflow or by Arrow, not by its type: `moved` names the key
         try:
             converted = spec[1](value)
@@ -379,6 +384,43 @@ def _row(
     if extra:
         row["extra_json"] = _json(extra)
     return row
+
+
+def _past_float(value: Any) -> bool:
+    """Whether `value` is an integer (not a bool) that a float64 holds only rounded, such as
+    `2**53 + 1`. An integer too large for any float is not: `float()` refuses it, and its map
+    travels in `extra_json` whole, as before."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    try:
+        return float(value) != value  # Python compares an int with a float exactly
+    except OverflowError:
+        return False
+
+
+def _scalars(value: Mapping[str, Any], map_type: Any) -> tuple[Any, dict[str, Any], bool]:
+    """The `scalars` map as its column's pairs (`_UNHELD` for none), what travels in `extra_json`
+    under `scalars`, and whether the map was refused by an overflow or by Arrow (`map_type`, when
+    given), not by a type.
+
+    - A logged bool is not a number in either engine (lane W3, DET-16): that one value is left out of
+      the column, and the rest of the map stays there for the Rust detectors.
+    - An integer a float64 holds only rounded (`_past_float`; capture keeps a logged Python integer
+      as it is, and the `.jsonl` holds it exactly; wave AO, BUG-24 a) stays in the column as the
+      nearest float, which the Rust detectors judge, and travels exactly in `extra_json` too, so
+      `row_to_record` gives the record back as the file holds it, in its order.
+    - Any other value the column refuses moves the whole map to `extra_json` and the column is null,
+      as before (lane W3)."""
+    column = {k: v for k, v in value.items() if not isinstance(v, bool)}
+    try:
+        converted = _map(_float)(column)
+    except (TypeError, ValueError):
+        return _UNHELD, column, False
+    except Exception:  # noqa: BLE001  OverflowError and the like: the value's, not the step's
+        return _UNHELD, column, True
+    if map_type is not None and not _fits(converted, map_type):
+        return _UNHELD, column, True
+    return converted, {k: v for k, v in value.items() if _past_float(v)}, False
 
 
 # The maps held entry by entry (wave AJ, A3), each with its entries' converter. `scalars` keeps
@@ -681,8 +723,10 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
         else:
             record[key] = _plain(value)
     if extra:
-        for key in _SPLIT:
-            # The entries the column could not hold, beside those it did (wave AJ, A3).
+        for key in (*_SPLIT, "scalars"):
+            # The entries the column could not hold, beside those it did (wave AJ, A3), and the
+            # scalars it holds only rounded, exactly (`_scalars`): an entry of the column's own name
+            # is replaced where it stands, so the record keeps its order.
             if key in record and isinstance(extra.get(key), dict):
                 record[key] = {**record[key], **extra.pop(key)}
         record.update(extra)
