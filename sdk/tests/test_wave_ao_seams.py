@@ -6,6 +6,12 @@
 2. The two overflow guards no lane made (lane AO-9's list): an integer too large for a float is
    unreadable to the Python detectors, as the Rust detectors read it (`detect/extra_json.rs`), and
    not finite to `first_divergence`; nothing raises.
+3. Checks across lanes, through a real server of this tree: (a) BUG-07 end to end at batch sizes 1
+   and 64, the default series equal through `scalar_series` and MCP `get_series`; (b) BUG-20 through
+   the store, all four readers giving the newer attempt's point; (c) a version 2 line with no
+   `"record": "scalars"` beside good lines, through the sender, the store and the local readers;
+   (d) a session that logs a value it cannot read, streamed; (e) lane AO-1's `run_id` rule against
+   what the Lightning and Hugging Face callbacks pass (what happens today, pinned; nothing changed).
 
 Records are written here by hand, in the shapes `JsonlSink` writes. Tests that need pyarrow or a
 `tensorquill-server` binary (`TENSORQUILL_SERVER_BIN`) skip one by one without them.
@@ -17,7 +23,12 @@ import importlib.util
 import json
 import math
 import os
+import signal
+import subprocess
+import time
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -185,3 +196,267 @@ def test_first_divergence_reads_an_integer_too_large_for_a_float_as_an_infinity(
     infinite = first_divergence(_loss_run("a", sign * math.inf), _loss_run("b", 3.0))
     assert big == infinite
     assert big["first_exact_difference"] == {"step": 2, "series": 1}
+
+
+# --- 3. Checks across lanes, through a real server ---------------------------------------------------
+
+class _Server:
+    """A server of this tree on a free port, stopped with SIGTERM by `close`, which returns its stderr."""
+
+    def __init__(self, store: Path) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "TENSORQUILL_TOKEN"}
+        self.process = subprocess.Popen(
+            [BINARY, "--listen", "127.0.0.1:0", "--store", str(store), "--flush-steps", "1",
+             "--flush-seconds", "0.2", "--watchdog-seconds", "0.5"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        line = self.process.stdout.readline()
+        assert "listening on" in line, line + self.process.stderr.read()
+        self.endpoint = f"grpc://127.0.0.1:{int(line.rsplit(':', 1)[1])}"
+
+    def close(self) -> str:
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGTERM)
+        self.process.wait(30)
+        said = self.process.stderr.read()
+        self.process.stdout.close()
+        self.process.stderr.close()
+        return said
+
+
+def _sent(tmp_path: Path, path: Path, run_id: str, batch_steps: int, attempt: int | None = None) -> Path:
+    """`path` sent by one `FlightSender` cut at `batch_steps`, claiming `attempt`; the run's store folder."""
+    from tensorquill import flight
+
+    store = tmp_path / f"store-{run_id}"
+    server = _Server(store)
+    try:
+        sender = flight.FlightSender(path, server.endpoint, run_id, 0, batch_steps=batch_steps,
+                                     await_attempt=attempt is not None)
+        if attempt is not None:
+            sender.attempt = attempt
+        assert sender.close(timeout=30.0) is True
+        assert sender.acked_offset == path.stat().st_size
+    finally:
+        server.close()
+    return store / "runs" / run_id
+
+
+def _mcp_points(folder: Path, name: str) -> list[list]:
+    from tensorquill.mcp_server import Source, get_series
+
+    answer = get_series(Source(folder), {"kind": "scalar", "name": name})
+    return [[step, value] for step, value in zip(answer["steps"], answer["values"]["value"])]
+
+
+# (a) BUG-07: the audit's three sessions under one run ID on rank 0 (lane AO-3's scenario), with a
+# training loss on B's and C's steps so the default series has points: A logs `eval_loss` at an
+# explicit step 50 and closes, B trains step 0, C trains step 100 and is the sender's attempt.
+A, B, C = 1_732_000_000_000, 1_732_000_100_000, 1_732_000_200_000
+
+
+def _tq01(run_id: str) -> list[dict]:
+    return [
+        {"schema_version": 2, "record": "scalars", "run_id": run_id, "rank": 0, "attempt": A, "step": 50,
+         "seq": 0, "ts": 10.0, "scalars": {"eval_loss": 99.0}},
+        {"schema_version": 1, "run_id": run_id, "rank": 0, "attempt": B, "step": 0, "ts": 20.0,
+         "grad_norm": 1.0, "scalars": {"loss": 1.0}},
+        {"schema_version": 1, "run_id": run_id, "rank": 0, "attempt": C, "step": 100, "ts": 30.0,
+         "grad_norm": 1.0, "scalars": {"loss": 2.0}},
+    ]
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("batch_steps", [1, 64])
+def test_bug07_the_default_series_from_the_store_is_the_files_through_both_readers(tmp_path, batch_steps):
+    from tensorquill.mcp_server import Source, ToolError, get_series
+
+    run_id = f"seam_a_{batch_steps}"
+    path = _write(tmp_path / f"{run_id}.rank0.jsonl", _tq01(run_id))
+    folder = _sent(tmp_path, path, run_id, batch_steps, attempt=C)
+    order = json.loads((folder / "rank=0" / "attempts.json").read_text())["attempts"]
+    assert [entry["attempt"] for entry in order] == [A, B, C]
+    expected = {"loss": [[0, 1.0], [100, 2.0]]}  # B's first step (0) rolls A's point at 50 back
+    assert evidence.scalar_series(path) == evidence.scalar_series(folder, rank=0) == expected
+    assert _mcp_points(folder, "loss") == expected["loss"]
+    with pytest.raises(ToolError, match="no scalar is named 'eval_loss'"):
+        get_series(Source(folder), {"kind": "scalar", "name": "eval_loss"})
+    assert evidence.scalar_series(folder, rank=0, all_attempts=True)["eval_loss"] == [[50, 99.0]]
+
+
+# (b) BUG-20 through the store: the four readers on a store the joined sender and server wrote.
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("records", [LATE, ROLLED_BACK_WHOLE], ids=["late", "rolled_back_whole"])
+@pytest.mark.parametrize("batch_steps", [1, 64])
+def test_bug20_the_series_of_a_store_gives_the_newer_attempts_point(tmp_path, records, batch_steps):
+    path = _write(tmp_path / "r.rank0.jsonl", records)
+    folder = _sent(tmp_path, path, "r", batch_steps)
+    assert evidence.scalar_series(folder, rank=0)["val"] == [[2, 2.0]]
+    assert _mcp_points(folder, "val") == [[2, 2.0]]
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("whole", [False, True], ids=["late", "rolled_back_whole"])
+def test_bug20_first_divergence_and_compare_runs_on_a_store_read_the_newer_attempts_point(tmp_path, whole):
+    from tensorquill.compare import compare_runs
+    from tensorquill.divergence import first_divergence
+
+    store = tmp_path / "store"
+    server = _Server(store)
+    try:
+        from tensorquill import flight
+
+        for run_id, late in (("a", True), ("b", False)):
+            path = _write(tmp_path / f"{run_id}.rank0.jsonl", _compared_run(run_id, late, whole))
+            assert flight.send_file(path, server.endpoint, run_id, 0, timeout=60) is True
+        time.sleep(0.5)
+    finally:
+        server.close()
+    raw = [evidence.load_records(store / "runs" / run_id, rank=0, all_attempts=True, scalars=True) for run_id in "ab"]
+    assert first_divergence(*raw)["first_exact_difference"] is None
+    part = compare_runs("a", "b", source=store)["divergence"]
+    assert part["first_exact_difference"] is None and part["state"] == "no_divergence", part["lines"]
+
+
+# (c) BUG-02, both sides joined: the sender leaves the line out (lane AO-2), so the store reads back;
+# the local file is refused by the readers that check every line, and listed by `list_runs`.
+
+def _unmarked(run_id: str) -> list[dict]:
+    return [{"schema_version": 2 if step == 2 else 1, "run_id": run_id, "rank": 0, "attempt": 1, "step": step,
+             "ts": float(step), "grad_norm": 1.0} for step in range(5)]
+
+
+@needs_pyarrow
+@needs_binary
+def test_bug02_a_version_2_line_without_the_mark_is_left_out_and_the_store_reads_back(tmp_path):
+    from tensorquill import flight, identity, runs
+
+    run_id = "v2u"
+    local = tmp_path / "local"
+    local.mkdir()
+    path = _write(local / f"{run_id}.rank0.jsonl", _unmarked(run_id))
+    store = tmp_path / "store"
+    server = _Server(store)
+    try:
+        assert flight.send_file(path, server.endpoint, run_id, 0, timeout=60) is False
+        sender = flight.FlightSender(path, server.endpoint, run_id, 0)  # a later sender of the same file
+        assert sender.close(30.0) is False and sender.left_out_lines == 1
+        time.sleep(1.0)  # a watchdog pass writes the rank's status
+    finally:
+        said = server.close()
+    assert [r["step"] for r in evidence.load_records(store / "runs" / run_id, all_attempts=True)] == [0, 1, 3, 4]
+    status = json.loads((store / "runs" / run_id / "watchdog.json").read_text())
+    [entry] = status["ranks"] if isinstance(status["ranks"], list) else status["ranks"].values()
+    assert "dropped_rows" not in entry and "1 with a null seq" not in said  # nothing of it reached the server
+    # The local file: the readers that check every line refuse it, naming the line (wave AF's rule,
+    # unchanged by wave AO); the listing, which reads no line's identity, lists the run.
+    for read in (evidence.build_evidence, evidence.load_records):
+        with pytest.raises(identity.MalformedRecordError, match="line 3: schema version 2 is the scalar-only record"):
+            read(path)
+    [listed] = runs.list_runs(local)
+    assert (listed["run_id"], listed["last_step"], listed["ranks"], listed["evidence"]["state"]) == (run_id, 4, [0], "missing")
+
+
+# (d) A session that logs a value it cannot read (lane AO-1, BUG-03), streamed by the joined sender.
+
+@needs_pyarrow
+@needs_binary
+def test_a_streamed_session_refuses_a_meta_value_and_closes_over_a_value_whose_move_fails(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    import tensorquill
+
+    class _Unreadable(torch.Tensor):
+        """A tensor whose copy off the device fails (lane AO-1's stand-in)."""
+
+        @classmethod
+        def __torch_function__(cls, func, types, args=(), kwargs=None):
+            if func is torch.stack:
+                raise RuntimeError("stand-in: the copy off the device failed")
+            return super().__torch_function__(func, types, args, kwargs or {})
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
+    store = tmp_path / "store"
+    server = _Server(store)
+    try:
+        model = torch.nn.Linear(4, 1)
+        session = tensorquill.init(model, run_id="seam_d", every=2, endpoint=server.endpoint, heartbeat_seconds=None)
+        for step in (0, None):
+            with pytest.raises(ValueError, match="x: the tensor is on meta, which holds no values"):
+                session.log({"x": torch.tensor(1.0, device="meta")}, step=step)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        for _ in range(4):
+            optimizer.zero_grad()
+            model(torch.randn(3, 4)).sum().backward()
+            session.log({"train/loss": 1.0})
+            optimizer.step()
+        session.log({"eval/loss": 0.5, "eval/bad": 1.0}, step=3)
+        session._scalar_records[-1]["scalars"]["eval/bad"] = torch.tensor(2.0).as_subclass(_Unreadable)
+        with warnings.catch_warnings(record=True) as said:
+            warnings.simplefilter("always")
+            session.close()  # never raises
+        sender = session._sink.sender
+        time.sleep(0.5)
+    finally:
+        server.close()
+    out = tmp_path / "tensorquill-out"
+    path = out / "seam_d.rank0.jsonl"
+    assert (out / "seam_d.rank0.end.json").exists()
+    assert sum("left out the value 'eval/bad'" in str(w.message) for w in said) == 1
+    assert (sender.acked_offset, sender.left_out_lines, sender.skipped_lines) == (path.stat().st_size, 0, 0)
+    stored = evidence.load_records(store / "runs" / "seam_d", scalars=True, all_attempts=True)
+    assert [(r["step"], r.get("scalars")) for r in stored] == [*[(s, {"train/loss": 1.0}) for s in range(4)],
+                                                               (3, {"eval/loss": 0.5})]
+
+
+# (e) Lane AO-1's `run_id` rule (BUG-06) against the callbacks: an explicit `run_id` that breaks it is
+# refused at `init`, one from the environment is fitted with a warning. The Lightning callback passes
+# its logger's run ID to `init` as an explicit one, so such an ID would stop the fit; MLflow's IDs
+# (32 hex digits) and W&B's (letters and digits) never break it. Pinned as it is today, for the owner.
+
+class _MLflowLoggerStandIn:
+    run_id = "exp/1"  # no real MLflow run ID has a '/': a stand-in for one that breaks the rule
+
+
+def _lightning_trainer(loggers: list) -> SimpleNamespace:
+    return SimpleNamespace(loggers=loggers, is_global_zero=True, precision_plugin=SimpleNamespace(), global_step=0)
+
+
+def test_today_a_lightning_loggers_run_id_that_breaks_the_rule_stops_the_fit_at_its_start(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("lightning")
+    from tensorquill import manifest
+    from tensorquill.lightning import TensorQuillCallback
+
+    monkeypatch.chdir(tmp_path)
+    callback = TensorQuillCallback(heartbeat_seconds=None)
+    with pytest.raises(ValueError, match="run_id 'exp/1' cannot be used: it holds '/'"):
+        callback.on_fit_start(_lightning_trainer([_MLflowLoggerStandIn()]), torch.nn.Linear(2, 2))
+    assert callback.session is None and not list(tmp_path.iterdir())  # nothing opened, nothing written
+    # The same ID from the environment is fitted, with a warning (lane AO-1's rule).
+    monkeypatch.setenv("MLFLOW_RUN_ID", "exp/1")
+    callback = TensorQuillCallback(heartbeat_seconds=None)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        callback.on_fit_start(_lightning_trainer([]), torch.nn.Linear(2, 2))
+    callback.session.close()
+    assert any("MLFLOW_RUN_ID gives the run ID 'exp/1'" in str(w.message) for w in said)
+    assert (tmp_path / "tensorquill-out" / "exp-1.rank0.jsonl").exists()
+    for real in ("0123456789abcdef0123456789abcdef", "3k9x2m1q"):  # an MLflow and a W&B run ID
+        assert manifest.run_id_problem(real) is None
+
+
+def test_a_run_id_given_to_the_hugging_face_callback_is_the_users_and_refused_when_it_breaks_the_rule(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from tensorquill.huggingface import TensorQuillCallback
+
+    monkeypatch.chdir(tmp_path)
+    callback = TensorQuillCallback(run_id="exp/1", heartbeat_seconds=None)
+    args = SimpleNamespace(eval_on_start=False, resume_from_checkpoint=None, output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="run_id 'exp/1' cannot be used: it holds '/'"):
+        callback.on_train_begin(args, SimpleNamespace(global_step=0), SimpleNamespace(), model=torch.nn.Linear(2, 2))
+    assert callback.session is None and not list(tmp_path.iterdir())
