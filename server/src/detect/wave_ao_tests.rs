@@ -309,3 +309,76 @@ fn an_attention_given_twice_is_its_last_value() {
     let detectors = judge(0, &[probe_batch(&[Some(last_null.as_str()); 5])], &usual()).unwrap();
     assert_eq!(detectors.kind_checks(), none.kind_checks());
 }
+
+// --- BUG-01, the other integer arithmetic on recorded counts: memory_growth --------------------
+
+/// One row per step from 0, each with the `system` text given.
+fn system_batch(systems: &[String]) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("rank", DataType::Int32, false),
+        Field::new("attempt", DataType::Int64, false),
+        Field::new("step", DataType::Int64, false),
+        Field::new("system_json", DataType::Utf8, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from_iter_values(systems.iter().map(|_| "run"))),
+            Arc::new(Int32Array::from_iter_values(systems.iter().map(|_| 0))),
+            Arc::new(Int64Array::from_iter_values(systems.iter().map(|_| 1))),
+            Arc::new(Int64Array::from_iter_values(0..systems.len() as i64)),
+            Arc::new(StringArray::from_iter_values(systems.iter())),
+        ],
+    )
+    .unwrap()
+}
+
+fn memory_growth(systems: &[String]) -> Option<Value> {
+    let detectors = judge(0, &[system_batch(systems)], &usual()).unwrap();
+    detectors
+        .incidents()
+        .into_iter()
+        .find(|incident| incident["kind"] == "memory_growth")
+}
+
+/// `memory_growth` subtracts the first of six rising `allocated` readings from the last, and the last
+/// from `total`. Python's integers do not overflow: six readings from `i64::MIN` to `i64::MAX` rose
+/// by 2**64 - 1 bytes, a growth. Before, `i64` subtraction panicked (debug) or wrapped to a fall
+/// (release).
+#[test]
+fn a_rise_of_allocated_past_i64_is_a_growth() {
+    let readings = [i64::MIN, -(1 << 62), 0, 1 << 61, 1 << 62, i64::MAX];
+    let systems: Vec<String> = readings
+        .iter()
+        .map(|allocated| format!(r#"{{"cuda":{{"allocated":{allocated},"total":17179869184}}}}"#))
+        .collect();
+    let incident = memory_growth(&systems).expect("a growth");
+    assert_eq!(
+        (
+            &incident["allocated_first"],
+            &incident["allocated"],
+            &incident["steps_to_total"]
+        ),
+        (&json!(i64::MIN), &json!(i64::MAX), &json!(0.0))
+    );
+    assert_eq!(incident["bytes_per_step"], json!((u64::MAX as f64) / 5.0));
+}
+
+/// The steps left to `total` are `max(total - allocated, 0) / bytes_per_step`: with a `total` of
+/// `i64::MIN` that is 0, where `i64` subtraction panicked (debug) or wrapped to a huge number (release).
+#[test]
+fn the_steps_to_a_total_below_allocated_by_more_than_i64_are_none_left() {
+    let mib = 1_i64 << 20;
+    let systems: Vec<String> = (0..6)
+        .map(|k| {
+            format!(
+                r#"{{"cuda":{{"allocated":{},"total":{}}}}}"#,
+                (1 + k) * 100 * mib,
+                i64::MIN
+            )
+        })
+        .collect();
+    let incident = memory_growth(&systems).expect("a growth");
+    assert_eq!(incident["steps_to_total"], json!(0.0));
+}
