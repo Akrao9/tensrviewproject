@@ -144,6 +144,12 @@ const RESTORE_CONCURRENCY: usize = 32;
 const REPLAY_CONCURRENCY: usize = 16;
 /// The wait after failed rebuilds stops doubling at this many times `replay_backoff`.
 const REPLAY_BACKOFF_MAX_DOUBLINGS: u32 = 6;
+/// A finished run whose rank waits to try a rebuild or a report again is kept in memory until that
+/// retry has failed this many times in a row, the wait having stopped doubling (wave AP, AO-03):
+/// about 21 minutes of failures at the default `replay_backoff` of 10 s. Then it is let go of as any
+/// settled run, its status saying the rank is not judged. A store that never heals so keeps a run
+/// only for a bounded time.
+const RETRY_HOLD_FAILURES: u32 = REPLAY_BACKOFF_MAX_DOUBLINGS + 1;
 /// A stream error is written to stderr at most this often; the ones between are counted in the next line.
 const STREAM_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -526,6 +532,42 @@ impl RankBuffer {
             && !self.detect_off
             && self.report_after.is_none_or(|after| now >= after)
     }
+
+    /// A rebuild of the rank's detectors or a write of its report failed and waits to be tried again,
+    /// whether or not its wait has passed.
+    fn retry_pending(&self) -> bool {
+        !self.detect_off
+            && match self.detectors {
+                Some(_) => self.report_failures > 0,
+                None => self.replay_failures > 0,
+            }
+    }
+
+    /// A retry is pending and has failed fewer than `RETRY_HOLD_FAILURES` times in a row: the rank's
+    /// run is not let go of (`Ingest::evict_run`), which would drop the retry with the detectors.
+    fn retry_holds_run(&self) -> bool {
+        self.retry_pending()
+            && match self.detectors {
+                Some(_) => self.report_failures < RETRY_HOLD_FAILURES,
+                None => self.replay_failures < RETRY_HOLD_FAILURES,
+            }
+    }
+
+    /// What the rank's retries have done so far: a change says one was tried.
+    fn retries_tried(&self) -> (u32, u32, u64) {
+        (self.report_failures, self.replay_failures, self.rebuilds)
+    }
+}
+
+/// What the pieces of one batch taken so far were (`Ingest::take_pieces`): the owner attempt's
+/// highest step kept, the rows kept of other attempts, and the rows of each kind not kept because
+/// they were not newer.
+#[derive(Default)]
+struct Taken {
+    progressed: Option<(i64, i64)>,
+    superseded: u64,
+    not_newer: u64,
+    scalars_not_newer: u64,
 }
 
 /// The newest part stored for a rank and since when its report has been behind it.
@@ -1034,26 +1076,33 @@ impl Ingest {
         // stored and counted, never progress (RS05; until Nov 19, 2026 the last attempt of the batch
         // to keep rows was taken as the rank's).
         let owner = self.watchdog.owner(key);
-        let mut progressed: Option<(i64, i64)> = None;
-        let mut superseded = 0;
-        let mut not_newer = 0;
-        for (attempt, batch) in pieces {
-            let (kept, discarded) = self.accept_attempt(key, attempt, batch, &mut buffer).await?;
-            not_newer += discarded;
-            if let Some((last, rows)) = kept {
-                if owner.is_none_or(|owner| owner == attempt) {
-                    progressed = Some((attempt, last));
-                } else {
-                    superseded += rows as u64;
-                }
+        let mut taken = Taken::default();
+        if let Err(status) = self
+            .take_pieces(key, owner, pieces, scalar_pieces, &mut buffer, &mut taken)
+            .await
+        {
+            // A piece of the batch could not be taken (the quota, a write or a read of the store that
+            // failed) after others were: their rows are in the buffer, or stored and judged by the
+            // flush that tried to make room, and the step watermark is past them, so the batch sent
+            // again finds them not newer and never makes them progress. The watchdog is told of them
+            // now, as it would have been had the batch been taken at once (AO-02, wave AP; until then
+            // the error returned first, and a rank whose rows were stored and judged read `last_step`
+            // null, its new attempt without steps, and the run unknown). The counts of rows not
+            // newer and of rows dropped are left to the batch sent again, which counts them as it
+            // would have.
+            let now = Instant::now();
+            self.watchdog.superseded(key, taken.superseded, now);
+            if let Some((attempt, step)) = taken.progressed {
+                self.watchdog.batch(key, attempt, Some(step), world_size, now);
             }
+            return Err(status);
         }
-        // The scalar-only rows never meet the step watermark and are never progress: not the rank's
-        // `last_step`, not the step given to the watchdog below, never a step the detectors read.
-        let mut scalars_not_newer = 0;
-        for (attempt, batch) in scalar_pieces {
-            scalars_not_newer += self.accept_scalars(key, attempt, batch, &mut buffer).await?;
-        }
+        let Taken {
+            progressed,
+            superseded,
+            not_newer,
+            scalars_not_newer,
+        } = taken;
         // Counted once the rest of the batch is taken: a batch refused before (the store could not
         // be read) is sent again, and its rows would be counted twice.
         if !dropped.is_empty() {
@@ -1095,6 +1144,37 @@ impl Ingest {
         }
         if question {
             buffer.acknowledged = held;
+        }
+        Ok(())
+    }
+
+    /// Takes a batch's pieces into the rank's buffer, its step rows' pieces and then its scalar-only
+    /// rows' (`accept`), and keeps in `taken` what each piece taken was, so that a piece that cannot
+    /// be taken leaves the caller knowing what the pieces before it were.
+    async fn take_pieces(
+        &self,
+        key: &Key,
+        owner: Option<i64>,
+        pieces: Vec<(i64, RecordBatch)>,
+        scalar_pieces: Vec<(i64, RecordBatch)>,
+        buffer: &mut RankBuffer,
+        taken: &mut Taken,
+    ) -> Result<(), Status> {
+        for (attempt, batch) in pieces {
+            let (kept, discarded) = self.accept_attempt(key, attempt, batch, buffer).await?;
+            taken.not_newer += discarded;
+            if let Some((last, rows)) = kept {
+                if owner.is_none_or(|owner| owner == attempt) {
+                    taken.progressed = Some((attempt, last));
+                } else {
+                    taken.superseded += rows as u64;
+                }
+            }
+        }
+        // The scalar-only rows never meet the step watermark and are never progress: not the rank's
+        // `last_step`, not the step given to the watchdog, never a step the detectors read.
+        for (attempt, batch) in scalar_pieces {
+            taken.scalars_not_newer += self.accept_scalars(key, attempt, batch, buffer).await?;
         }
         Ok(())
     }
@@ -1685,12 +1765,31 @@ impl Ingest {
     /// Refuses new batches and writes everything buffered. Called on `SIGTERM`, by `stop`. Ranks are
     /// written concurrently, so the time taken does not grow with the number of ranks; with
     /// a failing store it is bounded by the store's retry time, not multiplied by the ranks.
+    ///
+    /// A rank whose rebuild or report waits to be tried again (`replay_after`, `report_after`) has it
+    /// tried once more here, at once and without its wait, after its buffer is stored and before
+    /// `stop` writes the status (wave AP, AO-03; until then it was dropped, and a run whose store had
+    /// healed by the stop was left without the rank's `incidents.json` and unknown, for good: a
+    /// restarted server does not take a finished run up). One try, in the same round as the rank's
+    /// flush, and none for a rank whose flush failed or that was tried by its flush just now: the stop
+    /// waits for at most one more store round per rank, no backoff. When it fails again the rank stays
+    /// without a report, and the status says it is not judged.
     pub async fn shutdown(&self) -> Result<(), Status> {
         self.closed.store(true, Ordering::SeqCst);
         let results: Vec<Result<(), Status>> = futures::stream::iter(self.all_buffers())
             .map(|(key, buffer)| async move {
                 let mut buffer = buffer.lock().await;
-                self.flush(&key, &mut buffer).await
+                let tried = buffer.retries_tried();
+                let flushed = self.flush(&key, &mut buffer).await;
+                if flushed.is_ok() && self.config.detect && buffer.retry_pending() && buffer.retries_tried() == tried {
+                    if buffer.detectors.is_none() {
+                        buffer.replay_after = None;
+                        self.detect(&key, &mut buffer, &[]).await;
+                    } else {
+                        self.write_report(&key, &mut buffer).await;
+                    }
+                }
+                flushed
             })
             .buffer_unordered(FLUSH_CONCURRENCY)
             .collect()
@@ -1702,8 +1801,8 @@ impl Ingest {
     /// is taken from here on. The timed flush and the status writer (`tasks`, from
     /// `spawn_flusher` and `spawn_watchdog`) finish the round they are in and end: a flush is
     /// never cut between storing a part and judging it, which would leave that rank's
-    /// `incidents.json` behind its parts. Then every buffer is written and judged (`shutdown`),
-    /// and only then is each run's status written to say the server stopped, so the last
+    /// `incidents.json` behind its parts. Then every buffer is written and judged, and a rebuild or
+    /// report waiting to be tried again is tried once, at once (`shutdown`), and only then is each run's status written to say the server stopped, so the last
     /// `watchdog.json` comes after the last part and its `incidents.json`. The status is written
     /// even when a buffer could not be, and that error is returned after it; with the file off
     /// (`watchdog_interval` zero) none is written.
@@ -2181,12 +2280,15 @@ impl Ingest {
             let Ok(held) = buffer.try_lock() else {
                 return false;
             };
-            // Scalar-only rows still buffered (section 4.5) keep the run as step rows do.
+            // Scalar-only rows still buffered (section 4.5) keep the run as step rows do, and so does a
+            // rebuild or report waiting to be tried again, which the detectors held go with (wave AP,
+            // AO-03), for at most `RETRY_HOLD_FAILURES` failures in a row.
             if !held.batches.is_empty()
                 || !held.scalars.batches.is_empty()
                 || held.pending_offset.is_some()
                 || held.ack.is_some()
                 || held.sealed
+                || held.retry_holds_run()
             {
                 return false;
             }
