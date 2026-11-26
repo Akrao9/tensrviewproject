@@ -88,7 +88,7 @@ def test_a_partial_last_line_leaves_the_verdict_as_the_whole_lines_give_it(tmp_p
     assert whole["state"] == "no_divergence", whole["detail"]
     torn = compare_runs(str(write(tmp_path / "torn" / "pine.rank0.jsonl", pine, PARTIAL)), str(other))["divergence"]
     assert torn["state"] == "no_divergence", torn["detail"]
-    assert torn["unfinished_lines_left_out"] == {"a": [0]}
+    assert torn["unfinished_lines_left_out"] == {"A": [0]}
     assert {k: v for k, v in torn.items() if k not in ("detail", "unfinished_lines_left_out")} == \
         {k: v for k, v in whole.items() if k != "detail"}
 
