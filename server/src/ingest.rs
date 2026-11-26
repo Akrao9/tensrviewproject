@@ -975,14 +975,15 @@ impl Ingest {
         // too, counted as a refused batch though it held no row, and the refusal named no bytes of
         // the sender's, so the sender kept its offset and its rows never left (RS10).
         let question = batch.num_rows() == 0 && end_byte_offset == 0;
-        let (pieces, scalar_pieces, dropped) = if question {
-            (Vec::new(), Vec::new(), Dropped::new())
+        let (pieces, scalar_pieces, dropped, attempts) = if question {
+            (Vec::new(), Vec::new(), Dropped::new(), Vec::new())
         } else {
             // Rows that cannot be stored are dropped before anything of the batch is placed or kept,
             // and a batch none of whose rows can be read is refused and counted (RS10). Then the
             // scalar-only rows, those whose `seq` is not null, are taken out before the step
             // watermark is looked at (`WAVE_AL_CONTRACT.md` section 4.5).
-            let (batch, dropped, scalars) = match readable_rows(batch, row_versions(metadata.schema_version)) {
+            let (batch, dropped, scalars, attempts) = match readable_rows(batch, row_versions(metadata.schema_version))
+            {
                 Ok(kept) => kept,
                 Err(refused) => {
                     if let Some(column) = refused.column {
@@ -1009,16 +1010,16 @@ impl Ingest {
             } else {
                 split_by_attempt(batch)?
             };
-            (pieces, scalar_pieces, dropped)
+            (pieces, scalar_pieces, dropped, attempts)
         };
         // Every attempt of the batch has its place in the store's order before any row of it is
         // taken (contract 1): a batch that cannot have it is refused, and its sender sends it again.
-        // A scalar row's attempt is placed as a step row's is.
-        let attempts: Vec<i64> = pieces
-            .iter()
-            .chain(&scalar_pieces)
-            .map(|(attempt, _)| *attempt)
-            .collect();
+        // A scalar row's attempt is placed as a step row's is, and the attempts are placed in the
+        // order they first appear in the rows as sent (`attempts_in_row_order`), so the order does
+        // not depend on how the sender cut its batches. Until wave AO (BUG-07) the step rows'
+        // attempts were placed before the scalar rows': a file whose first line was an earlier
+        // attempt's scalar-only record placed that attempt after the next one when the lines came in
+        // one batch, and a point the next attempt rolled back came back in its series.
         self.place(key, sender, &attempts).await?;
         let buffer = self.buffer(key);
         let mut buffer = buffer.lock().await;
@@ -2464,12 +2465,40 @@ fn drop_unstorable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordB
 pub const SEQ_COLUMN: &str = "seq";
 
 /// The rows of a batch that can be stored (`drop_unstorable_rows`), and the rows dropped, with the
-/// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, and the
-/// scalar-only rows if there are any.
-fn readable_rows(batch: RecordBatch, readable: &[i32]) -> Result<(RecordBatch, Dropped, Option<RecordBatch>), Refused> {
+/// scalar-only rows taken out of them (`split_scalar_rows`): the step rows, the rows dropped, the
+/// scalar-only rows if there are any, and the attempts of the rows kept, of both kinds, in the order
+/// they first appear in the batch (`attempts_in_row_order`).
+type ReadableRows = (RecordBatch, Dropped, Option<RecordBatch>, Vec<i64>);
+
+fn readable_rows(batch: RecordBatch, readable: &[i32]) -> Result<ReadableRows, Refused> {
     let (batch, dropped) = drop_unstorable_rows(batch, readable)?;
+    let attempts = attempts_in_row_order(&batch);
     let (batch, scalars) = split_scalar_rows(batch)?;
-    Ok((batch, dropped, scalars))
+    Ok((batch, dropped, scalars, attempts))
+}
+
+/// The attempts of a batch's rows, each once, in the order they first appear (BUG-07, wave AO): the
+/// order the sender's file holds them, which is how the local reader orders a file's attempts. A
+/// batch without an `attempt` column (a sender from before attempts) is attempt 0, as
+/// `split_by_attempt` takes it. The column is Int64 without nulls here (`drop_unstorable_rows`); a
+/// negative attempt is refused by `split_by_attempt` before anything is placed.
+fn attempts_in_row_order(batch: &RecordBatch) -> Vec<i64> {
+    if batch.num_rows() == 0 {
+        return Vec::new();
+    }
+    let Some(attempts) = batch
+        .column_by_name("attempt")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+    else {
+        return vec![0];
+    };
+    let mut order: Vec<i64> = Vec::new();
+    for attempt in attempts.iter().flatten() {
+        if order.last() != Some(&attempt) && !order.contains(&attempt) {
+            order.push(attempt);
+        }
+    }
+    order
 }
 
 /// Takes the scalar-only rows, those whose `seq` is not null, out of a batch (section 4.5): the step
