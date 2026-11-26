@@ -403,21 +403,38 @@ class _StarvedFirsts:
         return {"kind": "starved_experts", "step": min(e["step"] for e in experts), "experts": experts}
 
 
+def _top_k_entries(record: Mapping[str, Any]) -> Iterable[tuple[Any, int]]:
+    """A record's `moe_top_k` entries the column carries: an integer that is not a bool and fits int32
+    (WAVE_AJ_CONTRACT.md, section 1). Any other entry, and a value that is not an object, is absent."""
+    given = record.get("moe_top_k")
+    if not isinstance(given, Mapping):
+        return ()
+    return [(name, k) for name, k in given.items() if isinstance(k, int) and not isinstance(k, bool) and -(2**31) <= k < 2**31]
+
+
+def _fixed_top_k(routers: Iterable[str], override: int | Mapping[str, int] | None) -> dict[str, int]:
+    """The routers whose experts per token `override` fixes, with the value: every router for one
+    value, the named ones for a value per router. A fixed router's recorded values are not read."""
+    if override is None:
+        return {}
+    if isinstance(override, int):
+        return {name: override for name in routers}
+    return {str(name): int(k) for name, k in override.items()}
+
+
 def _router_top_k(
     records: list[dict[str, Any]], routers: list[str], override: int | Mapping[str, int] | None
 ) -> dict[str, int]:
-    """Each router's experts per token: the last `moe_top_k` recorded for it, or `override`, else 1.
+    """Each router's experts per token at the end of the run: the last `moe_top_k` recorded for it,
+    or `override`, else 1 (the evidence's `top_k`). Each step is judged with the value in force at
+    that step (`_MoeSamples`), as Rust judges it (BUG-13).
     An entry the `moe_top_k` column cannot carry (anything but an integer that is not a bool and fits
     int32, WAVE_AJ_CONTRACT.md, section 1) is absent on its record, as Rust never sees it (wave AJ:
     before, `int(k)` raised on text and read 2.0 as 2)."""
     found: dict[str, int] = {}
     for record in records:
-        given = record.get("moe_top_k")
-        if not isinstance(given, Mapping):
-            continue
-        for name, k in given.items():
-            if isinstance(k, int) and not isinstance(k, bool) and -(2**31) <= k < 2**31:
-                found[name] = k
+        for name, k in _top_k_entries(record):
+            found[name] = k
     if isinstance(override, int):
         found = {name: override for name in routers}
     elif override is not None:
@@ -7546,21 +7563,31 @@ def _moe_samples(
     router_sizes: Mapping[str, int],
     router_top_k: Mapping[str, int],
     overload_threshold: float,
+    fixed_top_k: Mapping[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """The per-step MoE samples as the Python rules judge them: one for every record and
     router, with the experts found overloaded or dead there. `_mark_starved` adds the starved
-    ones. The Rust detectors make the same list (`tensorquill-server detect --samples`)."""
-    return _MoeSamples(router_sizes, router_top_k, overload_threshold).feed(records)
+    ones. The Rust detectors make the same list (`tensorquill-server detect --samples`).
+    `router_top_k` is each router's experts per token until a record gives one (`_MoeSamples`)."""
+    return _MoeSamples(router_sizes, router_top_k, overload_threshold, fixed_top_k).feed(records)
 
 
 class _MoeSamples:
     """`_moe_samples`'s state: each router's history and the samples made so far, fed records in step
     order (`feed`, any number of times), as `_GradSpikes` is (lane AD11). The router sizes, their
-    top-k and the threshold are the run's and fixed for the state: a record that changes any of them
-    changes every sample, so a state is not fed past such a change (`_Incremental`)."""
+    threshold are the run's and fixed for the state: a record that changes any of them changes every
+    sample, so a state is not fed past such a change (`_Incremental`).
 
-    def __init__(self, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int], overload_threshold: float) -> None:
-        self.router_sizes, self.router_top_k, self.overload_threshold = router_sizes, router_top_k, overload_threshold
+    Experts per token are judged step by step, as Rust's `Moe::row` judges them (BUG-13): a record's
+    `moe_top_k` applies to that record and the later ones, until another changes it. Before any,
+    a router's value is `router_top_k`'s (1 when it names none). A router `fixed_top_k` names keeps
+    that value whatever the records say (`top_k=`, an override)."""
+
+    def __init__(self, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int], overload_threshold: float,
+                 fixed_top_k: Mapping[str, int] | None = None) -> None:
+        self.router_sizes, self.overload_threshold = router_sizes, overload_threshold
+        self.fixed_top_k = dict(fixed_top_k or {})
+        self.router_top_k = {**router_top_k, **self.fixed_top_k}  # in force: changed by the records fed
         self.history: dict[str, list[tuple[list[int], int, float]]] = {name: [] for name in router_sizes}
         self.samples: list[dict[str, Any]] = []
 
@@ -7572,6 +7599,9 @@ class _MoeSamples:
         new: list[dict[str, Any]] = []
         for record in sorted(records, key=lambda r: r["step"]):
             step = int(record["step"])
+            for name, k in _top_k_entries(record):
+                if name not in self.fixed_top_k:
+                    router_top_k[name] = k
             moe = record.get("moe")
             if not isinstance(moe, Mapping):
                 moe = {}
@@ -7705,12 +7735,14 @@ class _Incremental:
         self.texts: list[str] = []  # each sample's JSON text, for the watcher's writer (`samples_text`)
         self.handed: list[dict[str, Any]] | None = None  # the last `samples` list given out
 
-    def _start(self, key: Any, router_sizes: Mapping[str, int], router_top_k: Mapping[str, int],
+    def _start(self, key: Any, router_sizes: Mapping[str, int], fixed_top_k: Mapping[str, int],
                overload_threshold: float, starve_window: int, starve_ratio: float, grad_key: str) -> None:
         self.key = key
         self.records = []
         self.texts = []
-        self.moe = _MoeSamples(dict(router_sizes), dict(router_top_k), overload_threshold)
+        # Each router's experts per token is read step by step from the records (BUG-13): 1 before
+        # any, unless `top_k=` fixes it.
+        self.moe = _MoeSamples(dict(router_sizes), {}, overload_threshold, fixed_top_k)
         self.starved = _StarvedMarks(starve_window, starve_ratio)
         self.starved_firsts = _StarvedFirsts()
         self.starts = _RouterStarts()
@@ -7720,7 +7752,7 @@ class _Incremental:
 
     def judge(self, records: list[dict[str, Any]], *, router_sizes: Mapping[str, int],
               router_top_k: Mapping[str, int], overload_threshold: float, starve_window: int,
-              starve_ratio: float, options: tuple[Any, ...]) -> dict[str, Any]:
+              starve_ratio: float, options: tuple[Any, ...], top_k: int | Mapping[str, int] | None = None) -> dict[str, Any]:
         grad_key = _gradient_key(records)
         key = repr((overload_threshold, starve_window, starve_ratio, options, list(router_sizes.items()),
                     list(router_top_k.items()), grad_key))
@@ -7738,7 +7770,8 @@ class _Incremental:
             new = records[len(kept):]
             self.path = ("incremental", len(new))
         else:
-            self._start(key, router_sizes, router_top_k, overload_threshold, starve_window, starve_ratio, grad_key)
+            self._start(key, router_sizes, _fixed_top_k(router_sizes, top_k), overload_threshold, starve_window,
+                        starve_ratio, grad_key)
             new = records
             self.path = ("full", why)
         self.records = list(records)
@@ -8005,7 +8038,7 @@ def _build_evidence(
         judged = (memo if memo is not None else _Incremental()).judge(
             records, router_sizes=router_sizes, router_top_k=router_top_k, overload_threshold=overload_threshold,
             starve_window=starve_window, starve_ratio=starve_ratio,
-            options=(drift_tolerance, _top_k_option(top_k), update_window))
+            options=(drift_tolerance, _top_k_option(top_k), update_window), top_k=top_k)
         samples = judged["samples"]
         incidents = []
         moe_hit = judged["moe_hit"]
