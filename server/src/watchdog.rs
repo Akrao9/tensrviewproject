@@ -158,7 +158,8 @@
 //! Rows the ingest drops because a key of theirs is null (RS10) are counted per rank in the rank's
 //! entry of its own run's status, once there is one: `dropped_rows`, the total, and
 //! `dropped_row_keys`, by the first null key of each row, with the rows whose `schema_version` is
-//! not one the server reads under `unsupported_schema_version` (from Nov 20, 2026). Batches refused
+//! not one the server reads under `unsupported_schema_version` (from Nov 20, 2026), and the rows of
+//! a version 2 record (`record_version` 2) with no `seq` under `seq` (from wave AO). Batches refused
 //! whole, because a key column was missing or of another type, are counted beside them:
 //! `refused_batches`, the total, and `refused_batch_keys`, by the column; the same batch sent
 //! again after its stream ended is not counted again. A rank that dropped or refused none has none

@@ -38,13 +38,17 @@
 //! `attempt=<a>/scalars-<first_seq:08>-<last_seq:08>.parquet`, created only if no object has that
 //! name, beside the parts and never one of them; a restarted server reads the watermark from those
 //! names. A flush stores the step part, then the scalars object, and only then acknowledges the
-//! offset. A batch without a `seq` column, or whose `seq` is null on every row, is all step rows and
+//! offset. A batch's attempts, of both kinds of row, are placed in the rank's order in the order they
+//! first appear in its rows (from wave AO, BUG-07), so the order does not depend on how the sender
+//! cut its batches. A batch without a `seq` column, or whose `seq` is null on every row, is all step rows and
 //! is handled as before.
 //!
 //! A row whose run, rank, step, attempt or schema version is null, or whose `schema_version` is not
 //! one its batch's metadata version allows (`ROW_VERSIONS`: 0 and 1 under metadata 1, a protocol 4
-//! sender's; 0, 1 and 2 under metadata 2, from the owner's decision of Nov 25, 2026), cannot be
-//! stored: it is dropped and counted under `unsupported_schema_version`, with a line on
+//! sender's; 0, 1 and 2 under metadata 2, from the owner's decision of Nov 25, 2026), or whose
+//! record is version 2 (`record_version`, the scalar-only record) with no `seq` (from wave AO,
+//! BUG-02), cannot be stored: it is dropped and counted, under its first null key, under
+//! `unsupported_schema_version`, or under `seq`, with a line on
 //! stderr and in the rank's entry of its run's `watchdog.json` (`dropped_rows`, `dropped_row_keys`),
 //! and the rest of its
 //! batch is kept and acknowledged (RS10). A batch whose key column is missing or of another type

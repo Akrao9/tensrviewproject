@@ -22,11 +22,12 @@ import json
 import os
 import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
-from tensorquill.evidence import _attempt_place, _parquet_parts, load_records, scalar_series
+from tensorquill.evidence import load_records, scalar_series
 from tensorquill.server_detect import find_binary
 
 try:  # each test is collected and skipped without pyarrow (a module skipped whole collects nothing)
@@ -127,6 +128,8 @@ BUG08_TABLE = [
 
 @pytest.mark.parametrize("case, entries, unlisted, expected", BUG08_TABLE, ids=[row[0] for row in BUG08_TABLE])
 def test_bug08_python_places_an_unlisted_attempt_as_the_server_does(case, entries, unlisted, expected):
+    from tensorquill.evidence import _attempt_place  # here, so a rename in that module fails these tests alone
+
     order = [attempt for attempt, _ in entries]
     attempts = order + unlisted
     assert sorted(attempts, key=lambda attempt: _attempt_place(order, attempt)) == expected
@@ -134,6 +137,8 @@ def test_bug08_python_places_an_unlisted_attempt_as_the_server_does(case, entrie
 
 @pytest.mark.parametrize("case, entries, unlisted, expected", BUG08_TABLE, ids=[row[0] for row in BUG08_TABLE])
 def test_bug08_python_lists_a_stores_parts_in_that_order(tmp_path, case, entries, unlisted, expected):
+    from tensorquill.evidence import _parquet_parts
+
     rank = tmp_path / "runs" / "r" / "rank=0"
     for attempt in [a for a, _ in entries] + unlisted:
         folder = rank / f"attempt={attempt}"
@@ -187,11 +192,20 @@ def test_bug02_a_version_2_row_with_a_null_seq_is_dropped_and_the_store_stays_re
     rows.insert(3, bad)
     store = tmp_path / "store"
     server = Server(store)
+    run = store / "runs" / run_id
     try:
         assert send_rows(server, run_id, rows, attempt) == [6]
+        # A watchdog pass writes the rank's status (every 0.5 s here) before the server stops.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if json.loads((run / "watchdog.json").read_text())["ranks"][0].get("dropped_rows"):
+                    break
+            except (OSError, ValueError, KeyError, IndexError):
+                pass
+            time.sleep(0.05)
     finally:
         err = server.close()
-    run = store / "runs" / run_id
     loaded = load_records(run)
     assert [record["step"] for record in loaded] == [0, 1, 2, 4, 5]
     assert f"{run_id} rank 0" in err and "1 with a null seq" in err, err
