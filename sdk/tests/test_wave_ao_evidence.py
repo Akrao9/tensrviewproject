@@ -11,6 +11,8 @@ pyarrow and a `tensorquill-server` binary (`TENSORQUILL_SERVER_BIN`); each skips
 from __future__ import annotations
 
 import json
+import os
+import random
 import sys
 from pathlib import Path
 from unittest import mock
@@ -255,3 +257,15 @@ def test_bug29_pin_one_runs_scalar_only_records_and_another_ranks_are_taken(tmp_
     # Another rank's scalar-only record of another run is that rank's, not this one's.
     other_rank = [*one_run, {**_point(1, 0, 0, loss=2.0), "run_id": "r2", "rank": 1}]
     assert evidence.build_evidence(other_rank, rank=0, detectors="python")["rank"] == 0
+
+
+def test_bug29_the_command_lines_rerun_export_is_the_judged_ranks(tmp_path, monkeypatch):
+    logged = _rerun_recorder(monkeypatch)
+    records = [_step(1, 0, scalars={"loss": 1.0}), _step(1, 1), _point(1, 0, 0, loss=2.0),
+               {**_point(1, 0, 0, loss=9.0), "rank": 1}]
+    path = _write(tmp_path / "r.rank0.jsonl", records)
+    monkeypatch.setattr(sys, "argv", ["tensorquill", str(path), "--detectors", "python", "--rerun",
+                                      str(tmp_path / "r.rrd"), "--output", str(tmp_path / "e.json")])
+    evidence.main()
+    assert [(step, value[1]) for step, entity, value in logged if entity == "/logged/loss"] == [(0, 2.0)]
+

@@ -7836,23 +7836,28 @@ def _build_evidence(
                      starve_window=starve_window, starve_ratio=starve_ratio, top_k=top_k,
                      update_window=update_window, none_given=True)
     held_ranks: list[int] | None = None
-    # The training records alone (`_load_counted` sets the scalar-only records apart, after the
-    # identity check): no engine judges a scalar-only record, and none is a step, so the evidence is
-    # the training records' (WAVE_AL_CONTRACT.md section 4.6, Q4 a).
-    if rank is not None and not (isinstance(source, (str, Path)) and Path(source).is_dir()):
+    # The training records alone are judged: no engine judges a scalar-only record, and none is a
+    # step, so the evidence is the training records' (WAVE_AL_CONTRACT.md section 4.6, Q4 a). A file's
+    # or a list's scalar-only records are read too, and set apart only once the records are known to
+    # be of one run, theirs included, as `scalar_series` and the MCP series check them (BUG-29). A
+    # store's `scalars-*` objects are not read for it: a store's rank folder is of one run.
+    whole = not (isinstance(source, (str, Path)) and Path(source).is_dir())
+    if rank is not None and whole:
         # A file or list is read whole either way: the ranks it holds are kept, so the evidence
         # can say it judged one of several (L21). A store's rank folder holds one rank.
-        everything, left_out = _load_counted(source, None, checked=identity_checked)
-        held_ranks = sorted({int(r.get("rank", 0)) for r in everything})
-        every_attempt = [r for r in everything if r.get("rank", 0) == rank]
+        everything, left_out = _load_counted(source, None, checked=identity_checked, scalars=True)
+        held_ranks = sorted({int(r.get("rank", 0)) for r in everything if not is_scalar_record(r)})
+        own = [r for r in everything if r.get("rank", 0) == rank]
     else:
-        every_attempt, left_out = _load_counted(source, rank, checked=identity_checked)
+        own, left_out = _load_counted(source, rank, checked=identity_checked, scalars=whole)
+    every_attempt, scalar_only = set_apart_scalars(own)
     if attempt_order:
         every_attempt = in_attempt_order(every_attempt, attempt_order)
     ranks = sorted({int(r.get("rank", 0)) for r in every_attempt})
     if len(ranks) > 1:
         raise ValueError(f"these records come from ranks {ranks}; pass rank= to read one of them")
-    check_one_run(every_attempt)
+    # The judged rank's scalar-only records: another rank's are that rank's.
+    check_one_run([*every_attempt, *(r for r in scalar_only if not ranks or r.get("rank", 0) == ranks[0])])
     # Lane W3's step-order rule: the effective run is judged in step order, rows of one step in
     # the order they arrived (a stable sort). Arrival order stays in `every_attempt`, for the
     # analyses that are about arrival (which attempt came first, repeats, resumes).
@@ -9811,16 +9816,19 @@ def _main() -> None:
     # A file is read whole and its rank picked by `build_evidence`, which then says which ranks the
     # file held (L21); a directory is read a rank at a time, as before.
     whole_file = not args.input.is_dir()
-    every, left_out = _load_counted(args.input, None if whole_file else rank, scalars=args.rerun is not None)
-    # The scalar-only records are read only for the Rerun export's series (section 4.6).
-    records, _ = set_apart_scalars(every)
+    # The scalar-only records are read for the Rerun export's series (section 4.6) and, in a file,
+    # for the check that the rank's records are of one run, theirs included (BUG-29).
+    every, left_out = _load_counted(args.input, None if whole_file else rank, scalars=whole_file or args.rerun is not None)
+    records, scalar_only = set_apart_scalars(every)
     held = sorted({int(r.get("rank", 0)) for r in records})
     if whole_file and rank is None and len(held) > 1:
         parser.error(f"{args.input} holds ranks {_rank_ranges(held, 8)}: choose one with --rank N (the evidence is one "
                      "rank's), or compare every rank with python -m tensorquill compare")
+    judged = rank if rank is not None else held[0] if len(held) == 1 else None
     own = records if rank is None else [r for r in records if r.get("rank", 0) == rank]
     try:
-        check_one_run(own)  # a usage error with either detectors, as the Rust path gives it
+        # A usage error with either detectors, as the Rust path gives it.
+        check_one_run([*own, *(r for r in scalar_only if judged is None or r.get("rank", 0) == judged)])
     except ValueError as error:
         parser.error(str(error))
     try:
@@ -9843,7 +9851,8 @@ def _main() -> None:
     print(run_state_line(evidence))
     print(f"wrote {'evidence' if args.compact_window is None else 'compact evidence'} -> {out_json}")
     if args.rerun is not None:
-        exported = every if rank is None else [r for r in every if r.get("rank", 0) == rank]
+        # The judged rank's records: another rank's scalar-only points are not this recording's.
+        exported = [r for r in every if judged is None or r.get("rank", 0) == judged]
         export_rerun(evidence, args.rerun, records=resolve_attempts(exported), attempt_order=attempts_first_seen(exported))
         print(f"wrote Rerun recording -> {args.rerun}")
 
