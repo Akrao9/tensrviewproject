@@ -113,6 +113,8 @@ mod lane_x4_tests;
 mod lane_y2_tests;
 #[cfg(test)]
 mod lane_z3_tests;
+#[cfg(test)]
+mod wave_ao_tests;
 pub mod replica;
 
 // The same values as the constants of the same names in evidence.py.
