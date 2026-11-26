@@ -8,6 +8,7 @@ tests that need Apple's MPS skip where it is not there.
 from __future__ import annotations
 
 import numbers
+import warnings
 
 import pytest
 import torch
@@ -185,3 +186,72 @@ def test_logs_step_rule_and_its_message_are_unchanged():
             session.log({"a": 1.0}, step=-1)
     finally:
         session.close()
+
+
+# ---- BUG-26, the clipping wrapper: a parameter unfrozen before `clip_grad_norm_` ------------------
+#
+# A parameter frozen at `init` joins the session's trainable ones at the optimizer's step
+# (`_take_unfrozen`), after `clip_grad_norm_` ran, so the wrapper did not match it on the step it was
+# unfrozen and `clip_grad_norm` was missing there. It counts once it is trainable, as at that step.
+
+
+def _one_step(model, optimizer, clip, *, inputs=None):
+    model(torch.ones(2, 4) if inputs is None else inputs).sum().backward()
+    norm = clip()
+    optimizer.step()
+    optimizer.zero_grad()
+    return norm
+
+
+def _quiet_init(model, sink, **options):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # every parameter frozen at `init` is warned of
+        return tensorquill.init(model, sink=sink, every=1, heartbeat_seconds=None, **options)
+
+
+def test_a_parameter_unfrozen_just_before_clipping_has_its_norm_recorded_on_that_step():
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    sink = MemorySink()
+    with _quiet_init(model, sink):
+        for p in model.parameters():
+            p.requires_grad_(True)
+        norm = _one_step(model, optimizer, lambda: torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5))
+        _one_step(model, optimizer, lambda: torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5))
+    assert [r["step"] for r in sink.records] == [0, 1]
+    assert sink.records[0].get("clip_grad_norm") == pytest.approx(float(norm), rel=1e-6)
+    assert "clip_grad_norm" in sink.records[1]
+
+
+def test_a_lora_like_model_clipping_only_its_newly_unfrozen_part_is_recorded():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    for p in model[1].parameters():
+        p.requires_grad_(False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    sink = MemorySink()
+    with _quiet_init(model, sink):
+        for p in model[1].parameters():
+            p.requires_grad_(True)
+        norm = _one_step(model, optimizer, lambda: torch.nn.utils.clip_grad_norm_(model[1].parameters(), 0.5))
+    assert sink.records[0].get("clip_grad_norm") == pytest.approx(float(norm), rel=1e-6)
+
+
+def test_a_clip_over_parameters_still_frozen_or_of_another_model_records_nothing():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    for p in model[1].parameters():
+        p.requires_grad_(False)
+    other = nn.Linear(4, 2)
+    optimizer = torch.optim.SGD(model[0].parameters(), lr=0.01)
+    sink = MemorySink()
+    with _quiet_init(model, sink):
+        def clip():
+            torch.nn.utils.clip_grad_norm_(model[1].parameters(), 0.5)  # frozen still
+            other(torch.ones(1, 4)).sum().backward()
+            torch.nn.utils.clip_grad_norm_(other.parameters(), 0.5)  # not this model's
+        _one_step(model, optimizer, clip)
+    assert "clip_grad_norm" not in sink.records[0]
