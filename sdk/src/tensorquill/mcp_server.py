@@ -61,6 +61,7 @@ from .evidence import (
     _attention_values,
     _discover_rank_folders,
     _parquet_parts,
+    _router_total,  # the detectors' rule for a router's counts on a record (wave AP, AO-05)
     rank_number,  # the one reader of `rank=<n>`: ASCII digits (lane X5, DET-17: `isdecimal()` took `rank=٣`)
     all_ranks_evidence,
     all_ranks_kinds,
@@ -1506,10 +1507,15 @@ def _columns(value: Any) -> dict[str, Any]:
 
 
 def _router_point(counts: Any, diversity: Any, expert: int | None) -> dict[str, Any] | None:
-    if not isinstance(counts, list) or not counts:
-        return None
-    tokens = sum(counts)
-    if tokens <= 0:
+    """A router's point from its counts, or None where it has none. The one rule for that is the
+    detectors' (`evidence._router_total`): a list of signed 64-bit integers, no bool among them,
+    whose sum is above 0; anything else is a missing sample in the evidence. Every reader of a
+    record's counts here goes through it, so a series read from the records and the check of
+    whether they are still what an evidence file judged (`_router_steps_changed`) hold a point at
+    the steps the evidence does (wave AP, AO-05: `sum` raised on text, and a bool made a point the
+    file never judged)."""
+    tokens = _router_total(counts)
+    if tokens is None or tokens <= 0:
         return None
     largest = max(range(len(counts)), key=lambda i: counts[i])
     point = {
@@ -1540,7 +1546,8 @@ def _rows(kind: str, name: str, records: Iterable[Mapping[str, Any]], expert: in
             moe_stats = record.get("moe_stats")
             stats = moe_stats.get(name) if isinstance(moe_stats, Mapping) else None
             diversity = stats.get("diversity") if isinstance(stats, Mapping) else None
-            point = _router_point((record.get("moe") or {}).get(name), diversity, expert)
+            moe = record.get("moe")
+            point = _router_point(moe.get(name) if isinstance(moe, Mapping) else None, diversity, expert)
         elif kind in PROBE_KINDS:
             point = _probe_point(kind, name, record.get("probe"))
         else:
@@ -2503,6 +2510,17 @@ def call_tool(source: Source, request_id: Any, params: Mapping[str, Any]) -> dic
         return _tool_reply(request_id, text, True)
 
 
+def _is_request_id(value: Any) -> bool:
+    """Whether `value` is an id a reply carries: a string, or a finite number that is not a bool.
+    JSON-RPC 2.0 allows a number with a fraction (it SHOULD NOT have one) and allows null, which
+    MCP forbids and this server refuses; NaN and Infinity, which Python's JSON reader takes, are no
+    JSON, so no reply could carry them. The one rule of `handle`'s check and of every error reply
+    that echoes an id (wave AP, AO-05: those took a bool and dropped a fraction)."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return False
+    return not isinstance(value, float) or math.isfinite(value)  # never `isfinite` of an int: 10**400 raises
+
+
 def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
@@ -2517,12 +2535,10 @@ def handle(source: Source, message: Any) -> dict[str, Any] | None:
     if not isinstance(method, str):
         if has_id and ("result" in message or "error" in message):
             return None  # a reply to a request; this server sends none
-        return _error(request_id if isinstance(request_id, (str, int)) else None, INVALID_REQUEST, "A request needs a `method`.")
+        return _error(request_id if _is_request_id(request_id) else None, INVALID_REQUEST, "A request needs a `method`.")
     if not has_id:
         return None  # a notification, `notifications/initialized` among them: never answered
-    if (isinstance(request_id, bool) or not isinstance(request_id, (str, int, float))
-            or (isinstance(request_id, float) and not math.isfinite(request_id))):
-        # NaN and Infinity, which Python's JSON reader takes, are no JSON: no reply could carry them.
+    if not _is_request_id(request_id):
         return _error(None, INVALID_REQUEST, "A request's `id` must be a string or a finite number.")
     if message.get("jsonrpc") != "2.0":
         return _error(request_id, INVALID_REQUEST, 'A request needs "jsonrpc": "2.0".')
@@ -2583,7 +2599,7 @@ def _reply_line(reply: Any) -> bytes:
     except ValueError:  # a value strict JSON has no form for, which `_strict` did not see
         traceback.print_exc(file=sys.stderr)
         kept = reply.get("id") if isinstance(reply, dict) else None
-        reply = _error(kept if isinstance(kept, (str, int)) else None, -32603,
+        reply = _error(kept if _is_request_id(kept) else None, -32603,
                        "Internal error (the reply is not strict JSON). The server is still running.")
         line = _line(reply)
     if _fits_line(line):
@@ -2621,7 +2637,7 @@ def handle_line(source: Source, line: bytes) -> bytes | None:
         reply = handle(source, message)
     except (Exception, SystemExit) as error:
         traceback.print_exc(file=sys.stderr)
-        request_id = message.get("id") if isinstance(message, dict) and isinstance(message.get("id"), (str, int)) else None
+        request_id = message.get("id") if isinstance(message, dict) and _is_request_id(message.get("id")) else None
         reply = _error(request_id, -32603, f"Internal error ({type(error).__name__}). The server is still running.")
     return _reply_line(reply) if reply is not None else None
 
