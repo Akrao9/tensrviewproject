@@ -9552,8 +9552,7 @@ def export_rerun(
                         continue  # a scalar-only record's point stands at this step (Q6 a)
                     value = _finite(val)
                     if value is not None:
-                        parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
-                        entity = f"/logged/{parts}"
+                        entity = _logged_entity(rr, str(name))
                         rr.log(entity, rr.Scalars(value))
                         logged_paths[entity] = name
                 probe = record.get("probe")
@@ -9567,8 +9566,7 @@ def export_rerun(
                             rr.log(entity, rr.Scalars(float(val)))
                             activation_paths.setdefault(key, set()).add(entity)
             for name, at in standing.items():
-                parts = "/".join(rr.escape_entity_path_part(p) for p in name.split("/") if p)
-                entity = f"/logged/{parts}"
+                entity = _logged_entity(rr, name)
                 for step, val in sorted(at.items()):
                     value = _finite(val)
                     if value is not None:
@@ -9675,6 +9673,18 @@ def _log_probe(
             rr.log(entity, rr.Tensor(values, dim_names=("query", "key")))
             map_paths[entity] = layer
     return series
+
+
+def _logged_entity(rr: Any, name: str) -> str:
+    """The `/logged/...` entity of a logged scalar's name: one entity for each name (BUG-28). A name
+    whose `/`-separated parts are all non-empty is that path, each part escaped, as before
+    (`train/loss` is `/logged/train/loss`). A name with an empty part (`/loss`, `a//b`, `loss/`) is
+    one escaped part, its `/` kept inside it, so it never meets another name's path: before, the
+    empty parts were dropped and `/loss` was `loss`'s entity."""
+    parts = name.split("/")
+    if all(parts):
+        return "/logged/" + "/".join(rr.escape_entity_path_part(part) for part in parts)
+    return "/logged/" + rr.escape_entity_path_part(name)
 
 
 def _listed(value: Any) -> list[Any]:
