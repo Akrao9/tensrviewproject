@@ -117,3 +117,26 @@ def test_bad_arguments_exit_2(tmp_path, argv, text, capsys):
 def test_two_cuda_devices_asked_for_and_missing_exit_2(tmp_path, capsys):
     assert smc.main(["--toy", "--out", str(tmp_path / "r")]) == smc.EXIT_USAGE
     assert "CUDA" in capsys.readouterr().err
+
+
+# ---- a real second device on a Mac: MPS beside the CPU (not CUDA: the sync count stays unread) ----------
+
+needs_mps = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Apple MPS beside the CPU")
+
+
+@needs_mps
+def test_by_hand_with_the_second_half_on_the_cpu_and_the_buffers_on_mps_every_copy_is_read(tmp_path):
+    """The session's buffers are on MPS (the embedding's device); the second half's statistics are
+    computed on the CPU and copied there, which `_output_unread` allows. Only the sync count is unread."""
+    code, verdict = _run(tmp_path, "manual", "--devices", "mps,cpu")
+    assert verdict["failures"] == [], json.dumps(verdict["lines"], indent=1)
+    assert verdict["not_exercised"] == ["synchronisation count"]
+    assert code == smc.EXIT_NOT_PROVEN
+
+
+@needs_mps
+def test_the_moe_arm_with_its_second_half_on_mps_refuses_those_routers_and_counts_them_once_fixed(tmp_path):
+    code, verdict = _run(tmp_path, "moe", "--devices", "cpu,mps")
+    assert verdict["failures"] == [], json.dumps(verdict["lines"], indent=1)
+    assert code == smc.EXIT_PASS  # the arm has no sync count; a router really is on another device
+    assert verdict["moe"]["refused_without_fix"] == verdict["moe"]["on_second"] != []
