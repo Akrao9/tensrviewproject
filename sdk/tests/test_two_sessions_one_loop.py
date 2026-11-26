@@ -11,6 +11,10 @@ The reference for "its own" is the same seeded loop run with one session only, o
 each two-session record must equal that run's record, apart from when it was written (`ts`,
 `attempt`). The two models' parameter names differ, so a name from the wrong model would show.
 
+The last test measures where one model's forward inside the other's update (a GAN's `D(G(z))`,
+and the generator's forward that makes the fake batch) lands in that model's records, as
+today's behaviour.
+
 Only torch and pytest are needed.
 """
 
@@ -183,3 +187,105 @@ def test_a_short_healthy_two_model_run_raises_nothing_on_either(d_steps):
     _, records = _run(("g", "d"), d_steps=d_steps)
     for which in ("g", "d"):
         assert ev.build_evidence(records[which], detectors="python")["incidents"] == [], which
+
+
+# ---- a model's forward inside the other model's update ------------------------------------------
+
+LOUD = 100.0
+
+
+def _cross_forward_run(how: str, iterations: int):
+    """A GAN loop in which each model's forward inside the other's update is made the largest:
+    the generator's in making the fake batch (from `z * LOUD`) and the discriminator's in `D(G(z))`
+    (on `G(z) * LOUD`). Hooks on `g.up` and `d.body` keep each forward's four numbers, as the
+    capture computes them, labelled by whose update it ran in. `how` makes the fake batch with
+    `.detach()` or under `torch.no_grad()`."""
+    torch.manual_seed(0)
+    g, d = Generator(), Critic()
+    opt_g = torch.optim.AdamW(g.parameters(), lr=1e-3)
+    opt_d = torch.optim.AdamW(d.parameters(), lr=1e-3)
+    data = torch.Generator().manual_seed(1)
+    seen: dict[str, list[tuple[str, int, dict]]] = {"g": [], "d": []}
+    now: list = [None]
+
+    def keep(which: str):
+        def hook(module, args, output):
+            x = output.detach().float()
+            std, mean = torch.std_mean(x)
+            seen[which].append((*now[0], {"mean": float(mean), "std": float(std), "abs_max": float(x.abs().amax()),
+                                          "zero_frac": float((x == 0).float().mean())}))
+        return hook
+
+    g.up.register_forward_hook(keep("g"))
+    d.body.register_forward_hook(keep("d"))
+    sinks = {k: tensorquill.MemorySink() for k in "gd"}
+    sessions = {k: tensorquill.init(m, sink=sinks[k], run_id=f"cross-{k}", **OPTIONS) for k, m in (("g", g), ("d", d))}
+    bce = nn.BCEWithLogitsLoss()
+    for it in range(iterations):
+        real = torch.randn(8, 4, generator=data) + 2
+        z = torch.randn(8, 4, generator=data)
+        opt_d.zero_grad()
+        now[0] = ("d", it)
+        if how == "no_grad":
+            with torch.no_grad():
+                fake = g(z * LOUD)
+        else:
+            fake = g(z * LOUD).detach()
+        loss_d = bce(d(real), torch.ones(8, 1)) + bce(d(fake / LOUD), torch.zeros(8, 1))
+        sessions["d"].log({"d/loss": loss_d.detach()})
+        loss_d.backward()
+        opt_d.step()
+        z = torch.randn(8, 4, generator=data)
+        opt_g.zero_grad()
+        now[0] = ("g", it)
+        loss_g = bce(d(g(z) * LOUD), torch.ones(8, 1))
+        sessions["g"].log({"g/loss": loss_g.detach()})
+        loss_g.backward()
+        opt_g.step()
+    for session in sessions.values():
+        session.close()
+    return seen, {k: s.records for k, s in sinks.items()}
+
+
+@pytest.mark.parametrize("how", ["detach", "no_grad"])
+def test_a_models_forward_inside_the_other_models_update_raises_only_its_abs_max(how):
+    """Today's behaviour, measured (Nov 26, 2026). A model's forward run inside the other model's
+    update is a training forward of that model, and the capture keeps a block's largest magnitude
+    over every forward until that model's own `optimizer.step()`, as it does for microbatches, while
+    `mean`, `std` and `zero_frac` are those of the last forward before it. So:
+
+    - the generator's forward in the discriminator's update (the fake batch) is in the
+      generator's `abs_max` of the same iteration;
+    - the discriminator's forward in the generator's update (`D(G(z))`) is in the discriminator's
+      `abs_max` of its next record, and the last iteration's is in no record;
+    - neither shows in the other three numbers."""
+    iterations = 4
+    seen, records = _cross_forward_run(how, iterations)
+    assert [r["step"] for r in records["g"]] == [r["step"] for r in records["d"]] == list(range(iterations))
+
+    def forwards(which: str, update: str, it: int) -> list[dict]:
+        return [stats for who, at, stats in seen[which] if (who, at) == (update, it)]
+
+    def same(record: dict, stats: dict, keys=("mean", "std", "zero_frac")) -> bool:
+        return all(record[k] == pytest.approx(stats[k], rel=1e-6, abs=1e-12) for k in keys)
+
+    for it, record in enumerate(records["g"]):
+        [inside_d], [own] = forwards("g", "d", it), forwards("g", "g", it)
+        block = record["layers"]["up"]
+        assert inside_d["abs_max"] > 10 * own["abs_max"]
+        assert block["abs_max"] == pytest.approx(inside_d["abs_max"], rel=1e-6)
+        assert same(block, own)
+
+    for it, record in enumerate(records["d"]):
+        own = forwards("d", "d", it)
+        assert len(own) == 2  # D(real), then D(fake)
+        block = record["layers"]["body"]
+        if it == 0:
+            assert block["abs_max"] == pytest.approx(max(f["abs_max"] for f in own), rel=1e-6)
+        else:
+            [inside_g] = forwards("d", "g", it - 1)  # D(G(z)) of the iteration before, after the last step
+            assert inside_g["abs_max"] > 5 * max(f["abs_max"] for f in own)
+            assert block["abs_max"] == pytest.approx(inside_g["abs_max"], rel=1e-6)
+        assert same(block, own[-1])
+    [last] = forwards("d", "g", iterations - 1)
+    assert all(r["layers"]["body"]["abs_max"] != pytest.approx(last["abs_max"], rel=1e-6) for r in records["d"])
