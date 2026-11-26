@@ -145,3 +145,31 @@ def test_bug20_the_export_takes_an_order_given_for_records_already_resolved(tmp_
     evidence.export_rerun(built, tmp_path / "r.rrd", records=evidence.resolve_attempts(FLIPPED),
                           attempt_order=evidence.attempts_first_seen(FLIPPED))
     assert [(step, value[1]) for step, entity, value in logged if entity == "/logged/val"] == [(2, 2.0)]
+
+
+# The two callers of the merge in other lanes' files. Each set its scalar-only records apart before
+# calling it and gives no order yet: they turn on at the join, once the coordinator passes the
+# stream's order there (`attempts_first_seen`; the report names the lines).
+
+@pytest.mark.xfail(strict=True, reason="mcp_server.py (lane AO-9's file) gives merged_scalar_points no order yet")
+def test_bug20_at_the_join_the_mcp_series_gives_the_newer_attempts_value(tmp_path):
+    from tensorquill.mcp_server import Source, get_series
+
+    path = _write(tmp_path / "r.rank0.jsonl", [_step(10, 0), _point(20, 1, 0, loss=20.0), _point(10, 1, 0, loss=10.0),
+                                                _step(20, 2)])
+    assert get_series(Source(path), {"kind": "scalar", "name": "loss"})["values"] == {"value": [20.0]}
+
+
+@pytest.mark.xfail(strict=True, reason="divergence.py (lane AO-6's file) gives scalar_points_in_order no order yet")
+def test_bug20_at_the_join_first_divergence_reads_the_newer_attempts_point():
+    from tensorquill.divergence import first_divergence
+
+    def run(name: str, late: bool) -> list[dict]:
+        rows = [{**_step(10, s, scalars={"loss": 1.0, "val": 2.0}), "run_id": name} for s in range(30)]
+        rows += [{**_point(20, 31, 0, val=2.0), "run_id": name}]
+        rows += [{**_step(20, s, scalars={"loss": 1.0, "val": 2.0}), "run_id": name} for s in range(35, 60)]
+        if late:  # attempt 10's late point at 31, below attempt 20's first training step (35)
+            rows.append({**_point(10, 31, 0, val=999.0), "run_id": name})
+        return rows
+
+    assert first_divergence(run("a", late=True), run("b", late=False))["first_exact_difference"] is None
