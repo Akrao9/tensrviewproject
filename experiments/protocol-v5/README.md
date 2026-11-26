@@ -57,6 +57,8 @@ Run again on Nov 26 with wave AO joined (`d56658b`), 57 of 57 claims held. Since
 
 The Nov 25 results are at commit `2c856ff`.
 
+Run again on Nov 26 with wave AP joined (`964148a`), 57 of 57 claims held, and no row differs from the run against `d56658b` (whose results are at `5ea1bd4`).
+
 ```bash
 git clone <this repository> <old> && git -C <old> checkout 85a477a
 cargo build --release --manifest-path <old>/server/Cargo.toml --bin tensorquill-server
