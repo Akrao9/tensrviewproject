@@ -106,6 +106,11 @@ def test_the_stall_fired_is_found_on_the_file_the_command_was_given(tmp_path, na
     assert (answer["kind"], answer["step"]) == ("rank_silent", 4)
     # The full twin of a compact file answers as well.
     assert _found(run.path, call["env"]["TENSORQUILL_INCIDENT_MCP_ID"])["kind"] == "rank_silent"
+    if window is None:
+        # And the compact twin of the full file handed over, written afterwards (`--compact` on it).
+        copy = _compact.write_compact(json.loads(run.path.read_text()), run.path, window=5)
+        assert copy.name == compact and run.path.read_text() == run.text
+        assert _found(copy, call["env"]["TENSORQUILL_INCIDENT_MCP_ID"])["kind"] == "rank_silent"
 
 
 @pytest.mark.parametrize("name, window", CASES)
