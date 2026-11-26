@@ -339,7 +339,8 @@ class Source:
         def build() -> dict[str, Any]:
             try:
                 return build_evidence([r for r in records if _rank_of(r) == rank], run_manifest=path)
-            except (KeyError, TypeError, ValueError) as error:
+            # OverflowError: an integer too large for a float, which a detector converts (BUG-25).
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise ToolError(f"the detectors could not read the records in {path} ({error!r}).") from None
 
         evidence = self._keep(("evidence", path, rank), self._capture_stamp(path), build)
@@ -527,6 +528,41 @@ def _same_rank_and_run(document: Mapping[str, Any], rank: int, records: list[dic
     runs = {record.get("run_id") if isinstance(record.get("run_id"), str) else "" for record in records}
     own_run = document.get("run_id") if isinstance(document.get("run_id"), str) else ""
     return _judged_rank(document) == rank and len(runs) <= 1 and own_run in (runs or {own_run})
+
+
+def _steps_said(steps: list[int]) -> str:
+    if not steps:
+        return "no step"
+    return f"step {steps[0]}" if len(steps) == 1 else f"{len(steps)} steps, steps {steps[0]} to {steps[-1]}"
+
+
+def _router_steps_changed(name: str, document: Mapping[str, Any], records: list[dict[str, Any]]) -> str | None:
+    """None when one rank's evidence file judged the router `name` at exactly the steps, with
+    exactly the counts, that `records` hold for it now; else what differs, for the answer. The
+    records may have changed after the file was written: a capture that grew, or one started again
+    (BUG-25, wave AO). Steps on which neither has a point (no counts, no routed token) are left out
+    on both sides, as a series leaves them out."""
+    judged: dict[int, Any] = {}
+    for sample in document.get("samples") or ():
+        if (isinstance(sample, dict) and sample.get("router") == name and not sample.get("missing")
+                and _router_point(sample.get("counts"), None, None) is not None):
+            judged[int(sample["step"])] = sample.get("counts")
+    held: dict[int, Any] = {}
+    for record in records:
+        moe = record.get("moe")
+        counts = moe.get(name) if isinstance(moe, Mapping) else None
+        if _router_point(counts, None, None) is not None:
+            held[int(record["step"])] = counts
+    if judged == held:
+        return None
+    at = sorted(judged)
+    now = sorted(held)
+    differ = next((step for step in at if step in held and held[step] != judged[step]), None)
+    return (
+        f"the router {name!r} at {_steps_said(at)}, and the records read here hold it at {_steps_said(now)}"
+        + (f", with other counts at step {differ}" if differ is not None and at == now else "")
+        + "; the records differ from what it judged, as when a capture grew or was started again"
+    )
 
 
 def _pick_rank(asked: int | None, default: int | None, ranks: list[int], what: str) -> int:
@@ -1032,7 +1068,7 @@ def score_display(entry: Mapping[str, Any]) -> str | None:
     if "score" not in entry and "score_note" not in entry:
         return None
     score = entry.get("score")
-    if isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(score):
+    if _finite(score) is not None:
         return f"score {score:.1f}"
     return SCORE_WORDS.get(str(entry.get("score_note")), "no score")
 
@@ -1589,14 +1625,29 @@ def _strict_number(value: Any) -> Any:
     return value
 
 
+def _too_large(value: Any) -> bool:
+    """An integer no float holds (10**400: `Session.log` takes it and the capture writes it)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    try:
+        float(value)
+    except OverflowError:
+        return True
+    return False
+
+
 def _finite(value: Any) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    """A finite number as recorded, else None: a bool, anything not a number, NaN, an Inf and an
+    integer too large for a float (`_too_large`, BUG-25, wave AO: `math.isfinite` raised on it)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or _too_large(value) or not math.isfinite(value):
         return None
     return value
 
 
 def _over_range(rows: list[tuple[int, dict[str, Any]]], column: str) -> dict[str, Any]:
-    """What a column did over every recorded step in the range, sampled or not."""
+    """What a column did over every recorded step in the range, sampled or not. An integer too
+    large for a float is counted apart (`too_large_for_a_float`), out of min, max and median: it
+    is finite, and no float holds it."""
     held = [(step, point[column]) for step, point in rows if point.get(column) is not None]
     finite = [(step, number) for step, value in held if (number := _finite(value)) is not None]
     out: dict[str, Any] = {"recorded": len(held)}
@@ -1607,9 +1658,12 @@ def _over_range(rows: list[tuple[int, dict[str, Any]]], column: str) -> dict[str
             "median": _strict_number(statistics.median(number for _, number in finite)),
             "first": _strict_number(finite[0][1]), "last": _strict_number(finite[-1][1]),
         })
-    bad = [step for step, value in held if _finite(value) is None]
+    large = [step for step, value in held if _too_large(value)]
+    bad = [step for step, value in held if _finite(value) is None and not _too_large(value)]
     if bad:
         out.update({"not_finite": len(bad), "first_not_finite_step": bad[0]})
+    if large:
+        out.update({"too_large_for_a_float": len(large), "first_too_large_step": large[0]})
     return out
 
 
@@ -1671,23 +1725,30 @@ def get_series(source: Source, arguments: Mapping[str, Any], fits: Callable[[dic
                 evidence = source.capture_evidence(path, origin["rank"])
             elif path_kind == "evidence" and source.document(path).get("view") != ALL_RANKS_VIEW:
                 document = source.document(path)
-                if _same_rank_and_run(document, origin["rank"], records):
+                same = _same_rank_and_run(document, origin["rank"], records)
+                omits = same and _compact._omits(document) is not None
+                changed = None if not same or omits else _router_steps_changed(name, document, records)
+                if same and changed is None:
                     evidence = document
-                    if _compact._omits(evidence) is not None:
+                    if omits:
                         window, evidence = evidence, None
                 else:
                     # Another rank's or run's evidence, or one that does not say whose (lane U7,
-                    # Nov 19, 2026: rank 0's samples were answered as rank 1's). This rank is
-                    # read from its own records, and judged on them where they are a capture.
+                    # Nov 19, 2026: rank 0's samples were answered as rank 1's); or this rank's, of
+                    # records that changed after it was written (BUG-25, wave AO: the capture grew
+                    # and the file's older samples answered). This rank is read from its own
+                    # records, and judged on them where they are a capture.
                     held_in = Path(origin["records"])
                     if held_in.is_file() and held_in.suffix == ".jsonl":
                         evidence = source.capture_evidence(held_in, origin["rank"])
                     judged = _judged_rank(document)
                     other_note = (
                         f"The evidence file {source.path} judged "
-                        + (f"rank {judged}" if judged is not None else "a rank it does not name")
-                        + (f" of run {document.get('run_id')!r}" if document.get("run_id") else "")
-                        + f", not rank {origin['rank']}'s records read here, so its samples and flags are not used:"
+                        + (changed if changed is not None else
+                           (f"rank {judged}" if judged is not None else "a rank it does not name")
+                           + (f" of run {document.get('run_id')!r}" if document.get("run_id") else "")
+                           + f", not rank {origin['rank']}'s records read here")
+                        + ", so its samples and flags are not used:"
                         + (" this series and its flags are from the detectors run on those records."
                            if evidence is not None else " this series is from those records, with no flags.")
                     )
@@ -2125,7 +2186,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " thinned to every nth recorded step, with the stride reported, and `over_range` gives the minimum,"
             " maximum (with their steps) and median over every recorded step in the range, so a one-step spike is"
             " not lost. Narrow `start` and `end` to see each step. Numbers have six significant digits; a NaN or"
-            ' Inf is the string "nan", "inf" or "-inf". A router\'s series from compact evidence that left steps'
+            ' Inf is the string "nan", "inf" or "-inf". An integer too large for a float is shown as recorded and'
+            " counted in `over_range` as `too_large_for_a_float`, out of its minimum, maximum and median."
+            " A router's series from compact evidence that left steps"
             " out says under `compact` which steps it covers. A rank's records that hold more than one run ID are"
             " refused with the IDs, as list_incidents refuses them: a series is of one run. A router's series carries"
             " `moe_source` and `moe_source_words` where the capture said how it read the routing: \"the dispatched"
@@ -2448,8 +2511,10 @@ def handle(source: Source, message: Any) -> dict[str, Any] | None:
         return _error(request_id if isinstance(request_id, (str, int)) else None, INVALID_REQUEST, "A request needs a `method`.")
     if not has_id:
         return None  # a notification, `notifications/initialized` among them: never answered
-    if isinstance(request_id, bool) or not isinstance(request_id, (str, int, float)):
-        return _error(None, INVALID_REQUEST, "A request's `id` must be a string or a number.")
+    if (isinstance(request_id, bool) or not isinstance(request_id, (str, int, float))
+            or (isinstance(request_id, float) and not math.isfinite(request_id))):
+        # NaN and Infinity, which Python's JSON reader takes, are no JSON: no reply could carry them.
+        return _error(None, INVALID_REQUEST, "A request's `id` must be a string or a finite number.")
     if message.get("jsonrpc") != "2.0":
         return _error(request_id, INVALID_REQUEST, 'A request needs "jsonrpc": "2.0".')
     params = message.get("params")
@@ -2474,24 +2539,82 @@ def handle(source: Source, message: Any) -> dict[str, Any] | None:
     return _error(request_id, METHOD_NOT_FOUND, f"Method not found: {method}. This server has initialize, ping, tools/list and tools/call.")
 
 
+def _fits_line(line: bytes) -> bool:
+    return len(line) + 1 <= MAX_ANSWER_BYTES  # the newline is part of the reply line
+
+
+def _cut_to_fit(text: str, build: Callable[[str], dict[str, Any]]) -> bytes | None:
+    """The line of `build(text)` with `text` cut, and marked cut, until the line fits; None when
+    not even an empty text fits. Measured on the line as written, where a character outside
+    ASCII is six or twelve bytes."""
+    if _fits_line(line := _line(build(text))):
+        return line
+    low, high = 0, len(text)  # `low` characters and the mark fit, `high` do not (or are the whole)
+    if not _fits_line(_line(build(" …"))):
+        return None
+    while high - low > 1:
+        middle = (low + high) // 2
+        if _fits_line(_line(build(text[:middle] + " …"))):
+            low = middle
+        else:
+            high = middle
+    return _line(build(text[:low] + " …"))
+
+
+def _reply_line(reply: Any) -> bytes:
+    """One reply as its line, within `MAX_ANSWER_BYTES` whatever it holds (BUG-25, wave AO). A tool's
+    answer is already fitted (`fit`); what can still be too long is an error's or a tool error's
+    text, which is cut, and the request's id, which every reply carries: an answer that cannot fit
+    with its id says so to that id, and one that cannot fit any reply with it is said with no id,
+    as JSON-RPC answers a request whose id it could not read."""
+    if isinstance(reply, list):  # a batch: the cap is per answer
+        return b"[" + b",".join(_reply_line(item) for item in reply) + b"]"
+    try:
+        line = _line(reply)
+    except ValueError:  # a value strict JSON has no form for, which `_strict` did not see
+        traceback.print_exc(file=sys.stderr)
+        kept = reply.get("id") if isinstance(reply, dict) else None
+        reply = _error(kept if isinstance(kept, (str, int)) else None, -32603,
+                       "Internal error (the reply is not strict JSON). The server is still running.")
+        line = _line(reply)
+    if _fits_line(line):
+        return line
+    request_id = reply.get("id")
+    cut: bytes | None = None
+    if isinstance(reply.get("error"), dict) and isinstance(reply["error"].get("message"), str):
+        error = reply["error"]
+        cut = _cut_to_fit(error["message"], lambda text: {**reply, "error": {**error, "message": text}})
+    elif isinstance(reply.get("result"), dict) and reply["result"].get("isError") is True:
+        text = reply["result"]["content"][0]["text"]
+        cut = _cut_to_fit(text, lambda shown: _tool_reply(request_id, shown, True))
+    if cut is not None:
+        return cut
+    size = len(_line(request_id))
+    message = (f"The answer to this request is longer than {MAX_ANSWER_BYTES} bytes with its id, which is {size}"
+               " bytes as JSON. Send the request again with a shorter id.")
+    line = _line(_error(request_id, INVALID_REQUEST, message))
+    return line if _fits_line(line) else _line(_error(None, INVALID_REQUEST, message))
+
+
 def handle_line(source: Source, line: bytes) -> bytes | None:
-    """The reply line to one line of input, without its newline, or None when there is none."""
+    """The reply line to one line of input, without its newline, or None when there is none. It is
+    at most `MAX_ANSWER_BYTES` long with its newline (`_reply_line`); a batch's, an answer each."""
     try:
         message = json.loads(line.decode("utf-8"))
     except ValueError as error:
-        return _line(_error(None, PARSE_ERROR, f"Parse error: the line is not JSON ({error})."))
+        return _reply_line(_error(None, PARSE_ERROR, f"Parse error: the line is not JSON ({error})."))
     try:
         if isinstance(message, list):  # a batch, which revision 2025-03-26 lets a client send (the cap is per answer)
             if not message:
-                return _line(_error(None, INVALID_REQUEST, "An empty batch."))
+                return _reply_line(_error(None, INVALID_REQUEST, "An empty batch."))
             replies = [reply for reply in (handle(source, item) for item in message) if reply is not None]
-            return _line(replies) if replies else None
+            return _reply_line(replies) if replies else None
         reply = handle(source, message)
     except (Exception, SystemExit) as error:
         traceback.print_exc(file=sys.stderr)
         request_id = message.get("id") if isinstance(message, dict) and isinstance(message.get("id"), (str, int)) else None
         reply = _error(request_id, -32603, f"Internal error ({type(error).__name__}). The server is still running.")
-    return _line(reply) if reply is not None else None
+    return _reply_line(reply) if reply is not None else None
 
 
 def serve(source: Source, reader: Any, writer: Any) -> None:
