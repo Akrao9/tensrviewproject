@@ -139,3 +139,93 @@ def test_an_evidence_file_that_judged_these_records_answers_with_its_own_flags(t
     answer = _series(mcp_server.Source(report))
     assert answer["steps"] == [0, 1, 2, 3] and answer["first_flagged_step"] == 1
     assert answer["values"]["overloaded"] == [0, 1, 0, 0] and "evidence_file" not in answer
+
+
+# --- 2. A number too large for a float --------------------------------------------------------
+
+BIG = 10**400  # `Session.log` takes it and the capture writes it; float() of it raises OverflowError
+
+SERIES_OF = [  # kind, name, the record's field holding it
+    ("scalar", "x", lambda v: {"scalars": {"x": v}}),
+    ("scalar", "grad_norm", lambda v: {"grad_norm": v}),
+    ("layer", "blk", lambda v: {"layers": {"blk": {"abs_max": v}}}),
+    ("parameter", "w", lambda v: {"grad_norms": {"w": v}}),
+]
+
+
+def _with(field, values: list) -> list[dict]:
+    return [{"schema_version": 1, "run_id": "r", "rank": 0, "step": step, **field(value)} for step, value in enumerate(values)]
+
+
+def _call(source: mcp_server.Source, name: str, arguments: dict, request_id=1) -> bytes:
+    request = {"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+    return mcp_server.handle_line(source, json.dumps(request).encode())
+
+
+@pytest.mark.parametrize("kind, name, field", SERIES_OF, ids=[f"{k}-{n}" for k, n, _ in SERIES_OF])
+def test_a_series_holding_an_integer_too_large_for_a_float_is_answered(tmp_path, kind, name, field):
+    """The integer is shown as recorded, left out of min, max and median, and counted apart from
+    the values that are not finite: it is a finite number that no float holds."""
+    capture = _write(tmp_path / "r.jsonl", _with(field, [1.0, 2.0, BIG, 4.0]))
+    answer = mcp_server.get_series(mcp_server.Source(capture), {"kind": kind, "name": name})
+    column = next(iter(answer["over_range"]))
+    assert answer["values"][column] == [1.0, 2.0, BIG, 4.0]
+    over = answer["over_range"][column]
+    assert over == {"recorded": 4, "min": 1.0, "min_step": 0, "max": 4.0, "max_step": 3, "median": 2.0,
+                    "first": 1.0, "last": 4.0, "too_large_for_a_float": 1, "first_too_large_step": 2}
+
+    reply = json.loads(_call(mcp_server.Source(capture), "get_series", {"kind": kind, "name": name}))
+    assert reply["result"]["isError"] is False
+
+
+def test_a_series_whose_every_value_is_too_large_for_a_float_has_no_range(tmp_path):
+    capture = _write(tmp_path / "r.jsonl", _with(lambda v: {"scalars": {"x": v}}, [BIG, -BIG]))
+    over = mcp_server.get_series(mcp_server.Source(capture), {"kind": "scalar", "name": "x"})["over_range"]["value"]
+    assert over == {"recorded": 2, "too_large_for_a_float": 2, "first_too_large_step": 0}
+
+
+def test_values_that_are_not_finite_are_still_counted_as_before(tmp_path):
+    """Pinned: a NaN and an Inf are `not_finite`, as before."""
+    capture = _write(tmp_path / "r.jsonl", _with(lambda v: {"scalars": {"x": v}}, [1.0, "nan", "inf", 2.0]))
+    over = mcp_server.get_series(mcp_server.Source(capture), {"kind": "scalar", "name": "x"})["over_range"]["value"]
+    assert over["not_finite"] == 2 and over["first_not_finite_step"] == 1 and "too_large_for_a_float" not in over
+
+
+@pytest.mark.xfail(strict=True, reason="lane AO-5: evidence._finite (evidence.py:437 at 453f1e2) calls math.isfinite"
+                   " on the integer; the attention series reads the probe through evidence._attention_values")
+def test_an_attention_series_holding_an_integer_too_large_for_a_float_is_answered(tmp_path):
+    probe = lambda v: {"probe": {"attention": {"att": {"entropy_share": [v], "max_logit": [0.5]}}}}
+    capture = _write(tmp_path / "r.jsonl", _with(probe, [0.5, 0.6, BIG, 0.7]))
+    answer = mcp_server.get_series(mcp_server.Source(capture), {"kind": "attention", "name": "att"})
+    assert answer["steps"] == [0, 1, 2, 3]
+
+
+def test_a_capture_the_detectors_cannot_read_for_a_large_integer_is_said_so(tmp_path):
+    """A router's series on a capture runs the detectors; where they raise on the integer (lane
+    AO-5's to fix), the answer says the detectors could not read the records, and the server does
+    not report a failure of its own."""
+    rows = [{**row, "grad_norm": BIG if row["step"] == 2 else 1.0} for row in _rows(range(4))]
+    capture = _write(tmp_path / "r.jsonl", rows)
+    reply = json.loads(_call(mcp_server.Source(capture), "get_series", {"kind": "router", "name": ROUTER}))
+    text = reply["result"]["content"][0]["text"]
+    assert "failed inside the server" not in text
+    if reply["result"]["isError"]:  # until lane AO-5's fix lands
+        assert "could not read the records" in text and "OverflowError" in text
+
+
+@pytest.mark.xfail(strict=True, reason="lane AO-5: build_evidence raises OverflowError on a grad_norm of 10**400"
+                   " (evidence._finite, evidence.py:437 at 453f1e2)")
+def test_a_routers_series_on_a_capture_with_a_large_integer_is_answered(tmp_path):
+    rows = [{**row, "grad_norm": BIG if row["step"] == 2 else 1.0} for row in _rows(range(4))]
+    capture = _write(tmp_path / "r.jsonl", rows)
+    assert _series(mcp_server.Source(capture))["steps"] == [0, 1, 2, 3]
+
+
+@pytest.mark.xfail(strict=True, reason="lane AO-6: divergence._number (divergence.py:118 at 453f1e2) calls"
+                   " float() on the integer, which first_divergence reaches through compare_runs")
+def test_compare_runs_over_a_run_holding_an_integer_too_large_for_a_float_is_answered(tmp_path):
+    for run_id, third in (("a", BIG), ("b", 3.0)):
+        _write(tmp_path / f"{run_id}.jsonl", [{"schema_version": 1, "run_id": run_id, "rank": 0, "step": step,
+                                               "scalars": {"loss": third if step == 2 else 1.0 + step}} for step in range(4)])
+    reply = json.loads(_call(mcp_server.Source(tmp_path / "a.jsonl"), "compare_runs", {"runs": ["a", "b"]}))
+    assert "failed inside the server" not in reply["result"]["content"][0]["text"]
