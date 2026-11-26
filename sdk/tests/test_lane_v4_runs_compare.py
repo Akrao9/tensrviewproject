@@ -267,7 +267,10 @@ def test_cli08_a_rank_that_fails_only_when_part_4_reads_it_does_not_end_part_4_f
     real = ev.load_records
 
     def flaky(source, *, rank=None, all_attempts=False, scalars=False):
-        if not all_attempts and rank == 1 and Path(source).name == "after":
+        # Part 4's read is the one with the scalar-only records (`scalars=True`); opening the run
+        # reads every attempt without them. (Wave AO: part 4 now reads every attempt too, to take
+        # the stream's attempt order before resolving, BUG-20.)
+        if scalars and rank == 1 and Path(source).name == "after":
             raise OSError("the part went away")
         return real(source, rank=rank, all_attempts=all_attempts, scalars=scalars)
 

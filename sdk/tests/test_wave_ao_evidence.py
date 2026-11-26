@@ -150,10 +150,9 @@ def test_bug20_the_export_takes_an_order_given_for_records_already_resolved(tmp_
 
 
 # The two callers of the merge in other lanes' files. Each set its scalar-only records apart before
-# calling it and gives no order yet: they turn on at the join, once the coordinator passes the
-# stream's order there (`attempts_first_seen`; the report names the lines).
+# calling it and gave no order; at the join (lane AO-S) each passes the stream's order
+# (`attempts_first_seen`).
 
-@pytest.mark.xfail(strict=True, reason="mcp_server.py (lane AO-9's file) gives merged_scalar_points no order yet")
 def test_bug20_at_the_join_the_mcp_series_gives_the_newer_attempts_value(tmp_path):
     from tensorquill.mcp_server import Source, get_series
 
@@ -162,7 +161,6 @@ def test_bug20_at_the_join_the_mcp_series_gives_the_newer_attempts_value(tmp_pat
     assert get_series(Source(path), {"kind": "scalar", "name": "loss"})["values"] == {"value": [20.0]}
 
 
-@pytest.mark.xfail(strict=True, reason="divergence.py (lane AO-6's file) gives scalar_points_in_order no order yet")
 def test_bug20_at_the_join_first_divergence_reads_the_newer_attempts_point():
     from tensorquill.divergence import first_divergence
 
