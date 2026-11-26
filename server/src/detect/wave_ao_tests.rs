@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int32Builder, Int64Array, Int64Builder, ListBuilder, MapBuilder, StringArray, StringBuilder};
+use arrow::array::{
+    Array, Int32Array, Int32Builder, Int64Array, Int64Builder, ListBuilder, MapBuilder, StringArray, StringBuilder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Value};

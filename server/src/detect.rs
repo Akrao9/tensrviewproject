@@ -113,9 +113,9 @@ mod lane_x4_tests;
 mod lane_y2_tests;
 #[cfg(test)]
 mod lane_z3_tests;
+pub mod replica;
 #[cfg(test)]
 mod wave_ao_tests;
-pub mod replica;
 
 // The same values as the constants of the same names in evidence.py.
 pub const OVERLOAD_THRESHOLD: f64 = 0.35;
@@ -695,9 +695,16 @@ fn fsum(values: impl Iterator<Item = f64>) -> f64 {
     hi
 }
 
+/// The sum of a router's counts, exact as Python's integer sum is (BUG-01): `i64` counts summed in
+/// `i64` passed its range on valid rows, which panicked a debug build and wrapped in a release build.
+/// Of any sum within `i64`, `as f64` is what it was.
+fn counts_sum(counts: &[i64]) -> i128 {
+    counts.iter().map(|count| i128::from(*count)).sum()
+}
+
 /// Python's `_diversity_from_counts`: the effective number of experts over their number.
 fn diversity_from_counts(counts: &[i64]) -> f64 {
-    let total: i64 = counts.iter().sum();
+    let total = counts_sum(counts);
     if total <= 0 || counts.is_empty() {
         return 0.0;
     }
@@ -708,7 +715,7 @@ fn diversity_from_counts(counts: &[i64]) -> f64 {
     entropy.exp() / counts.len() as f64
 }
 
-fn effective_overload_threshold(experts: usize, tokens: i64, base: f64) -> f64 {
+fn effective_overload_threshold(experts: usize, tokens: i128, base: f64) -> f64 {
     if experts <= 1 || tokens <= 0 {
         return 1.0;
     }
@@ -717,7 +724,7 @@ fn effective_overload_threshold(experts: usize, tokens: i64, base: f64) -> f64 {
     base.max(1.5 * mean).max(mean + 3.0 * se)
 }
 
-fn dead_experts_significant(experts: usize, tokens: i64, overloaded: bool, dead: usize, diversity: f64) -> bool {
+fn dead_experts_significant(experts: usize, tokens: i128, overloaded: bool, dead: usize, diversity: f64) -> bool {
     if experts <= 1 || tokens <= 0 || dead == 0 {
         return false;
     }
@@ -1478,14 +1485,15 @@ struct Router {
     name: String,
     top_k: i64,
     /// The baseline for a top-k router: its last `OVERLOAD_WINDOW` samples that were not
-    /// flagged, as (counts, assignments, diversity), with the counts summed per expert.
-    window: VecDeque<(Arc<[i64]>, i64, f64)>,
-    window_sums: Vec<i64>,
-    window_total: i64,
+    /// flagged, as (counts, assignments, diversity), with the counts summed per expert. Every sum
+    /// of counts is an `i128`, exact as Python's ([`counts_sum`]).
+    window: VecDeque<(Arc<[i64]>, i128, f64)>,
+    window_sums: Vec<i128>,
+    window_total: i128,
     /// The trailing `starve_window` samples, for the starved check.
-    recent: VecDeque<(Arc<[i64]>, i64)>,
-    recent_sums: Vec<i64>,
-    recent_tokens: i64,
+    recent: VecDeque<(Arc<[i64]>, i128)>,
+    recent_sums: Vec<i128>,
+    recent_tokens: i128,
     /// Where this router was last found in a row's `moe_stats`.
     stats_at: usize,
     /// The most experts any of its recorded counts had: the size of the sample it is given
@@ -1522,7 +1530,7 @@ enum Leading {
 impl Router {
     /// Python's `_jump_overloaded`: in a router whose diversity just dropped, the experts
     /// whose fraction of tokens rose by `OVERLOAD_JUMP` over their average in the baseline.
-    fn jump_overloaded(&self, counts: &[i64], tokens: i64, diversity: f64, scratch: &mut Vec<f64>) -> Vec<usize> {
+    fn jump_overloaded(&self, counts: &[i64], tokens: i128, diversity: f64, scratch: &mut Vec<f64>) -> Vec<usize> {
         if self.window.len() < OVERLOAD_MIN_HISTORY {
             return Vec::new();
         }
@@ -1552,19 +1560,19 @@ impl Router {
         overloaded
     }
 
-    fn keep_in_baseline(&mut self, counts: &Arc<[i64]>, tokens: i64, diversity: f64) {
+    fn keep_in_baseline(&mut self, counts: &Arc<[i64]>, tokens: i128, diversity: f64) {
         if self.window_sums.len() < counts.len() {
             self.window_sums.resize(counts.len(), 0);
         }
         for (sum, count) in self.window_sums.iter_mut().zip(counts.iter()) {
-            *sum += count;
+            *sum += i128::from(*count);
         }
         self.window_total += tokens;
         self.window.push_back((Arc::clone(counts), tokens, diversity));
         if self.window.len() > OVERLOAD_WINDOW {
             let (old, old_tokens, _) = self.window.pop_front().expect("the window is not empty");
             for (sum, count) in self.window_sums.iter_mut().zip(old.iter()) {
-                *sum -= count;
+                *sum -= i128::from(*count);
             }
             self.window_total -= old_tokens;
         }
@@ -1577,7 +1585,7 @@ impl Router {
     fn starved(
         &mut self,
         counts: &Arc<[i64]>,
-        tokens: i64,
+        tokens: i128,
         dead: &[usize],
         window: usize,
         ratio: f64,
@@ -1588,14 +1596,14 @@ impl Router {
             self.recent_tokens = 0;
         }
         for (sum, count) in self.recent_sums.iter_mut().zip(counts.iter()) {
-            *sum += count;
+            *sum += i128::from(*count);
         }
         self.recent_tokens += tokens;
         self.recent.push_back((Arc::clone(counts), tokens));
         if self.recent.len() > window {
             let (old, old_tokens) = self.recent.pop_front().expect("the window is not empty");
             for (sum, count) in self.recent_sums.iter_mut().zip(old.iter()) {
-                *sum -= count;
+                *sum -= i128::from(*count);
             }
             self.recent_tokens -= old_tokens;
         }
@@ -1633,7 +1641,8 @@ enum OverloadRule {
 struct Sample {
     router: usize,
     counts: Arc<[i64]>,
-    tokens: i64,
+    /// The counts' exact sum, written as Python writes it ([`counts_sum`]).
+    tokens: i128,
     /// None for counts that sum to zero: a missing sample, which no rule read.
     judged: Option<Judged>,
 }
@@ -1777,7 +1786,7 @@ impl Moe {
                     count_values.value(at)
                 }
             }));
-            let tokens: i64 = router_counts.iter().sum();
+            let tokens = counts_sum(&router_counts);
             if tokens <= 0 {
                 // A missing sample: nothing is judged and no window moves.
                 if let Some(kept) = &mut self.kept {
@@ -2038,7 +2047,7 @@ struct SampleOut<'a> {
     step: i64,
     layer: usize,
     router: &'a str,
-    routed_tokens: i64,
+    routed_tokens: i128,
     counts: &'a [i64],
     diversity: Option<f64>,
     overloaded: &'a [usize],
