@@ -1092,15 +1092,48 @@ def where_runs_part(opened: list[Mapping[str, Any]], labels: list[str], *, read_
     }
 
 
+def _whole_lines(source: Path, rank: int) -> list[dict[str, Any]]:
+    """One rank's records of a `.jsonl` file's whole lines, training and scalar-only together in
+    the file's order: the lines the watcher reads (`evidence._Tail`, as `_read_local` reads the
+    file), so a line that is not a JSON object is left out, and so is a last line with no newline,
+    which the job may still be writing. Every record is checked as it is read, whatever its rank,
+    with its file and line (WAVE_AF_CONTRACT.md, section 1).
+
+    The file's order is the order the attempts first appear in, which `resolve_attempts` reads as
+    their order (contract 1). `_Tail` sets the scalar-only records apart as it reads, and joining
+    its two lists put every attempt that wrote a training record before every attempt that wrote
+    only scalar-only records so far: an older attempt whose first line was a scalar-only record
+    became the newest, and a partial last line could turn `no_divergence` into `diverged` (lane
+    AO-6, BUG-22)."""
+    from .identity import check, in_file
+
+    data = source.read_bytes()
+    end = data.rfind(b"\n") + 1  # a last line with no newline is still being written
+    found: list[dict[str, Any]] = []
+    for number, line in enumerate(data[:end].splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # a line torn by a killed process
+        if isinstance(record, dict):
+            check(record, in_file(source, number))
+            if record.get("rank", 0) == rank:
+                found.append(record)
+    return found
+
+
 def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[str, Any]], bool]:
     """One rank's step records for part 4, as `load_records(path, rank=rank, scalars=True)` reads
     them, and whether a line that is not whole was left out: a `.jsonl` file the job is still
-    writing (or one with a line torn by a killed process) is read on its whole lines, as
-    `_open_local` reads it, with the attempts resolved as `load_records` resolves them. A list is
-    a rank's several files: every attempt of each, in that order, then resolved together (lane
-    V4, CLI-13). The scalar-only records are among them, resolved with the training records'
-    cutoffs: `first_divergence` reads them as series points (WAVE_AL_CONTRACT.md Q8 a)."""
-    from .evidence import _Tail, load_records, resolve_attempts, resolve_attempts_across
+    writing (or one with a line torn by a killed process) is read on its whole lines in the
+    file's order (`_whole_lines`), as `_open_local` reads it, with the attempts resolved as
+    `load_records` resolves them. A list is a rank's several files: every attempt of each, in
+    that order, then resolved together (lane V4, CLI-13). The scalar-only records are among them,
+    in their place, resolved with the training records' cutoffs: `first_divergence` reads them as
+    series points (WAVE_AL_CONTRACT.md Q8 a)."""
+    from .evidence import load_records, resolve_attempts, resolve_attempts_across
 
     if isinstance(path, (list, tuple)):
         per_file: list[list[dict[str, Any]]] = []  # each file's own order kept (contract 1, lane W3)
@@ -1115,9 +1148,7 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
                 source = Path(one)
                 if source.is_dir() or source.suffix == ".parquet":
                     raise
-                tail = _Tail(source, rank)
-                tail.poll()
-                found = [*tail.records, *tail.scalars]
+                found = _whole_lines(source, rank)
                 torn = True
             per_file.append(_not_read_yet(found, seen))
         return resolve_attempts_across(per_file), torn
@@ -1129,9 +1160,7 @@ def _step_records(path: str | Path | list[str], rank: int) -> tuple[list[dict[st
         source = Path(path)
         if source.is_dir() or source.suffix == ".parquet":
             raise
-        tail = _Tail(source, rank)
-        tail.poll()
-        return resolve_attempts([*tail.records, *tail.scalars]), True
+        return resolve_attempts(_whole_lines(source, rank)), True
 
 
 def _left_out_text(left_out: Mapping[str, list[int]], *, of_ranks: bool) -> str:
