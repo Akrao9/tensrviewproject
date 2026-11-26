@@ -126,7 +126,9 @@ def test_a_compact_file_beside_the_records_reads_them_by_the_same_rule(tmp_path,
     capture = _write(tmp_path / "r.jsonl", _records(bad, at))
     document = ev.build_evidence(str(capture), detectors="python")
     small = _compact.compact_evidence(document, 1)
-    assert _compact._omits(small) is not None
+    # A router never read at any step has no sample to leave out: that file omits nothing, and is
+    # then judged as a full one (`_router_steps_changed`).
+    assert (_compact._omits(small) is not None) == any(s.get("router") == ROUTER for s in document["samples"])
     report = tmp_path / "r.evidence.compact.json"
     ev.write_evidence(small, report)
 
