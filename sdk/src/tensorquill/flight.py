@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .identity import SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record
+from .identity import SCALAR_VERSION, SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 from .sink import _finite
 
@@ -338,9 +338,14 @@ def _row(
             row["probe_json"], row["probe_maps"], row["probe_histograms"] = _split_probe(value)
             continue
         if key == "scalars" and isinstance(value, dict):
-            # A logged bool is not a number in either engine (lane W3, DET-16): that one value is left
-            # out of the row, and the rest of the map stays in its column for the Rust detectors.
-            value = {k: v for k, v in value.items() if not isinstance(v, bool)}
+            held, aside, counted = _scalars(value, None if schema is None else schema.field(spec[0]).type)
+            if held is not _UNHELD:
+                row[spec[0]] = held
+            if aside:
+                extra[key] = aside
+            if counted and moved is not None:
+                moved.append(key)
+            continue
         counted = False  # refused by an overflow or by Arrow, not by its type: `moved` names the key
         try:
             converted = spec[1](value)
@@ -379,6 +384,45 @@ def _row(
     if extra:
         row["extra_json"] = _json(extra)
     return row
+
+
+def _past_float(value: Any) -> bool:
+    """Whether `value` is an integer (not a bool) that a float64 holds only rounded, such as
+    `2**53 + 1`. An integer too large for any float is not: `float()` refuses it, and its map
+    travels in `extra_json` whole, as before."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    try:
+        return float(value) != value  # Python compares an int with a float exactly
+    except OverflowError:
+        return False
+
+
+def _scalars(value: Mapping[str, Any], map_type: Any) -> tuple[Any, dict[str, Any], bool]:
+    """The `scalars` map as its column's pairs (`_UNHELD` for none), what travels in `extra_json`
+    under `scalars`, and whether the map was refused by an overflow or by Arrow (`map_type`, when
+    given), not by a type.
+
+    - A logged bool is not a number in either engine (lane W3, DET-16): that one value is left out of
+      the column, and the rest of the map stays there for the Rust detectors. It travels in
+      `extra_json` (wave AO, BUG-24 b; before, it was dropped from the row), so a record read back
+      from the store holds it as the file does, after the column's entries.
+    - An integer a float64 holds only rounded (`_past_float`; capture keeps a logged Python integer
+      as it is, and the `.jsonl` holds it exactly; wave AO, BUG-24 a) stays in the column as the
+      nearest float, which the Rust detectors judge, and travels exactly in `extra_json` too, so
+      `row_to_record` gives the record back as the file holds it, in its order.
+    - Any other value the column refuses moves the whole map to `extra_json`, its bools with it, and
+      the column is null, as before (lane W3)."""
+    column = {k: v for k, v in value.items() if not isinstance(v, bool)}
+    try:
+        converted = _map(_float)(column)
+    except (TypeError, ValueError):
+        return _UNHELD, dict(value), False
+    except Exception:  # noqa: BLE001  OverflowError and the like: the value's, not the step's
+        return _UNHELD, dict(value), True
+    if map_type is not None and not _fits(converted, map_type):
+        return _UNHELD, dict(value), True
+    return converted, {k: v for k, v in value.items() if isinstance(v, bool) or _past_float(v)}, False
 
 
 # The maps held entry by entry (wave AJ, A3), each with its entries' converter. `scalars` keeps
@@ -681,8 +725,10 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
         else:
             record[key] = _plain(value)
     if extra:
-        for key in _SPLIT:
-            # The entries the column could not hold, beside those it did (wave AJ, A3).
+        for key in (*_SPLIT, "scalars"):
+            # The entries the column could not hold, beside those it did (wave AJ, A3), and the
+            # scalars it holds only rounded, exactly (`_scalars`): an entry of the column's own name
+            # is replaced where it stands, so the record keeps its order.
             if key in record and isinstance(extra.get(key), dict):
                 record[key] = {**record[key], **extra.pop(key)}
         record.update(extra)
@@ -816,6 +862,13 @@ def _store_of(document: Mapping[str, Any]) -> str | None:
     return store_id if isinstance(store_id, str) and store_id else None
 
 
+def _left_out_of(document: Mapping[str, Any]) -> int:
+    """The lines of the run left out before the offset, as an offset file keeps them
+    (`FlightSender.left_out_lines`): an integer of 0 or more, else 0 (a file written before the key)."""
+    value = document.get("left_out", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
 def read_offset(path: Path) -> int:
     return read_binding(path)["offset"]
 
@@ -897,6 +950,19 @@ def parse_lines(
 # The identity fields the sender checks before it sends a line (`WAVE_AF_CONTRACT.md` section 10).
 # Not `schema_version`: a version the server does not read is sent, for the server to count (RS10).
 SENDER_FIELDS = ("rank", "attempt", "step")
+# A line of record version 2, which this package reads as the scalar-only record alone, is checked
+# with its `schema_version` too (wave AO, BUG-02): `identity.check` then refuses one with no
+# `"record": "scalars"`, and one whose `seq` is not an integer of 0 or more. Sent, such a line was a
+# step row of `record_version` 2 with a null `seq`, which a server stored as a training step in a
+# part every Python reader then refused.
+_SCALAR_FIELDS = ("schema_version", *SENDER_FIELDS)
+
+
+def _sender_fields(record: Mapping[str, Any]) -> tuple[str, ...]:
+    """The identity fields `rows_to_send` checks on `record`: `SENDER_FIELDS`, and `schema_version`
+    too when the record says it is of the scalar-only record's version."""
+    version = record.get("schema_version") if isinstance(record, Mapping) else None
+    return _SCALAR_FIELDS if type(version) is int and version == SCALAR_VERSION else SENDER_FIELDS
 _KEY_DEFAULTS = {"schema_version": 0, "rank": 0, "attempt": 0}
 
 
@@ -924,7 +990,8 @@ def rows_to_send(
 ) -> tuple[Any, list[int], int]:
     """`records` as one record batch of `schema`, the training steps it holds, and how many records were
     left out for a key: a `rank`, `attempt` or `step` that `identity.check` does not take (negative,
-    not an integer, or a missing `step`; wave AG, `WAVE_AF_CONTRACT.md` section 10), or a key
+    not an integer, or a missing `step`; wave AG, `WAVE_AF_CONTRACT.md` section 10), a record of version 2
+    that is not a whole scalar-only record (no `"record": "scalars"`, or no valid `seq`; wave AO), or a key
     column whose value cannot be stored (a null or a string where a key column needs an integer,
     an integer too large for its column). Such a line is skipped and counted like a line that is
     not JSON, and the lines after it are sent. Were it kept, every retry would start again at it
@@ -968,7 +1035,7 @@ def rows_to_send(
     skipped = 0
     for index, record in enumerate(records):
         try:
-            check(record, None, SENDER_FIELDS)
+            check(record, None, _sender_fields(record))
         except MalformedRecordError as error:
             skipped += 1
             leave_out(index, record, error.field, error.value)
@@ -1115,6 +1182,10 @@ class FlightSender:
             _say(f"tensorquill: {left_out}. The local file has all of it; the run streams as usual.", stacklevel=4)
         self.last_error: BaseException | None = None
         self.skipped_lines = 0
+        # Lines of this run the sender left out (`rows_to_send`'s count: a key it cannot send) in the
+        # part of the file the server confirmed, kept in the offset file (`left_out`) so a later
+        # sender of the same file counts them too (wave AO, BUG-24 c). See `left_out_lines`.
+        self._left_out_acked = 0
         # Fields sent in `extra_json` because their column cannot hold the value (`rows_to_send`):
         # the step is sent and the server reads that value as absent. Said once per sender.
         self.moved_fields = 0
@@ -1196,6 +1267,18 @@ class FlightSender:
         """Bytes of the local file that the server has stored."""
         return self._acked
 
+    @property
+    def left_out_lines(self) -> int:
+        """Lines of this run in the part of the file the server confirmed (`acked_offset`) that were
+        never sent: a line `rows_to_send` leaves out for a key it cannot send (a step past Int64, a
+        negative rank, a record of version 2 that is not a whole scalar-only record). The confirmed
+        offset moves past such a line, so its bytes count as acknowledged, but the server does not
+        have it. Kept in the offset file, so a later sender of the same file starts from the same
+        count; this sender's own skips are also in `skipped_lines`. A line that is not one of this
+        run's records (not JSON, another run's) is counted in `skipped_lines` alone. While this is
+        above 0, `close()` returns False."""
+        return self._left_out_acked
+
     def unacked_bytes(self) -> int | None:
         """Bytes of the local file the server has not confirmed; None when the file cannot be
         read, which is not "nothing left to send"."""
@@ -1206,8 +1289,10 @@ class FlightSender:
 
     def close(self, timeout: float = CLOSE_TIMEOUT) -> bool:
         """Send the complete lines that are left and wait up to `timeout` seconds for the
-        server to store them. Returns whether the whole file was acknowledged; if not, says
-        where the local file is. Call after the local file's writer has been closed.
+        server to store them. Returns whether the whole file was acknowledged and no line of this
+        run in it was left out (`left_out_lines`, counted across senders of the file; wave AO,
+        BUG-24 c); if not, says where the local file is. Call after the local file's writer has
+        been closed.
 
         In a forked child (a `DataLoader` worker, a `multiprocessing` process) this does
         nothing and returns False: a fork copies this object but not its thread, and the
@@ -1233,7 +1318,18 @@ class FlightSender:
                 f"{self.offset_path.name} the next time this run ID streams.",
                 file=sys.stderr,
             )
-        return left == 0
+        left_out = self._left_out_acked
+        if left_out:
+            lines = "1 line" if left_out == 1 else f"{left_out} lines"
+            print(
+                f"tensorquill: {lines} of run {self.run_id} in {self.path} {'was' if left_out == 1 else 'were'} "
+                f"not sent to {self.endpoint}, which does not have {'it' if left_out == 1 else 'them'}: "
+                f"{'its' if left_out == 1 else 'their'} identity fields cannot be sent (said when the sender skipped "
+                f"{'it' if left_out == 1 else 'the first'}). The local file keeps "
+                f"{'it' if left_out == 1 else 'them'} as written; sender.left_out_lines counts them.",
+                file=sys.stderr,
+            )
+        return left == 0 and left_out == 0
 
     # Everything below runs on the sender thread.
 
@@ -1492,6 +1588,7 @@ class FlightSender:
         store = {"store_id": self._store_id} if self._store_id is not None else {}
         write_offset(self.offset_path, end, {**self._destination, **identity, **store})
         self._acked = end
+        self._left_out_acked = identity.get("left_out", 0)
         with self._pending_lock:
             for done in [done for done in self._pending if done <= end]:
                 del self._pending[done]
@@ -1549,9 +1646,13 @@ class FlightSender:
             offset = start + sum(len(line) + 1 for line in lines[:line_index])
             step = steps[index]
             found = "absent" if value is MalformedRecordError.ABSENT else _shown(value)
-            why = ("tensorquill reads an integer of 0 or more; the server would refuse the whole batch holding it"
-                   if field in SENDER_FIELDS and isinstance(value, int) and not isinstance(value, bool)
-                   and value < 0 else "its column in the stream cannot hold it")
+            if field == "schema_version":
+                why = ('schema version 2 is the scalar-only record, which has "record": "scalars"; sent, it would '
+                       "be stored as a step no reader takes")
+            elif field in SENDER_FIELDS and isinstance(value, int) and not isinstance(value, bool) and value < 0:
+                why = "tensorquill reads an integer of 0 or more; the server would refuse the whole batch holding it"
+            else:
+                why = "its column in the stream cannot hold it"
             shown_step = "" if step is MalformedRecordError.ABSENT else f" (step {_shown(step)})"
             print(
                 f"tensorquill: the line at byte {offset} of {self.path}{shown_step} is not sent to {self.endpoint}: "
@@ -1562,16 +1663,19 @@ class FlightSender:
         except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
             pass
 
-    def _sent(self, data: bytes, end: int) -> int:
+    def _sent(self, data: bytes, end: int, left_out: int = 0) -> int:
         """Move the identity windows past `data`, the bytes just sent, which end at `end`, and return
         where they begin: the start a refusal of them must name (RS10), which the batch's metadata
-        states too (`start_byte_offset`)."""
+        states too (`start_byte_offset`). `left_out` is the count of lines of this run left out from
+        byte 0 to `end` (`left_out_lines`), which the offset file keeps beside `end` once it is
+        confirmed; 0 is not written."""
         start = end - len(data)
         if len(self._head) < HEAD_BYTES:
             self._head += data[: HEAD_BYTES - len(self._head)]
         self._tail = (self._tail + data[-TAIL_BYTES:])[-TAIL_BYTES:]
         with self._pending_lock:
-            self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail)}
+            self._pending[end] = {"head": _digest(self._head), "tail": _digest(self._tail),
+                                  **({"left_out": left_out} if left_out else {})}
             self._starts[end] = start  # where the batch that ends here began (RS10)
         return start
 
@@ -1599,9 +1703,13 @@ class FlightSender:
                     identity = file_identity(self.path, offset)
                 except (OSError, ValueError):
                     return  # later acks name the batches this stream sends
+            if "left_out" not in identity and self._left_out_acked:
+                # An offset this stream did not send: the count confirmed so far, never more than is known.
+                identity = {**identity, "left_out": self._left_out_acked}
             store = {"store_id": self._store_id} if self._store_id is not None else {}
             write_offset(self.offset_path, offset, {**self._destination, **identity, **store})
             self._acked = offset
+            self._left_out_acked = identity.get("left_out", 0)
             with self._pending_lock:
                 for end in [end for end in self._pending if end <= offset]:
                     del self._pending[end]
@@ -1620,6 +1728,8 @@ class FlightSender:
         # batch (L3): until then nothing past byte 0 is sent and nothing is counted as confirmed.
         probing = saved > 0
         self._acked = 0
+        self._left_out_acked = 0
+        left_out = 0  # lines of this run left out from byte 0 to `sent` (`left_out_lines`)
         self._store_id = None
         sent = 0
         schema = flight_schema()
@@ -1716,6 +1826,7 @@ class FlightSender:
                         reason = self._bound(named[0])
                         if reason is None:
                             self._acked = sent = saved
+                            self._left_out_acked = left_out = _left_out_of(self._binding)
                             life["start"] = life["sent"] = saved
                         else:
                             self._replay(reason)
@@ -1738,12 +1849,13 @@ class FlightSender:
                         refused: list[tuple[int, str, Any]] = []
                         batch, steps, unstorable = rows_to_send(records, schema, moved, refused)
                         self.skipped_lines += skipped + unstorable
+                        left_out += unstorable
                         if moved:
                             self._say_moved(moved)
                         if refused:
                             self._say_skipped(sent, lines, places, refused,
                                               [r.get("step", MalformedRecordError.ABSENT) for r in records])
-                        start = self._sent(b"".join(line + b"\n" for line in lines), end)
+                        start = self._sent(b"".join(line + b"\n" for line in lines), end, left_out)
                         metadata = metadata_for(end, steps, start=start)
                         writer.write_with_metadata(batch, pa.py_buffer(metadata))
                         sent = life["sent"] = end
@@ -1855,7 +1967,9 @@ def send_file(
     tls_root_certs: bytes | str | os.PathLike[str] | None = None,
 ) -> bool:
     """Send what a finished run's `.jsonl` file still owes the server. Returns whether the
-    server confirmed the whole file."""
+    server confirmed the whole file and holds every line of this run in it: False while a line of
+    this run was left out (`FlightSender.left_out_lines`, which the offset file keeps, so sending the
+    file again says the same)."""
     return FlightSender(
         path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs
     ).close(timeout)
@@ -2115,21 +2229,36 @@ class StreamingSink:
         self.sender = sender
         self.heartbeat = heartbeat
         self.path = sink.path
+        # The step of the last training record written through this sink, or None when none was:
+        # the step a stop at `close()` names (detector rules contract, part 7; wave AO, BUG-24 d).
+        self.last_step: int | None = None
 
     def write(self, records: list[dict[str, Any]]) -> None:
         self._sink.write(records)
+        for record in records:  # once the write returned: a record whose write raised is not counted
+            if isinstance(record, Mapping) and not is_scalar_record(record):
+                step = record.get("step")
+                if isinstance(step, int) and not isinstance(step, bool) and step >= 0:
+                    self.last_step = step
 
     def close(self) -> None:
         """The local file first, then the heartbeat and the sender. A local file whose close raises
         stops capture: the heartbeat is told (`sink_error`) before it ends, so its last beat carries
-        the stop, and the error is raised after the stream is closed."""
+        the stop, and the error is raised after the stream is closed.
+
+        The stop names `last_step`, the last training step written through this sink, as the
+        session's own stop names the last step it committed: at a close, the session has handed
+        every step it committed to the writer, so the two are the same step. Before, it named none,
+        so a run that committed step 0 read as one that committed nothing, and the session's own
+        stop after it does nothing once a stop is set. None when no training record was written
+        (a scalar-only record is not a step)."""
         failure: BaseException | None = None
         try:
             self._sink.close()
         except BaseException as error:  # noqa: BLE001  raised again below, once the stream is closed
             failure = error
             if self.heartbeat is not None:
-                self.heartbeat.stop_capture("sink_error")
+                self.heartbeat.stop_capture("sink_error", step=self.last_step)
         if self.heartbeat is not None:
             self.heartbeat.close()
         self.sender.close()
