@@ -375,7 +375,7 @@ def test_the_listing_reads_one_rank_of_two_writers_as_several_writers_not_health
     row = rows[0]
     assert row["run_id"] == "same" and row["ranks"] == [0]
     assert row["evidence"]["state"] == "several_writers"
-    assert row["evidence"]["writers"] == {"0": [first.name, second.name]}
+    assert row["evidence"]["writers"] == [{"rank": 0, "files": [first.name, second.name]}]
     assert row["run_state"] is None and row["incidents"] is None and row["last_step"] is None
     assert second.name in row["evidence"]["detail"]
 

@@ -31,7 +31,7 @@ from . import manifest as _manifest
 # A record's identity fields (WAVE_AF_CONTRACT.md, section 1): checked where records are loaded,
 # before either engine is chosen, by lane F's one check (`identity.check`).
 from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part, is_scalar_record
-from .sink import read_end_marker
+from .sink import read_end_marker, writers_block
 from .data_checks import (
     CHANGES_LISTED,
     DATA_STALL_STEPS,
@@ -7873,6 +7873,10 @@ def build_evidence(
     (`sink.read_end_marker`): read from `source` when that is the file, or from `records_file`
     for a caller that hands over records it has already read. Any state but `closed` means the
     run is not known to have finished. A server's store or a list of records has none.
+    `writers`, for that same file, is there only when another process wrote the same run ID and
+    rank at once, in a file of its own beside it (`<run_id>.rank<N>.<pid>.jsonl`,
+    `sink.writers_block`): `{"state": "several", "files", "detail"}`. The file then holds one of the
+    rank's writers, not the rank's whole, whatever its run state says of its own records.
 
     The evidence's `run` block (project, name, run ID) is read from the run manifest
     (`manifest.py`): the one beside `source` when that is a path, or `run_manifest`, which is
@@ -8235,6 +8239,9 @@ def _build_evidence(
         # The ranks' replica observations compared (`compare_replicas`), only where a record holds one.
         **({"replica": replica} if replica is not None else {}),
         **({"run_end": read_end_marker(ended)} if (ended := _records_file(source, records_file)) else {}),
+        # Another process's file of the same run ID and rank beside it (`sink.writers_block`): this
+        # file holds one of the rank's writers, not the rank's whole.
+        **({"writers": writers} if ended and (writers := writers_block(ended)) else {}),
         **({"not_checked": not_checked} if not_checked else {}),
         # Skipped updates by who reported them: the server's, else counted here (contract, section 1).
         **({"skipped_updates": skipped} if (skipped := (
@@ -9099,6 +9106,9 @@ def incident_summary(evidence: Mapping[str, Any]) -> str:
     ended = run_end_line(evidence)
     if ended:
         notes.append(ended)
+    writers = evidence.get("writers")
+    if isinstance(writers, Mapping) and writers.get("detail"):
+        notes.append(f"Writers: {writers['detail']}.")
     left_out = lines_left_out_line(evidence)
     if left_out:
         notes.append(left_out)
