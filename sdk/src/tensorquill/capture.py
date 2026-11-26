@@ -12,6 +12,7 @@ Rules this module follows (see the Capture SDK section of the v3 plan):
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 import math
@@ -407,6 +408,22 @@ def _tokens(args: Any) -> int | None:
         return None
     total = x.numel()
     return total // width if type(total) is int else None
+
+
+def _index_range_problem(spec: Router, counts: torch.Tensor, n: int, steps: Sequence[int]) -> tuple[str, None] | None:
+    """The refusal of a router whose expert ids reached `n_experts` on a step of a block, from its counts
+    on the CPU (`_judge_index_ranges`, and the pinned path's `_settle_refusals`); None when none did."""
+    width = _count_width(spec)
+    outside = counts.reshape(n, width)[:, spec.n_experts + 1].tolist()
+    bad = next((i for i, v in enumerate(outside) if v), None)
+    if bad is None:
+        return None
+    source = "its indices= function returned" if spec.indices is not None else "its output's first integer tensor held"
+    return (
+        f"{source} {outside[bad]} value{'s' if outside[bad] != 1 else ''} "
+        f"outside 0 to {spec.n_experts - 1} at step {steps[bad]}, which match no expert",
+        None,
+    )
 
 
 def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: Any = None) -> str:
@@ -1613,6 +1630,7 @@ class Session:
         probe_head: str | bool | None = None,
         ends_step: Any = None,
         mirror_scalars: bool = False,
+        pinned_flush: bool = False,
         _plan: _Plan | None = None,
     ) -> None:
         # Every check first, with nothing changed (`_plan_session`); `init` has made them already.
@@ -1697,6 +1715,10 @@ class Session:
         # Each problem is (why, which fix `_refusal` names, None for the usual two).
         self._router_problems: dict[str, list[tuple[str, str | None]]] = {name: [] for name in self._routers}
         self._router_problems_said: set[str] = set()
+        self._said_lock = threading.Lock()  # the said set is read and added to by the writer too (pinned path)
+        # On the pinned path only: each router's first reason, kept by the writer, which judges the index
+        # ranges there (`_settle`); the hook's own list stays the training thread's.
+        self._router_first: dict[str, tuple[str, str | None]] = {}
         self._router_refusals_written: set[str] = set()
         # Each router's `moe_source` once it is known and written (`_moe_forms`, contract part 7).
         self._moe_source_written: set[str] = set()
@@ -1924,6 +1946,25 @@ class Session:
         self._phase = "train"
         self._ticks = 0
         self._error: BaseException | None = None
+        # What the stop says when `_error` came from the pinned path's settle, not the sink: (what, reason).
+        self._error_said: tuple[str, str] | None = None
+        # The pinned-memory flush (`init(pinned_flush=True)`, lane AQ-1; see `_CudaCopies`). The mode is the
+        # session's, fixed here: with it, every block is settled on the writer, in queue order, even after
+        # the copy itself has fallen back to a blocking read (`pinned_flush` turns False then, said once).
+        self._pinned_mode = False
+        self.pinned_flush = False
+        self._copier: Any = None
+        self._pool: _PinnedPool | None = None
+        self._update_why_late: dict[str, str] = {}  # the writer's `UPDATES_NO_OPTIMIZER` note (pinned path)
+        self._said_later: collections.deque[str] = collections.deque()  # warnings the writer found
+        self._pinned_off_said = False
+        if pinned_flush:
+            try:
+                self._copier = _pinned_backend(self.device)
+            except Exception as error:  # noqa: BLE001  never into training: the blocking path, said once
+                self._say_pinned_off(error, now=True)
+            else:
+                self._pinned_mode = self.pinned_flush = True
         # GPU memory and NVML readings once per flush (system.py), and the host time spent
         # waiting for batches (datawait.py). Both off unless asked for.
         self._system = SystemReadings(self.device) if system else None
@@ -3357,7 +3398,8 @@ class Session:
             )
         return False
 
-    def _say_replica_unread(self, spreads: torch.Tensor, seen: Sequence[int]) -> None:
+    def _say_replica_unread(self, spreads: torch.Tensor, seen: Sequence[int],
+                            say: Callable[[str], None] | None = None) -> None:
         """Name once each replicated parameter left out of the cross-GPU check, from the block's
         spreads, already on the CPU: no transfer and no sync is added. The same on every rank,
         since every rank leaves out the same rows; the reason is this rank's own when it could
@@ -3371,11 +3413,12 @@ class Session:
                     continue
                 self._replica_unread_said.add(name)
                 why = self._replica_unread_here.get(name) or f"on another replica in the group, {_unread_reason(code)}"
-                _warn(
-                    f"TensorQuill is not comparing the parameter {name!r} across replicas: {why}. It is left out "
-                    "of replica_spread, so the cross-GPU drift check does not cover it.",
-                    stacklevel=4,
-                )
+                message = (f"TensorQuill is not comparing the parameter {name!r} across replicas: {why}. It is left "
+                           "out of replica_spread, so the cross-GPU drift check does not cover it.")
+                if say is None:
+                    _warn(message, stacklevel=4)
+                else:
+                    say(message)
 
     def _observe_replicas(self, row: int) -> dict[str, Any] | None:
         """This step's replica observation (contract 1) into row `row` of the observation ring:
@@ -3542,12 +3585,14 @@ class Session:
         self._commit(step, caller_skipped=skipped)
 
     def _router_refusals(self) -> dict[str, str]:
-        """Each refused router's reason: why, and the fixes for how it was named (`_refusal`)."""
-        return {
-            name: _refusal(name, self._routers[name], *found[0], device=self._counts[name].device)
-            for name, found in self._router_problems.items()
-            if found
-        }
+        """Each refused router's reason: why, and the fixes for how it was named (`_refusal`). On the
+        pinned path a router's first reason may be one the writer found (`_router_first`)."""
+        out: dict[str, str] = {}
+        for name, found in self._router_problems.items():
+            first = self._router_first.get(name) or (found[0] if found else None)
+            if first:
+                out[name] = _refusal(name, self._routers[name], *first, device=self._counts[name].device)
+        return out
 
     def _moe_forms(self, counts: torch.Tensor, n: int, refused: Mapping[str, str]) -> dict[str, dict[str, str]]:
         """`moe_source` for each router counted in this block and not said before (contract part 7):
@@ -3576,7 +3621,8 @@ class Session:
             offset += size
         return out
 
-    def _layers_not_read(self, floats: torch.Tensor | None, n: int) -> dict[str, str]:
+    def _layers_not_read(self, floats: torch.Tensor | None, n: int,
+                         firsts: Sequence[str | None] | None = None) -> dict[str, str]:
         """`layers_not_read` for this block (contract part 7, the author's word: a once-per-run note of
         a persistent limitation): each watched block whose hook found it could not read its output and
         that was read on no step so far, this block's included, with the hook's reason. Read from the
@@ -3588,24 +3634,30 @@ class Session:
                 size = n * len(self.layer_names) * (_SEEN + 1)
                 seen = floats[:size].reshape(n, len(self.layer_names), _SEEN + 1)[:, :, _SEEN]
                 self._layers_ever_read.update(int(row) for row in seen.amax(0).nonzero().reshape(-1).tolist())
+            if firsts is None:  # the hooks' first problems as they are now; the pinned path passes its snapshot
+                firsts = [problems[0] if problems else None for problems in self._layer_problems]
             found = {
-                name: problems[0]
-                for row, (name, problems) in enumerate(zip(self.layer_names, self._layer_problems))
-                if problems and row not in self._layers_ever_read and name not in self._layers_not_read_written
+                name: first
+                for row, (name, first) in enumerate(zip(self.layer_names, firsts))
+                if first and row not in self._layers_ever_read and name not in self._layers_not_read_written
             }
         except Exception:  # noqa: BLE001  # the note is lost, never the block
             return {}
         self._layers_not_read_written.update(found)
         return found
 
-    def _say_router_problems(self, stacklevel: int) -> None:
-        for name, reason in self._router_refusals().items():
-            if name not in self._router_problems_said:
+    def _say_router_problems(self, stacklevel: int, refusals: Mapping[str, str] | None = None,
+                             say: Callable[[str], None] | None = None) -> None:
+        for name, reason in (self._router_refusals() if refusals is None else refusals).items():
+            with self._said_lock:  # the writer says them too on the pinned path (`_settle`)
+                if name in self._router_problems_said:
+                    continue
                 self._router_problems_said.add(name)
-                _warn(
-                    f"TensorQuill is not counting the router {name!r}: {reason}. Its expert loads are not recorded.",
-                    stacklevel=stacklevel,
-                )
+            message = f"TensorQuill is not counting the router {name!r}: {reason}. Its expert loads are not recorded."
+            if say is None:
+                _warn(message, stacklevel=stacklevel)
+            else:
+                say(message)
 
     def _judge_index_ranges(self, counts: torch.Tensor, n: int) -> None:
         """Refuse a router whose expert ids reached n_experts on any step of this block: from its
@@ -3618,22 +3670,15 @@ class Session:
             width = _count_width(spec)
             size = n * width
             if not self._router_problems[name]:
-                outside = counts[offset : offset + size].reshape(n, width)[:, spec.n_experts + 1].tolist()
-                bad = next((i for i, v in enumerate(outside) if v), None)
-                if bad is not None:
-                    source = (
-                        "its indices= function returned" if spec.indices is not None
-                        else "its output's first integer tensor held"
-                    )
-                    self._router_problems[name].append((
-                        f"{source} {outside[bad]} value{'s' if outside[bad] != 1 else ''} "
-                        f"outside 0 to {spec.n_experts - 1} at step {self._steps[bad]}, which match no expert",
-                        None,
-                    ))
+                problem = _index_range_problem(spec, counts[offset : offset + size], n, self._steps)
+                if problem is not None:
+                    self._router_problems[name].append(problem)
             offset += size
 
     @torch.no_grad()
     def _commit(self, step: int | None, caller_skipped: bool | None = None) -> None:
+        if self._said_later:
+            self._say_later()  # the pinned path's warnings, found on the writer
         if self._error is not None and not self._stopped:
             self._stop(self._error)  # the sink failed on the writer thread: said here, on this one
         for held in self._held_forwards:  # a forward held in this step and not claimed is not the next step's
@@ -3844,6 +3889,9 @@ class Session:
         by `_put`, and anything else that raises here stops capture, as a flush that raises does."""
         if self._scalar_records and not self._stopped:
             try:
+                if self._pinned_mode:
+                    self._put_scalar_records_pinned()
+                    return
                 self._put(([],))
             except Exception as error:  # noqa: BLE001
                 self._stop(error, f"queuing the scalar-only records raised {_short(error)}", reason="flush_error")
@@ -4012,6 +4060,9 @@ class Session:
         )
 
     def _flush_ring(self, *, hold_newest: bool) -> None:
+        if self._pinned_mode:
+            self._flush_ring_pinned(hold_newest=hold_newest)
+            return
         if self._probe_owed and not hold_newest:
             self._run_owed_probe()  # the newest step's, before it leaves the ring (a held one stays)
         if self._held is not None:
@@ -4064,11 +4115,7 @@ class Session:
         if any(flag and not (amp and amp.get("step_skipped")) for flag, amp in zip(no_optimizer, amps)):
             # A step that was not skipped, yet no optimizer of this model stepped: the one that
             # did holds none of its parameters. A skipped step says nothing of that.
-            self._update_why.setdefault(
-                UPDATES_NO_OPTIMIZER,
-                "no optimizer that has stepped holds this model's parameters (DeepSpeed ZeRO, Megatron-LM and "
-                "FSDP1 step flattened or copied parameters), so there is no Adam state to read for them",
-            )
+            self._update_why.setdefault(UPDATES_NO_OPTIMIZER, _NO_OPTIMIZER_WHY)
         update_why = {name: why for name, why in self._update_why.items() if name not in self._update_why_written}
         self._update_why_written.update(update_why)
         grad_why = self._new_grad_why()
@@ -4113,12 +4160,359 @@ class Session:
             block = tuple(first[key] for key in _BLOCK_FIELDS)
         self._put(block)
 
+    # ---- the pinned path (`pinned_flush=True`): gather here, settle on the writer -------------------------
+
+    def _say_pinned_off(self, why: str, *, now: bool) -> None:
+        """Turn the pinned copy off for the rest of the session (every later flush reads with a blocking
+        copy; blocks are still settled on the writer, in order) and say so once: now, on the training
+        thread, or from the writer through `_said_later`."""
+        self.pinned_flush = False
+        if self._pinned_off_said:
+            return
+        self._pinned_off_said = True
+        message = (f"TensorQuill's pinned flush (pinned_flush=True) is off for the rest of this session: {why}. "
+                   "Blocks of steps are moved off the device with a blocking copy instead, as with "
+                   "pinned_flush=False; the records are the same.")
+        if now:
+            _warn(message, stacklevel=5)
+        else:
+            self._said_later.append(message)
+
+    def _say_later(self) -> None:
+        """Say, on the training thread, what the writer found to warn of on the pinned path."""
+        while self._said_later:
+            try:
+                message = self._said_later.popleft()
+            except IndexError:
+                return
+            _warn(message, stacklevel=4)
+
+    def _pinned_wait_failed(self, error: BaseException) -> Callable[[torch.Tensor], torch.Tensor]:
+        """On the writer: a copy's event could not be waited for. The path goes off, and the block is read
+        from its staging tensor, which the session still holds, with a blocking copy on the writer."""
+        self._say_pinned_off(f"waiting for a copy to pinned host memory raised {_short(error)}", now=False)
+        return getattr(self._copier, "read", None) or (lambda staging: staging.cpu())
+
+    def _launch(self, moves: _Moves) -> _Transfer:
+        """Start moving `moves` to the host, on the training thread, with no host read: each part on the
+        session's device packed into one fresh staging tensor (on the current stream, so after whatever
+        wrote the ring), then one copy into a pinned buffer (`_CudaCopies.copy`). A part elsewhere is read
+        at once (a CPU part is cloned). With the copy off, or in a forked process, every part is read now
+        with a blocking copy, as `_flush_ring` reads it; a failure here turns it off, said once."""
+        parts = moves.parts
+        copier = self._copier
+        if not (self.pinned_flush and copier is not None and os.getpid() == self._pid):
+            return _Transfer([_cpu_copy(part) for part in parts])
+        layout: list[Any] = []
+        packed: list[tuple[int, torch.Tensor]] = []
+        size = 0
+        for part in parts:
+            if part.device == self.device:
+                nbytes = part.numel() * part.element_size()
+                layout.append((size, nbytes, part.dtype, tuple(part.shape)))
+                packed.append((size, part))
+                size += -(-nbytes // _PINNED_ALIGN) * _PINNED_ALIGN
+            else:
+                layout.append(_cpu_copy(part))  # on another device: read now (a stated limit)
+        if not packed:
+            return _Transfer(layout)
+        try:
+            staging = torch.empty(size, dtype=torch.uint8, device=self.device)
+            for start, part in packed:
+                flat = part.detach().reshape(-1)
+                if flat.numel():
+                    staging[start : start + flat.numel() * flat.element_size()].copy_(flat.view(torch.uint8))
+            if self._pool is None:
+                self._pool = _PinnedPool(copier)
+            buffer, kept = self._pool.take(size)
+            try:
+                event = copier.copy(staging, buffer)
+            except BaseException:
+                self._pool.give(buffer, kept)
+                raise
+        except Exception as error:  # noqa: BLE001  never into training: this flush and the rest read now
+            self._say_pinned_off(f"a copy to pinned host memory could not be made ({_short(error)})", now=True)
+            return _Transfer([_cpu_copy(part) for part in parts])
+        return _Transfer(layout, event=event, buffer=buffer, kept=kept, staging=staging, pool=self._pool)
+
+    def _gather_scalar_records(self, moves: _Moves) -> tuple[list[dict[str, Any]], Any] | None:
+        """`_put`'s scalar-only records, their tensors added to `moves` (None when none is pending)."""
+        if not self._scalar_records:
+            return None
+        pending, self._scalar_records = self._scalar_records, []
+        rows = [record["scalars"] for record in pending]
+        if not any(isinstance(value, torch.Tensor) for row in rows for value in row.values()):
+            return pending, (rows, [])
+        try:
+            return pending, _scalars_gather(rows, moves)
+        except Exception:  # noqa: BLE001  as `_put`: each value on its own, one that fails left out (BUG-03)
+            return pending, (self._scalar_rows_one_by_one(pending), [])
+
+    def _enqueue_pending(self, item: _Pending) -> None:
+        self._enqueue(item)
+        item.queued = not self._stopped
+
+    def _flush_ring_pinned(self, *, hold_newest: bool) -> None:
+        """`_flush_ring` on the pinned path, its training-thread half: the ring's lists taken and reset, what
+        the hooks and the training thread have found so far kept as it is now, and every device tensor the
+        block needs handed to `_launch`, then the item queued. What needs the values on the host (`_settle`)
+        is left to the writer. The held step (`_hold_newest`) stays in the ring as there."""
+        if self._probe_owed and not hold_newest:
+            self._run_owed_probe()  # the newest step's, before it leaves the ring (a held one stays)
+        if self._held is not None:
+            self._release_held_pinned()
+            return
+        n = len(self._steps)
+        if n == 0:
+            return
+        moves = _Moves()
+        has_act = self._act.numel() > 0
+        has_grads = any(self._ring_grad_seen) and self._grad.numel() > 0 and self._ring_grad is not None
+        floats: int | None = None
+        if has_act and has_grads:
+            floats = moves.add(torch.cat([self._ring_act[:n].reshape(-1), self._ring_grad[:n].reshape(-1)]))  # type: ignore[index]
+        elif has_act:
+            floats = moves.add(self._ring_act[:n].reshape(-1))
+        elif has_grads:
+            floats = moves.add(self._ring_grad[:n].reshape(-1))  # type: ignore[index]
+        counts = (moves.add(torch.cat([ring[:n].reshape(-1) for ring in self._ring_counts.values()]))
+                  if self._ring_counts else None)
+        spread_seen = self._ring_spread_seen
+        spreads = moves.add(self._ring_spread[:n]) if self._ring_spread is not None and any(spread_seen) else None
+        obs_seen, scopes = self._ring_obs_seen, self._ring_scope
+        observed = any(obs_seen) and self._ring_obs is not None and self._ring_obs_sig is not None
+        obs = moves.add(self._ring_obs[:n]) if observed else None  # type: ignore[index]
+        obs_sig = moves.add(self._ring_obs_sig[:n]) if observed else None  # type: ignore[index]
+        clip_seen = self._ring_clip_seen
+        clips = moves.add(self._ring_clip[:n]) if any(clip_seen) else None
+        update_seen = self._ring_update_seen
+        updates = moves.add(self._ring_update[:n]) if any(update_seen) else None
+        amp_rows, scalar_rows, checkpoint_rows = self._ring_amp, self._ring_scalars, self._ring_checkpoint
+        amps = _scalars_gather(amp_rows, moves)
+        scalars = _scalars_gather(scalar_rows, moves)
+        checkpoints = _checkpoints_gather(checkpoint_rows, moves)
+        # A one-step ring that is held (`every=1`) puts no block now: the scalar-only records wait for the
+        # release, as they do on the blocking path.
+        records = None if hold_newest and n == 1 else self._gather_scalar_records(moves)
+        transfer = self._launch(moves)  # before the ring changes below (`_ring_update[0]`)
+        no_optimizer, grad_seen, weight_seen = self._ring_no_optimizer, self._ring_grad_seen, self._ring_weight_seen
+        steps, lrs, stamps, data_rows, waits, probes = (self._steps, self._ring_lr, self._ring_ts, self._ring_data,
+                                                        self._ring_wait, self._ring_probe)
+        act_size = self._act.numel() if has_act else 0
+        data = {
+            "n": n, "has_act": has_act, "act_size": act_size, "hold": hold_newest, "steps": steps, "lrs": lrs,
+            "floats": floats, "counts": counts, "spreads": spreads, "clips": clips, "clip_seen": clip_seen,
+            "grad_seen": grad_seen, "weight_seen": weight_seen, "spread_seen": spread_seen, "scalars": scalars,
+            "probes": probes, "stamps": stamps, "amps": amps, "data_rows": data_rows, "checkpoints": checkpoints,
+            "waits": waits, "updates": updates, "update_seen": update_seen, "obs": obs, "obs_sig": obs_sig,
+            "obs_seen": obs_seen, "scopes": scopes, "param_names": self.param_names, "no_optimizer": no_optimizer,
+            "records": records,
+            # What the training thread and the hooks have produced so far, as it is now (`_settle`).
+            "update_why": dict(self._update_why),
+            "grad_why": self._new_grad_why(),
+            "system": self._system.flush() if self._system is not None else None,
+            "hook_refusals": {name: found[0] for name, found in self._router_problems.items() if found},
+            "layer_firsts": [problems[0] if problems else None for problems in self._layer_problems],
+        }
+        item = _Pending("block", data, transfer)
+        self._clear_ring_lists()
+        self._ring_no_optimizer = []
+        self._ring_update_seen = []
+        self._ring_obs_seen, self._ring_scope = [], []
+        self._ring_wait = []
+        if hold_newest:
+            # As `_hold_newest`: the newest step stays in the ring as its only row, its Python entries as
+            # they were (here also its logged tensors, which are read again only if they change).
+            self._held = {"block": None, "act_size": act_size, "dirty": set(), "source": item}
+            self._steps, self._ring_lr, self._ring_ts = steps[-1:], lrs[-1:], stamps[-1:]
+            self._ring_data, self._ring_wait, self._ring_no_optimizer = data_rows[-1:], waits[-1:], no_optimizer[-1:]
+            self._ring_scalars, self._ring_amp = scalar_rows[-1:], amp_rows[-1:]
+            self._ring_probe, self._ring_checkpoint = probes[-1:], checkpoint_rows[-1:]
+            self._ring_grad_seen, self._ring_weight_seen = grad_seen[-1:], weight_seen[-1:]
+            self._ring_clip_seen, self._ring_spread_seen = clip_seen[-1:], spread_seen[-1:]
+            self._ring_update_seen = update_seen[-1:]
+            self._ring_obs_seen, self._ring_scope = obs_seen[-1:], scopes[-1:]
+            if self.updates and n > 1:
+                self._ring_update[0].copy_(self._ring_update[n - 1])
+            if n == 1:
+                return  # queued with its release (`_settle_release`), so the queue counts one block a step
+        self._enqueue_pending(item)
+
+    def _release_held_pinned(self) -> None:
+        """`_release_held` on the pinned path: what arrived for the held step since its flush (a save, a
+        probe, a follower's update, weight check or loss), its device rows handed to `_launch`, and the
+        release queued after the flush it belongs to; the writer puts the two together."""
+        held, self._held = self._held, None
+        if held is None:
+            return
+        dirty = held["dirty"]
+        moves = _Moves()
+        data = {
+            "act_size": held["act_size"],
+            "checkpoints": _checkpoints_gather(self._ring_checkpoint, moves),
+            "probes": self._ring_probe,
+            "weight_seen": self._ring_weight_seen,
+            "update_seen": self._ring_update_seen,
+            "scalars": _scalars_gather(self._ring_scalars, moves) if "scalars" in dirty else None,
+            "updates": moves.add(self._ring_update[:1]) if "update" in dirty else None,
+            # Marked only by a weight check read again (`_follow`), so the rows are four wide.
+            "grad": moves.add(self._ring_grad[0, :, 2:]) if "grad" in dirty and self._ring_grad is not None else None,
+            "update_why": dict(self._update_why),
+            "grad_why": self._new_grad_why(),
+        }
+        data["records"] = self._gather_scalar_records(moves)
+        transfer = self._launch(moves)
+        self._clear_ring_lists()
+        self._enqueue_pending(_Pending("release", data, transfer, source=held["source"]))
+
+    def _put_scalar_records_pinned(self) -> None:
+        """`_put_scalar_records` on the pinned path: a block with no steps, its tensors moved as a flush's."""
+        moves = _Moves()
+        records = self._gather_scalar_records(moves)
+        if records is not None:
+            self._enqueue_pending(_Pending("records", {"records": records}, self._launch(moves)))
+
+    def _new_update_why(self, snapshot: Mapping[str, str]) -> dict[str, str]:
+        """The update notes not yet written: the training thread's as gathered, then the writer's own."""
+        combined = dict(snapshot)
+        for name, why in self._update_why_late.items():
+            combined.setdefault(name, why)
+        found = {name: why for name, why in combined.items() if name not in self._update_why_written}
+        self._update_why_written.update(found)
+        return found
+
+    def _settle_refusals(self, counts: torch.Tensor | None, n: int, steps: Sequence[int],
+                         hook_refusals: Mapping[str, tuple[str, str | None]]) -> dict[str, str]:
+        """Each router's refusal for this block, as `_judge_index_ranges` and `_router_refusals` make it on
+        the blocking path: its first problem ever; the index ranges judged when the hooks had found none."""
+        refused: dict[str, str] = {}
+        offset = 0
+        for name, spec in self._routers.items():
+            size = n * _count_width(spec)
+            first = self._router_first.get(name)
+            if first is None:
+                first = hook_refusals.get(name)
+                if first is None and counts is not None:
+                    first = _index_range_problem(spec, counts[offset : offset + size], n, steps)
+                if first is not None:
+                    self._router_first[name] = first
+            if first is not None:
+                refused[name] = _refusal(name, spec, *first, device=self._counts[name].device)
+            offset += size
+        return refused
+
+    def _with_records(self, block: tuple[Any, ...], records: Any, values: list[torch.Tensor]) -> tuple[Any, ...]:
+        if records is None:
+            return block
+        pending, gathered = records
+        rows = _scalars_settle(gathered, values)
+        ready = [{**record, "scalars": row} for record, row in zip(pending, rows) if row]
+        return tuple(block) + (None,) * (len(_BLOCK_FIELDS) - len(block)) + (ready,)
+
+    def _settle(self, item: _Pending) -> list[tuple[Any, ...]]:
+        """The writer's half of a pinned flush, in queue order: wait for the copy (`_Transfer.take`), then
+        what `_flush_ring` does with the values on the host, from what was gathered and from the state this
+        half owns (`_router_first`, `_router_refusals_written`, `_moe_source_written`, `_layers_ever_read`,
+        `_update_why_written`). Returns the blocks to write, as `_decode` takes them. Warnings are queued
+        for the training thread (`_say_later`)."""
+        if item.kind == "release":
+            return self._settle_release(item)
+        item.settled = True
+        values = item.transfer.take(self._pinned_wait_failed)
+        d = item.data
+        if item.kind == "records":
+            return [self._with_records(([],), d["records"], values)]
+
+        def get(key: str) -> torch.Tensor | None:
+            return None if d[key] is None else values[d[key]]
+
+        n = d["n"]
+        floats, counts, spreads, clips, updates, obs, obs_sig = (
+            get(key) for key in ("floats", "counts", "spreads", "clips", "updates", "obs", "obs_sig")
+        )
+        amps = _scalars_settle(d["amps"], values)
+        scalars = _scalars_settle(d["scalars"], values)
+        checkpoints = _checkpoints_settle(d["checkpoints"], values)
+        say = self._said_later.append
+        refused = self._settle_refusals(counts, n, d["steps"], d["hook_refusals"])
+        if counts is not None:
+            self._say_router_problems(0, refusals=refused, say=say)
+        if spreads is not None:
+            self._say_replica_unread(spreads, d["spread_seen"], say=say)
+        if any(flag and not (amp and amp.get("step_skipped")) for flag, amp in zip(d["no_optimizer"], amps)):
+            self._update_why_late.setdefault(UPDATES_NO_OPTIMIZER, _NO_OPTIMIZER_WHY)
+        update_why = self._new_update_why(d["update_why"])
+        announce = {name: why for name, why in refused.items() if name not in self._router_refusals_written}
+        self._router_refusals_written.update(announce)
+        sources = self._moe_forms(counts, n, refused) if counts is not None else {}
+        layers_why = self._layers_not_read(floats if d["has_act"] else None, n, firsts=d["layer_firsts"])
+        block = (
+            d["steps"], d["lrs"], floats, counts, spreads, clips, d["clip_seen"], d["grad_seen"], d["weight_seen"],
+            d["spread_seen"], scalars, d["probes"], d["stamps"], amps, d["data_rows"], checkpoints, d["waits"],
+            d["system"], refused, announce, updates, d["update_seen"], update_why, d["grad_why"], obs, obs_sig,
+            d["obs_seen"], d["scopes"], d["param_names"], sources, layers_why,
+        )
+        if d["hold"]:
+            first, item.held = self._split_newest(dict(zip(_BLOCK_FIELDS, block)), d["act_size"])
+            if n == 1:
+                return []
+            block = tuple(first[key] for key in _BLOCK_FIELDS)
+        return [self._with_records(block, d["records"], values)]
+
+    def _settle_release(self, item: _Pending) -> list[tuple[Any, ...]]:
+        """The held step's block: the half its flush kept (`item.source.held`), with what arrived since."""
+        source = item.source
+        if source is not None and not source.settled:
+            self._settle(source)  # a one-step ring's flush, queued with its release (`_flush_ring_pinned`)
+        values = item.transfer.take(self._pinned_wait_failed)
+        held = None if source is None else source.held
+        if held is None:
+            return []
+        source.held = None  # type: ignore[union-attr]
+        d = item.data
+        held["checkpoints"] = _checkpoints_settle(d["checkpoints"], values)
+        held["probes"] = d["probes"]
+        held["weight_seen"] = d["weight_seen"]
+        held["update_seen"] = d["update_seen"]
+        if d["scalars"] is not None:
+            held["scalars"] = _scalars_settle(d["scalars"], values)
+        if d["updates"] is not None:
+            held["updates"] = values[d["updates"]]
+        if d["grad"] is not None and held["floats"] is not None:
+            weights = held["floats"][d["act_size"] :].view(-1, 4)
+            weights[:, 2:] = values[d["grad"]]
+        held["update_why"] = {**held["update_why"], **self._new_update_why(d["update_why"])}
+        held["grad_why"] = {**held["grad_why"], **d["grad_why"]}
+        return [self._with_records(tuple(held[key] for key in _BLOCK_FIELDS), d["records"], values)]
+
     def _hold_newest(self, block: dict[str, Any], *, act_size: int, originals: tuple[Any, ...]) -> dict[str, Any] | None:
         """Split a full ring's block, already on the CPU in one transfer: the steps but the newest,
         returned to be queued now, and the newest, kept as `self._held` (`_release_held`). Its
         rows stay in the ring too, as its only row, so what arrives for it after it ended is
         recorded there as for any step in the ring; only a device row changed since is read
         again when it is written. None when the ring held one step (`every=1`)."""
+        n = len(block["steps"])
+        last = n == 1
+        first, held = self._split_newest(block, act_size)
+        self._held = {"block": held, "act_size": act_size, "dirty": set()}
+        # The ring keeps the newest step as its only row, at row 0: its Python entries as they were
+        # (logged tensors still on the device), and its update row on the device for a follower's.
+        steps, lrs, stamps, data_rows, waits, no_optimizer = originals
+        self._steps, self._ring_lr, self._ring_ts = steps[-1:], lrs[-1:], stamps[-1:]
+        self._ring_data, self._ring_wait, self._ring_no_optimizer = data_rows[-1:], waits[-1:], no_optimizer[-1:]
+        self._ring_scalars, self._ring_amp = block["scalars"][-1:], block["amps"][-1:]  # on the CPU now
+        self._ring_probe, self._ring_checkpoint = block["probes"][-1:], block["checkpoints"][-1:]
+        self._ring_grad_seen, self._ring_weight_seen = block["grad_seen"][-1:], block["weight_seen"][-1:]
+        self._ring_clip_seen, self._ring_spread_seen = block["clip_seen"][-1:], block["spread_seen"][-1:]
+        self._ring_update_seen = block["update_seen"][-1:]
+        self._ring_obs_seen, self._ring_scope = block["obs_seen"][-1:], block["scopes"][-1:]
+        if self.updates and n > 1:
+            self._ring_update[0].copy_(self._ring_update[n - 1])
+        return None if last else first
+
+    def _split_newest(self, block: dict[str, Any], act_size: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        """`_hold_newest`'s split of a block already on the CPU: the steps but the newest, and the newest.
+        Host work only; on the pinned path it runs on the writer (`_settle`)."""
         n = len(block["steps"])
         first: dict[str, Any] = {}
         held: dict[str, Any] = {}
@@ -4155,26 +4549,15 @@ class Session:
         first["system"], held["system"] = None, block["system"]
         first["refused"] = held["refused"] = block["refused"]
         first["param_names"] = held["param_names"] = block["param_names"]
-        self._held = {"block": held, "act_size": act_size, "dirty": set()}
-        # The ring keeps the newest step as its only row, at row 0: its Python entries as they were
-        # (logged tensors still on the device), and its update row on the device for a follower's.
-        steps, lrs, stamps, data_rows, waits, no_optimizer = originals
-        self._steps, self._ring_lr, self._ring_ts = steps[-1:], lrs[-1:], stamps[-1:]
-        self._ring_data, self._ring_wait, self._ring_no_optimizer = data_rows[-1:], waits[-1:], no_optimizer[-1:]
-        self._ring_scalars, self._ring_amp = block["scalars"][-1:], block["amps"][-1:]  # on the CPU now
-        self._ring_probe, self._ring_checkpoint = block["probes"][-1:], block["checkpoints"][-1:]
-        self._ring_grad_seen, self._ring_weight_seen = block["grad_seen"][-1:], block["weight_seen"][-1:]
-        self._ring_clip_seen, self._ring_spread_seen = block["clip_seen"][-1:], block["spread_seen"][-1:]
-        self._ring_update_seen = block["update_seen"][-1:]
-        self._ring_obs_seen, self._ring_scope = block["obs_seen"][-1:], block["scopes"][-1:]
-        if self.updates and n > 1:
-            self._ring_update[0].copy_(self._ring_update[n - 1])
-        return None if last else first
+        return first, held
 
     def _release_held(self) -> None:
         """Queue the step kept back when the ring last filled, with what arrived for it since:
         a save, a probe, a follower's update, weight check or loss. Only what changed on the
         device is read again (with a follower, once a block); otherwise no transfer."""
+        if self._pinned_mode:
+            self._release_held_pinned()
+            return
         held, self._held = self._held, None
         if held is None:
             return
@@ -4226,14 +4609,22 @@ class Session:
             # `seq` is not reused, and a reader needs none to follow another.
             ready = [{**record, "scalars": row} for record, row in zip(pending, rows) if row]
             block = tuple(block) + (None,) * (len(_BLOCK_FIELDS) - len(block)) + (ready,)
+        self._enqueue(block)
+
+    def _enqueue(self, item: Any) -> None:
+        """`_put`'s hand-over, for a block or a pinned path's item (`_Pending`): never waits while training."""
         try:
             if self._close_by is None:
-                self._queue.put_nowait(block)
+                self._queue.put_nowait(item)
             else:
                 # In `close()` no training step waits, and a writer that is slow but working gets
                 # until the close's deadline to make room for the last block.
-                self._queue.put(block, timeout=max(self._close_by - time.monotonic(), 0.0))
+                self._queue.put(item, timeout=max(self._close_by - time.monotonic(), 0.0))
         except queue.Full:
+            if isinstance(item, _Pending):
+                item.transfer.drop()
+                if item.source is not None and not item.source.queued:
+                    item.source.transfer.drop()  # a one-step ring's flush, which went with its release
             blocks = self._queue.maxsize
             if self._close_by is not None:
                 self._stop(RuntimeError(f"the writer had not made room for the last block within {CLOSE_SECONDS:g} s "
@@ -4299,6 +4690,8 @@ class Session:
         `flush_error`), and the next beat goes at once."""
         if self._stopped:
             return
+        if cause is self._error and self._error_said is not None and what is None:
+            what, reason = self._error_said[0], reason or self._error_said[1]  # the pinned path's settle raised
         self._stopped = True
         self.writer_error = _without_traceback(cause)  # no frames kept, so no cycle through the session (`_drain`)
         # Contract 3: a streamed session's heartbeat says so from now on, with a short reason word
@@ -4313,7 +4706,10 @@ class Session:
             except Exception:  # noqa: BLE001  a beat that cannot be told is the server's limit, not training's
                 pass
         self._clear_ring_lists()
-        self._held = None
+        held, self._held = self._held, None
+        source = held.get("source") if held else None
+        if source is not None and not source.queued:
+            source.transfer.drop()  # a one-step ring's flush that waited for its release (pinned path)
         self._probe_owed = False
         self._scalar_records = []  # lost with the steps not yet handed to the writer (contract section 4.2)
         try:  # an idle writer ends now; a busy one ends once the queue is empty (`_drain`)
@@ -4524,6 +4920,7 @@ class Session:
                            reason="close_timeout")
         wait = STOPPED_CLOSE_SECONDS if self._stopped else max(deadline - time.monotonic(), 0.0)
         self._worker.join(wait)
+        self._say_later()  # what the writer found on the pinned path, said here on the caller's thread
         if self._worker.is_alive():
             self._stop(RuntimeError(f"the writer had not finished within {wait:g} s at close"), reason="close_timeout")
             try:
@@ -4572,18 +4969,34 @@ class Session:
                 item = self._queue.get()
                 if item is None:
                     return
-                if self._error is None:
+                blocks = [item]
+                if isinstance(item, _Pending):
+                    # The pinned path (`pinned_flush=True`): wait for the copy, then make the block(s).
+                    blocks = []
+                    if self._error is None:
+                        try:
+                            blocks = self._settle(item)
+                        except BaseException as error:  # noqa: BLE001
+                            self._error = _without_traceback(error)
+                            self._error_said = (f"moving a block of steps off the device raised {_short(error)}",
+                                                "flush_error")
+                    item.transfer.drop()  # passed over, or already taken: its buffer goes back either way
+                    if item.source is not None:
+                        item.source.transfer.drop()
+                for block in blocks:
+                    if self._error is not None:
+                        break
                     if self._system is not None:
                         # NVML is asked for here, on the writer thread, and read on a thread of its own;
                         # the newest finished reading is attached and nothing waits for one (system.py).
                         # A failure is written as a note in the record and never stops the writer.
                         # Found by its type, not its place, so other parts of the block can come after it.
                         try:
-                            item = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in item)
+                            block = tuple(self._system.write(x) if isinstance(x, SystemPart) else x for x in block)
                         except Exception:  # noqa: BLE001
                             pass
                     try:
-                        self._sink.write(self._decode(*item))
+                        self._sink.write(self._decode(*block))
                     except BaseException as error:  # noqa: BLE001
                         # Kept without its traceback: that holds this frame, and through it the
                         # session, which then outlives its last reference until a garbage collection
@@ -4853,6 +5266,214 @@ def _checkpoints_to_cpu(rows: list[dict[str, Any] | None]) -> list[dict[str, Any
     return rows
 
 
+# ---- the pinned-memory flush (`init(pinned_flush=True)`, lane AQ-1) ----------------------------------
+#
+# A flush on this path issues device work only, on the training thread: every tensor the block needs is
+# packed into one fresh `uint8` staging tensor on the current stream, and one copy into a pinned host
+# buffer is issued on a copy stream of the session's own, ordered after the pack by an event. The writer
+# thread waits for the copy's event, takes the values out, gives the buffer back, and only then does what
+# needs host values (`Session._settle`). The staging tensor is what keeps the ring free: the copy never
+# reads the ring, which the next step overwrites on the training stream. `PINNED_BUFFERS` host buffers are
+# kept (two: one being read by the writer while the next is filled); while the writer holds both, a flush
+# takes one more from PyTorch's caching host allocator, dropped after use, so what is pinned at once is
+# bounded by the writer queue's bound. Any failure turns the path off for the session, said once: the
+# blocking `.cpu()` of today is used from then on.
+PINNED_BUFFERS = 2
+_PINNED_ALIGN = 16  # bytes: every part of the staging tensor starts here, so it can be viewed as any dtype
+_PINNED_MIN_BYTES = 4096
+_NO_OPTIMIZER_WHY = (
+    "no optimizer that has stepped holds this model's parameters (DeepSpeed ZeRO, Megatron-LM and "
+    "FSDP1 step flattened or copied parameters), so there is no Adam state to read for them"
+)
+
+
+def _record_stream(tensor: torch.Tensor, stream: Any) -> None:
+    tensor.record_stream(stream)
+
+
+class _CudaCopies:
+    """The copy stream of one CUDA device and the pinned buffers it copies into. `cuda` is `torch.cuda`
+    (a stand-in in the tests). Nothing here waits: `copy` returns the event the writer waits for."""
+
+    def __init__(self, device: torch.device, cuda: Any = None) -> None:
+        self.cuda = torch.cuda if cuda is None else cuda
+        self.device = device
+        self.stream = self.cuda.Stream(device=device)
+
+    def buffer(self, nbytes: int) -> torch.Tensor:
+        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+    def copy(self, staging: torch.Tensor, host: torch.Tensor) -> Any:
+        # The pack was issued on the current stream, after every write into the ring it reads: the copy
+        # stream waits for an event recorded after it (`cudaStreamWaitEvent`, which does not block the
+        # host). Same dtype, both contiguous: one `cudaMemcpyAsync`, which does not block for pinned memory.
+        ready = self.cuda.Event()
+        ready.record(self.cuda.current_stream(self.device))
+        self.stream.wait_event(ready)
+        with self.cuda.stream(self.stream):
+            host[: staging.numel()].copy_(staging, non_blocking=True)
+        # Used on a stream other than its own: not reused before the copy is done, even if dropped unread.
+        _record_stream(staging, self.stream)
+        done = self.cuda.Event(blocking=True)  # the writer's wait yields the CPU instead of spinning
+        done.record(self.stream)
+        return done
+
+    def read(self, staging: torch.Tensor) -> torch.Tensor:
+        """A blocking read of `staging` on the writer thread, ordered after the pack (the copy stream
+        waits for it), for a copy whose event could not be waited for."""
+        with self.cuda.stream(self.stream):
+            return staging.cpu()
+
+
+def _pinned_backend(device: torch.device) -> Any:
+    """The copier for `device`; raises, saying why, where there is none."""
+    if device.type != "cuda":
+        raise RuntimeError(f"it needs a CUDA device, and this session's device is {device.type}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available in this process")
+    return _CudaCopies(device)
+
+
+class _PinnedPool:
+    """The host buffers: `PINNED_BUFFERS` kept and reused, more taken while the writer holds those.
+    Taken on the training thread, given back by the writer once it has taken a block's values out."""
+
+    def __init__(self, copier: Any) -> None:
+        self.copier = copier
+        self.lock = threading.Lock()
+        self.free: list[torch.Tensor] = []
+        self.kept = 0
+
+    def take(self, nbytes: int) -> tuple[torch.Tensor, bool]:
+        with self.lock:
+            for i, buffer in enumerate(self.free):
+                if buffer.numel() >= nbytes:
+                    return self.free.pop(i), True
+            if self.free:  # free but too small for this block: made again, larger
+                self.free.pop()
+                self.kept -= 1
+            keep = self.kept < PINNED_BUFFERS
+            if keep:
+                self.kept += 1
+        size = max(_PINNED_MIN_BYTES, 1 << (max(nbytes, 1) - 1).bit_length()) if keep else nbytes
+        try:
+            return self.copier.buffer(size), keep
+        except BaseException:
+            if keep:
+                with self.lock:
+                    self.kept -= 1
+            raise
+
+    def give(self, buffer: torch.Tensor, kept: bool) -> None:
+        if kept:
+            with self.lock:
+                self.free.append(buffer)
+
+
+class _Moves:
+    """The tensors one flush hands to the writer, by index."""
+
+    def __init__(self) -> None:
+        self.parts: list[torch.Tensor] = []
+
+    def add(self, tensor: torch.Tensor) -> int:
+        self.parts.append(tensor)
+        return len(self.parts) - 1
+
+
+class _Transfer:
+    """One flush's values on the host: ready at once, or packed (`layout` holds `(offset, nbytes,
+    dtype, shape)` for a packed part and the host tensor itself for one already there)."""
+
+    def __init__(self, layout: list[Any], event: Any = None, buffer: torch.Tensor | None = None,
+                 kept: bool = False, staging: torch.Tensor | None = None, pool: _PinnedPool | None = None) -> None:
+        self.layout, self.event, self.buffer, self.kept, self.staging, self.pool = layout, event, buffer, kept, staging, pool
+
+    def take(self, failed: Callable[[BaseException], Any]) -> list[torch.Tensor]:
+        """On the writer: wait for the copy, take the values out, give the buffer back. A wait that raises
+        reads the kept staging tensor instead (`failed` returns the reader) and turns the path off."""
+        if self.event is None:
+            return self.layout
+        try:
+            source = self.buffer
+            try:
+                self.event.synchronize()
+            except Exception as error:  # noqa: BLE001
+                reader = failed(error)
+                source = reader(self.staging)
+            return [part if isinstance(part, torch.Tensor)
+                    else source[part[0] : part[0] + part[1]].view(part[2]).reshape(part[3]).clone()
+                    for part in self.layout]
+        finally:
+            self.drop()
+
+    def drop(self) -> None:
+        """Give the buffer back unread (a block passed over). A copy still in flight into it is on the one
+        copy stream, so the next copy into it comes after; the next read waits for its own event."""
+        if self.buffer is not None and self.pool is not None:
+            self.pool.give(self.buffer, self.kept)
+        self.buffer = self.staging = self.event = None
+
+
+class _Pending:
+    """A queued item of the pinned path: what the training thread gathered, and its transfer. `held` is
+    the newest step's half, kept by the writer for the release that follows (`kind="release"`)."""
+
+    def __init__(self, kind: str, data: dict[str, Any], transfer: _Transfer, source: "_Pending | None" = None) -> None:
+        self.kind, self.data, self.transfer, self.source = kind, data, transfer, source
+        self.held: dict[str, Any] | None = None
+        self.queued = False  # handed to the writer (`_enqueue_pending`); a one-step ring's waits for its release
+        self.settled = False  # taken by the writer (`_settle`)
+
+
+def _scalars_gather(rows: list[dict[str, Any]], moves: _Moves) -> tuple[list[dict[str, Any]], list[tuple[int, list[tuple[int, str]]]]]:
+    """`_scalars_to_cpu`'s first half, on the device: each device's tensors stacked (to the dtype of its
+    first, as there) and added to `moves`. Returns copies of the rows and where each value goes."""
+    by_device: dict[torch.device, list[tuple[int, str, torch.Tensor]]] = {}
+    for i, row in enumerate(rows):
+        for name, value in row.items():
+            if isinstance(value, torch.Tensor):
+                by_device.setdefault(value.device, []).append((i, name, value))
+    plan = [
+        (moves.add(torch.stack([t.to(entries[0][2].dtype) for _, _, t in entries])), [(i, name) for i, name, _ in entries])
+        for entries in by_device.values()
+    ]
+    return [dict(row) for row in rows], plan
+
+
+def _scalars_settle(gathered: tuple[list[dict[str, Any]], list[Any]], values: list[torch.Tensor]) -> list[dict[str, Any]]:
+    rows, plan = gathered
+    for index, keys in plan:
+        for (i, name), value in zip(keys, values[index].tolist()):
+            rows[i][name] = value
+    return rows
+
+
+def _checkpoints_gather(rows: list[dict[str, Any] | None], moves: _Moves) -> tuple[list[dict[str, Any] | None], list[tuple[int, int]]]:
+    """`_checkpoints_to_cpu`'s first half: a resumed optimizer's `step` tensor added to `moves`, on a copy
+    of its row (the training thread may still change the row of a held step)."""
+    out: list[dict[str, Any] | None] = []
+    plan: list[tuple[int, int]] = []
+    for row in rows:
+        snapshot = row.get("optimizer") if row else None
+        if snapshot is not None and isinstance(snapshot.get("step_after"), torch.Tensor):
+            value = snapshot["step_after"]
+            row = {**row, "optimizer": {**snapshot}}
+            if value.numel() == 1:
+                plan.append((len(out), moves.add(value.detach().reshape(1))))
+            else:
+                row["optimizer"]["step_after"] = None
+        out.append(row)
+    return out, plan
+
+
+def _checkpoints_settle(gathered: tuple[list[dict[str, Any] | None], list[tuple[int, int]]], values: list[torch.Tensor]) -> list[dict[str, Any] | None]:
+    rows, plan = gathered
+    for i, index in plan:
+        rows[i]["optimizer"]["step_after"] = values[index].reshape(()).item()  # type: ignore[index]
+    return rows
+
+
 def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Replace logged tensors with Python floats: one transfer per device for the block."""
     by_device: dict[torch.device, list[tuple[int, str, torch.Tensor]]] = {}
@@ -5088,6 +5709,7 @@ def init(
     updates: bool = False,
     ends_step: Any = None,
     mirror_scalars: bool = True,
+    pinned_flush: bool = False,
 ) -> Session:
     """Start capturing `model`. Call after `model.to(device)` and before `torch.compile`.
 
@@ -5288,7 +5910,20 @@ def init(
             come before or after. A function bound before `init` (`from mlflow import log_metric`)
             and `MlflowClient` calls are not seen. The wrappers come off when the last session that
             mirrors closes or stops. See `mirror.py` and the README. `False` installs nothing.
+        pinned_flush: move each block of steps off a CUDA device without the training thread waiting
+            for it. At a flush the ring is packed into one staging tensor on the device and copied into
+            pinned host memory on a CUDA stream of the session's own, after an event recorded on the
+            current stream; the writer thread waits for the copy's event and makes every read of the
+            values. The training thread makes no host read and calls no `torch.cuda.synchronize()`. The
+            records are the same as with `False`, which is the default until this path has run on a GPU.
+            On a device that is not CUDA, or when pinned memory, the stream or a copy fails, the blocking
+            copy is used for the rest of the session, said once in a warning; never an error in training.
+            Two pinned buffers of one block each (about 0.3 MB for a 7B dense model at `every=50`, 1 MB
+            for Mixtral 8x7B), and more while the writer is more than two blocks behind. Still read with
+            a blocking copy: a logged tensor on a device other than the session's, and the probe.
     """
+    if not isinstance(pinned_flush, bool):
+        raise ValueError(f"pinned_flush must be True or False, not {pinned_flush!r}")
     mode = capture if capture is not None else ("routers" if routers else "full")
     if mode not in CAPTURE_MODES:
         raise ValueError(f"capture must be one of {sorted(CAPTURE_MODES)}, got {capture!r}")
@@ -5378,6 +6013,7 @@ def init(
             updates=updates,
             ends_step=ends_step,
             mirror_scalars=mirror_scalars,
+            pinned_flush=pinned_flush,
             _plan=plan,
         )
     except BaseException:

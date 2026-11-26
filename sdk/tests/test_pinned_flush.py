@@ -47,10 +47,13 @@ VOLATILE = {"ts", "attempt", "run_id", "step_time", "data_wait", "system"}
 
 
 def _clean(value):
+    """The record without what differs between runs, and NaN as a string so that it equals itself."""
     if isinstance(value, dict):
         return {key: _clean(item) for key, item in value.items() if key not in VOLATILE}
     if isinstance(value, list):
         return [_clean(item) for item in value]
+    if isinstance(value, float) and value != value:
+        return "nan"
     return value
 
 
@@ -134,11 +137,11 @@ def _out_of_range(state):
     return indices
 
 
-def _train(*, pinned: bool, scenario: str = "full", every: int = 4, steps: int = 11, sink=None, model=None,
+def _train(*, pinned: bool, scenario: str = "full", every: int = 4, steps: int = 11, sink=None, compiled=False,
            **init_kwargs):
     """A seeded run of `scenario`; returns the cleaned records, TensorQuill's warnings and the session."""
     torch.manual_seed(0)
-    model = model if model is not None else ToyMoE()
+    model = ToyMoE()
     sink = sink if sink is not None else tensorquill.MemorySink()
     state = {"bad": False}
     kwargs: dict = {"routers": {"router": 4}, "capture": "full"}
@@ -173,6 +176,7 @@ def _train(*, pinned: bool, scenario: str = "full", every: int = 4, steps: int =
     with warnings.catch_warnings(record=True) as said:
         warnings.simplefilter("always")
         session = tensorquill.init(model, sink=sink, every=every, pinned_flush=pinned, **kwargs)
+        forward = torch.compile(model, backend="eager") if compiled else model
         for i in range(steps):
             if scenario == "unfrozen" and i == 5:
                 for p in model.out.parameters():
@@ -181,7 +185,7 @@ def _train(*, pinned: bool, scenario: str = "full", every: int = 4, steps: int =
             opt.zero_grad()
             if opt2 is not None:
                 opt2.zero_grad()
-            loss = model(torch.randn(16, 8)).pow(2).mean()
+            loss = forward(torch.randn(16, 8)).pow(2).mean()
             if scenario == "scaler" and i == 5:
                 loss = loss * float("inf")
             if scaler is not None:
@@ -190,6 +194,8 @@ def _train(*, pinned: bool, scenario: str = "full", every: int = 4, steps: int =
                 scaler.update()
             else:
                 loss.backward()
+                if scenario == "updates":
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # the clip rows of the ring
                 opt.step()
                 if opt2 is not None:
                     opt2.step()  # after the lead ended the step: a follower
@@ -200,7 +206,7 @@ def _train(*, pinned: bool, scenario: str = "full", every: int = 4, steps: int =
                 session.checkpoint({"model": model.state_dict(), "optimizer": opt.state_dict()})
         session.close()
     told = sorted(str(w.message) for w in said if "TensorQuill" in str(w.message))
-    return [_clean(r) for r in sink.records], told, session
+    return [_clean(r) for r in getattr(sink, "records", [])], told, session
 
 
 SCENARIOS = ["full", "routers", "grads_n", "updates", "follower", "scaler", "refusal", "unfrozen"]
@@ -225,6 +231,16 @@ def test_every_ring_size_and_a_flush_before_the_ring_fills(use_fake, every):
     use_fake(FakeCopies("late"))
     got, _, _ = _train(pinned=True, every=every, steps=7)
     assert got == expected
+
+
+def test_a_copy_that_lands_late_holds_the_flushs_values_not_the_next_steps(use_fake):
+    """The writer waits 30 ms for each copy, and the copy lands only then: by that time training has
+    written the next steps into the ring. A copy that read the ring itself, not a snapshot of it, would
+    write those. The update and clip rows are parts read straight from the ring (`updates=True`)."""
+    expected, _, _ = _train(pinned=False, scenario="updates", every=2, steps=9)
+    use_fake(FakeCopies("late", wait_seconds=0.03))
+    got, _, session = _train(pinned=True, scenario="updates", every=2, steps=9)
+    assert session.writer_error is None and got == expected
 
 
 def test_a_writer_behind_takes_more_buffers_and_never_reuses_one_it_has_not_read(use_fake):
@@ -339,8 +355,9 @@ def test_close_waits_for_the_last_copies_and_leaves_the_end_marker(use_fake, tmp
     use_fake(FakeCopies("late", wait_seconds=0.2))
     _, _, session = _train(pinned=True, steps=10, sink=tensorquill.JsonlSink(path))
     assert session.writer_error is None
-    steps = [json.loads(line)["step"] for line in path.read_text().splitlines()]
-    assert steps == list(range(10))
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["step"] for r in lines if "record" not in r] == list(range(10))  # step records
+    assert [r["step"] for r in lines if "record" in r] == [1, 4, 7]  # and the scalar-only ones
     assert (tmp_path / "run.end.json").exists()
 
 
@@ -367,6 +384,43 @@ def test_a_stop_writes_what_was_queued_before_it(use_fake):
     got = run(True)
     assert [r["step"] for r in got] == [0, 1, 2, 3, 4, 5]  # the held step 5 went with step 6's end
     assert got == expected
+
+
+def test_a_writer_a_full_queue_behind_stops_capture_at_the_same_step_as_on_the_blocking_path(use_fake, monkeypatch):
+    """The queue holds four blocks (`QUEUE_STEPS=4`, every=1) and the sink is stuck until training ends: the
+    pinned path queues one item a block, as the blocking path does, so both stop at the same step."""
+    monkeypatch.setattr(capture, "QUEUE_STEPS", 4)
+
+    class Stuck(tensorquill.MemorySink):
+        def __init__(self):
+            super().__init__()
+            self.go = threading.Event()
+
+        def write(self, records):
+            self.go.wait(10)
+            super().write(records)
+
+    def run(pinned: bool):
+        torch.manual_seed(0)
+        model = ToyMoE()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        sink = Stuck()
+        with warnings.catch_warnings(record=True) as said:
+            warnings.simplefilter("always")
+            session = tensorquill.init(model, sink=sink, every=1, routers={"router": 4}, pinned_flush=pinned)
+            for _ in range(10):
+                opt.zero_grad()
+                model(torch.randn(16, 8)).pow(2).mean().backward()
+                opt.step()
+            sink.go.set()
+            session.close()
+        assert session._stopped and "behind training" in str(session.writer_error)
+        return [_clean(r) for r in sink.records], sorted(str(w.message) for w in said if "TensorQuill" in str(w.message))
+
+    expected = run(False)
+    use_fake(FakeCopies("late"))
+    assert run(True) == expected
+    assert [r["step"] for r in expected[0]] == [0, 1, 2, 3, 4]
 
 
 def test_a_sink_that_fails_stops_capture_as_on_the_blocking_path(use_fake):
@@ -403,13 +457,9 @@ def test_in_a_forked_process_no_copy_is_issued(use_fake):
 
 
 def test_under_torch_compile_the_records_are_the_same(use_fake):
-    def compiled():
-        torch.manual_seed(0)
-        return torch.compile(ToyMoE(), backend="eager")
-
-    expected, _, _ = _train(pinned=False, scenario="plain", model=compiled(), steps=6)
+    expected, _, _ = _train(pinned=False, scenario="plain", compiled=True, steps=6)
     use_fake(FakeCopies("late"))
-    got, _, session = _train(pinned=True, scenario="plain", model=compiled(), steps=6)
+    got, _, session = _train(pinned=True, scenario="plain", compiled=True, steps=6)
     assert session.pinned_flush and got == expected
 
 
@@ -528,3 +578,4 @@ def test_pid_is_the_sessions_own():
     session = tensorquill.init(nn.Linear(2, 2), sink=tensorquill.MemorySink())
     assert session._pid == os.getpid()
     session.close()
+
