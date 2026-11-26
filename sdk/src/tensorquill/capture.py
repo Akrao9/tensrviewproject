@@ -504,17 +504,20 @@ def _sharded(model: nn.Module) -> str | None:
     return None
 
 
-def _explicit_step(step: Any) -> int:
+def _explicit_step(step: Any, what: str = "session.log(..., step=...): step", least: int = 0) -> int:
     """`Session.log`'s `step=` as an `int`, or the refusal of contract section 4.2: a bool, a float and
     anything not an integer raise `TypeError`, a negative integer `ValueError`. Any `numbers.Integral`
-    but a bool is an integer, as `identity.check` takes a step. `None` never reaches here: it is no
-    step, the same as leaving `step=` out (the owner's decision, Nov 24)."""
+    but a bool is an integer, as `identity.check` takes a step. `None` never reaches here from `log`:
+    it is no step, the same as leaving `step=` out (the owner's decision, Nov 24).
+
+    The same rule for `init`'s `start_step` and `every` (BUG-05: a bool is an `int`, so
+    `start_step=True` was written as `"step": true`, which every reader refuses): `what` names the
+    argument in the message, and `least` is the smallest value taken."""
     if isinstance(step, bool) or not isinstance(step, numbers.Integral):
-        raise TypeError(f"session.log(..., step=...): step must be an integer of 0 or more, not "
-                        f"{type(step).__name__} {step!r}")
+        raise TypeError(f"{what} must be an integer of {least} or more, not {type(step).__name__} {step!r}")
     value = int(step)
-    if value < 0:
-        raise ValueError(f"session.log(..., step=...): step must be an integer of 0 or more, not {value}")
+    if value < least:
+        raise ValueError(f"{what} must be an integer of {least} or more, not {value}")
     return value
 
 
@@ -903,17 +906,44 @@ def _real(buf: torch.Tensor) -> bool:
     return type(buf) is torch.Tensor
 
 
+def _version_setter_takes_sequences() -> bool | None:
+    """Whether `torch._C._autograd._unsafe_set_version_counter` takes sequences of tensors and versions
+    (later releases) or one tensor and one version (PyTorch 2.6), asked once with two empty tuples:
+    a release that takes sequences sets nothing, one that does not raises a `TypeError` whose text
+    names only the two empty tuples. None when the function is not there."""
+    setter = getattr(getattr(torch._C, "_autograd", None), "_unsafe_set_version_counter", None)
+    if setter is None:
+        return None
+    try:
+        setter((), ())
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+# Chosen once, at import, with no tensor: a call in the wrong form raises a `TypeError` whose text
+# prints each tensor it was given (`Tensor.__repr__` runs inside the C call), and an exception raised
+# while it prints, such as the `SystemExit` of a job's SIGTERM handler, is lost there (SIG-26: on
+# PyTorch 2.6 the tuple form was tried first at every step with hooked buffers).
+_VERSION_SETTER_TAKES_SEQUENCES = _version_setter_takes_sequences()
+
+
 def _restore_versions(tensors: Sequence[torch.Tensor], versions: Sequence[int]) -> None:
     """Set each tensor's autograd version back, what `torch.autograd._unsafe_preserve_version_counter`
-    does on exit. Private API, so best effort: without it the version stays bumped, as before."""
+    does on exit, in the form this PyTorch takes (`_VERSION_SETTER_TAKES_SEQUENCES`), so no call fails.
+    Private API, so best effort: without it the version stays bumped, as before."""
+    form = _VERSION_SETTER_TAKES_SEQUENCES
+    if form is None:
+        return
     try:
-        torch._C._autograd._unsafe_set_version_counter(tuple(tensors), tuple(versions))
-    except Exception:  # noqa: BLE001
-        try:  # older releases take one tensor at a time
+        setter = torch._C._autograd._unsafe_set_version_counter
+        if form:
+            setter(tuple(tensors), tuple(versions))
+        else:  # PyTorch 2.6 takes one tensor at a time
             for tensor, version in zip(tensors, versions):
-                torch._C._autograd._unsafe_set_version_counter(tensor, version)
-        except Exception:  # noqa: BLE001
-            pass
+                setter(tensor, version)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class _NotRecomputed:
@@ -1224,6 +1254,65 @@ def _skip_forward(module: nn.Module, phase: _Evaluating, held: _Held | None) -> 
     return False
 
 
+def _add_square(acc: torch.Tensor, value: torch.Tensor | float) -> None:
+    """Add the square of a norm to `acc`, in place, on `acc`'s device and with no sync. `acc` is
+    `[s, e]`, standing for the sum of squares `s * 4**e`: `e` is the largest binary exponent of the
+    norms added this step and `s` their squares scaled by it, so `s` stays near 1 whatever their size.
+
+    BUG-04: the squares were added in float32, so a finite norm above about 1.8e19 (a float64 model's,
+    or one passed by hand) became `inf` and a false `non_finite` incident fired, and a Python float
+    above about 1.3e154 raised `OverflowError` from `float(norm) ** 2`. The norm is split into its
+    mantissa and exponent (`frexp`) in its own dtype and on its own device first, so one of any float64
+    size fits, also in a session on Apple MPS, which has no float64. In float32's range the sum is the
+    one float32 squares added up gave, bit for bit: scaling by a power of two is exact. A NaN or an
+    infinite norm stays one. Called once per clipping call: a dozen element-wise operations on two
+    numbers, traced like any other under `torch.compile`."""
+    # Each kind of value as `m2 * 4**e`, `m2` its squared mantissa in `acc`'s dtype, rounded as the
+    # float32 buffer rounded it: a tensor moved to float32 and squared there, a Python float squared in
+    # float64 and then rounded.
+    if isinstance(value, torch.Tensor) and value.dtype == torch.float64:
+        mantissa, exponent = torch.frexp(value)  # on its own device: float64 is never on MPS
+        m, e = mantissa.to(acc), exponent.to(acc)
+        m2 = m * m
+    elif isinstance(value, torch.Tensor):
+        # float32 or narrower (or an integer) fits float32's range, and its square needs only one split:
+        # above 2**60, scaled by 2**-66 (exact), with exponent 66; else as it is. No `frexp`, which
+        # PyTorch 2.6 does not have on MPS, and no log.
+        v = value.to(acc)
+        big = v.abs() > _SQUARE_SPLIT
+        m = torch.where(big, v * _SQUARE_SHRINK, v)
+        e = big.to(acc) * _SQUARE_SHIFT
+        m2 = m * m
+    else:
+        mantissa_host, exponent_host = math.frexp(value)
+        m2 = torch.full((), mantissa_host * mantissa_host, dtype=acc.dtype, device=acc.device)
+        e = torch.full((), exponent_host, dtype=acc.dtype, device=acc.device)
+    s0, e0 = acc[0], acc[1]
+    # The larger exponent of the two, a zero having none; the other term is scaled down to it. A zero or
+    # a value that is not finite is left as it is (scaling it could make `0 * inf`, a NaN).
+    top = torch.where(s0 == 0, e, torch.where(m2 == 0, e0, torch.maximum(e0, e)))
+    plain0 = (s0 == 0) | ~torch.isfinite(s0)
+    plain = (m2 == 0) | ~torch.isfinite(m2)
+    a = torch.where(plain0, s0, torch.ldexp(s0, 2 * (e0 - top)))
+    b2 = torch.where(plain, m2, torch.ldexp(m2, 2 * (e - top)))
+    acc.copy_(torch.stack((a + b2, top)))
+
+
+_SQUARE_SPLIT, _SQUARE_SHIFT = 2.0**60, 66.0
+_SQUARE_SHRINK = 2.0 ** -_SQUARE_SHIFT
+
+
+def _norm_of_squares(s: float, e: float) -> float:
+    """The norm `_add_square`'s `[s, e]` stands for, `sqrt(s) * 2**e`, read on the host in float64."""
+    root = math.sqrt(s)
+    if root == 0 or not math.isfinite(root) or not math.isfinite(e):
+        return root
+    try:
+        return math.ldexp(root, int(e))
+    except OverflowError:  # past float64's range: the norms are finite, their total is not
+        return math.inf
+
+
 def _clip_grad_norm_wrapper(parameters: Any, *args: Any, **kwargs: Any) -> Any:
     # `clip_grad_norm_` turns a generator into a list itself; do it first so the
     # parameters can also be matched against each session's model.
@@ -1261,10 +1350,28 @@ def _clips_session(session: "Session", parameters: Any) -> bool:
     """Whether the parameters given to `clip_grad_norm_` (a list, or one tensor) include any
     of `session`'s trainable ones. Not the first alone: in a LoRA or PEFT model the first is a
     frozen base weight, and the Hugging Face `Trainer` clips `model.parameters()`. The walk
-    stops at the first trainable parameter, a few in for such a model."""
+    stops at the first trainable parameter, a few in for such a model.
+
+    A parameter frozen at `init` that is trainable now counts too (BUG-26): it joins the session's
+    trainable ones only at the optimizer's step (`_take_unfrozen`), after the clipping, so on the
+    step it was unfrozen it was missed and that step had no `clip_grad_norm`. Looked for only when
+    no parameter matched otherwise, through the session's weak references, so an id another tensor
+    took after a frozen parameter was freed never matches."""
     if isinstance(parameters, torch.Tensor):
-        return id(parameters) in session._param_ids
-    return not session._param_ids.isdisjoint(map(id, parameters))
+        parameters = (parameters,)
+    if not session._param_ids.isdisjoint(map(id, parameters)):
+        return True
+    return bool(session._frozen) and _clips_unfrozen(session, parameters)
+
+
+def _clips_unfrozen(session: "Session", parameters: Any) -> bool:
+    """Whether `parameters` holds one of `session`'s parameters frozen at `init` that is trainable now."""
+    trainable = {}
+    for _, ref in session._frozen:
+        param = ref()
+        if param is not None and param.requires_grad:
+            trainable[id(param)] = param
+    return bool(trainable) and any(trainable.get(id(p)) is p for p in parameters)
 
 
 def _watch_clipping(session: "Session") -> None:
@@ -1344,6 +1451,7 @@ def _plan_session(
     ends_step: Any = None,
     auto_step: bool = True,
     mirror_scalars: bool = False,
+    start_step: Any = 0,
 ) -> _Plan:
     """Every check `init` and `Session` make of the model and the options, and what they work
     out from them, with nothing changed: no hook, thread, file or global. `init` runs it before
@@ -1351,8 +1459,11 @@ def _plan_session(
     A layer filter, a `replica_params` filter and `get_output_embeddings` are each called once."""
     if hasattr(model, "_orig_mod"):
         raise ValueError("call tensorquill.init(model) before torch.compile(model)")
-    if every < 1:
-        raise ValueError("every must be at least 1")
+    # `log`'s rule for `step=` (BUG-05): a bool, a float or anything not an integer raises `TypeError`.
+    if not isinstance(every, bool) and isinstance(every, numbers.Integral) and int(every) < 1:
+        raise ValueError("every must be at least 1")  # the message it had
+    _explicit_step(every, "every", least=1)
+    _explicit_step(start_step, "start_step")
     if isinstance(grads, bool):
         grad_every = 1 if grads else 0
     elif isinstance(grads, int) and grads >= 0:
@@ -1509,8 +1620,10 @@ class Session:
             model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
             replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
             replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
-            mirror_scalars=mirror_scalars,
+            mirror_scalars=mirror_scalars, start_step=start_step,
         )
+        # Checked by `_plan_session` (BUG-05); an integer that is not an `int` (NumPy's) is written as one.
+        every, start_step = int(every), int(start_step)
         # The optimizer whose step ends each step (`init(ends_step=...)`, wave AE section 3), weakly
         # held, or None for the default lead; and the steps of this model's other optimizers before it
         # first stepped, for the one warning that it has not (`_before_optimizer_step`).
@@ -1628,9 +1741,10 @@ class Session:
         self._ring_grad_seen: list[bool] = []
         self._ring_weight_seen: list[Any] = []  # False, or the weight check's optimizer ownership and dtypes
         # Squared total gradient norm reported by gradient clipping this step (summed over
-        # calls, for models clipped in several groups), and its ring.
-        self._clip = torch.zeros((), **f32)
-        self._ring_clip = torch.zeros(every, **f32)
+        # calls, for models clipped in several groups), and its ring: `[s, e]` for `s * 4**e`
+        # (`_add_square`), so a finite norm of any float64 size stays finite (BUG-04).
+        self._clip = torch.zeros(2, **f32)
+        self._ring_clip = torch.zeros(every, 2, **f32)
         self._clip_recorded = False
         self._foreign_steps = 0
         # Lets an outer wrapper see that an inner one already recorded: a count, or a `_ClipCall` written
@@ -1741,6 +1855,7 @@ class Session:
         # Scalar-only records (`log(..., step=N)`) not yet handed to the writer, their values as
         # logged (a tensor still on its device), and the next one's `seq`, counted from 0 per session.
         self._scalar_records: list[dict[str, Any]] = []
+        self._scalars_unread_said = False  # a scalar-only record's value left out (`_scalar_rows_one_by_one`)
         self._scalar_seq = 0
         self._ring_probe: list[dict[str, Any] | None] = []
         self._probe_off_written = False
@@ -2775,9 +2890,9 @@ class Session:
                 value = unwrap_local(value)
             if value.numel() != 1:
                 return
-            self._clip.add_(value.reshape(()).to(self._clip).square())
+            _add_square(self._clip, value.reshape(()))
         else:
-            self._clip.add_(float(norm) ** 2)
+            _add_square(self._clip, float(norm))
         self._clip_recorded = True
         if torch.compiler.is_compiling():
             # Written, never read, while traced (lane AD3): `+= 1` read the count, and Dynamo guarded
@@ -2797,7 +2912,9 @@ class Session:
         """Record scalars such as the loss for the step in progress, without a GPU sync.
 
         `session.log({"train/loss": loss})` or `session.log(loss=loss)`. Values are
-        Python numbers or one-element tensors. A tensor is copied on its device and moved
+        Python numbers or one-element tensors. A tensor that holds no values to read, judged from
+        its device and layout alone (on `meta`, nested, sparse), raises `ValueError` before anything
+        is recorded. A tensor is copied on its device and moved
         to the CPU with the rest of the step data every `every` steps, so logging a CUDA
         loss does not stall training. Call it before `optimizer.step()`: with automatic
         step counting, the step ends there, and a value logged afterwards belongs to the
@@ -2883,6 +3000,9 @@ class Session:
                 tensor = value.detach()
                 if type(tensor) is not torch.Tensor:
                     tensor = unwrap_local(tensor)
+                unread = _value_unread(tensor)
+                if unread is not None:
+                    raise ValueError(f"{name}: {unread}")
                 if tensor.numel() != 1:
                     raise ValueError(f"{name}: expected one value, got shape {tuple(tensor.shape)}")
                 # A copy, so the value neither keeps a larger tensor alive nor changes later.
@@ -3719,9 +3839,14 @@ class Session:
 
     def _put_scalar_records(self) -> None:
         """Queue the scalar-only records no block of steps took, in a block with no steps (`_decode`).
-        Nothing when none is pending: one test of a list."""
+        Nothing when none is pending: one test of a list. Never raises (BUG-03: it ran outside the
+        guard `_flush` keeps, in `flush()` and `close()`): a value that fails as it is moved is left out
+        by `_put`, and anything else that raises here stops capture, as a flush that raises does."""
         if self._scalar_records and not self._stopped:
-            self._put(([],))
+            try:
+                self._put(([],))
+            except Exception as error:  # noqa: BLE001
+                self._stop(error, f"queuing the scalar-only records raised {_short(error)}", reason="flush_error")
 
     def _clear_ring_lists(self) -> None:
         self._steps = []
@@ -4093,8 +4218,13 @@ class Session:
             pending, self._scalar_records = self._scalar_records, []
             rows = [record["scalars"] for record in pending]
             if any(isinstance(value, torch.Tensor) for row in rows for value in row.values()):
-                rows = _scalars_to_cpu(rows)
-            ready = [{**record, "scalars": row} for record, row in zip(pending, rows)]
+                try:
+                    rows = _scalars_to_cpu(rows)
+                except Exception:  # noqa: BLE001  never into training, `flush()` or `close()` (BUG-03)
+                    rows = self._scalar_rows_one_by_one(pending)
+            # A record left with no value is not written (as `log` writes none for no values); its
+            # `seq` is not reused, and a reader needs none to follow another.
+            ready = [{**record, "scalars": row} for record, row in zip(pending, rows) if row]
             block = tuple(block) + (None,) * (len(_BLOCK_FIELDS) - len(block)) + (ready,)
         try:
             if self._close_by is None:
@@ -4116,6 +4246,39 @@ class Session:
                 f"the writer fell {blocks} blocks ({_queue_rings(self.every) * self.every} steps) behind training, "
                 f"{cause}"
             ), reason="writer_behind")
+
+    def _scalar_rows_one_by_one(self, pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The scalar-only records' values when moving them off the device together raised: each tensor
+        moved on its own, and one whose move raises left out of its record, the others kept, as a gradient
+        whose norm raised is left out on its own (`record_grads`). Said once per session in a warning
+        that names the first value left out. Capture goes on: a value of a scalar-only record is not a
+        block of steps, so neither the steps after it nor the end marker at `close()` is lost (BUG-03:
+        the move raised out of `flush()` and `close()`, which then wrote no end marker and left the
+        writer thread running). A value `log` cannot read at all (on `meta`, nested, sparse) is refused
+        at the call (`_value_unread`); this is for one that fails as it is moved."""
+        rows: list[dict[str, Any]] = []
+        left_out: list[tuple[Any, str, BaseException]] = []
+        for record in pending:
+            row: dict[str, Any] = {}
+            for name, value in record["scalars"].items():
+                if isinstance(value, torch.Tensor):
+                    try:
+                        value = _scalars_to_cpu([{name: value}])[0][name]
+                    except Exception as error:  # noqa: BLE001
+                        left_out.append((record.get("step"), name, error))
+                        continue
+                row[name] = value
+            rows.append(row)
+        if left_out and not self._scalars_unread_said:
+            self._scalars_unread_said = True
+            step, name, error = left_out[0]
+            more = f", and {len(left_out) - 1} more" if len(left_out) > 1 else ""
+            _warn(
+                f"TensorQuill left out the value {name!r} logged at step {step} ({_short(error)} as it was moved off "
+                f"the device){more}: the rest of each record is written, and capture goes on. Said once per session.",
+                stacklevel=4,
+            )
+        return rows
 
     def _stop(self, cause: BaseException, what: str | None = None, reason: str | None = None) -> None:
         """Stop capture for the rest of the session, on the training thread, and say so once.
@@ -4564,7 +4727,7 @@ class Session:
                         name for name, row in zip(names, grad[i]) if row[3] > 0
                     ]
             if clips is not None and clip_seen[i]:
-                record["clip_grad_norm"] = math.sqrt(float(clips[i]))
+                record["clip_grad_norm"] = _norm_of_squares(float(clips[i][0]), float(clips[i][1]))
                 if amps is not None and amps[i] and _CLIP_CALLS in amps[i]:
                     record["clip_calls"] = amps[i][_CLIP_CALLS]
             if update_rows is not None and update_seen and update_seen[i]:
@@ -4703,6 +4866,19 @@ def _scalars_to_cpu(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for (i, name, _), value in zip(entries, values):
             out[i][name] = value
     return out
+
+
+def _value_unread(tensor: torch.Tensor) -> str | None:
+    """Why `session.log` cannot take a tensor, from its device and layout alone (no values read, so
+    no sync, and the same under `torch.compile`), as `_grad_unread` judges a gradient; None when it
+    can. A tensor on `meta` was taken before (BUG-03) and its transfer then raised at `close()`."""
+    if tensor.device.type == "meta":
+        return "the tensor is on meta, which holds no values"
+    if tensor.is_nested:
+        return "the tensor is a nested tensor"
+    if tensor.layout != torch.strided:
+        return f"the tensor is a {str(tensor.layout).removeprefix('torch.')} tensor, not a dense one"
+    return None
 
 
 def _grad_unread(grad: torch.Tensor) -> str | None:
@@ -4931,7 +5107,11 @@ def init(
             and a rank given another one is warned and writes under rank 0's. So call `init`
             on every rank: a rank that has not heard from rank 0 within
             `tensorquill.tracker.RUN_ID_WAIT_SECONDS` (300 s, or the group's timeout if
-            shorter) writes under an ID of its own, with a warning.
+            shorter) writes under an ID of its own, with a warning. It names the run's files
+            in the output folder, so it may hold no `/`, `\\`, `:` or control character and may
+            not be `.` or `..`: a `run_id` given here that does raises `ValueError`, and one from
+            the environment, a tracker or a launcher is made to fit, each such character
+            replaced by `-`, with a warning (`manifest.run_id_problem`).
         project: the project the run is listed and compared under. Defaults to
             `TENSORQUILL_PROJECT`, then the tracker's (W&B's project, or
             `MLFLOW_EXPERIMENT_NAME`), then `uncategorized`. W&B's rule applies: at most 128
@@ -4944,7 +5124,8 @@ def init(
             `python -m tensorquill compare`. Nothing is read from the tracker's config.
             These five go into the run manifest, `<run_id>.run.json` beside the `.jsonl`
             file, which rank 0 writes here (see `manifest.py`); other ranks write nothing.
-        every: steps kept on the device between transfers to the CPU.
+        every: steps kept on the device between transfers to the CPU, an integer of 1 or
+            more: a bool, a float or a string raises `TypeError`, a number below 1 `ValueError`.
         capture: `"routers"` records MoE router load only: cheap enough to leave on
             (+0.02% to +0.78% on Granite on an RTX PRO 6000). `"full"` adds block
             activation statistics, gradient norms every step and a weight check every 50
@@ -5059,7 +5240,9 @@ def init(
             `tensor_model_parallel`, that is
             `lambda name, p: not getattr(p, "tensor_model_parallel", False)`.
         start_step: the first step number. Pass the step you resume from, so a resumed
-            run does not repeat step numbers already written.
+            run does not repeat step numbers already written. An integer of 0 or more, by the
+            rule `session.log`'s `step=` follows: a bool (`True` is an `int` in Python), a float
+            or a string raises `TypeError`, a negative integer `ValueError`.
         clip_norm: record the total gradient norm that `torch.nn.utils.clip_grad_norm_`
             returns for this model's parameters, as `clip_grad_norm`, in any capture mode.
             A call counts when any parameter it is given is one of the model's trainable
@@ -5118,6 +5301,7 @@ def init(
     if group is not None and not isinstance(group, str):
         raise ValueError(f"group must be a string, not {type(group).__name__}")
     _manifest.resolve_name(name, None)
+    _manifest.check_run_id(run_id)  # one that could name a file outside the output folder (BUG-06)
     tags, config = _manifest.clean_tags(tags), _manifest.clean_config(config)
     # Every check of the model and the options too, before the run is resolved (which tells other
     # ranks its ID) or anything is opened: an `init` that is rejected changes nothing.
@@ -5125,13 +5309,16 @@ def init(
         model, every=every, layers=layers, routers=routers, grads=grads, weights=weights,
         replica_every=replica_every, probe=probe, probe_every=probe_every, probe_head=probe_head,
         replica_params=replica_params, scaler=scaler, ends_step=ends_step, auto_step=auto_step,
-        mirror_scalars=mirror_scalars,
+        mirror_scalars=mirror_scalars, start_step=start_step,
     )
     # What `init` opens is undone if a later step fails (`_undo`): the default sink and its file,
     # the run manifest, the stream to a server. A sink the caller passed in is never closed here.
     undo: list[Callable[[], Any]] = []
     try:
         run = resolve_run(run_id)
+        fitted = _manifest.fit_run_id(run.run_id, run.source)  # one TensorQuill was not given (BUG-06)
+        if fitted != run.run_id:
+            run = _replace(run, run_id=fitted)
         if sink is None:
             sink = _open_default_sink(Path("tensorquill-out") / f"{run.run_id}.rank{run.rank}.jsonl", undo)
         # The project and the name are facts of the run, and a tracker's run exists on rank 0
