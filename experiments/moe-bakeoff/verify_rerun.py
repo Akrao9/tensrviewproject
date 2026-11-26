@@ -40,27 +40,38 @@ def expected_expert_rows(by_key, step, layer):
     The loads, changes and order come from the counts. The status label is the detector's own
     flag in the evidence, because the rule behind it (share, diversity drop or collapse) is
     not a function of one sample's counts; `test_fixtures.py` checks those flags.
+
+    A step is compared with the layer's last earlier step on which the router routed tokens, else
+    its last earlier step. The layer's first step has none: `previous` is None, every change is
+    `n/a` and the rows are in order of load (the SDK's contract for that table, DET-14).
     """
-    previous = max(s for s, l in by_key if l == layer and s < step)
-    sample, baseline = by_key[step, layer], by_key[previous, layer]
+    earlier = sorted(s for s, l in by_key if l == layer and s < step)
+    routed = [s for s in earlier if by_key[s, layer]["routed_tokens"] > 0]
+    previous = (routed or earlier or [None])[-1]
+    sample = by_key[step, layer]
+    baseline = by_key[previous, layer] if previous is not None else None
     rows = []
-    for expert, (count, before) in enumerate(zip(sample["counts"], baseline["counts"], strict=True), 1):
+    for expert, count in enumerate(sample["counts"], 1):
         share = count / sample["routed_tokens"]
-        delta = share - before / baseline["routed_tokens"]
         status = ("Dead" if expert in sample["dead"] else "Overloaded" if expert in sample["overloaded"]
                   else "Starved" if expert in sample["starved"] else "Idle" if count == 0 else "Active")
-        rows.append((-delta, expert, [f"#{expert:03}", f"{share * 100:.2f}%", f"{delta * 100:+.2f}", status]))
+        if baseline is not None and baseline["routed_tokens"] > 0:
+            delta = share - baseline["counts"][expert - 1] / baseline["routed_tokens"]
+            rows.append((-delta, expert, [f"#{expert:03}", f"{share * 100:.2f}%", f"{delta * 100:+.2f}", status]))
+        else:
+            rows.append((-share, expert, [f"#{expert:03}", f"{share * 100:.2f}%", "n/a", status]))
     return previous, [cells for *_, cells in sorted(rows, key=lambda row: row[:2])]
 
 
 def verify_expert_load(store, by_key, steps, layer, rune_tree=None):
     tables = read_samples(store, "/incident/expert_load", "TextDocument:text")
-    expected_steps = {step for step in steps if any(s < step for s in steps)}
+    expected_steps = set(steps)  # every step, the first with no earlier step to compare with
     require_steps(tables, expected_steps, "Expert load table")
     for step in sorted(expected_steps):
         previous, expected = expected_expert_rows(by_key, step, layer)
         lines = tables[step].splitlines()
-        if lines[0] != f"**Layer {layer:02} expert load** · step {step} vs. {previous}":
+        compared = f"vs. {previous}" if previous is not None else "(no earlier step to compare with)"
+        if lines[0] != f"**Layer {layer:02} expert load** · step {step} {compared}":
             raise ValueError(f"Expert load heading differs at step {step}: {lines[0]!r}")
         rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in lines[4:]]
         if rows != expected:
