@@ -2509,8 +2509,10 @@ def handle(source: Source, message: Any) -> dict[str, Any] | None:
         return _error(request_id if isinstance(request_id, (str, int)) else None, INVALID_REQUEST, "A request needs a `method`.")
     if not has_id:
         return None  # a notification, `notifications/initialized` among them: never answered
-    if isinstance(request_id, bool) or not isinstance(request_id, (str, int, float)):
-        return _error(None, INVALID_REQUEST, "A request's `id` must be a string or a number.")
+    if (isinstance(request_id, bool) or not isinstance(request_id, (str, int, float))
+            or (isinstance(request_id, float) and not math.isfinite(request_id))):
+        # NaN and Infinity, which Python's JSON reader takes, are no JSON: no reply could carry them.
+        return _error(None, INVALID_REQUEST, "A request's `id` must be a string or a finite number.")
     if message.get("jsonrpc") != "2.0":
         return _error(request_id, INVALID_REQUEST, 'A request needs "jsonrpc": "2.0".')
     params = message.get("params")
@@ -2535,24 +2537,82 @@ def handle(source: Source, message: Any) -> dict[str, Any] | None:
     return _error(request_id, METHOD_NOT_FOUND, f"Method not found: {method}. This server has initialize, ping, tools/list and tools/call.")
 
 
+def _fits_line(line: bytes) -> bool:
+    return len(line) + 1 <= MAX_ANSWER_BYTES  # the newline is part of the reply line
+
+
+def _cut_to_fit(text: str, build: Callable[[str], dict[str, Any]]) -> bytes | None:
+    """The line of `build(text)` with `text` cut, and marked cut, until the line fits; None when
+    not even an empty text fits. Measured on the line as written, where a character outside
+    ASCII is six or twelve bytes."""
+    if _fits_line(line := _line(build(text))):
+        return line
+    low, high = 0, len(text)  # `low` characters and the mark fit, `high` do not (or are the whole)
+    if not _fits_line(_line(build(" …"))):
+        return None
+    while high - low > 1:
+        middle = (low + high) // 2
+        if _fits_line(_line(build(text[:middle] + " …"))):
+            low = middle
+        else:
+            high = middle
+    return _line(build(text[:low] + " …"))
+
+
+def _reply_line(reply: Any) -> bytes:
+    """One reply as its line, within `MAX_ANSWER_BYTES` whatever it holds (BUG-25, wave AO). A tool's
+    answer is already fitted (`fit`); what can still be too long is an error's or a tool error's
+    text, which is cut, and the request's id, which every reply carries: an answer that cannot fit
+    with its id says so to that id, and one that cannot fit any reply with it is said with no id,
+    as JSON-RPC answers a request whose id it could not read."""
+    if isinstance(reply, list):  # a batch: the cap is per answer
+        return b"[" + b",".join(_reply_line(item) for item in reply) + b"]"
+    try:
+        line = _line(reply)
+    except ValueError:  # a value strict JSON has no form for, which `_strict` did not see
+        traceback.print_exc(file=sys.stderr)
+        kept = reply.get("id") if isinstance(reply, dict) else None
+        reply = _error(kept if isinstance(kept, (str, int)) else None, -32603,
+                       "Internal error (the reply is not strict JSON). The server is still running.")
+        line = _line(reply)
+    if _fits_line(line):
+        return line
+    request_id = reply.get("id")
+    cut: bytes | None = None
+    if isinstance(reply.get("error"), dict) and isinstance(reply["error"].get("message"), str):
+        error = reply["error"]
+        cut = _cut_to_fit(error["message"], lambda text: {**reply, "error": {**error, "message": text}})
+    elif isinstance(reply.get("result"), dict) and reply["result"].get("isError") is True:
+        text = reply["result"]["content"][0]["text"]
+        cut = _cut_to_fit(text, lambda shown: _tool_reply(request_id, shown, True))
+    if cut is not None:
+        return cut
+    size = len(_line(request_id))
+    message = (f"The answer to this request is longer than {MAX_ANSWER_BYTES} bytes with its id, which is {size}"
+               " bytes as JSON. Send the request again with a shorter id.")
+    line = _line(_error(request_id, INVALID_REQUEST, message))
+    return line if _fits_line(line) else _line(_error(None, INVALID_REQUEST, message))
+
+
 def handle_line(source: Source, line: bytes) -> bytes | None:
-    """The reply line to one line of input, without its newline, or None when there is none."""
+    """The reply line to one line of input, without its newline, or None when there is none. It is
+    at most `MAX_ANSWER_BYTES` long with its newline (`_reply_line`); a batch's, an answer each."""
     try:
         message = json.loads(line.decode("utf-8"))
     except ValueError as error:
-        return _line(_error(None, PARSE_ERROR, f"Parse error: the line is not JSON ({error})."))
+        return _reply_line(_error(None, PARSE_ERROR, f"Parse error: the line is not JSON ({error})."))
     try:
         if isinstance(message, list):  # a batch, which revision 2025-03-26 lets a client send (the cap is per answer)
             if not message:
-                return _line(_error(None, INVALID_REQUEST, "An empty batch."))
+                return _reply_line(_error(None, INVALID_REQUEST, "An empty batch."))
             replies = [reply for reply in (handle(source, item) for item in message) if reply is not None]
-            return _line(replies) if replies else None
+            return _reply_line(replies) if replies else None
         reply = handle(source, message)
     except (Exception, SystemExit) as error:
         traceback.print_exc(file=sys.stderr)
         request_id = message.get("id") if isinstance(message, dict) and isinstance(message.get("id"), (str, int)) else None
         reply = _error(request_id, -32603, f"Internal error ({type(error).__name__}). The server is still running.")
-    return _line(reply) if reply is not None else None
+    return _reply_line(reply) if reply is not None else None
 
 
 def serve(source: Source, reader: Any, writer: Any) -> None:
