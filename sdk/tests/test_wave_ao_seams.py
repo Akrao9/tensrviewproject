@@ -12,6 +12,9 @@
    `"record": "scalars"` beside good lines, through the sender, the store and the local readers;
    (d) a session that logs a value it cannot read, streamed; (e) lane AO-1's `run_id` rule against
    what the Lightning and Hugging Face callbacks pass (what happens today, pinned; nothing changed).
+4. The pages: each sentence the seam wrote or removed, read as the page has it, beside the code it
+   describes (`sdk/README.md`, `sdk/RUN_ON_YOUR_JOB.md`, the bake-off's README, `detect.rs`'s module
+   note and `WAVE_AL_CONTRACT.md`).
 
 Records are written here by hand, in the shapes `JsonlSink` writes. Tests that need pyarrow or a
 `tensorquill-server` binary (`TENSORQUILL_SERVER_BIN`) skip one by one without them.
@@ -460,3 +463,262 @@ def test_a_run_id_given_to_the_hugging_face_callback_is_the_users_and_refused_wh
     with pytest.raises(ValueError, match="run_id 'exp/1' cannot be used: it holds '/'"):
         callback.on_train_begin(args, SimpleNamespace(global_step=0), SimpleNamespace(), model=torch.nn.Linear(2, 2))
     assert callback.session is None and not list(tmp_path.iterdir())
+
+
+# --- 4. The pages ------------------------------------------------------------------------------------
+
+SDK = Path(__file__).resolve().parents[1]
+ROOT = SDK.parent
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _page(relative: str) -> str:
+    path = ROOT / relative
+    if not path.exists():
+        pytest.skip(f"no {relative} in this checkout")
+    return path.read_text(encoding="utf-8")
+
+
+def _section(text: str, start: str, end: str) -> str:
+    return _flat(text[text.index(start):text.index(end)])
+
+
+def _readme(start: str, end: str) -> str:
+    return _section(_page("sdk/README.md"), start, end)
+
+
+WHAT_IS_BUILT = ("## What is built\n", "\n## Support: what is captured")
+STREAMING = ("## Streaming to an ingest server\n", "\n## Detector benchmark on 64 ranks")
+DETECTORS = ("## Detectors in the server\n", "\n## Compact evidence and the trigger")
+DATA_WAIT = ("## GPU memory, NVML and data wait\n", "\n## Projects, run names and comparing runs")
+COMPARING = ("## Projects, run names and comparing runs\n", "\n## Scalars mirrored from W&B and MLflow")
+MIRROR = ("## Scalars mirrored from W&B and MLflow\n", "\n## Scalar-only records")
+MCP = ("## For a coding agent: a read-only MCP server\n", "\n## A score, four measurements")
+PLACED = ("## Records that cannot be placed, every rank's keys", "\n## Things to know")
+
+
+def test_the_scalars_bullet_says_what_log_refuses_and_what_is_left_out():
+    text = _readme(*WHAT_IS_BUILT)
+    for words in ("**A value it cannot read (Nov 26, 2026).** `log` refuses a tensor on `meta` (it holds no values), a "
+                  "nested tensor and one that is not dense, such as a sparse one, with `ValueError` naming the key, "
+                  "before anything is recorded, with or without `step=`.",
+                  "A scalar-only record's tensor whose copy off the device fails when the record is written is left out "
+                  "of the record, with one warning per session naming the first; the record's other values are kept, a "
+                  "record left with no value is not written, and capture goes on: `flush()` and `close()` do not raise "
+                  "from it, and `close()` writes the end marker."):
+        assert words in text, words
+
+
+def test_log_refuses_those_values_and_one_warning_names_the_first_left_out(tmp_path):
+    """The two sentences above, run: the refusals' words, and two values whose copy fails, in two records."""
+    torch = pytest.importorskip("torch")
+    import tensorquill
+    from tensorquill.sink import JsonlSink
+
+    class _Unreadable(torch.Tensor):
+        @classmethod
+        def __torch_function__(cls, func, types, args=(), kwargs=None):
+            if func is torch.stack:
+                raise RuntimeError("stand-in: the copy off the device failed")
+            return super().__torch_function__(func, types, args, kwargs or {})
+
+    path = tmp_path / "r.rank0.jsonl"
+    session = tensorquill.init(torch.nn.Linear(2, 2), run_id="r", sink=JsonlSink(path), heartbeat_seconds=None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # PyTorch's own warning that nested tensors are a prototype
+        nested = torch.nested.nested_tensor([torch.ones(1), torch.ones(2)])
+    for value, said in ((torch.tensor(1.0, device="meta"), "x: the tensor is on meta, which holds no values"),
+                        (nested, "x: the tensor is a nested tensor"),
+                        (torch.ones(1).to_sparse(), "x: the tensor is a sparse_coo tensor, not a dense one")):
+        for step in (None, 3):
+            with pytest.raises(ValueError, match=said):
+                session.log({"x": value}, step=step)
+    session.log({"a/kept": 0.5, "a/bad": 1.0}, step=1)
+    session._scalar_records[-1]["scalars"]["a/bad"] = torch.tensor(2.0).as_subclass(_Unreadable)
+    session.log({"b/bad": 1.0}, step=2)
+    session._scalar_records[-1]["scalars"]["b/bad"] = torch.tensor(2.0).as_subclass(_Unreadable)
+    with warnings.catch_warnings(record=True) as told:
+        warnings.simplefilter("always")
+        session.close()
+    left_out = [str(w.message) for w in told if "left out the value" in str(w.message)]
+    assert len(left_out) == 1 and "'a/bad'" in left_out[0]
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(r["step"], r["scalars"]) for r in lines if r.get("record") == "scalars"] == [(1, {"a/kept": 0.5})]
+    assert path.with_name("r.rank0.end.json").exists()
+
+
+def test_the_run_id_row_says_what_is_refused_and_what_is_fitted():
+    from tensorquill import manifest
+
+    text = _readme(*WHAT_IS_BUILT)
+    assert ("A `run_id=` that could name a file outside the output folder, one that holds `/`, `\\`, `:` or a control "
+            "character or is `.` or `..`, is refused at `init` with `ValueError` before anything is opened (Nov 26, "
+            "2026); one from the environment, a tracker or a launcher is made to fit instead, each such character, or "
+            "the whole `.` or `..`, becoming `-`, with a warning. The Lightning callback passes its logger's run ID as "
+            "`run_id=`, so there such an ID would be refused; MLflow's and W&B's run IDs hold none of these "
+            "characters.") in text
+    for refused, fitted in (("a/b", "a-b"), ("a\\b", "a-b"), ("C:x", "C-x"), ("a\nb", "a-b"), ("a\x00b", "a-b"),
+                            (".", "-"), ("..", "-")):
+        assert manifest.run_id_problem(refused) and manifest.conform_run_id(refused) == fitted
+    for taken in ("a..b", "exp 1", "résumé_7"):
+        assert manifest.run_id_problem(taken) is None
+
+
+def test_the_streaming_section_says_what_the_sender_leaves_out_and_returns():
+    text = _readme(*STREAMING)
+    for words in ("So is a row of a version 2 record whose `seq` is null in a batch of protocol 5 (a version 2 record "
+                  "that is not a whole scalar-only record, which this SDK's sender does not send), counted under `seq` "
+                  "(Nov 26, 2026).",
+                  "`tensorquill.flight.send_file(path, endpoint, run_id, rank)` sends the rest later, and returns whether "
+                  "the server confirmed the whole file and holds every line of the run in it: False while a line of the "
+                  "run was left out.",
+                  "A scalar-only line whose `seq` is not an integer of 0 or more is skipped and counted like a line whose "
+                  "key cannot be stored, never sent as a step, and so is a line of schema version 2 with no "
+                  '`"record": "scalars"` (Nov 26, 2026).',
+                  "In `scalars`, an integer a float64 holds only rounded (past 2**53) is in the column as the nearest "
+                  "float, which the Rust detectors read, and travels exact in `extra_json` too; a Boolean, which the "
+                  "column leaves out, travels in `extra_json`. Both come back from the store as the file has them, a "
+                  "Boolean after the column's entries (Nov 26, 2026)."):
+        assert words in text, words
+
+
+def test_the_placed_section_says_what_the_sender_leaves_out_and_what_init_refuses():
+    text = _readme(*PLACED)
+    for words in ("- The capture writes a `session.step(step=...)` below 0 as given; such a file is then refused, so give "
+                  "steps of 0 or more. `init` refuses a `start_step` that is not an integer of 0 or more and an `every` "
+                  "that is not an integer of 1 or more, before anything is written: `TypeError` for a bool, a float or "
+                  "another type, `ValueError` for one too small (Nov 26, 2026).",
+                  "nor one whose key the stream cannot hold, nor a line of `schema_version` 2 that is not a whole "
+                  'scalar-only record (no `"record": "scalars"`).',
+                  "`close()` and `send_file` then return False, and `close()` says so in one line on stderr: "
+                  "`sender.left_out_lines` counts such lines of the run in the part of the file the server confirmed, "
+                  "and the `.offset` file keeps the count, so sending the file again says False too. A line that is not "
+                  "JSON, or is another run's, is counted in `skipped_lines` alone and changes neither (Nov 26, 2026)."):
+        assert words in text, words
+    assert "writes a `step=` or `start_step=` below 0 as given" not in text
+
+
+def test_init_refuses_those_steps_as_the_page_says(tmp_path):
+    torch = pytest.importorskip("torch")
+    import tensorquill
+    from tensorquill.sink import JsonlSink
+
+    for given, raised in (({"start_step": -1}, ValueError), ({"start_step": True}, TypeError),
+                          ({"start_step": 1.0}, TypeError), ({"every": 0}, ValueError), ({"every": True}, TypeError),
+                          ({"every": 2.0}, TypeError)):
+        path = tmp_path / "s.rank0.jsonl"
+        with pytest.raises(raised):
+            tensorquill.init(torch.nn.Linear(2, 2), run_id="s", sink=JsonlSink(path), heartbeat_seconds=None, **given)
+        assert path.read_text() == ""
+
+
+def test_no_difference_of_the_engines_on_moe_records_is_left_on_the_page():
+    """Both bullets of "Two more, in hand-made records only" no longer hold: the `moe_top_k` one since
+    wave AO (BUG-13, lane AO-5), the diversity one since wave AL (`fd31084`, section 1.5 of the
+    contract). The run below shows the second."""
+    text = _readme(*DETECTORS)
+    for gone in ("Two more, in hand-made records only", "One more, in hand-made records only",
+                 "Python applies the last `moe_top_k` a run recorded to every step",
+                 "A recorded `moe_stats` diversity that is not a finite number is used as it is by Python"):
+        assert gone not in text, gone
+
+
+@needs_pyarrow
+@needs_binary
+@pytest.mark.parametrize("recorded", ["nan", "inf", None, True, 10**400])
+def test_both_engines_take_a_diversity_that_is_not_a_finite_number_from_the_counts(recorded):
+    rows = [{"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "moe": {"router": [37, 1, 1, 1]},
+             "moe_top_k": {"router": 1}, "moe_stats": {"router": {"diversity": recorded if step == 10 else 0.9}}}
+            for step in range(30)]
+    python, rust = ([s["diversity"] for s in evidence.build_evidence(rows, detectors=engine)["samples"] if s["step"] == 10]
+                    for engine in ("python", "rust"))
+    assert python == rust and python[0] != 0.9 and math.isfinite(python[0])
+
+
+def test_the_data_wait_bullet_says_a_nested_fetch_is_counted_once():
+    assert ("A fetch made inside another fetch on the same thread (a dataset or collate function that pulls from a "
+            "second `DataLoader` or a `time_data` iterator) is part of the outer wait and is counted once (Nov 26, "
+            "2026).") in _readme(*DATA_WAIT)
+
+
+def test_the_first_divergence_bullet_says_how_attempts_are_resolved_and_which_point_stands():
+    text = _readme(*COMPARING)
+    assert ("Attempts are resolved where their training step ranges overlap or touch, or where resolving them leaves "
+            "out only scalar-only records (Nov 26, 2026), so that rows `compare` has already resolved are read as they "
+            "are; raw rows whose first attempt trained wholly above a later one, with no step in common, are left as "
+            "given. Of two attempts' scalar-only points at one step the later attempt's stands, by the order the "
+            "attempts first appear in the rows given: where a resumed job rolled back every training step of an earlier "
+            "attempt, give the rows raw, since rows `load_records` resolved no longer show that attempt first.") in text
+    assert "Attempts are resolved only where their step ranges overlap or touch" not in text
+
+
+def test_rows_load_records_resolved_lose_the_place_of_an_attempt_rolled_back_whole():
+    """The limit the page states, run: the shape rolled back whole, as `load_records` resolves it."""
+    from tensorquill.divergence import first_divergence
+
+    a, b = (evidence.load_records(_compared_run(run_id, late, True), scalars=True) for run_id, late in (("a", True), ("b", False)))
+    assert first_divergence(a, b)["first_exact_difference"] == {"step": 31, "series": 1}
+
+
+def test_the_mirror_section_states_no_limit_on_a_small_integer():
+    text = _readme(*MIRROR)
+    assert "One limit: if the mirror stored a key first and you then `session.log` the very same small integer" not in text
+    assert "(Python shares the objects for -5 to 256)" not in text
+
+
+def test_the_lightning_and_hugging_face_rows_say_the_loss_and_the_baseline_phase():
+    text = _readme(*WHAT_IS_BUILT)
+    for words in ("the back-propagated loss per optimizer step (under a `GradScaler`, as with `16-mixed`, the loss before "
+                  "the scaler multiplied it; since Nov 26, 2026), and the `16-mixed` scaler",
+                  "During `eval_on_start`'s evaluation the callback sets the phase `\"baseline\"`, a pause as `\"eval\"` "
+                  "is, so its loader time is not step 0's `data_wait`; with several evaluation datasets the phase stays "
+                  "`\"eval\"` until the last one ends, so no dataset's loader time is training's (Nov 26, 2026)."):
+        assert words in text, words
+
+
+def test_the_mcp_section_says_what_bounds_an_answer_and_a_value_too_large_for_a_float():
+    from tensorquill import mcp_server
+
+    text = _readme(*MCP)
+    assert ("No answer is longer than 50,000 bytes, errors included; in a batch, each answer is held to that. A long "
+            "series is thinned to 200 points with the stride reported, and the minimum, maximum and median are still "
+            "taken over every recorded step; a value too large for a float is shown as recorded and left out of them, "
+            "counted as `too_large_for_a_float` with `first_too_large_step` (Nov 26, 2026).") in text
+    assert "No reply is longer than 50 KB." not in text
+    assert mcp_server.MAX_ANSWER_BYTES == 50_000
+
+
+def test_the_guide_says_init_refuses_a_negative_start_step():
+    text = _flat(_page("sdk/RUN_ON_YOUR_JOB.md"))
+    assert ("The capture writes a `session.step(step=...)` below 0 as given, and the file is then refused this way, so "
+            "give steps of 0 or more; `init` refuses a `start_step` below 0 before anything is written.") in text
+    assert "writes a `step=` or `start_step=` below 0 as given" not in text
+
+
+def test_the_bake_offs_page_counts_the_verifiers_four_tables():
+    text = _flat(_page("experiments/moe-bakeoff/README.md"))
+    assert ("The verifier recomputes the loads, changes and row order of the four layer 31 expert load tables from the "
+            "counts (the status label is the evidence's flag; the first table, at step 1,750, has no earlier step to "
+            "compare with, Nov 26)") in text
+    assert "the three layer 31 expert load tables" not in text
+
+
+def test_the_server_detectors_module_note_says_both_engines_judge_experts_per_token_alike():
+    text = _flat(_page("server/src/detect.rs").replace("//!", ""))
+    assert ("*Experts per token.* A record is judged with the `moe_top_k` known when it arrives, here and in Python "
+            "since wave AO (BUG-13), so a run that changes it in mid-run is judged step by step alike.") in text
+    assert "Python applies the last `moe_top_k` recorded in the run" not in text
+
+
+def test_the_contract_turns_item_5_of_lane_al_4s_list_and_names_the_seq_drop_beside_s15():
+    text = _flat(_page("WAVE_AL_CONTRACT.md"))
+    assert ("which matters only for an attempt that holds scalar-only records alone. **Goes beyond.** **Accepted as built "
+            "by the owner, Nov 24 (row S14).** **Turned by the owner, Nov 26 (wave AO, accepting lane AO-6's BUG-22):** "
+            "`compare` on a torn local file reads its whole lines in the file's order, the scalar-only records in their "
+            "place (lane AO-6, BUG-22).") in text
+    assert ("The offline modes read all three (sections 3, 4.5, 5). Under metadata 2, a version 2 row whose `seq` is "
+            "null, which is not a whole scalar-only record, is dropped and counted the same way under the key `seq` "
+            "(lane AO-3, BUG-02; accepted by the owner, Nov 26)") in text
