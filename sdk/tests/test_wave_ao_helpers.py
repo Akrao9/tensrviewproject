@@ -231,3 +231,68 @@ def test_a_fetch_under_the_eval_phase_is_not_counted_and_leaves_the_flag_down(cl
         clock.now += 4.0
         session.step()
     assert _waits(sink) == [(1.0, 5.0)]
+
+
+# ---- BUG-27: a bool tensor in a list of Python ints ----------------------------------------------
+
+
+def test_a_bool_tensor_after_an_int_is_a_bool_not_the_integer_one():
+    from tensorquill.data import batch_hash
+
+    ones = batch_hash([1, 1])
+    for flag in (torch.tensor(True), torch.tensor([True])):
+        assert batch_hash([1, flag]) != ones
+        assert batch_hash([1, flag]) == batch_hash([1, True])  # as a bool tensor first already was
+    assert batch_hash([1, torch.tensor(False)]) == batch_hash([1, False]) != batch_hash([1, 0])
+
+
+def test_ranks_drawing_one_and_a_bool_tensor_are_not_a_duplicate_batch():
+    from tensorquill.data import batch_hash
+    from tensorquill.data_checks import detect_duplicate_batches
+
+    def records(second):
+        return [{"rank": rank, "step": 9, "data": {"batches": 1, "batch_hash": batch_hash([1, value])}}
+                for rank, value in enumerate((1, second))]
+
+    assert detect_duplicate_batches(records(1)) is not None  # the control: the same batch on two ranks
+    assert detect_duplicate_batches(records(True)) is None
+    assert detect_duplicate_batches(records(torch.tensor(True))) is None
+
+
+# Pinned beside the fix: every other id keeps its hash.
+
+
+def test_integer_ids_of_other_types_after_an_int_keep_the_hash_of_the_ints():
+    import enum
+
+    from tensorquill.data import batch_hash
+
+    class Shard(enum.IntEnum):
+        TWO = 2
+
+    expected = batch_hash([1, 2])
+    assert expected == "v2:cb1bef76b5e68e77"
+    for two in (torch.tensor(2), torch.tensor([2]), torch.tensor(2, dtype=torch.uint8),
+                torch.tensor(2, dtype=torch.int32), Shard.TWO):
+        assert batch_hash([1, two]) == expected, two
+    assert batch_hash(torch.tensor([1, 2])) == expected
+
+
+def test_numpy_integer_ids_after_an_int_keep_the_hash_of_the_ints():
+    np = pytest.importorskip("numpy")
+    from tensorquill.data import batch_hash
+
+    assert batch_hash([1, np.int64(2)]) == batch_hash([1, np.int32(2)]) == batch_hash([1, 2])
+
+
+def test_the_hashes_written_before_stay_the_same():
+    """Values of the candidate's own encoding, for ids the fix does not touch."""
+    from tensorquill.data import batch_hash
+
+    assert batch_hash([1, 1]) == "v2:bb153dc27acf9bbf"
+    assert batch_hash([1, True]) == "v3:a8d6c9c56c1210a5"
+    assert batch_hash([True, 1]) == batch_hash([torch.tensor(True), 1]) == "v3:67e453c50d1b70b3"
+    assert batch_hash(list(range(1024))) == batch_hash(torch.arange(1024))
+    assert batch_hash([1, 2**63]) == "v2:5cf5707f7c6801b7"  # beyond int64: typed items
+    assert batch_hash(["a", 1]) == "v2:cc40eb8dfc65b276"
+    assert batch_hash([1, 2.5]) == "v2:bab08894da12d9bd"
