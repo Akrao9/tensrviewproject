@@ -16,12 +16,24 @@ or the whole block (`--fault`; see there for why not a few ordinary channels). I
 
 `--toy` uses a tiny random Llama on random tokens, for checking the script on CPU; add
 `--backend aot_eager` where Inductor is not set up.
+
+`--smoke` is the same run without the plant, never scored (the multi-GPU test plan's T3). Run with
+two GPUs visible and no torchrun, the `Trainer` sets `n_gpu` to the GPU count and wraps the model in
+`nn.DataParallel` (Transformers 5.23.0, `training_args.py` and `Trainer._wrap_model`); the smoke
+writes `smoke.json` under `--out` with `torch.cuda.device_count()`, the `Trainer`'s `n_gpu`, whether
+the model it trained was wrapped in `nn.DataParallel`, and each check's PASS or FAIL (the spike check
+"not checked": nothing is planted). It exits 0 when training finished, whatever the checks say, and 3
+when training raised (the error is in `smoke.json`).
+
+    python examples/trainer_check.py --out runs/smoke-trainer-two-visible --precision bf16 --smoke
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -125,6 +137,16 @@ def agrees(compared: dict, tolerance: float = 0.01) -> bool:
     return compared["pairs"] > 0 and not compared["problems"] and compared["worst"] < tolerance
 
 
+def data_parallel_wrap(trainer) -> tuple[bool, str]:
+    """Whether the model the `Trainer` trained (`model_wrapped`) is an `nn.DataParallel`, looked for
+    inside a `torch.compile` wrapper too, and the wrapper's type as a short text."""
+    wrapped = trainer.model_wrapped
+    inner = getattr(wrapped, "_orig_mod", None)
+    if inner is not None:
+        return isinstance(inner, torch.nn.DataParallel), f"{type(wrapped).__name__}({type(inner).__name__})"
+    return isinstance(wrapped, torch.nn.DataParallel), type(wrapped).__name__
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True, help="new directory for the run")
@@ -147,6 +169,8 @@ def main() -> None:
     parser.add_argument("--eager", action="store_true", help="do not compile")
     parser.add_argument("--backend", default="inductor", help="torch.compile backend (aot_eager to skip Inductor)")
     parser.add_argument("--toy", action="store_true", help="tiny random Llama on random tokens, CPU allowed")
+    parser.add_argument("--smoke", action="store_true",
+                        help="no plant, never scored: write smoke.json (GPU count, n_gpu, the DataParallel wrap, each check)")
     args = parser.parse_args()
 
     from transformers import (
@@ -190,11 +214,14 @@ def main() -> None:
     blocks = [name for name, _ in tensorquill.capture._select_layers(model, "blocks")]
     seeded_block = blocks[len(blocks) // 2]
     # Before the Trainer and its callback, so the hook runs before TensorQuill's hook.
-    channels = outlier_channels(model, seeded_block, args.fault, args.channels, model.config.hidden_size, fixed)
-    flag, handle = install_outlier(
-        model.get_submodule(seeded_block), model.config.hidden_size, channels, args.factor, device,
-        next(model.parameters()).dtype,
-    )
+    if args.smoke:
+        channels, flag, handle = None, None, None
+    else:
+        channels = outlier_channels(model, seeded_block, args.fault, args.channels, model.config.hidden_size, fixed)
+        flag, handle = install_outlier(
+            model.get_submodule(seeded_block), model.config.hidden_size, channels, args.factor, device,
+            next(model.parameters()).dtype,
+        )
 
     class SeedOutlier(TrainerCallback):
         def on_step_begin(self, _args, state, control, **kwargs):
@@ -222,20 +249,33 @@ def main() -> None:
         def _get_train_sampler(self, *a, **k):
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
-    trainer = InOrder(model=model, args=training_args, train_dataset=dataset, callbacks=[SeedOutlier(), callback])
+    trainer = InOrder(model=model, args=training_args, train_dataset=dataset,
+                      callbacks=[callback] if args.smoke else [SeedOutlier(), callback])
     name = torch.cuda.get_device_name() if cuda else "CPU"
     mode = "eager" if args.eager else args.backend
-    print(f"{torch.__version__} on {name} | {'toy Llama' if args.toy else args.model} | {mode} | {precision} | "
-          f"clip {args.max_grad_norm:g} | seeding {seeded_block} from step {args.seed_step} "
-          f"({args.fault}: {'all channels' if args.fault == 'block' else channels})", flush=True)
+    if args.smoke:
+        print(f"{torch.__version__} on {name} | {'toy Llama' if args.toy else args.model} | {mode} | {precision} | "
+              f"clip {args.max_grad_norm:g} | smoke: nothing planted | {torch.cuda.device_count()} CUDA devices "
+              f"visible, Trainer n_gpu {training_args.n_gpu}", flush=True)
+    else:
+        print(f"{torch.__version__} on {name} | {'toy Llama' if args.toy else args.model} | {mode} | {precision} | "
+              f"clip {args.max_grad_norm:g} | seeding {seeded_block} from step {args.seed_step} "
+              f"({args.fault}: {'all channels' if args.fault == 'block' else channels})", flush=True)
 
     recompiles: list[str] = []
+    train_error = None
     try:
         with torch._dynamo.config.patch(skip_nnmodule_hook_guards=False):
             trainer.train()
+    except Exception as error:  # noqa: BLE001  the smoke records it; the scored run raises as before
+        if not args.smoke:
+            raise
+        train_error = f"{type(error).__name__}: {error}"
+        print(f"training raised: {train_error}", flush=True)
     finally:
         callback.close()
-        handle.remove()
+        if handle is not None:
+            handle.remove()
     compiled = 0
     if not args.eager:
         compiled, recompiles = recompiled_frames(torch._dynamo.utils.get_compilation_metrics())
@@ -244,30 +284,35 @@ def main() -> None:
     records = tensorquill.load_records(jsonl)
     history = [e for e in trainer.state.log_history if "loss" in e and "grad_norm" in e]
     failures: list[str] = []
+    results: dict[str, str] = {}  # for the smoke: each check's result by a short name
 
-    def check(ok: bool, text: str) -> None:
+    def check(ok: bool, text: str, key: str | None = None) -> None:
         print(f"{'PASS' if ok else 'FAIL'}: {text}")
+        if key is not None:
+            results[key] = "PASS" if ok else "FAIL"
         if not ok:
             failures.append(text)
 
     print("\n--- Steps, loss and clipping ---")
     steps = [r["step"] for r in records]
     check(steps == list(range(args.steps)) and trainer.state.global_step == args.steps,
-          f"{len(records)} records, steps 0 to {args.steps - 1}, matching Trainer's global_step")
+          f"{len(records)} records, steps 0 to {args.steps - 1}, matching Trainer's global_step", "steps")
     losses = [r.get("scalars", {}).get("train/loss") for r in records]
     norms = [r.get("clip_grad_norm") for r in records]
-    check(all(recorded(v) for v in losses), "train/loss recorded on every step")
-    check(all(recorded(v) for v in norms), "clip_grad_norm recorded on every step")
+    check(all(recorded(v) for v in losses), "train/loss recorded on every step", "train/loss")
+    check(all(recorded(v) for v in norms), "clip_grad_norm recorded on every step", "clip_grad_norm")
     agreement = trainer_agreement(losses, norms, history, args.log_every)
     for name, label in (("loss", "interval mean of train/loss"), ("grad_norm", "clip_grad_norm")):
         compared = agreement[name]
         check(agrees(compared), f"{label} agrees with Trainer's logged {name} on {compared['pairs']} of "
-                                f"{len(history)} logged steps (largest difference {100 * compared['worst']:.3f}%)")
+                                f"{len(history)} logged steps (largest difference {100 * compared['worst']:.3f}%)",
+              "loss agreement" if name == "loss" else "grad_norm agreement")
         for problem in compared["problems"][:5]:
             print(f"  {problem}")
     if precision == "fp16":
         skipped = sum(1 for r in records if r.get("step_skipped"))
-        check(all("grad_scale" in r for r in records), f"grad_scale recorded on every step ({skipped} steps skipped)")
+        check(all("grad_scale" in r for r in records), f"grad_scale recorded on every step ({skipped} steps skipped)",
+              "grad_scale")
 
     print("\n--- Detection ---")
     evidence = tensorquill.build_evidence(records)
@@ -275,20 +320,41 @@ def main() -> None:
     spike = next((i for i in evidence["incidents"] if i["kind"] == "activation_spike"), None)
     # The fault shows in every later block too; the incident must lead with the first, the seeded one.
     hit = spike is not None and spike["step"] == args.seed_step and spike["modules"][0]["module"] == seeded_block
-    check(hit, f"activation spike at step {args.seed_step}, first in {seeded_block}")
-    if spike is not None and not hit:
+    if args.smoke:
+        print("NOT CHECKED: activation spike (no plant: --smoke)")
+        results["activation spike"] = "not checked: no plant"
+    else:
+        check(hit, f"activation spike at step {args.seed_step}, first in {seeded_block}")
+    if spike is not None and not hit and not args.smoke:
         print(f"  First spike: step {spike['step']}, modules {[m['module'] for m in spike['modules'][:5]]}")
     probes = [r["probe"] for r in records if "probe" in r]
-    check(bool(probes) and all("error" not in p for p in probes), f"{len(probes)} probe passes, none failed")
+    check(bool(probes) and all("error" not in p for p in probes), f"{len(probes)} probe passes, none failed", "probe")
 
     if not args.eager:
         print("\n--- Compile ---")
         breaks = sum(torch._dynamo.utils.counters["graph_break"].values())
-        check(breaks == 0, f"{breaks} graph breaks")
+        check(breaks == 0, f"{breaks} graph breaks", "graph breaks")
         check(compiled > 0 and not recompiles,
-              f"{compiled} frames compiled, none more than once" + ("" if not recompiles else ": " + "; ".join(recompiles)))
+              f"{compiled} frames compiled, none more than once" + ("" if not recompiles else ": " + "; ".join(recompiles)),
+              "recompiles")
 
     print(f"\nCapture: {jsonl}")
+    if args.smoke:
+        import transformers
+
+        wrapped, kind = data_parallel_wrap(trainer)
+        smoke = {
+            "scored": False, "plant": None, "cuda_device_count": torch.cuda.device_count(),
+            "cuda_devices": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+            "n_gpu": training_args.n_gpu, "data_parallel": wrapped, "model_wrapped": kind,
+            "torchrun": "WORLD_SIZE" in os.environ, "precision": precision, "compile": mode,
+            "torch": torch.__version__, "transformers": transformers.__version__, "train_error": train_error,
+            "checks": results, "failures": failures,
+        }
+        (args.out / "smoke.json").write_text(json.dumps(smoke, indent=1), encoding="utf-8")
+        print(f"Smoke, not scored: {args.out / 'smoke.json'} ({torch.cuda.device_count()} CUDA devices, n_gpu "
+              f"{training_args.n_gpu}, DataParallel {wrapped}: {kind}; {len(failures)} check(s) failed)")
+        sys.exit(3 if train_error is not None else 0)
     if failures:
         print(f"\n{len(failures)} check(s) failed")
         sys.exit(1)
