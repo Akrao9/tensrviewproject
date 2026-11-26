@@ -254,7 +254,9 @@ def test_ci_installs_the_sdk_through_the_helper_and_nowhere_resolves_the_unpubli
         pytest.skip("no workflow in this checkout")
     text = workflow.read_text(encoding="utf-8")
     assert not re.search(r"^\s*pip install -e ", text, re.M), "`pip install -e .` cannot resolve tensorquill-server yet"
-    assert text.count("pip install --no-deps -e .") == text.count("pip install -r <(python packaging/requirements.py") >= 1
+    # Wave AO (BUG-30, lane AO-9): `requirements.py` writes a file first, so its failure fails the step.
+    assert (text.count("pip install --no-deps -e .") == text.count('pip install -r "$RUNNER_TEMP/requirements.txt"')
+            == text.count("python packaging/requirements.py ") >= 1)
 
 
 def test_the_install_helper_reads_a_built_wheels_requirements(tmp_path):

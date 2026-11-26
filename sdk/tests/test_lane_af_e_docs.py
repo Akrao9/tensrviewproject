@@ -547,12 +547,18 @@ def test_offline_detect_refuses_a_negative_key_and_carries_attempt_order(tmp_pat
 
 def test_the_capture_writes_a_negative_step_as_given_and_the_file_is_then_refused(tmp_path):
     path = tmp_path / "n.rank0.jsonl"
+    # Wave AO (BUG-05, lane AO-1, accepted Nov 26): `init` refuses a negative `start_step` before
+    # anything is opened; `session.step(step=...)` below 0 is still written as given.
+    with pytest.raises(ValueError, match="start_step must be an integer of 0 or more, not -2"):
+        tensorquill.init(nn.Linear(2, 2), run_id="n", sink=JsonlSink(path), heartbeat_seconds=None,
+                         auto_step=False, start_step=-2)
+    assert path.read_text() == ""  # the sink, built before `init`, made the file: nothing is written to it
     session = tensorquill.init(nn.Linear(2, 2), run_id="n", sink=JsonlSink(path), heartbeat_seconds=None,
-                               auto_step=False, start_step=-2)
+                               auto_step=False, start_step=0)
     session.step()
     session.step(step=-5)
     session.close()
-    assert [json.loads(line)["step"] for line in path.read_text().splitlines()] == [-2, -5]
+    assert [json.loads(line)["step"] for line in path.read_text().splitlines()] == [0, -5]
     with pytest.raises(identity.MalformedRecordError):
         ev.load_records(path)
     for text in (NEW, flat(GUIDE)):

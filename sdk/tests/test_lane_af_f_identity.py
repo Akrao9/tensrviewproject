@@ -188,8 +188,10 @@ VALID = [
 # field names, is refused into `extra_json` with the map's entries kept in its order. `moved` is the same.
 # Step 2 adds `seq`, null on every one of these rows: with it dropped, each row is step 1's, byte for byte
 # (the digests were 381b15a4bf06… and 15d845e6196a… before it).
-PROTOCOL_5_ROWS = "84742141cf771148d6d621cf5ab63d6c46968dfdbf7c4e330de6e856c20f03cc"
-PROTOCOL_5_ROWS_SCHEMA = "b7db61c828534be814840694cef57c34250336a4dbdb9b6790c39cc7065c64c7"
+# Wave AO (BUG-24 b, lane AO-2): the third record's logged bool travels in `extra_json` under `scalars`;
+# with it dropped, the digests are 84742141cf77… and b7db61c82853…, as before.
+PROTOCOL_5_ROWS = "ce9bb3be7f76b4da13f1afd5eec635d6c8b36060a9f50be28ef41af2741a787b"
+PROTOCOL_5_ROWS_SCHEMA = "9b29c756074bcc005a758a332f72ddc8edff318458effc8b157963c9723d81c7"
 
 
 def _rows_digest(schema) -> str:

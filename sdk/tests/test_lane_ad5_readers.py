@@ -370,11 +370,11 @@ def make(run_id: str = "a", steps: range = range(120), rank: int = 0, attempt: i
 
 def test_resolved_rows_are_not_resolved_again_and_compare_says_they_are_resolved(tmp_path, monkeypatch):
     # `compare`'s rows for a rank's two files given newest first: the restart (steps 50-119) and what
-    # the original kept (0-49). Resolving them again by first appearance drops the whole restart.
+    # the original kept (0-49).
     original = make("b", range(81), attempt=100)
     restart = [{**row, "ts": 5000.0 + row["step"]} for row in make("b", range(50, 120), attempt=200, spike_from=90)]
     rows = resolve_attempts_across([restart, original])
-    assert len(resolve_attempts(rows)) == 50  # what a second resolution would leave
+    assert len(resolve_attempts(rows)) == 120  # in attempt order (BUG-21), a second resolution leaves them all
     found = first_divergence(make(), rows, resolved=True)
     assert found["runs"]["b"]["records"] == 120 and "replaced_records" not in found["runs"]["b"]
     assert found["answer"] == "diverged" and found["divergence"]["step"] == 90

@@ -324,14 +324,31 @@ def test_this_server_stores_a_scalar_only_record_apart_and_load_records_reads_it
 
 
 @needs_server
-def test_this_server_stores_a_version_2_record_without_the_mark_and_load_records_refuses_its_part(tmp_path):
+def test_this_sdk_does_not_send_a_version_2_record_without_the_mark_and_the_store_reads_back(tmp_path):
+    """Wave AO, both sides of BUG-02 joined. The sender leaves the line out (lane AO-2): `send_file`
+    says False and the offset file counts it (`left_out`, decision c), also when the file is sent
+    again; nothing of it reaches the server, so its four training steps are stored and read back.
+    What a server does with such a row sent by hand (dropped and counted under `seq`, lane AO-3) is
+    pinned by `test_wave_ao_ingest.py` and `server/tests/wave_ao_ingest_test.rs`."""
+    from tensorquill import evidence
+
     run_id = "v2u"
-    store = _send(tmp_path, run_id, _records(run_id, {2: 2}))
+    store, path = tmp_path / "store", tmp_path / f"{run_id}.rank0.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in _records(run_id, {2: 2})))
+    server = _Server(store)
+    try:
+        assert flight.send_file(path, server.endpoint, run_id, 0, timeout=60) is False
+        binding = flight.read_binding(flight.offset_path(path))
+        assert (binding["offset"], binding.get("left_out")) == (path.stat().st_size, 1)
+        assert flight.send_file(path, server.endpoint, run_id, 0, timeout=60) is False  # the count is kept
+        time.sleep(1.5)  # a watchdog pass writes the rank's status
+    finally:
+        server.close()
     part, rows, records, entry = _stored(store, run_id)
-    assert (rows, records) == ([2] * 5, [1, 1, 2, 1, 1])
+    assert (rows, records) == ([2] * 4, [1] * 4)
     assert not list((store / "runs" / run_id).rglob("scalars-*.parquet"))
-    assert "dropped_rows" not in entry and "dropped_row_keys" not in entry, entry  # not dropped, not counted
-    assert _refusal(store, run_id) == f"schema_version is 2 at {part}, row 2: {UNMARKED}"
+    assert "dropped_rows" not in entry and "dropped_row_keys" not in entry, entry  # nothing reached the server
+    assert [r["step"] for r in evidence.load_records(store / "runs" / run_id, all_attempts=True)] == [0, 1, 3, 4]
 
 
 @needs_server
