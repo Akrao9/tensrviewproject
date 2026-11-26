@@ -409,13 +409,20 @@ def test_an_explicit_run_id_that_could_leave_the_folder_is_refused_with_a_sink_g
     assert [p for p in tmp_path.rglob("*") if p.is_file() and p.stat().st_size] == []
 
 
-@pytest.mark.parametrize("variable", ["MLFLOW_RUN_ID", "TORCHELASTIC_RUN_ID"])
-@pytest.mark.parametrize("found, fitted", [("../../escaped", "..-..-escaped"), ("sweep1/trial2", "sweep1-trial2"),
-                                            ("a\\b:c", "a-b-c"), ("a\nb", "a-b"), ("..", "-")])
-def test_a_run_id_from_the_environment_is_made_to_fit_with_a_warning(tmp_path, monkeypatch, variable, found,
+_FITTED = [("../../escaped", "..-..-escaped"), ("sweep1/trial2", "sweep1-trial2"), ("a\\b:c", "a-b-c"),
+           ("a\nb", "a-b"), ("..", "-")]
+
+
+# MLflow's ID is taken as it is; torchrun's rendezvous ID becomes `run-<id>` (`tracker._launcher_run_id`),
+# so `..` there is `run-..`, which stays in the folder.
+@pytest.mark.parametrize("variable, value, found, fitted", [
+    *(("MLFLOW_RUN_ID", value, value, fitted) for value, fitted in _FITTED),
+    *(("TORCHELASTIC_RUN_ID", value, f"run-{value}", f"run-{fitted}") for value, fitted in _FITTED if value != ".."),
+])
+def test_a_run_id_from_the_environment_is_made_to_fit_with_a_warning(tmp_path, monkeypatch, variable, value, found,
                                                                        fitted):
     work = _work_folder(tmp_path, monkeypatch)
-    monkeypatch.setenv(variable, found)
+    monkeypatch.setenv(variable, value)
     with pytest.warns(RuntimeWarning, match=r"is recorded under") as said:
         with tensorquill.init(nn.Linear(2, 2), project="p", heartbeat_seconds=None) as session:
             records_file = session._sink.path
