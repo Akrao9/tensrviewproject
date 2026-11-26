@@ -62,6 +62,8 @@ def test_init_writes_the_manifest_beside_the_records_with_every_field(toy_moe, t
                tags=["moe", "bf16"], config={"lr": 0.01, "layers": 4})
     written = json.loads((tmp_path / "run-1.run.json").read_text())
     assert written.pop("created_at").endswith("Z")
+    # The numerical settings as `init` found them (test_lane_aq6_numerical_settings.py).
+    assert written.pop("numerical_settings")["read_at"] == "init"
     assert written == {
         "schema_version": 1, "project": "granite", "name": "baseline", "run_id": "run-1", "group": "sweep-a",
         "tags": ["moe", "bf16"], "world_size": 1, "sdk_version": tensorquill.__version__,
