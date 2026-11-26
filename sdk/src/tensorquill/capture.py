@@ -5232,6 +5232,7 @@ def init(
     if group is not None and not isinstance(group, str):
         raise ValueError(f"group must be a string, not {type(group).__name__}")
     _manifest.resolve_name(name, None)
+    _manifest.check_run_id(run_id)  # one that could name a file outside the output folder (BUG-06)
     tags, config = _manifest.clean_tags(tags), _manifest.clean_config(config)
     # Every check of the model and the options too, before the run is resolved (which tells other
     # ranks its ID) or anything is opened: an `init` that is rejected changes nothing.
@@ -5246,6 +5247,9 @@ def init(
     undo: list[Callable[[], Any]] = []
     try:
         run = resolve_run(run_id)
+        fitted = _manifest.fit_run_id(run.run_id, run.source)  # one TensorQuill was not given (BUG-06)
+        if fitted != run.run_id:
+            run = _replace(run, run_id=fitted)
         if sink is None:
             sink = _open_default_sink(Path("tensorquill-out") / f"{run.run_id}.rank{run.rank}.jsonl", undo)
         # The project and the name are facts of the run, and a tracker's run exists on rank 0

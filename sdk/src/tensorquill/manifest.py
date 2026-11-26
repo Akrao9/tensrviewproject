@@ -22,6 +22,7 @@ import math
 import os
 import re
 import sys
+import unicodedata
 import warnings
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -36,6 +37,13 @@ NAME_ENV = "TENSORQUILL_RUN_NAME"
 # applied because the name becomes part of a path in listings.
 PROJECT_MAX_LENGTH = 128
 PROJECT_FORBIDDEN = "/\\#?%:"
+# A run ID names the files of a run beside its records (`<run_id>.rank<N>.jsonl`, `<run_id>.run.json`),
+# so it may hold no path separator, no drive mark (`C:x` is a path of its own on Windows) and no
+# control character, and may not be `.` or `..` (BUG-06: `../../escaped` wrote outside the output
+# folder, `sweep1/trial2` into a subfolder whose manifest landed in a doubled one). Narrower than the
+# server's rule for the folder it makes of the ID (`plain_run_id` in `server/src/ingest.rs`: letters,
+# digits, `-`, `_` and `.` only): an ID such as `exp 1` stays in the folder and is still taken here.
+RUN_ID_FORBIDDEN = "/\\:"
 MANIFEST_SUFFIX = ".run.json"  # local: <run_id>.run.json
 STORE_MANIFEST = "run.json"  # a server's store: runs/<run_id>/run.json
 METADATA_KEY = "run_manifest"  # the key in a Flight batch's app_metadata
@@ -82,6 +90,64 @@ def conform_project(project: str) -> str:
     """`project` with each forbidden character replaced by `-` and cut to the allowed length."""
     cleaned = "".join("-" if c in PROJECT_FORBIDDEN else c for c in project)[:PROJECT_MAX_LENGTH]
     return cleaned or DEFAULT_PROJECT
+
+
+def _run_id_forbidden(c: str) -> bool:
+    return c in RUN_ID_FORBIDDEN or unicodedata.category(c) == "Cc"
+
+
+def run_id_problem(run_id: str) -> str | None:
+    """Why `run_id` cannot name a run's files in the output folder (`RUN_ID_FORBIDDEN`), or None."""
+    if not run_id:
+        return "it is empty"
+    if run_id in (".", ".."):
+        return f"it is {run_id!r}, which names a folder, not a run"
+    bad = sorted({c for c in run_id if _run_id_forbidden(c)})
+    if bad:
+        return ("it holds " + ", ".join(repr(c) for c in bad) + " (it names files in the output folder, so it may "
+                "hold no '/', '\\', ':' or control character)")
+    return None
+
+
+def conform_run_id(run_id: str) -> str:
+    """`run_id` with each character `run_id_problem` refuses replaced by `-`, and `-` for `.` or `..`.
+    It depends on `run_id` alone, so every rank makes the same ID of the one rank 0 shared."""
+    cleaned = "".join("-" if _run_id_forbidden(c) else c for c in run_id)
+    return "-" if cleaned in ("", ".", "..") else cleaned
+
+
+def check_run_id(run_id: Any) -> None:
+    """`init`'s check of an explicit `run_id`, before anything is opened: one that could name a file
+    outside the output folder raises `ValueError`, like any other bad argument."""
+    if isinstance(run_id, str) and run_id:
+        problem = run_id_problem(run_id)
+        if problem:
+            raise ValueError(f"run_id {run_id!r} cannot be used: {problem}")
+
+
+_RUN_ID_SOURCES = {
+    "explicit": "rank 0's run_id", "env": "MLFLOW_RUN_ID", "mlflow": "the MLflow run", "wandb": "the W&B run",
+    "launcher": "the launcher's job ID", "generated": "the generated run ID",
+}
+
+
+def fit_run_id(run_id: Any, source: str) -> Any:
+    """A run ID TensorQuill was not given (the environment's, a tracker's, a launcher's, or one rank 0
+    shared from an older TensorQuill) made to fit (`conform_run_id`) when `run_id_problem` refuses it,
+    with a warning, as `resolve_project` fits a project name from there: an ID TensorQuill was never
+    given must not stop a run from starting, nor name a file outside the output folder."""
+    if not isinstance(run_id, str) or not run_id:
+        return run_id
+    problem = run_id_problem(run_id)
+    if problem is None:
+        return run_id
+    fitted = conform_run_id(run_id)
+    _say(
+        f"{_RUN_ID_SOURCES.get(source, source)} gives the run ID {run_id!r}, which cannot name TensorQuill's files "
+        f"({problem}); the run is recorded under {fitted!r}. Pass run_id= to choose the ID.",
+        stacklevel=4,
+    )
+    return fitted
 
 
 def _text(value: Any) -> str | None:
