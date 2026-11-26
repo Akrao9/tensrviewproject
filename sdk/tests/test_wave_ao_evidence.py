@@ -365,3 +365,100 @@ def test_bug09_thirty_seeds_both_engines_agree_on_the_gradient_kinds(seed):
     for kind in GRAD_KINDS:
         assert python["kind_checks"][kind]["value"] == rust["kind_checks"][kind]["value"]
     assert python.get("gradient_trend") == pytest.approx(rust.get("gradient_trend"))
+
+
+# ---- BUG-11: the replica comparison, read as replica.rs reads an observation -------------------
+#
+# REPLICA_OBSERVATION_CONTRACT.md section 1: `v` is 1; `fp` is `[norm, sum]` or `[norm, sum,
+# projection]`; `sig` a decimal string. Rust reads a record of another `v` as naming no group, an
+# entry with fewer than two fingerprints (or none) as unread, and compares `sig` as JSON values.
+
+LAUNCH = "a" * 32
+
+
+def _replica(rank: int, *, sig=None, fp=None, ranks=(0, 1), **replica) -> dict:
+    param = {"shape": [2], "dtype": "float32", "fp": [1.0, 1.0] if fp is None else fp,
+             "sig": f"s{rank}" if sig is None else sig}
+    body = {"v": 1, "launch": LAUNCH, "group": list(ranks), "signature": "fold64-v1", "params": {"w": param}, **replica}
+    return {"run_id": "r", "rank": rank, "step": 49, "replica": body}
+
+
+def _steps(records: list[dict]) -> list[dict]:
+    return evidence.compare_replicas(records)["steps"]
+
+
+def _rust_replica(records: list[dict]) -> dict:
+    pytest.importorskip("pyarrow")
+    if not SERVER_BIN or not Path(SERVER_BIN).exists():
+        pytest.skip("needs a tensorquill-server binary (TENSORQUILL_SERVER_BIN)")
+    from tensorquill.server_detect import server_run_report
+
+    return server_run_report(records, binary=SERVER_BIN)["replica"]
+
+
+@pytest.mark.parametrize("version", ["absent", 2, 1.0, True, "1"])
+def test_bug11_an_observation_of_another_version_names_no_group(version):
+    records = [_replica(r, fp=[1.0 + 8 * r, 1.0]) for r in (0, 1)]
+    for record in records:
+        if version == "absent":
+            del record["replica"]["v"]
+        else:
+            record["replica"]["v"] = version
+    found = evidence.compare_replicas(records)
+    assert found["replica_drift"] == []
+    assert found["steps"] == [{"launch": LAUNCH, "group": None, "step": 49, "coverage": "not_established", "why": "group"}]
+
+
+@pytest.mark.parametrize("fp", [[9.0], [], None, "1.0", {"0": 1.0}], ids=["one", "empty", "null", "text", "object"])
+def test_bug11_an_entry_with_fewer_than_two_fingerprints_is_unread(fp):
+    records = [_replica(r, sig="s", fp=[1.0 + 8 * r][: len(fp)] if isinstance(fp, list) else [1.0, 1.0]) for r in (0, 1)]
+    for record in records:
+        if not isinstance(fp, list):
+            record["replica"]["params"]["w"]["fp"] = fp
+    step = _steps(records)[0]
+    assert step["fingerprints"] == "not_compared" and step["fingerprints_why"] == "no_parameters"
+    assert step["signatures"] == "not_compared" and step["not_compared"] == {"w": "unread"}
+
+
+@pytest.mark.parametrize("pair", [(123, "123"), (True, 1), (1, 1.0)], ids=["int_text", "bool_int", "int_float"])
+def test_bug11_signatures_are_compared_as_json_values(pair):
+    records = [_replica(r, sig=pair[r]) for r in (0, 1)]
+    step = _steps(records)[0]
+    assert step["signatures"] == "differ" and step["signature_parameters"] == ["w"]
+
+
+def test_bug11_attribution_by_signatures_compares_json_values_too():
+    records = [_replica(r, sig=123 if r == 0 else "123", ranks=(0, 1, 2)) for r in (0, 1, 2)]
+    attributed = evidence.compare_replicas(records)["attribution"]
+    assert attributed == [{"step": 49, "launch": LAUNCH, "group": [0, 1, 2], "parameter": "w", "by": "signatures",
+                           "verdict": "attributed", "outliers": [0]}]
+
+
+def test_bug11_pin_the_contracts_record_is_compared_as_before():
+    agree = [_replica(r, sig="-4611686018427387904", fp=[1.25, -0.5, 0.125], projection="name-v1") for r in (0, 1)]
+    assert _steps(agree)[0]["fingerprints"] == "agree" and _steps(agree)[0]["signatures"] == "agree"
+    drift = [_replica(r, sig="7", fp=[1.25 + r, -0.5]) for r in (0, 1)]
+    found = evidence.compare_replicas(drift)
+    assert found["steps"][0]["fingerprints"] == "drift" and len(found["replica_drift"]) == 1
+
+
+REPLICA_CASES = {
+    "no_v": [{**_replica(r, fp=[1.0 + 8 * r, 1.0]), "replica": {k: v for k, v in _replica(r, fp=[1.0 + 8 * r, 1.0])["replica"].items() if k != "v"}} for r in (0, 1)],
+    "short_fp": [_replica(r, sig="s", fp=[1.0 + 8 * r]) for r in (0, 1)],
+    "empty_fp": [_replica(r, sig="s", fp=[]) for r in (0, 1)],
+    "sig_int_text": [_replica(r, sig=123 if r == 0 else "123") for r in (0, 1)],
+    "sig_bool_int": [_replica(r, sig=True if r == 0 else 1) for r in (0, 1)],
+    "three_ranks_sig": [_replica(r, sig=123 if r == 0 else "123", ranks=(0, 1, 2)) for r in (0, 1, 2)],
+    "group_not_ints": [_replica(r, ranks=(0, "1")) for r in (0, 1)],
+    "launch_not_text": [_replica(r, launch=5) for r in (0, 1)],
+    "the_contracts": [_replica(r, sig="-4611686018427387904", fp=[1.25, -0.5, 0.125], projection="name-v1") for r in (0, 1)],
+}
+
+
+@pytest.mark.parametrize("name", sorted(REPLICA_CASES))
+def test_bug11_both_engines_give_the_same_replica_comparison(name):
+    records = REPLICA_CASES[name]
+    python, rust = evidence.compare_replicas(records), _rust_replica(records)
+    for key in ("steps", "replica_drift", "attribution"):
+        assert python.get(key) == rust.get(key), key
+
