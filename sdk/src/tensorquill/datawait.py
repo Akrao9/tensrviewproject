@@ -22,6 +22,10 @@ Two ways to turn it on:
   it the `DataLoader` timer does not count the same wait again, nor does a `time_data` inside
   another. Its fetches count under the same rule as the `DataLoader` timer's (`_counts`).
 
+A fetch made inside another fetch on the same thread (a `DataLoader` whose dataset or collate
+function pulls from a second `DataLoader` or `time_data` iterator) is part of the outer wait and
+is counted once, by whichever timer is outermost.
+
 A fetch counts when it is made on the thread that created the session, while its phase is
 `"train"`, and not with the model in eval mode and gradients off: the rule by which the forward
 hooks tell an evaluation that is not marked (`capture._evaluating`), so the evaluation loop of
@@ -56,6 +60,11 @@ def _timed_next(self: Any) -> Any:
     sessions = _counting()
     if not sessions:
         return original(self)
+    # The guard `_counts` reads, as `_TimedIterator` sets it: a loader (or a `time_data` iterator)
+    # fetched inside this fetch, on this thread, is part of this wait and is not counted again.
+    # Only the sessions that count this fetch had it down (`_counts`), so only theirs is raised.
+    for session in sessions:
+        session._fetching = True
     start = time.perf_counter()
     try:
         return original(self)
@@ -63,6 +72,7 @@ def _timed_next(self: Any) -> Any:
         elapsed = time.perf_counter() - start
         for session in sessions:
             session._pending_data_wait += elapsed
+            session._fetching = False
 
 
 def _counts(session: "Session", thread: int) -> bool:
