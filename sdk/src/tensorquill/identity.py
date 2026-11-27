@@ -46,6 +46,11 @@ FIELDS = ("schema_version", "rank", "attempt", "step")
 # The largest value each integer field's column holds (`flight.flight_schema()`), and the column's type:
 # a larger value is not valid (`WAVE_AF_CONTRACT.md` section 12; AQ5-D6, the author's answer).
 BOUNDS = {"rank": (2**31 - 1, "Int32"), "attempt": (2**63 - 1, "Int64"), "step": (2**63 - 1, "Int64")}
+# The most ranks a run has: the server's `watchdog::MAX_RANKS`, which refuses a stream of a rank at or
+# over it and a batch of a larger `world_size` (wave AR, lane AR-4). A reader takes no larger
+# `world_size` as a list to expand (`evidence`, `compare`, `runs`), and the sender streams nothing of a
+# session over it (`flight.attach`). Here so that `flight` can read it without importing `evidence`.
+MAX_EXPECTED_RANKS = 100_000
 _ABSENT = object()
 
 

@@ -473,9 +473,10 @@ def test_d6_a_session_past_int64_never_raises_and_sends_the_steps_it_can(how, tm
 
 
 def test_d6_a_session_whose_rank_is_past_int32_never_raises(tmp_path, monkeypatch):
-    """`RANK` past Int32: the session trains, flushes and closes without raising and writes its file;
-    the server refuses the stream's descriptor (`rank=2147483648`), which the sender says on close and
-    which stops nothing in training. A pin."""
+    """`RANK` past Int32: the session trains, flushes and closes without raising and writes its file.
+    Until lane AR-7 the server refused the stream's descriptor (`rank=2147483648`), which the sender
+    said on close; since then the session starts no sender for a rank the server refuses and says so
+    at `init` (`test_lane_ar7_over_the_limit.py`). Either way nothing is stored. A pin."""
     torch = pytest.importorskip("torch")
     Server = _server()
 
@@ -503,8 +504,8 @@ def test_d6_a_session_whose_rank_is_past_int32_never_raises(tmp_path, monkeypatc
 
 def test_d6_a_session_whose_attempt_is_past_int64_never_raises(tmp_path, monkeypatch):
     """The session's own attempt past Int64 (`capture._next_attempt`, normally Unix milliseconds): the
-    session trains, flushes and closes without raising and writes its file; the sender sends nothing
-    of it, and every reader refuses the file by name. A pin."""
+    session trains, flushes and closes without raising and writes its file; nothing of it is sent (since
+    lane AR-7 no sender is started for it), and every reader refuses the file by name. A pin."""
     torch = pytest.importorskip("torch")
     Server = _server()
     from tensorquill import capture

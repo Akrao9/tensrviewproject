@@ -30,7 +30,9 @@ from typing import Any, Iterable, Mapping
 from . import manifest as _manifest
 # A record's identity fields (WAVE_AF_CONTRACT.md, section 1): checked where records are loaded,
 # before either engine is chosen, by lane F's one check (`identity.check`).
-from .identity import MalformedRecordError, check as check_identity, in_file, in_list, in_part, is_scalar_record
+from .identity import (
+    MAX_EXPECTED_RANKS, MalformedRecordError, check as check_identity, in_file, in_list, in_part, is_scalar_record,
+)
 from .sink import read_end_marker, writers_block
 from .data_checks import (
     CHANGES_LISTED,
@@ -5256,7 +5258,7 @@ ALL_RANKS = "all"
 ALL_RANKS_VIEW = "all_ranks"
 ALL_RANKS_VIEW_VERSION = 1
 # `world_size` names the ranks a job should have; a bogus huge value is not taken as a list to expand.
-MAX_EXPECTED_RANKS = 100_000
+# The number is `identity.MAX_EXPECTED_RANKS`, the server's `watchdog::MAX_RANKS` (imported above).
 # Lines of the text summary given to incidents on only some ranks before the rest are counted.
 SUMMARY_PARTIAL_LINES = 8
 

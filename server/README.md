@@ -63,6 +63,11 @@ which decides which attempt owns the rank after a restart). The run's `watchdog.
 whether each rank is making progress; a rank whose capture stopped while training went on
 reads `capture_stopped`, which is neither a hang nor finished.
 
+A run has at most 100,000 ranks (`watchdog::MAX_RANKS`). A stream of rank 100,000 or more, a batch
+whose `world_size` is over 100,000 and a heartbeat of such a rank are refused with
+`INVALID_ARGUMENT` ("over this server's limit of 100000 ranks a run") and nothing of them is
+stored or walked; the SDK checks the same limit before it streams and starts no stream past it.
+
 A rank reads `reconnecting` for `--silent-seconds` after its stream drops without ending, and
 `lost` after that. `reconnecting` is the state of the connection. A rank that was healthy at the
 drop has no severity for that time and counts as active. A rank that was already `silent` or

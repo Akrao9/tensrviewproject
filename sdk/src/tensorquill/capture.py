@@ -1168,6 +1168,13 @@ def _next_attempt() -> int:
     return _last_attempt
 
 
+def _coming_attempt() -> int:
+    """The attempt `_next_attempt` would give now, without taking it: what `init` checks against the
+    server's bound before the stream starts (`flight.attach`), as the session takes its attempt later.
+    It can only be smaller than the one taken, by a session started in between on another thread."""
+    return max(time.time_ns() // 1_000_000, _last_attempt + 1)
+
+
 # The attempt of the session handing its work counter to a heartbeat on this thread, while it does
 # (`Session._install`), read by the heartbeat as the counter is set (`flight.Heartbeat._take_attempt`).
 # Per thread, so a session started on another thread in between cannot give its attempt to this one's
@@ -5799,7 +5806,9 @@ def init(
             no socket is opened. For custom/self-signed server certificates under `grpcs://`,
             set `TENSORQUILL_TLS_CA` to the PEM CA path. Needs `pip install pyarrow`.
             A second writer of the run's rank (one that found the rank's file held and writes
-            `<run_id>.rank<N>.<pid>.jsonl`) streams nothing and says so once. See `flight.py`.
+            `<run_id>.rank<N>.<pid>.jsonl`) streams nothing and says so once. So does a session the
+            server would refuse: a rank of 100,000 or more, a world size over 100,000, or an
+            attempt past Int64 (`flight.attach`). See `flight.py`.
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
             the model has no repeated blocks. `"all"`: every leaf module with parameters,
@@ -6030,7 +6039,7 @@ def init(
         given = sink
         sink = attach(
             sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds,
-            stack_seconds=stack_seconds, manifest=run_manifest,
+            stack_seconds=stack_seconds, manifest=run_manifest, attempt=_coming_attempt(),
         )
         if sink is not given:
             undo.append(lambda: _close_stream(sink))

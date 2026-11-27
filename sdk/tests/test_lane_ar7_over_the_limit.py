@@ -118,7 +118,7 @@ def test_the_server_refuses_with_the_limit_the_sdk_checks():
 
 
 @pytest.mark.parametrize("rank, world, what", [
-    (LIMIT, LIMIT + 1, f"rank {LIMIT} is over the server's limit of {LIMIT} ranks a run (ranks 0 to {LIMIT - 1})"),
+    (LIMIT, LIMIT, f"rank {LIMIT} is over the server's limit of {LIMIT} ranks a run (ranks 0 to {LIMIT - 1})"),
     (2**31, 4, f"rank {2**31} is over the server's limit of {LIMIT} ranks a run (ranks 0 to {LIMIT - 1})"),
     (0, LIMIT + 1, f"world size {LIMIT + 1} is over the server's limit of {LIMIT} ranks a run"),
 ], ids=["rank-at-the-limit", "rank-past-int32", "world-over-the-limit"])

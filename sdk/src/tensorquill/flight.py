@@ -25,7 +25,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from .identity import SCALAR_VERSION, SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record
+from .identity import (
+    BOUNDS, MAX_EXPECTED_RANKS, SCALAR_VERSION, SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record,
+)
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
 from .sink import _finite
 
@@ -2293,6 +2295,24 @@ class StreamingSink:
             raise failure
 
 
+def _over_the_servers_limits(rank: Any, world_size: Any, attempt: Any) -> list[str]:
+    """What of a session the server would refuse (`attach`): each number over its limit, in words."""
+    def number(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    limit = MAX_EXPECTED_RANKS
+    over = []
+    if number(rank) and rank >= limit:
+        over.append(f"rank {rank} is over the server's limit of {limit} ranks a run (ranks 0 to {limit - 1})")
+    if number(world_size) and world_size > limit:
+        over.append(f"world size {world_size} is over the server's limit of {limit} ranks a run")
+    bound = BOUNDS["attempt"][0]
+    if number(attempt) and attempt > bound:
+        over.append(f"this session's attempt {attempt} is past Int64 ({bound}), the most the server's attempt "
+                    "column holds")
+    return over
+
+
 def attach(
     sink: Any,
     run_id: str,
@@ -2305,9 +2325,19 @@ def attach(
     heartbeat_seconds: float | None = HEARTBEAT_SECONDS,
     stack_seconds: float | None = STACK_SECONDS,
     manifest: Mapping[str, Any] | None = None,
+    attempt: int | None = None,
 ) -> Any:
     """Start streaming `sink`'s file when `endpoint` or `TENSORQUILL_ENDPOINT` is set;
     otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported.
+
+    A session the server would refuse is never streamed either (wave AR, lane AR-7): a `rank` of
+    `MAX_EXPECTED_RANKS` (100,000) or more (which covers a rank no Int32 holds), a `world_size` over
+    it, or the session's `attempt` past Int64. The server refuses such a stream, batch or heartbeat,
+    and the sender would send the same bytes again at its backoff for the rest of the run. So the sink
+    is returned unchanged, no sender and no heartbeat are started, and which number is over which
+    limit is said once; the session then behaves as one with no endpoint. `world_size` and `attempt`
+    are the ones `init` has at this point; the sender sends this `world_size` on every batch, never a
+    later one.
 
     A second writer of the run's rank is never streamed (the author's answer, wave AR): a sink that
     found the rank's file held by another writer and writes a file of its own beside it
@@ -2335,6 +2365,12 @@ def attach(
             "endpoint= streams the local .jsonl file, so the sink must be a JsonlSink "
             f"(or left as the default), not {type(sink).__name__}"
         )
+    over = _over_the_servers_limits(rank, world_size, attempt)
+    if over:
+        _say(f"tensorquill.init: {'; '.join(over)}, so nothing of {Path(path).name} is streamed to {endpoint}: no "
+             "sender and no heartbeat are started, since the server would refuse every batch and every beat. The "
+             "file is written here as usual.", stacklevel=3)
+        return sink
     heartbeat = None
     try:
         # The heartbeat first: the stream's first connection waits for its first beat.
