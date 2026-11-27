@@ -738,8 +738,9 @@ def test_a_slow_sink_stops_capture_instead_of_making_training_wait(monkeypatch):
     assert [r["step"] for r in sink.records] == [0, 1, 2]
     assert [str(w.message) for w in caught if "TensorQuill" in str(w.message)] == [
         f"TensorQuill stopped capturing for this session: {session.writer_error}. Training goes on and does not "
-        "wait; the steps already handed to the writer are written, no later step is, and the records file gets "
-        "no end marker, so it reads as cut off. The cause is session.writer_error."
+        "wait; the steps already handed to the writer are still written while the sink takes them, no later "
+        "step is written, nor a scalar still pending, and the records file gets no end marker, so it reads as "
+        "cut off. The cause is session.writer_error."
     ]
     assert "2 blocks (2 steps) behind" in str(session.writer_error)
 

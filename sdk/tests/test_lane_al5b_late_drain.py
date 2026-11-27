@@ -23,7 +23,7 @@ import tensorquill
 
 LEFT_OUT = "left out the scalar"
 UNFROZEN = "frozen when the session started"
-STOPPED = "the steps already handed to the writer are written, no later step is"
+STOPPED = "no later step is written, nor a scalar still pending"  # the clause every cause's text shares (lane AR-7)
 
 
 def _late_before_unfreeze(compiled: bool, every: int, unfreeze: bool = True):

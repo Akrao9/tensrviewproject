@@ -4744,12 +4744,24 @@ class Session:
             self._unwatch_scaler()
         except Exception:  # noqa: BLE001
             pass
+        on_writer = cause is self._error
         if what is None:
-            what = f"its sink raised {_short(cause)}" if cause is self._error else str(cause)
+            what = f"its sink raised {_short(cause)}" if on_writer else str(cause)
+        # What the file holds depends on the cause (`_drain`): after the writer's own failure (a sink
+        # write, or the pinned path's settle) or the sink's close, every block queued after it is passed
+        # over; after a writer behind or a flush that raised here, what was queued is still written; a
+        # writer not finished at `close()` writes what it was handed only as far as it gets.
+        if on_writer or reason == "sink_error":
+            kept = "the records written before that are kept, the steps still queued for the writer are passed over"
+        elif reason == "close_timeout":
+            kept = ("the writer has not finished, so the steps already handed to it are written only as far as it "
+                    "gets before the process ends")
+        else:
+            kept = "the steps already handed to the writer are still written while the sink takes them"
         _warn(
-            f"TensorQuill stopped capturing for this session: {what}. Training goes on and does not wait; "
-            "the steps already handed to the writer are written, no later step is, and the records file gets "
-            "no end marker, so it reads as cut off. The cause is session.writer_error.",
+            f"TensorQuill stopped capturing for this session: {what}. Training goes on and does not wait; {kept}, "
+            "no later step is written, nor a scalar still pending, and the records file gets no end marker, so it "
+            "reads as cut off. The cause is session.writer_error.",
             stacklevel=4,
         )
 
