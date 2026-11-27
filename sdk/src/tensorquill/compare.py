@@ -13,7 +13,11 @@ exact run ID wins; a name that fits several runs is refused with their IDs.
 The result has four parts, in this order, and the printed summary keeps the order:
 
 1. `setup`: what differs between the run manifests: project, group, world size, the SDK and
-   PyTorch versions, and each `config` key that differs.
+   PyTorch versions, each `config` key that differs, and each of the run's numerical settings
+   that differs (`numerical_settings.<what was read>`, as `init` found them on rank 0; a run
+   whose manifest is older than them is `numerical_settings_not_recorded`, never compared). A run
+   started again is compared by its latest start, and `numerical_settings_starts_differ` names a
+   run whose own starts differ in them.
 2. `checked`: the runs' `kind_checks` side by side. A kind checked in one run and not
    configured, unavailable or not yet with enough history in another is listed here, before
    any incident, so "no incident" in one run is never set against "not looked for" in another.
@@ -730,6 +734,82 @@ def _differ(values: list[Any]) -> bool:
                for v in values[1:])
 
 
+_SETTING_COMPARED = _manifest.SETTING_COMPARED  # what of an entry of `numerical_settings` is compared
+
+
+def _starts_differ(block: Mapping[str, Any]) -> dict[str, Any] | None:
+    """For a run started again whose starts' numerical settings differ (`earlier_starts`, see
+    `manifest.merge_numerical_settings`): how many earlier starts are kept, how many were left out
+    and whether one was not recorded, and the settings that differ among its starts. None for a
+    run of one start or of starts with the same settings. Two runs are still compared by their
+    latest start (`settings`)."""
+    earlier = [e for e in block.get("earlier_starts") or () if isinstance(e, Mapping)]
+    left_out = block.get("earlier_starts_left_out")
+    left_out = left_out if isinstance(left_out, int) and not isinstance(left_out, bool) and left_out > 0 else 0
+    if not earlier and not left_out:
+        return None
+    starts = [*earlier, block]
+    names: list[str] = []
+    for start in reversed(starts):  # the latest start's order first
+        settings = start.get("settings")
+        names += [str(n) for n in (settings if isinstance(settings, Mapping) else ()) if str(n) not in names]
+
+    def entry(start: Mapping[str, Any], name: str) -> Any:
+        settings = start.get("settings")
+        found = settings.get(name) if isinstance(settings, Mapping) else None
+        return ({k: found[k] for k in _SETTING_COMPARED if k in found} if isinstance(found, Mapping)
+                else {"not_read": start.get("not_read")})
+
+    return {
+        "earlier_starts": len(earlier),
+        **({"earlier_starts_left_out": left_out} if left_out else {}),
+        **({"earlier_starts_not_recorded": True} if block.get("earlier_starts_not_recorded") else {}),
+        "settings": [name for name in names if _differ([entry(start, name) for start in starts])],
+    }
+
+
+def _compare_numerical_settings(known: list[tuple[str, Mapping[str, Any]]],
+                                differs: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """The runs' numerical settings (`manifest.numerical_settings`) set side by side: each setting
+    that differs is added to `differs` as `numerical_settings.<name>`, with `not_read_in` for a run
+    that could not read it (and its reason). Returns the names that are the same in every run that
+    recorded them, and the runs whose manifest is older than the settings: those are said, never
+    compared, so a setting not recorded is never taken for its default."""
+    blocks = [(label, _manifest.numerical_settings(m)) for label, m in known]
+    not_recorded = [label for label, block in blocks if not block["recorded"]]
+    recorded = []
+    for label, block in blocks:
+        if block["recorded"]:
+            settings = block.get("settings")
+            whole = block.get("not_read") if isinstance(block.get("not_read"), str) else None
+            recorded.append((label, settings if isinstance(settings, Mapping) else {}, whole))
+    same: list[str] = []
+    if len(recorded) < 2:
+        return same, not_recorded
+    names = list(dict.fromkeys(str(name) for _, settings, _ in recorded for name in settings))
+    for name in names:
+        entries = []
+        for _, settings, whole in recorded:
+            entry = settings.get(name)
+            entries.append(entry if isinstance(entry, Mapping) else
+                           {"not_read": whole or "the run manifest does not list this setting"})
+        # What was read decides, not a warning given while reading it; a value cut to its first
+        # characters also carries its length, so two cut alike and of other lengths differ.
+        if not _differ([{key: entry[key] for key in _SETTING_COMPARED if key in entry} for entry in entries]):
+            same.append(name)
+            continue
+        labelled = list(zip((label for label, _, _ in recorded), entries))
+        unread = {label: str(entry.get("not_read")) for label, entry in labelled if "value" not in entry}
+        cut = {label: entry["cut_from_length"] for label, entry in labelled if "cut_from_length" in entry}
+        differs.append({
+            "field": f"{_manifest.NUMERICAL_SETTINGS_KEY}.{name}",
+            "values": {label: entry.get("value") for label, entry in labelled},
+            **({"not_read_in": unread} if unread else {}),
+            **({"cut_from_length": cut} if cut else {}),
+        })
+    return same, not_recorded
+
+
 def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[str, Any]:
     known = [(label, run["manifest"]) for label, run in zip(labels, opened) if isinstance(run.get("manifest"), Mapping)]
     differs: list[dict[str, Any]] = []
@@ -759,11 +839,22 @@ def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[st
                     **({"not_set_in": missing} if missing else {}),
                 })
         same_config = [key for key in keys if not any(d["field"] == f"config.{key}" for d in differs)]
+    settings_same, settings_unknown = _compare_numerical_settings(known, differs)
+    # A run whose own starts differ in them (a run started again): said, and compared by its latest start.
+    starts_differ = {}
+    for label, m in known:
+        block = _manifest.numerical_settings(m)
+        found = _starts_differ(block) if block["recorded"] else None
+        if found is not None:
+            starts_differ[label] = found
     return {
         "differs": differs,
         "same": same,
         "config_keys_same": same_config,
         **({"config_not_known": config_unknown} if config_unknown else {}),
+        "numerical_settings_same": settings_same,
+        **({"numerical_settings_not_recorded": settings_unknown} if settings_unknown else {}),
+        **({"numerical_settings_starts_differ": starts_differ} if starts_differ else {}),
         # A run without a manifest says nothing of its setup; it is left out of the differences.
         "no_manifest": [label for label, run in zip(labels, opened) if not isinstance(run.get("manifest"), Mapping)],
     }
@@ -1468,13 +1559,31 @@ def summary_text(result: Mapping[str, Any]) -> str:
     setup = result["setup"]
     lines.append(f"1. Setup: {len(setup['differs'])} difference{'s' if len(setup['differs']) != 1 else ''}")
     for item in setup["differs"]:
-        lines.append(f"   {item['field']}: " + ", ".join(f"{label} {_value(value)}" for label, value in item["values"].items()))
+        unread, cut = item.get("not_read_in") or {}, item.get("cut_from_length") or {}
+        lines.append(f"   {item['field']}: " + ", ".join(
+            f"{label} not read ({unread[label]})" if label in unread else
+            f"{label} {_value(value)}" + (f" (the first characters of {cut[label]:,})" if label in cut else "")
+            for label, value in item["values"].items()))
     if setup.get("config_not_known"):
         lines.append(f"   the config of {', '.join(setup['config_not_known'])} was too large to send to its server and is "
                      "not in the store: left out of the differences (the run's local manifest has it)")
     if setup["no_manifest"]:
         lines.append(f"   no run manifest for {', '.join(setup['no_manifest'])}: "
                      "its setup is not known and is left out of the differences")
+    if setup.get("numerical_settings_not_recorded"):
+        lines.append(f"   numerical settings not recorded for {', '.join(setup['numerical_settings_not_recorded'])}: "
+                     "its manifest was written before TensorQuill recorded them, so they are left out of the "
+                     "differences")
+    for label, found in (setup.get("numerical_settings_starts_differ") or {}).items():
+        kept = found["earlier_starts"]
+        notes = [f"{kept} earlier start{'s' if kept != 1 else ''} kept"]
+        if found.get("earlier_starts_left_out"):
+            notes.append(f"{found['earlier_starts_left_out']} more left out")
+        if found.get("earlier_starts_not_recorded"):
+            notes.append("one recorded before the settings were")
+        lines.append(f"   {label}'s own starts differ in their numerical settings: "
+                     f"{', '.join(found['settings']) or 'none of those kept'} ({'; '.join(notes)}); "
+                     "it is compared by its latest start")
 
     checked = result["checked"]
     whole = checked.get("all_ranks_read") or {}

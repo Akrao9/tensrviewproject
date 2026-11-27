@@ -278,6 +278,212 @@ def _versions() -> tuple[str | None, str | None]:
     return getattr(package, "__version__", None), getattr(torch, "__version__", None) and str(torch.__version__)
 
 
+# --- The run's numerical settings (item OG1) -------------------------------------------------
+#
+# Whether healthy data-parallel replicas come out bit-identical depends on these settings, so a
+# replica result is only read against them. They are read as `init` finds them, on the rank that
+# writes the manifest (rank 0), and never set. OpGuard's `runtime_policy.py` records the first six
+# before and after it sets them; `CUDA_DEVICE_MAX_CONNECTIONS` is the seventh, since its value hid
+# two DeepSpeed races in their reproductions. Warn-only is its own read of the first setting, and
+# two more TF32 controls are read beside `allow_tf32`: `cuda.matmul.fp32_precision` (newer
+# PyTorch) and `cudnn.allow_tf32`.
+#
+# Each entry is named by what was read, and is `{"value": v}` (an environment variable that is not
+# set is `{"value": None}`) or `{"not_read": why}`: a setting this PyTorch lacks, or whose read
+# raised, is said, never left out or guessed. A warning given while reading is kept beside the
+# value (`"warning"`) and never shown or raised, so `python -W error` does not stop `init`. None of
+# these reads initialises CUDA: they are flags of the process and of the C++ context.
+
+NUMERICAL_SETTINGS_KEY = "numerical_settings"
+NOT_RECORDED = "the run manifest was written before TensorQuill recorded the run's numerical settings"
+SETTING_TEXT_MAX = 256  # an environment variable's value, or a value's text, kept to this many characters
+_ERROR_TEXT_MAX = 200
+_TORCH_SETTINGS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+    # (name, attribute path below `torch`, whether it is called)
+    ("torch.are_deterministic_algorithms_enabled()", ("are_deterministic_algorithms_enabled",), True),
+    ("torch.is_deterministic_algorithms_warn_only_enabled()", ("is_deterministic_algorithms_warn_only_enabled",), True),
+    ("torch.backends.cudnn.deterministic", ("backends", "cudnn", "deterministic"), False),
+    ("torch.backends.cudnn.benchmark", ("backends", "cudnn", "benchmark"), False),
+    ("torch.backends.cuda.matmul.allow_tf32", ("backends", "cuda", "matmul", "allow_tf32"), False),
+    ("torch.utils.deterministic.fill_uninitialized_memory", ("utils", "deterministic", "fill_uninitialized_memory"), False),
+    # The newer control of the same choice as `allow_tf32` (PyTorch 2.9 and later; "none", "ieee" or
+    # "tf32"), and cuDNN's own TF32 switch for convolutions.
+    ("torch.backends.cuda.matmul.fp32_precision", ("backends", "cuda", "matmul", "fp32_precision"), False),
+    ("torch.backends.cudnn.allow_tf32", ("backends", "cudnn", "allow_tf32"), False),
+)
+_ENV_SETTINGS = ("CUBLAS_WORKSPACE_CONFIG", "CUDA_DEVICE_MAX_CONNECTIONS")
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
+
+
+def _setting_value(value: Any) -> dict[str, Any]:
+    """A setting's value as the manifest keeps it: plain JSON as it is, anything else as its
+    text, and a text longer than `SETTING_TEXT_MAX` cut, with its length."""
+    if value is None or isinstance(value, (bool, int)):
+        return {"value": value}
+    if isinstance(value, float):
+        return {"value": value if math.isfinite(value) else str(value)}
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:  # noqa: BLE001  a value's own __str__
+            value = f"<{type(value).__name__}>"
+    if len(value) > SETTING_TEXT_MAX:
+        return {"value": value[:SETTING_TEXT_MAX], "cut_from_length": len(value)}
+    return {"value": value}
+
+
+class _Missing(Exception):
+    """A setting this PyTorch does not have."""
+
+
+def _read_one(read: Any) -> dict[str, Any]:
+    """`read()` as an entry: its value, or why it could not be read. Never raises."""
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            entry = _setting_value(read())
+        if caught:
+            first = caught[0]
+            entry["warning"] = _cut(f"{first.category.__name__}: {first.message}", _ERROR_TEXT_MAX)
+        return entry
+    except _Missing as missing:
+        return {"not_read": str(missing)}
+    except Exception as error:  # noqa: BLE001  a read that raises is recorded, never raised
+        return {"not_read": _cut(f"reading it raised {type(error).__name__}: {error}", _ERROR_TEXT_MAX)}
+
+
+def _torch_reader(torch: Any, path: tuple[str, ...], call: bool) -> Any:
+    def read() -> Any:
+        found = torch
+        for depth, part in enumerate(path):
+            try:
+                found = getattr(found, part)
+            except AttributeError:
+                version = getattr(torch, "__version__", None)
+                raise _Missing(f"this PyTorch{f' ({version})' if version else ''} has no "
+                               f"torch.{'.'.join(path[: depth + 1])}") from None
+        return found() if call else found
+
+    return read
+
+
+def _read_numerical_settings() -> dict[str, Any]:
+    torch = sys.modules.get("torch")  # never imported here: `init` has imported it already
+    settings: dict[str, Any] = {}
+    for name, path, call in _TORCH_SETTINGS:
+        settings[name] = ({"not_read": "torch is not imported"} if torch is None
+                          else _read_one(_torch_reader(torch, path, call)))
+    for variable in _ENV_SETTINGS:
+        settings[f"os.environ.get('{variable}')"] = _read_one(lambda variable=variable: os.environ.get(variable))
+    return {"read_at": "init", "settings": settings}
+
+
+def numerical_settings_block() -> dict[str, Any]:
+    """The manifest's `numerical_settings`: each setting as this process has it now. Never raises."""
+    try:
+        return _read_numerical_settings()
+    except Exception as error:  # noqa: BLE001  nothing here may stop a run
+        return {"read_at": "init", "not_read": _cut(f"reading them raised {type(error).__name__}: {error}",
+                                                     _ERROR_TEXT_MAX)}
+
+
+def numerical_settings(manifest: Mapping[str, Any] | None) -> dict[str, Any]:
+    """What a run manifest says of the run's numerical settings, for every reader that shows them:
+    the block with `recorded: True`, or `{"recorded": False, "why": ...}` for a run without a
+    manifest or one written before they were recorded. A run whose settings were not recorded is
+    never read as having the defaults."""
+    if not isinstance(manifest, Mapping):
+        return {"recorded": False, "why": "the run has no manifest"}
+    block = manifest.get(NUMERICAL_SETTINGS_KEY)
+    if not isinstance(block, Mapping):
+        return {"recorded": False, "why": NOT_RECORDED}
+    return {"recorded": True, **block}
+
+
+# --- A run started again under its run ID ----------------------------------------------------
+#
+# The latest start's settings stay where a reader looks for them (`settings`, `read_at_utc`, and
+# `starts`, the starts in a row that had them). An earlier start's are kept only when they differ
+# from the start after it, as one entry of `earlier_starts`, oldest first, in the same shape: a run
+# resumed many times with the same settings grows by a count, never by an entry. Settings are the
+# same when every entry's value, reason for not being read and cut length are (`SETTING_COMPARED`;
+# a warning given while reading is no difference).
+#
+# The cap: at most `EARLIER_STARTS_MAX` earlier starts, and the whole `numerical_settings` block at
+# most `NUMERICAL_SETTINGS_MAX_BYTES` of compact JSON, a quarter of the server's 64 KiB limit for a
+# whole manifest. Over either, the oldest earlier start after the first is dropped, and counted in
+# `earlier_starts_left_out`: the first start (the one the replicas began under) and the latest
+# are always kept. One start's block is at most about 6 KB (ten entries of a 256-character value and
+# a 200-character warning), so the first and the latest always fit. A start whose manifest was
+# written before the settings were recorded sets `earlier_starts_not_recorded`, which stays.
+
+EARLIER_STARTS_MAX = 8
+NUMERICAL_SETTINGS_MAX_BYTES = 16_384
+SETTING_COMPARED = ("value", "not_read", "cut_from_length")  # what of an entry decides that two starts differ
+_START_KEYS = ("read_at_utc", "starts", "settings", "not_read")  # what of a block one start is
+
+
+def _comparable(block: Mapping[str, Any]) -> Any:
+    settings = block.get("settings")
+    settings = settings if isinstance(settings, Mapping) else {}
+    return ({str(name): {k: entry[k] for k in SETTING_COMPARED if k in entry}
+             for name, entry in settings.items() if isinstance(entry, Mapping)}, block.get("not_read"))
+
+
+def _block_bytes(block: Mapping[str, Any]) -> int:
+    return len(json.dumps(block, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def merge_numerical_settings(earlier: Mapping[str, Any], document: Mapping[str, Any]) -> dict[str, Any]:
+    """`document`, the manifest of a start of the run whose manifest was `earlier`, with the earlier
+    starts' numerical settings kept as the comment above says. Never raises: what cannot be merged
+    is left as `document` has it."""
+    document = dict(document)
+    new = document.get(NUMERICAL_SETTINGS_KEY)
+    if not isinstance(new, Mapping):
+        return document
+    try:
+        before = earlier.get(NUMERICAL_SETTINGS_KEY)
+        if not isinstance(before, Mapping):
+            document[NUMERICAL_SETTINGS_KEY] = {**new, "earlier_starts_not_recorded": True}
+            return document
+        kept = [dict(e) for e in before.get("earlier_starts") or () if isinstance(e, Mapping)]
+        left_out = before.get("earlier_starts_left_out")
+        left_out = left_out if isinstance(left_out, int) and not isinstance(left_out, bool) and left_out > 0 else 0
+        merged = dict(new)
+        if _comparable(before) == _comparable(new):
+            # The same settings again: one more start of the run of starts that had them.
+            starts = before.get("starts")
+            merged["starts"] = (starts if isinstance(starts, int) and not isinstance(starts, bool) else 1) + 1
+            if "read_at_utc" in before:
+                merged["read_at_utc"] = before["read_at_utc"]
+        else:
+            kept.append({k: before[k] for k in _START_KEYS if k in before})
+        if before.get("earlier_starts_not_recorded"):
+            merged["earlier_starts_not_recorded"] = True
+        while kept:
+            merged.pop("earlier_starts", None)
+            merged.pop("earlier_starts_left_out", None)
+            merged["earlier_starts"] = kept
+            if left_out:
+                merged["earlier_starts_left_out"] = left_out
+            if len(kept) <= EARLIER_STARTS_MAX and _block_bytes(merged) <= NUMERICAL_SETTINGS_MAX_BYTES:
+                break
+            del kept[1 if len(kept) > 1 else 0]
+            left_out += 1
+        if not kept:
+            merged.pop("earlier_starts", None)
+            if left_out:
+                merged["earlier_starts_left_out"] = left_out
+        document[NUMERICAL_SETTINGS_KEY] = merged
+    except Exception:  # noqa: BLE001  nothing here may stop a run: the latest start's settings stand
+        pass
+    return document
+
+
 def build_manifest(
     *,
     run_id: str | None,
@@ -291,6 +497,7 @@ def build_manifest(
     created_at: str | None = None,
 ) -> dict[str, Any]:
     sdk_version, torch_version = _versions()
+    created_at = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "project": project,
@@ -298,13 +505,17 @@ def build_manifest(
         "run_id": run_id,
         "group": group,
         "tags": list(tags or ()),
-        "created_at": created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": created_at,
         "world_size": world_size,
         "sdk_version": sdk_version,
         "torch_version": torch_version,
         # Where the run ID came from: explicit, env (MLFLOW_RUN_ID), mlflow, wandb, launcher or generated.
         "run_id_source": run_id_source,
         "config": dict(config or {}),
+        # As `init` found them on this rank, read and never set (item OG1; `numerical_settings_block`).
+        # This start's: when they were read, and one start so far (`write_manifest` counts the starts
+        # with the same settings and keeps an earlier start's that differ, `merge_numerical_settings`).
+        NUMERICAL_SETTINGS_KEY: {**numerical_settings_block(), "read_at_utc": created_at, "starts": 1},
     }
 
 
@@ -363,6 +574,9 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> bool:
         document = dict(manifest)
         if earlier and _text(earlier.get("created_at")) and earlier.get("run_id") == document.get("run_id"):
             document["created_at"] = earlier["created_at"]
+        if earlier and earlier.get("run_id") == document.get("run_id"):
+            # A run started again keeps its earlier starts' numerical settings that differ.
+            document = merge_numerical_settings(earlier, document)
         path.parent.mkdir(parents=True, exist_ok=True)
         scratch = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         scratch.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
