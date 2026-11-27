@@ -244,13 +244,19 @@ def test_bug24b_a_map_of_bools_alone_and_a_scalar_only_record():
 
 
 @needs_arrow
-def test_bug24b_a_map_its_column_refuses_travels_whole_with_its_bools():
-    """Any other refusal moves the whole map to `extra_json` (lane W3's rule, unchanged): with its
-    bools now, and its exact integers."""
+def test_bug24b_an_entry_its_column_refuses_travels_alone_with_the_bools():
+    """Any other refused entry travels alone in `extra_json`, beside the bools and the exact integers,
+    and the rest of the map stays in the column (AQ5-D7, the author, Nov 26, 2026; under lane W3's rule
+    it moved the whole map). A map with no held entry still travels whole."""
     scalars = {"loss": 1.0, "note": "text", "ok": True, "n": 2**53 + 1}
     row = _rows([step_record("r", 0, scalars=scalars)], True)[0]
-    assert row["scalars"] is None
+    assert row["scalars"] == [("loss", 1.0), ("n", float(2**53 + 1))]
+    assert json.loads(row["extra_json"])["scalars"] == {"note": "text", "ok": True, "n": 2**53 + 1}
     assert flight.row_to_record(row)["scalars"] == scalars
+    alone = {"note": "text", "ok": True}
+    row = _rows([step_record("r", 0, scalars=alone)], True)[0]
+    assert row["scalars"] is None
+    assert flight.row_to_record(row)["scalars"] == alone
 
 
 def test_bug24b_through_a_real_server_the_stored_record_is_the_files(tmp_path):
