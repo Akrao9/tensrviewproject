@@ -14,7 +14,7 @@ The result has four parts, in this order, and the printed summary keeps the orde
 
 1. `setup`: what differs between the run manifests: project, group, world size, the SDK and
    PyTorch versions, each `config` key that differs, and each of the run's numerical settings
-   that differs (`numerical_settings.<what was read>`, as `init` found them on rank 0; a run
+   that differs (`numerical_settings.<what was read>`, as `init` found them on rank 0, from the manifest; a run
    whose manifest is older than them is `numerical_settings_not_recorded`, never compared). A run
    started again is compared by its latest start, and `numerical_settings_starts_differ` names a
    run whose own starts differ in them. `init`'s `pinned_flush` switch differs as `pinned_flush`

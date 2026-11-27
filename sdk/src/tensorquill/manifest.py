@@ -8,6 +8,9 @@ manifest adds the labels a person lists and compares runs by:
 - in a server's store it is `runs/<run_id>/run.json`, written by the server from the copy that
   rides on rank 0's first batch of each stream (`flight.py`).
 
+Rank 0's numerical settings are in the manifest; each rank above 0 writes its own beside its
+records, `<run_id>.rank<N>.settings.json` (`write_rank_settings`, local only).
+
 A run recorded before the manifest existed has none. It reads as project `uncategorized` with
 its run ID as its name (`run_block`).
 
@@ -728,9 +731,10 @@ def write_rank_settings(records_file: str | Path | None, run_id: Any, rank: Any,
     run ID. Never raises: a file that cannot be written is said once and the run goes on."""
     if records_file is None or not run_id or not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
         return False
-    path = rank_settings_path(records_file, str(run_id), rank)
+    path: Any = records_file  # what the warning names if the path itself cannot be made
     scratch: Path | None = None
     try:
+        path = rank_settings_path(records_file, str(run_id), rank)
         undo.append(_put_back(path))
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         document: dict[str, Any] = {
