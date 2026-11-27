@@ -50,7 +50,10 @@ def three_rounds(tq_ms, **kw):
 def test_the_pass_line_passes_only_with_every_criterion_met():
     status, criteria = judged(three_rounds([100.5, 100.9, 101.5]))
     assert status == "pass", criteria
-    assert all(c["ok"] for c in criteria)
+    # Since the author's change of Nov 26, 2026 the overhead line is reported here and scored by
+    # overhead_harness.py: every other criterion is met, and that one is not judged.
+    assert all(c["ok"] for c in criteria if c.get("scored", True))
+    assert [c["name"] for c in criteria if not c.get("scored", True)] == ["median overhead 1% or less"]
 
 
 def test_the_overhead_is_the_median_of_the_paired_round_ratios():
@@ -63,7 +66,6 @@ def test_the_overhead_is_the_median_of_the_paired_round_ratios():
 
 
 @pytest.mark.parametrize("change, failing", [
-    ({"tq_ms": [102.0, 101.5, 103.0]}, "median overhead"),
     ({"breaks": 1}, "zero graph breaks"),
     ({"recompiles": 2}, "zero recompiles"),
     ({"skips": 3}, "CUDA-graph skips"),
@@ -88,13 +90,15 @@ def test_an_arm_that_did_not_run_or_crashed_is_never_passed():
     assert summary["wandb"]["states"] == ["not_run"] and "median_ms" not in summary["wandb"]
 
 
-def test_the_overhead_is_judged_on_the_rounds_mean_step_not_the_per_step_median():
+def test_the_overhead_is_reported_on_the_rounds_mean_step_not_the_per_step_median():
     # A periodic cost (the flushes) moves the mean and leaves the per-step median where it was.
     results = three_rounds([100.0, 100.0, 100.0])
     for r in results["tensorquill"]:
         r["mean_ms"] = 102.0
     status, criteria = judged(results)
-    assert status == "fail" and [c["name"] for c in criteria if c["ok"] is False] == ["median overhead 1% or less"]
+    line = next(c for c in criteria if c["name"] == "median overhead 1% or less")
+    assert "+2.00%" in line["detail"]  # the mean step's figure, not the per-step median's +0.00%
+    assert line["ok"] is None and status == "pass"  # reported, not scored (the author, Nov 26, 2026)
 
 
 def test_a_gpu_run_without_cuda_graphs_is_not_proven_not_passed():
@@ -192,7 +196,7 @@ def test_the_figure_moe_dogfood_printed_is_reported_beside_the_scored_one():
     assert tq["overhead_median"] == pytest.approx(100.6 / 100.0 - 1)  # the scored one: the median of the paired rounds
     _, criteria = gate.verdict(plain, gate.summarize(plain, results), True)
     line = next(c for c in criteria if c["name"].startswith("median overhead"))
-    assert line["ok"] and "moe_dogfood.py" in line["detail"] and "OTHER SIDE" not in line["detail"]
+    assert line["ok"] is None and "moe_dogfood.py" in line["detail"] and "OTHER SIDE" not in line["detail"]
     # Baselines that moved between rounds: paired, +0.50%, +1.82%, +1.67%; by median rounds, +0.50%.
     results = three_rounds([100.5, 112.0, 91.5])
     results["off"][1]["mean_ms"], results["off"][2]["mean_ms"] = 110.0, 90.0
@@ -200,4 +204,4 @@ def test_the_figure_moe_dogfood_printed_is_reported_beside_the_scored_one():
     assert summary["tensorquill"]["overhead_of_median_rounds"] == pytest.approx(0.005)
     _, criteria = gate.verdict(plain, summary, True)
     line = next(c for c in criteria if c["name"].startswith("median overhead"))
-    assert line["ok"] is False and "OTHER SIDE OF THE LINE" in line["detail"]  # scored as built, the other said aloud
+    assert line["ok"] is None and "OTHER SIDE OF THE LINE" in line["detail"]  # reported, the other said aloud
