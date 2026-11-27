@@ -11,7 +11,9 @@
 TensorQuill at all), `env` (environment variables for its process), `limit` (a fraction such as
 0.01, or null to report it without judging it; absent: `--limit`), `baseline` (the arm it is paired
 with, `off` unless given) and `log_loss` (whether it logs the loss each step, as the gate does;
-default true). The harness passes `sink` (a JSON Lines file beside the arm's result) and `run_id`
+default true). A detector or switch is judged over the same capture without it, not over capture
+off (the author, Nov 26, 2026, for `K3`'s 0.5%): give it `"baseline": "routers"`, or whichever arm
+is that capture. The harness passes `sink` (a JSON Lines file under `arms/capture/`) and `run_id`
 itself, so an arm may not set them; it passes the model's router spec as `routers` unless the arm
 sets `"routers"` itself (`null`: none). Every run has two capture-off arms, `off` (the baseline)
 and `off-again` (the same arm again), so the noise between identical arms is measured in the same
@@ -46,8 +48,9 @@ after each arm process (a second after it ends), and after the run, no process m
 and its utilization must be under 5%; just before and just after its timed steps each arm sees at
 most one process, itself. The driver never opens a CUDA context. A process list that never shows
 the run's own arm (a container's view) leaves utilization as the only check, and the result says so;
-no reader at all marks the run not checked. Either finding of another user, or no check, makes every
-verdict cannot tell. Start from a fresh runtime: a notebook kernel holding the GPU counts as another
+no reader at all marks the run not checked. Another user seen, no check, or a GPU not shown to be
+unshared (utilization only) makes every verdict cannot tell: such a run still measures and reports
+every figure, but scores no limit (the author, Nov 26, 2026). Start from a fresh runtime: a notebook kernel holding the GPU counts as another
 process.
 
 **Files** in `--out`: `plan.json` (settings, for `--resume`), `arms/<arm>-r<round>.json` and `.log`,
@@ -525,9 +528,11 @@ def exclusivity(samples: list[dict], *, method: str | None, device_type: str) ->
     if reasons:
         return {"status": "shared", "usable": False, "method": method, "reasons": reasons}
     if not any(len(s.get("processes", [])) >= 1 for s in samples if s["where"].startswith("arm")):
-        return {"status": "utilization only", "usable": True, "method": method,
-                "reasons": ["the process list never showed this run's own arm (a container's view?): only the "
-                            "GPU's utilization while idle was checked"]}
+        # The author, Nov 26, 2026: such a run measures and reports, but scores no limit; the plan's condition
+        # for these measurements is a GPU that is not shared.
+        return {"status": "utilization only", "usable": False, "method": method,
+                "reasons": ["the GPU was not shown to be unshared: the process list never showed this run's own arm "
+                            "(a container's view?), so only the GPU's utilization while idle was checked"]}
     return {"status": "exclusive", "usable": True, "method": method, "reasons": []}
 
 
@@ -1025,7 +1030,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--arm-set", default="routers", help=f"one of {', '.join(ARM_SETS)}")
-    parser.add_argument("--arm", action="append", default=[], help="NAME=JSON, an arm of its own (repeatable)")
+    parser.add_argument("--arm", action="append", default=[],
+                        help="NAME=JSON, an arm of its own (repeatable); a detector or switch such as K3 is judged "
+                             'over the same capture without it: "baseline": "routers"')
     parser.add_argument("--arms-file", type=Path, help="a JSON list of arms")
     parser.add_argument("--limit", type=float, default=DEFAULT_LIMIT, help="the default limit, e.g. 0.01 or 0.005")
     parser.add_argument("--confidence", type=float, default=0.95)
