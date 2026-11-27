@@ -1,0 +1,137 @@
+{
+ "says": "The run state's `ranks_unknown` reason in both engines: `run_state` in sdk/src/tensorquill/evidence.py and in server/src/watchdog.rs. It lists the lowest `cap` unknown ranks in `ranks`, counts the others in `ranks_omitted`, a key written only when some are left out, and its `detail` starts with the whole count. Read by sdk/tests/test_lane_as1_ranks_unknown.py and server/src/watchdog/lane_as1_tests.rs.",
+ "how": "Each case's `given` is a server status: `world_size` (null for none), one entry for each rank in `connected` (attempt 1, last step 19, state active), `missing_ranks` and, when given, `missing_ranks_omitted`. Every connected rank is judged: it has a current report of attempt 1, so the ranks unknown are those the status expects and nobody judged. Rank lists are written as spans, [first, last] with both ends included. `expected.ranks` is the reason's `ranks`; `expected.ranks_omitted` is its count, and the key is absent from the reason when it is absent here; `expected.detail_starts` is how its `detail` begins in both engines (each goes on in its own words).",
+ "cap": 1000,
+ "cases": {
+  "under_the_cap": {
+   "given": {
+    "world_size": 1000,
+    "connected": [
+     0
+    ],
+    "judged": [
+     0
+    ],
+    "missing_ranks": [
+     [1, 999]
+    ]
+   },
+   "expected": {
+    "ranks": [
+     [1, 999]
+    ],
+    "detail_starts": "999 ranks without a current report"
+   }
+  },
+  "exactly_at_the_cap": {
+   "given": {
+    "world_size": 1001,
+    "connected": [
+     0
+    ],
+    "judged": [
+     0
+    ],
+    "missing_ranks": [
+     [1, 1000]
+    ]
+   },
+   "expected": {
+    "ranks": [
+     [1, 1000]
+    ],
+    "detail_starts": "1000 ranks without a current report"
+   }
+  },
+  "one_over_the_cap": {
+   "given": {
+    "world_size": 1002,
+    "connected": [
+     0
+    ],
+    "judged": [
+     0
+    ],
+    "missing_ranks": [
+     [1, 1000]
+    ],
+    "missing_ranks_omitted": 1
+   },
+   "expected": {
+    "ranks": [
+     [1, 1000]
+    ],
+    "ranks_omitted": 1,
+    "detail_starts": "1001 ranks without a current report"
+   }
+  },
+  "over_the_cap_with_gaps_lists_the_lowest": {
+   "given": {
+    "world_size": 1300,
+    "connected": [
+     0,
+     500,
+     1200
+    ],
+    "judged": [
+     0,
+     500,
+     1200
+    ],
+    "missing_ranks": [
+     [1, 499],
+     [501, 1001]
+    ],
+    "missing_ranks_omitted": 297
+   },
+   "expected": {
+    "ranks": [
+     [1, 499],
+     [501, 1001]
+    ],
+    "ranks_omitted": 297,
+    "detail_starts": "1297 ranks without a current report"
+   }
+  },
+  "counted_missing_ranks_with_no_world_size": {
+   "given": {
+    "world_size": null,
+    "connected": [0, 1500],
+    "judged": [0, 1500],
+    "missing_ranks": [
+     [1, 1000]
+    ],
+    "missing_ranks_omitted": 499
+   },
+   "expected": {
+    "ranks": [
+     [1, 1000]
+    ],
+    "ranks_omitted": 499,
+    "detail_starts": "1499 ranks without a current report"
+   }
+  },
+  "a_world_at_the_server_s_limit": {
+   "given": {
+    "world_size": 100000,
+    "connected": [
+     0
+    ],
+    "judged": [
+     0
+    ],
+    "missing_ranks": [
+     [1, 1000]
+    ],
+    "missing_ranks_omitted": 98999
+   },
+   "expected": {
+    "ranks": [
+     [1, 1000]
+    ],
+    "ranks_omitted": 98999,
+    "detail_starts": "99999 ranks without a current report"
+   }
+  }
+ }
+}
