@@ -74,7 +74,7 @@ def test_a_loader_late_by_its_own_work_passes_when_capture_adds_nothing(tmp_path
     _slow_loader(monkeypatch, 0.060)
     out = tmp_path / "sys"
     with contextlib.redirect_stdout(io.StringIO()) as printed:
-        code = gs.main(["--out", str(out), "--steps", "50", "--every", "10", "--wait-ms", "5", "--wait-slack-ms", "30"])
+        code = gs.main(["--out", str(out), "--steps", "100", "--every", "10", "--wait-ms", "5", "--wait-slack-ms", "30"])
     result = json.loads((out / "system.json").read_text())
     failed = [c["name"] for c in result["checks"] if not c["ok"]]
     assert failed == [] and code == gs.NOT_PROVEN, (failed, printed.getvalue())

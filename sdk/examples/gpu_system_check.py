@@ -39,10 +39,11 @@ what TensorQuill recorded against what the script reads itself:
   machine's load, a collection the process owes) is measured at its start only; the `nvidia-smi`
   thread does not run during them.
 
-  On the Mac this script was written on, with TensorQuill on, step 100 (at `--every 50`) spent 34 to
-  73 ms more in `next()` than the sleep, by both timers, in every run; with TensorQuill off, in the same
+  Before the capture-off steps were added (lane AI-1's runs, Nov 22, 2026), on the Mac this script was
+  written on, with TensorQuill on, step 100 (at `--every 50`) spent 34 to 73 ms more in `next()` than the sleep, by both timers, in every run; with TensorQuill off, in the same
   loop, it did not: a delay of the training thread (`loader_delay_check.py`), not a fault of the timer.
-  One such step is inside the 98% line.
+  With the capture-off steps first, one run on that Mac (Nov 27, 2026, under heavy load) had its one
+  such step at step 219, 94 ms over its sleep. One such step is inside the 98% line.
 - **CUDA memory** (the record's `system.cuda`, at each flush). Right after `optimizer.step()` on
   that step the script reads `torch.cuda.memory_allocated`, `memory_reserved` and
   `max_memory_allocated`. These are the same allocator's counters, so they check that TensorQuill
@@ -78,9 +79,11 @@ what TensorQuill recorded against what the script reads itself:
   samples, is not moved by one value taken during a transient (a flush, a change of power state).
   Limit, not measured: TensorQuill reads NVML right after a flush, at the same point of a step each
   time, while `nvidia-smi`'s samples fall anywhere in a step. Where a board reports instantaneous
-  power rather than an average over a second (NVML's API reference says GA100, the A100's chip, and
-  older chips do; read for this change, not checked on a GPU), a load that changes within a step
-  can keep the two medians apart.
+  power rather than an average over a second, a load that changes within a step can keep the two
+  medians apart. NVML's header says of `nvmlDeviceGetPowerUsage`, which TensorQuill calls: "On Ampere
+  (except GA100) or newer GPUs, the API returns power averaged over 1 sec interval. On GA100 and older
+  architectures, instantaneous power is returned" (read in the copy NVIDIA publishes with go-nvml,
+  Nov 27, 2026). The A100 is GA100. How `nvidia-smi`'s `power.draw` is averaged on it was not read.
 
 **Neither rule has run on a GPU.** Their windows and statistics were fixed from the reasoning above
 before any measurement, and the recorded A100 numbers were not used to choose them.
