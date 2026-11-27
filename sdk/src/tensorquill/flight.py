@@ -1116,6 +1116,12 @@ class OlderServer(ConnectionError):
     goes once the server is upgraded; the sender keeps trying."""
 
 
+class OverTheLimit(ConnectionError):
+    """A sender whose rank or world size the server refuses (over `MAX_EXPECTED_RANKS`, the server's
+    `watchdog::MAX_RANKS`): its `last_error` from the start. It opens no connection and starts no
+    thread, and `close()` returns False at once (wave AR, lane AR-7)."""
+
+
 class MalformedBatch(ConnectionError):
     """The server ended the stream because it could not decode a record batch this sender sent
     (`INVALID_ARGUMENT` with `MALFORMED_BATCH`; wave AR, lane AR-4's guard). The sender's `last_error`
@@ -1207,6 +1213,7 @@ class FlightSender:
         backoff_cap: float = BACKOFF_CAP,
         hold: threading.Event | None = None,
         await_attempt: bool = False,
+        _said_from: int = 1,
     ) -> None:
         import pyarrow.flight  # noqa: F401  fail here, at init, when pyarrow is missing
 
@@ -1291,6 +1298,16 @@ class FlightSender:
         self._attempt: int | None = None
         self._named = threading.Event()
         self._await_attempt = await_attempt
+        # A rank or world size the server refuses (lane AR-7): nothing is sent, so no thread is started
+        # and no connection made, said once here, at the call that made the sender (`_said_from`
+        # frames above this one). The attempt is on the file's lines, each checked as it is read.
+        over = _over_the_servers_limits(rank, world_size, None)
+        self._over: str | None = "; ".join(over) or None
+        if self._over is not None:
+            self.last_error = OverTheLimit(self._over)
+            _say(f"tensorquill: {self._over}, so nothing of {self.path.name} is sent to {endpoint}: the server would "
+                 "refuse it, so no connection is made. The file is kept as written.", stacklevel=1 + _said_from)
+            return
         self._thread = threading.Thread(
             target=self._run, name=f"tensorquill-flight-rank{rank}", daemon=True
         )
@@ -1343,6 +1360,8 @@ class FlightSender:
         process that called `init` is the one that streams the file."""
         if os.getpid() != self._pid:
             return False
+        if self._over is not None:
+            return False  # nothing was sent, and that was said when the sender was made
         self._deadline = time.monotonic() + timeout
         self._closing.set()
         self._thread.join(timeout)
@@ -2047,9 +2066,10 @@ def send_file(
     """Send what a finished run's `.jsonl` file still owes the server. Returns whether the
     server confirmed the whole file and holds every line of this run in it: False while a line of
     this run was left out (`FlightSender.left_out_lines`, which the offset file keeps, so sending the
-    file again says the same)."""
+    file again says the same). A rank the server refuses (100,000 or more, lane AR-7) is not sent:
+    that is said once and False returned at once, with no connection made."""
     return FlightSender(
-        path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs
+        path, endpoint, run_id, rank, token=token, tls_root_certs=tls_root_certs, _said_from=2
     ).close(timeout)
 
 
