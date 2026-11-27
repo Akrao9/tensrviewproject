@@ -1,7 +1,8 @@
 //! The one reader of a row's `extra_json` text, shared by every detector that reads a key there
 //! (`detect.rs`: `step_skipped_by` and `step_skipped_part`, `clip_calls`, refused `grad_norms`,
 //! `moe_refused`, `update_not_read`, the stalled-weight onset's notes, `grads_not_read`,
-//! `layers_not_read`, `moe_source` and, in protocol 5's layout, a layer's refused fields for
+//! `layers_not_read`, `moe_source`, `scalars` for a row whose column is null (a row stored before
+//! AQ5-D7, `Scalars::logged`) and, in protocol 5's layout, a layer's refused fields for
 //! `non_finite`; `replica.rs`: the observation, its scope and the spread's
 //! fallback), and of the four other JSON columns (lane AR-3, Nov 26, 2026, AQ5-D2; the author:
 //! "The Nov 22 reading of an oversized integer extended to `system_json`, `data_json`,
