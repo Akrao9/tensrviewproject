@@ -1,5 +1,8 @@
 //! A `DoPut` stream's messages, decoded as the server decodes them (`ingest::decode_put`), and the step
-//! rows that come out judged (`detect::judge`). It must return rows or an error, never panic.
+//! rows that come out judged (`detect::judge`). It must return rows or an error, never panic. A batch
+//! Arrow's reader panics on is an error (`INVALID_ARGUMENT`, a malformed record batch) since the decode
+//! is guarded (wave AR, lane AR-4); an `INTERNAL` status saying the decode panicked is a panic the guard
+//! caught outside Arrow, and fails the run.
 //!
 //! The input is cut into parts, each a 4-byte little-endian length and that many bytes (a length past
 //! the end takes the rest), and every three parts make one message: its data header, its data body and
@@ -43,8 +46,13 @@ fuzz_target!(|data: &[u8]| {
         }
         messages.push(message);
     }
-    let Ok(decoded) = decode_put(messages) else {
-        return;
+    let decoded = match decode_put(messages) {
+        Ok(decoded) => decoded,
+        // `ingest.rs`'s status for a panic the guard caught outside Arrow (`INTERNAL`).
+        Err(status) if status.message() == "the decode of a message of the stream panicked" => {
+            panic!("the decode panicked outside Arrow: {status:?}");
+        }
+        Err(_) => return,
     };
     let steps: Vec<_> = decoded
         .iter()
