@@ -198,7 +198,10 @@ def signature(found: list[str]) -> str:
     route, rest = first.split(": ", 1)
     if rest.startswith("refused by "):
         return f"{route}:{rest.split(':', 1)[0]}"
-    return f"{route}:{re.sub(r'\[[^\]]*\]', '', rest.split(':', 1)[0]).strip()}"
+    # The pattern is taken out of the f-string: a backslash inside one is a syntax error before
+    # Python 3.12, and the package supports 3.10.
+    path = re.sub(r"\[[^\]]*\]", "", rest.split(":", 1)[0]).strip()
+    return f"{route}:{path}"
 
 
 # --- the generator itself ------------------------------------------------------------------------
