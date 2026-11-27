@@ -637,6 +637,62 @@ fn arrow_reader_panics(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// Whether Arrow Flight's own decoder, unguarded by TensorQuill, panics on `messages`: the decoder over
+/// the messages as one stream, polled to its end, as `run_stream` polled it before wave AR. Run inside
+/// the guard only so the hook stays quiet for it.
+fn arrow_decoder_panics(messages: Vec<FlightData>) -> Option<String> {
+    let read = AssertUnwindSafe(|| {
+        futures::executor::block_on(async {
+            let mut decoder =
+                arrow_flight::decode::FlightDataDecoder::new(futures::stream::iter(messages.into_iter().map(Ok)));
+            while let Some(message) = futures::StreamExt::next(&mut decoder).await {
+                if message.is_err() {
+                    break;
+                }
+            }
+        })
+    });
+    match decode_guard::guard(read) {
+        Ok(()) => None,
+        Err(decode_guard::Caught::Arrow(text)) => Some(text),
+        Err(decode_guard::Caught::Other(payload)) => Some(panic_text(payload.as_ref())),
+    }
+}
+
+#[test]
+fn mutated_put_streams_that_panic_arrow_s_decoder_give_the_malformed_batch_status() {
+    // AQ5-R1 and AQ5-R2 on the live path: every mutated `DoPut` stream of seed 14 on which Arrow
+    // Flight's own decoder panics is refused by `decode_put` (the guarded decode `run_stream` runs)
+    // with the malformed-batch status, counted by Arrow's message.
+    let mut rng = Rng::new(14);
+    let mut found = Vec::new();
+    let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
+    for iteration in 0..iterations() {
+        let (messages, what) = mutated_put(&mut rng, iteration);
+        let Some(arrow_text) = arrow_decoder_panics(messages.clone()) else {
+            continue;
+        };
+        *kinds
+            .entry(arrow_text.split(':').next().unwrap_or_default().to_string())
+            .or_default() += 1;
+        match decode_put(messages) {
+            Err(status) if is_malformed(&status) => {}
+            other => found.push(format!(
+                "iteration {iteration}: {what}: arrow said {arrow_text:?}; decode_put gave {:?}",
+                other.map(|batches| batches.len())
+            )),
+        }
+    }
+    for (kind, count) in &kinds {
+        eprintln!("seed 14: {count} mutated DoPut streams panic arrow's decoder with {kind:?}");
+    }
+    assert!(
+        !kinds.is_empty(),
+        "no mutated DoPut stream of seed 14 panics arrow's decoder any more"
+    );
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
 #[test]
 fn a_put_batch_whose_body_is_cut_short_is_refused_without_a_panic() {
     // AQ5-R1 on the live path (turned on in wave AR, lane AR-4).

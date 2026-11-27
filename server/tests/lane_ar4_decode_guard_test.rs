@@ -451,7 +451,16 @@ impl Binary {
     fn stop(mut self) -> String {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.stderr.join().unwrap()
+        let stderr = std::mem::replace(&mut self.stderr, std::thread::spawn(String::new));
+        stderr.join().unwrap()
+    }
+}
+
+impl Drop for Binary {
+    /// A test that fails before `stop` leaves no server running.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

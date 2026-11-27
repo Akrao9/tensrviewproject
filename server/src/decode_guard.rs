@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn a_location_is_in_arrow_by_its_crate_folder() {
         assert!(in_arrow(
-            "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-60.1.0/src/buffer/immutable.rs"
+            "registry/src/index.crates.io-1949cf8c6b5b557f/arrow-buffer-60.1.0/src/buffer/immutable.rs"
         ));
         assert!(in_arrow("vendor\\arrow-ipc\\src\\reader.rs"));
         assert!(!in_arrow("src/detect.rs"));
