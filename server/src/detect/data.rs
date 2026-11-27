@@ -406,9 +406,14 @@ pub fn duplicate_batches(ranks: &BTreeMap<i32, BTreeMap<i64, (Option<i64>, Strin
 pub fn read_batches(input: impl std::io::Read) -> Result<Vec<RecordBatch>, String> {
     let reader = arrow::ipc::reader::StreamReader::try_new(input, None)
         .map_err(|error| format!("the input is not an Arrow IPC stream: {error}"))?;
-    reader
-        .collect::<Result<Vec<RecordBatch>, _>>()
-        .map_err(|error| format!("cannot read the Arrow IPC stream: {error}"))
+    // Guarded (lane AR-7): a record batch Arrow's reader panics on is the error `MALFORMED_INPUT`.
+    crate::decode_guard::collect_batches(reader).map_err(|error| {
+        if error.starts_with(crate::decode_guard::MALFORMED_INPUT) {
+            error
+        } else {
+            format!("cannot read the Arrow IPC stream: {error}")
+        }
+    })
 }
 
 /// `tensorquill-server detect --run`: the rows of every rank of one run in, and the run's
