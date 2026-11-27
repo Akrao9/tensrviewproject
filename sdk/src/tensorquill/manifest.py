@@ -403,6 +403,87 @@ def numerical_settings(manifest: Mapping[str, Any] | None) -> dict[str, Any]:
     return {"recorded": True, **block}
 
 
+# --- A run started again under its run ID ----------------------------------------------------
+#
+# The latest start's settings stay where a reader looks for them (`settings`, `read_at_utc`, and
+# `starts`, the starts in a row that had them). An earlier start's are kept only when they differ
+# from the start after it, as one entry of `earlier_starts`, oldest first, in the same shape: a run
+# resumed many times with the same settings grows by a count, never by an entry. Settings are the
+# same when every entry's value, reason for not being read and cut length are (`SETTING_COMPARED`;
+# a warning given while reading is no difference).
+#
+# The cap: at most `EARLIER_STARTS_MAX` earlier starts, and the whole `numerical_settings` block at
+# most `NUMERICAL_SETTINGS_MAX_BYTES` of compact JSON, a quarter of the server's 64 KiB limit for a
+# whole manifest. Over either, the oldest earlier start after the first is dropped, and counted in
+# `earlier_starts_left_out`: the first start (the one the replicas began under) and the latest
+# are always kept. One start's block is at most about 6 KB (ten entries of a 256-character value and
+# a 200-character warning), so the first and the latest always fit. A start whose manifest was
+# written before the settings were recorded sets `earlier_starts_not_recorded`, which stays.
+
+EARLIER_STARTS_MAX = 8
+NUMERICAL_SETTINGS_MAX_BYTES = 16_384
+SETTING_COMPARED = ("value", "not_read", "cut_from_length")  # what of an entry decides that two starts differ
+_START_KEYS = ("read_at_utc", "starts", "settings", "not_read")  # what of a block one start is
+
+
+def _comparable(block: Mapping[str, Any]) -> Any:
+    settings = block.get("settings")
+    settings = settings if isinstance(settings, Mapping) else {}
+    return ({str(name): {k: entry[k] for k in SETTING_COMPARED if k in entry}
+             for name, entry in settings.items() if isinstance(entry, Mapping)}, block.get("not_read"))
+
+
+def _block_bytes(block: Mapping[str, Any]) -> int:
+    return len(json.dumps(block, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def merge_numerical_settings(earlier: Mapping[str, Any], document: Mapping[str, Any]) -> dict[str, Any]:
+    """`document`, the manifest of a start of the run whose manifest was `earlier`, with the earlier
+    starts' numerical settings kept as the comment above says. Never raises: what cannot be merged
+    is left as `document` has it."""
+    document = dict(document)
+    new = document.get(NUMERICAL_SETTINGS_KEY)
+    if not isinstance(new, Mapping):
+        return document
+    try:
+        before = earlier.get(NUMERICAL_SETTINGS_KEY)
+        if not isinstance(before, Mapping):
+            document[NUMERICAL_SETTINGS_KEY] = {**new, "earlier_starts_not_recorded": True}
+            return document
+        kept = [dict(e) for e in before.get("earlier_starts") or () if isinstance(e, Mapping)]
+        left_out = before.get("earlier_starts_left_out")
+        left_out = left_out if isinstance(left_out, int) and not isinstance(left_out, bool) and left_out > 0 else 0
+        merged = dict(new)
+        if _comparable(before) == _comparable(new):
+            # The same settings again: one more start of the run of starts that had them.
+            starts = before.get("starts")
+            merged["starts"] = (starts if isinstance(starts, int) and not isinstance(starts, bool) else 1) + 1
+            if "read_at_utc" in before:
+                merged["read_at_utc"] = before["read_at_utc"]
+        else:
+            kept.append({k: before[k] for k in _START_KEYS if k in before})
+        if before.get("earlier_starts_not_recorded"):
+            merged["earlier_starts_not_recorded"] = True
+        while kept:
+            merged.pop("earlier_starts", None)
+            merged.pop("earlier_starts_left_out", None)
+            merged["earlier_starts"] = kept
+            if left_out:
+                merged["earlier_starts_left_out"] = left_out
+            if len(kept) <= EARLIER_STARTS_MAX and _block_bytes(merged) <= NUMERICAL_SETTINGS_MAX_BYTES:
+                break
+            del kept[1 if len(kept) > 1 else 0]
+            left_out += 1
+        if not kept:
+            merged.pop("earlier_starts", None)
+            if left_out:
+                merged["earlier_starts_left_out"] = left_out
+        document[NUMERICAL_SETTINGS_KEY] = merged
+    except Exception:  # noqa: BLE001  nothing here may stop a run: the latest start's settings stand
+        pass
+    return document
+
+
 def build_manifest(
     *,
     run_id: str | None,
@@ -416,6 +497,7 @@ def build_manifest(
     created_at: str | None = None,
 ) -> dict[str, Any]:
     sdk_version, torch_version = _versions()
+    created_at = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "project": project,
@@ -423,7 +505,7 @@ def build_manifest(
         "run_id": run_id,
         "group": group,
         "tags": list(tags or ()),
-        "created_at": created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": created_at,
         "world_size": world_size,
         "sdk_version": sdk_version,
         "torch_version": torch_version,
@@ -431,7 +513,9 @@ def build_manifest(
         "run_id_source": run_id_source,
         "config": dict(config or {}),
         # As `init` found them on this rank, read and never set (item OG1; `numerical_settings_block`).
-        NUMERICAL_SETTINGS_KEY: numerical_settings_block(),
+        # This start's: when they were read, and one start so far (`write_manifest` counts the starts
+        # with the same settings and keeps an earlier start's that differ, `merge_numerical_settings`).
+        NUMERICAL_SETTINGS_KEY: {**numerical_settings_block(), "read_at_utc": created_at, "starts": 1},
     }
 
 
@@ -490,6 +574,9 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> bool:
         document = dict(manifest)
         if earlier and _text(earlier.get("created_at")) and earlier.get("run_id") == document.get("run_id"):
             document["created_at"] = earlier["created_at"]
+        if earlier and earlier.get("run_id") == document.get("run_id"):
+            # A run started again keeps its earlier starts' numerical settings that differ.
+            document = merge_numerical_settings(earlier, document)
         path.parent.mkdir(parents=True, exist_ok=True)
         scratch = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         scratch.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
