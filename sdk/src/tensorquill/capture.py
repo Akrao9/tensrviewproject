@@ -5771,7 +5771,8 @@ def init(
         config: an optional flat dictionary of hyperparameters, compared between runs by
             `python -m tensorquill compare`. Nothing is read from the tracker's config.
             These five go into the run manifest, `<run_id>.run.json` beside the `.jsonl`
-            file, which rank 0 writes here (see `manifest.py`); other ranks write nothing.
+            file, which rank 0 writes here (see `manifest.py`); each other rank writes its
+            numerical settings beside its records instead, `<run_id>.rank<N>.settings.json`.
         every: steps kept on the device between transfers to the CPU, an integer of 1 or
             more: a bool, a float or a string raises `TypeError`, a number below 1 `ValueError`.
         capture: `"routers"` records MoE router load only: cheap enough to leave on
@@ -5940,6 +5941,7 @@ def init(
             current stream; the writer thread waits for the copy's event and makes every read of the
             values. The training thread makes no host read and calls no `torch.cuda.synchronize()`. The
             records are the same as with `False`, which is the default until this path has run on a GPU.
+            The run manifest records the switch as given (`pinned_flush`).
             On a device that is not CUDA, or when pinned memory, the stream or a copy fails, the blocking
             copy is used for the rest of the session, said once in a warning; never an error in training.
             Two pinned buffers of one block each (about 0.3 MB for a 7B dense model at `every=50`, 1 MB
@@ -5976,7 +5978,8 @@ def init(
         mirror_scalars=mirror_scalars, start_step=start_step,
     )
     # What `init` opens is undone if a later step fails (`_undo`): the default sink and its file,
-    # the run manifest, the stream to a server. A sink the caller passed in is never closed here.
+    # the run manifest, a rank's settings file, the stream to a server. A sink the caller passed in
+    # is never closed here.
     undo: list[Callable[[], Any]] = []
     try:
         run = resolve_run(run_id)

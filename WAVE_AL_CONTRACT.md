@@ -403,7 +403,7 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
 
 - **The same `.jsonl`, the same byte cursor, the same stream.** The sender converts it like any line, to a row of protocol 5's layout:
   - `seq` set (a step row's `seq` is null) and `record_version` 2;
-  - `scalars` in the `scalars` column, under wave W3's rule;
+  - `scalars` in the `scalars` column entry by entry, a refused entry in `extra_json` under `scalars` (`WAVE_AJ_CONTRACT.md` section 3, Nov 26, 2026; until then under wave W3's whole-map rule);
   - `record` restored by `row_to_record` from a non-null `seq`.
 - **The sender's checks are unchanged:** `rank`, `attempt` and `step` are checked as for any line (`SENDER_FIELDS`).
 - **The batch metadata's `min_step` and `max_step` are the batch's training rows' range** (the owner, Nov 24, row S13). A scalar-only row's step is not counted. A batch holding only scalar-only rows carries for both what a batch with no steps carries today. Case `scalar_batch_metadata_counts_training_rows`. The server reads neither key; it takes steps from the rows (section 4.5).

@@ -50,6 +50,11 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 **A map with no held entry reads as an absent key**, in both engines. In Rust the column is null.
 - This is the A9 case: `weight_norms` whose only entry is refused is not a weight check, so `weight_jumps.checks` is 2, not 3.
 
+**A top-level `grad_norm` whose value its float64 column refuses reads as an absent key** (wave AR, AQ5-D3, Nov 27, 2026), in both engines and to every rule that reads it: a bool, a text other than the sink's "nan", "inf" and "-inf", a list, an object, an integer too large for a float.
+- It does not break a stall's streak, and it is no value of a spike or a trend.
+- A non-finite value the column carries is a value, and `non_finite`'s.
+- Only the readers of `grad_norm` were audited for this. The other top-level float fields (`clip_grad_norm`, `grad_scale`, `data_wait`, `step_time`, `lr`) rest on the generated sweep, which found no disagreement on them, not on an audit of their readers.
+
 **MoE routers.** A router is a name with a held `moe` entry on some record. Python's `_router_sizes` must count only those names.
 - Then the SDK's sample guard in `build_evidence(detectors="rust")` agrees with the server, because both see the routers the column holds.
 - The guard itself is not changed. It still says "build the server from the same version", which is then true only of a real mismatch.
