@@ -14,10 +14,13 @@ The result has four parts, in this order, and the printed summary keeps the orde
 
 1. `setup`: what differs between the run manifests: project, group, world size, the SDK and
    PyTorch versions, each `config` key that differs, and each of the run's numerical settings
-   that differs (`numerical_settings.<what was read>`, as `init` found them on rank 0; a run
+   that differs (`numerical_settings.<what was read>`, as `init` found them on rank 0, from the manifest; a run
    whose manifest is older than them is `numerical_settings_not_recorded`, never compared). A run
    started again is compared by its latest start, and `numerical_settings_starts_differ` names a
-   run whose own starts differ in them.
+   run whose own starts differ in them. `init`'s `pinned_flush` switch differs as `pinned_flush`
+   between runs that recorded it; a run whose manifest is older is `pinned_flush_not_recorded`.
+   Within a run read from local files, `numerical_settings_ranks` sets each rank above 0's
+   settings (its `<run_id>.rank<N>.settings.json`) against rank 0's.
 2. `checked`: the runs' `kind_checks` side by side. A kind checked in one run and not
    configured, unavailable or not yet with enough history in another is listed here, before
    any incident, so "no incident" in one run is never set against "not looked for" in another.
@@ -810,6 +813,64 @@ def _compare_numerical_settings(known: list[tuple[str, Mapping[str, Any]]],
     return same, not_recorded
 
 
+def _rank_files(run: Mapping[str, Any]) -> dict[int, Path]:
+    """The records file of each rank a local run was read from (`records`), by rank."""
+    records = run.get("records") if isinstance(run.get("records"), Mapping) else {}
+    ranks = records.get("ranks")
+    found: dict[int, Path] = {}
+    if isinstance(ranks, Mapping):
+        for number, where in ranks.items():
+            first = where[0] if isinstance(where, (list, tuple)) and where else where
+            if isinstance(number, int) and isinstance(first, (str, Path)):
+                found[number] = Path(first)
+    elif isinstance(records.get("rank"), int) and isinstance(records.get("path"), (str, Path)):
+        found[records["rank"]] = Path(records["path"])
+    return found
+
+
+def _compare_rank_settings(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[str, Any]:
+    """Within each run read from local files, each rank above 0's numerical settings (its
+    `<run_id>.rank<N>.settings.json`, `manifest.write_rank_settings`) set against rank 0's (the
+    manifest's), by the latest start of each: the ranks compared, the ones that differ with the
+    settings that do, and the ranks whose file is not there (a run recorded before the file
+    existed, or a write that failed). Only runs with a rank above 0 read and rank 0's settings
+    recorded; a run in a server's store is not here, since the store never has the file. Rank N
+    of one run is not set against rank N of another: the runs are compared by rank 0's."""
+    found: dict[str, Any] = {}
+    for label, run in zip(labels, opened):
+        if (run.get("read_from") or {}).get("kind") != "local records":
+            continue
+        others = {n: p for n, p in _rank_files(run).items() if n > 0}
+        zero = _manifest.numerical_settings(run.get("manifest"))
+        if not others or not zero["recorded"]:
+            continue
+        compared: list[int] = []
+        differ: list[dict[str, Any]] = []
+        missing: list[int] = []
+        for number, path in sorted(others.items()):
+            document = _manifest.read_rank_settings(_manifest.rank_settings_path(path, str(run["run_id"]), number))
+            if document is None or document.get("run_id") != run["run_id"] or document.get("rank") != number:
+                missing.append(number)
+                continue
+            compared.append(number)
+            block = _manifest.numerical_settings(document)
+            settings = [s if isinstance(s, Mapping) else {} for s in (zero.get("settings"), block.get("settings"))]
+            names = list(dict.fromkeys(str(n) for one in settings for n in one))
+
+            def entry(one: Mapping[str, Any], name: str, whole: Any) -> Any:
+                got = one.get(name)
+                return ({k: got[k] for k in _SETTING_COMPARED if k in got} if isinstance(got, Mapping)
+                        else {"not_read": whole or "not listed"})
+
+            wholes = (zero.get("not_read"), block.get("not_read"))
+            names = [n for n in names if _differ([entry(one, n, w) for one, w in zip(settings, wholes)])]
+            if names:
+                differ.append({"rank": number, "settings": names})
+        found[label] = {"compared_with_rank_0": compared, **({"differ": differ} if differ else {}),
+                        **({"not_recorded": missing} if missing else {})}
+    return found
+
+
 def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[str, Any]:
     known = [(label, run["manifest"]) for label, run in zip(labels, opened) if isinstance(run.get("manifest"), Mapping)]
     differs: list[dict[str, Any]] = []
@@ -839,6 +900,13 @@ def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[st
                     **({"not_set_in": missing} if missing else {}),
                 })
         same_config = [key for key in keys if not any(d["field"] == f"config.{key}" for d in differs)]
+    # `init`'s pinned-flush switch (lane AR-6): compared among the runs whose manifest records it; a
+    # manifest older than it says so, and is never read as off.
+    switches = [(label, _manifest.pinned_flush_of(m)) for label, m in known]
+    with_switch = [(label, value) for label, value in switches if value is not None]
+    switch_unknown = [label for label, value in switches if value is None] if with_switch else []
+    if len(with_switch) > 1 and _differ([value for _, value in with_switch]):
+        differs.append({"field": _manifest.PINNED_FLUSH_KEY, "values": dict(with_switch)})
     settings_same, settings_unknown = _compare_numerical_settings(known, differs)
     # A run whose own starts differ in them (a run started again): said, and compared by its latest start.
     starts_differ = {}
@@ -847,14 +915,18 @@ def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[st
         found = _starts_differ(block) if block["recorded"] else None
         if found is not None:
             starts_differ[label] = found
+    by_rank = _compare_rank_settings(opened, labels)
     return {
         "differs": differs,
         "same": same,
         "config_keys_same": same_config,
         **({"config_not_known": config_unknown} if config_unknown else {}),
+        **({"pinned_flush_not_recorded": switch_unknown} if switch_unknown else {}),
         "numerical_settings_same": settings_same,
         **({"numerical_settings_not_recorded": settings_unknown} if settings_unknown else {}),
         **({"numerical_settings_starts_differ": starts_differ} if starts_differ else {}),
+        # Each rank above 0 against rank 0 within one run of local files (lane AR-6).
+        **({"numerical_settings_ranks": by_rank} if by_rank else {}),
         # A run without a manifest says nothing of its setup; it is left out of the differences.
         "no_manifest": [label for label, run in zip(labels, opened) if not isinstance(run.get("manifest"), Mapping)],
     }
@@ -1570,6 +1642,9 @@ def summary_text(result: Mapping[str, Any]) -> str:
     if setup["no_manifest"]:
         lines.append(f"   no run manifest for {', '.join(setup['no_manifest'])}: "
                      "its setup is not known and is left out of the differences")
+    if setup.get("pinned_flush_not_recorded"):
+        lines.append(f"   pinned_flush not recorded for {', '.join(setup['pinned_flush_not_recorded'])}: its manifest was "
+                     "written before TensorQuill recorded the switch, so it is left out of the differences")
     if setup.get("numerical_settings_not_recorded"):
         lines.append(f"   numerical settings not recorded for {', '.join(setup['numerical_settings_not_recorded'])}: "
                      "its manifest was written before TensorQuill recorded them, so they are left out of the "
@@ -1584,6 +1659,15 @@ def summary_text(result: Mapping[str, Any]) -> str:
         lines.append(f"   {label}'s own starts differ in their numerical settings: "
                      f"{', '.join(found['settings']) or 'none of those kept'} ({'; '.join(notes)}); "
                      "it is compared by its latest start")
+    for label, found in (setup.get("numerical_settings_ranks") or {}).items():
+        for item in found.get("differ") or ():
+            lines.append(f"   {label}'s rank {item['rank']} differs from its rank 0 in its numerical settings: "
+                         f"{', '.join(item['settings'])}")
+        if found.get("not_recorded"):
+            missing = found["not_recorded"]
+            lines.append(f"   numerical settings of {label}'s rank{'s' if len(missing) != 1 else ''} "
+                         f"{', '.join(map(str, missing))} not recorded (no settings file beside "
+                         f"{'their' if len(missing) != 1 else 'its'} records): only rank 0's are compared there")
 
     checked = result["checked"]
     whole = checked.get("all_ranks_read") or {}

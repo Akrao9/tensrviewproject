@@ -8,6 +8,9 @@ manifest adds the labels a person lists and compares runs by:
 - in a server's store it is `runs/<run_id>/run.json`, written by the server from the copy that
   rides on rank 0's first batch of each stream (`flight.py`).
 
+Rank 0's numerical settings are in the manifest; each rank above 0 writes its own beside its
+records, `<run_id>.rank<N>.settings.json` (`write_rank_settings`, local only).
+
 A run recorded before the manifest existed has none. It reads as project `uncategorized` with
 its run ID as its name (`run_block`).
 
@@ -51,7 +54,10 @@ METADATA_KEY = "run_manifest"  # the key in a Flight batch's app_metadata
 # (`MANIFEST_MAX_BYTES` in `server/src/ingest.rs`); this is below it, since the two write
 # numbers a little differently.
 MANIFEST_SEND_BYTES = 60_000
-_RANK_FILE = re.compile(r"^(?P<run_id>.+)\.rank\d+\.jsonl$")
+# A rank's records file, `<run_id>.rank<N>.jsonl`, or a second writer's of the same rank,
+# `<run_id>.rank<N>.<pid>.jsonl` (`sink.JsonlSink`, lane AQ-2): read from the right, ASCII digits
+# only, as `sink.records_file_parts` reads it (lane AR-6). The run ID may hold dots.
+_RANK_FILE = re.compile(r"^(?P<run_id>.+)\.rank[0-9]+(?:\.[0-9]+)?\.jsonl$")
 
 
 def _say(message: str, stacklevel: int = 2) -> None:
@@ -295,6 +301,7 @@ def _versions() -> tuple[str | None, str | None]:
 # these reads initialises CUDA: they are flags of the process and of the C++ context.
 
 NUMERICAL_SETTINGS_KEY = "numerical_settings"
+PINNED_FLUSH_KEY = "pinned_flush"  # `init(pinned_flush=...)` as it was given (lane AR-6)
 NOT_RECORDED = "the run manifest was written before TensorQuill recorded the run's numerical settings"
 SETTING_TEXT_MAX = 256  # an environment variable's value, or a value's text, kept to this many characters
 _ERROR_TEXT_MAX = 200
@@ -495,10 +502,15 @@ def build_manifest(
     config: dict[str, Any] | None = None,
     world_size: int | None = None,
     created_at: str | None = None,
+    pinned_flush: bool | None = None,
 ) -> dict[str, Any]:
+    """The run manifest. `pinned_flush` is `init`'s switch as it was given (lane AR-6): the path the
+    flush then took may still have fallen back to the blocking copy (no CUDA, a failed copy), which
+    the session says once. Left out (None), as by a caller that is not `init`, the manifest has no
+    `pinned_flush` key, so it never claims the switch was off (`PINNED_FLUSH_KEY`)."""
     sdk_version, torch_version = _versions()
     created_at = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {
+    document = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "project": project,
         "name": name,
@@ -517,6 +529,16 @@ def build_manifest(
         # with the same settings and keeps an earlier start's that differ, `merge_numerical_settings`).
         NUMERICAL_SETTINGS_KEY: {**numerical_settings_block(), "read_at_utc": created_at, "starts": 1},
     }
+    if pinned_flush is not None:
+        document[PINNED_FLUSH_KEY] = bool(pinned_flush)
+    return document
+
+
+def pinned_flush_of(manifest: Mapping[str, Any] | None) -> bool | None:
+    """The `pinned_flush` switch a run manifest records, or None for a manifest that does not record
+    it (one written before lane AR-6, or not by `init`): never read as off."""
+    found = manifest.get(PINNED_FLUSH_KEY) if isinstance(manifest, Mapping) else None
+    return found if isinstance(found, bool) else None
 
 
 def manifest_to_send(manifest: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, str | None]:
@@ -599,9 +621,10 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> bool:
 
 
 def run_id_of_file(path: str | Path) -> str | None:
-    """The run ID a file named `<run_id>.rank<N>.jsonl` carries. The match is anchored at the
-    end, since a run ID may hold dots (`run-slurm1234.0`)."""
-    found = _RANK_FILE.match(Path(path).name)
+    """The run ID a file named `<run_id>.rank<N>.jsonl` or `<run_id>.rank<N>.<pid>.jsonl` (a second
+    writer's) carries. The match is anchored at the end, since a run ID may hold dots
+    (`run-slurm1234.0`)."""
+    found = _RANK_FILE.fullmatch(Path(path).name)
     return found.group("run_id") if found else None
 
 
@@ -650,3 +673,122 @@ def run_block(run_id: Any, manifest: Mapping[str, Any] | None) -> dict[str, Any]
         "name": _text(manifest.get("name")) or (str(run_id) if run_id is not None else None),
         "run_id": run_id,
     }
+
+
+# --- The other ranks' numerical settings (lane AR-6, item 9's option A) ----------------------
+#
+# Rank 0's settings are in the run manifest. Each rank above 0 writes its own, the same block, to
+# `<run_id>.rank<N>.settings.json` beside its records at `init` (`write_rank_settings`, one line
+# of `capture.init`). The file follows the sink's file as the end marker does: a second writer of
+# the rank (`<run_id>.rank<N>.<pid>.jsonl`, `sink.JsonlSink`) writes
+# `<run_id>.rank<N>.<pid>.settings.json` and never replaces the first writer's. A rank started
+# again under its run ID keeps an earlier start's settings that differ, as the manifest does
+# (`merge_numerical_settings`). The file is local only: a server's store never sees it.
+# It ends in neither `.jsonl` nor `.run.json`, so no folder scan takes it for records or a manifest.
+
+RANK_SETTINGS_SUFFIX = ".settings.json"
+RANK_SETTINGS_SCHEMA_VERSION = 1
+
+
+def rank_settings_path(records_file: str | Path, run_id: str, rank: int) -> Path:
+    """Where rank `rank` of run `run_id` keeps its numerical settings: the records file's own name
+    with `.settings.json` for `.jsonl` when it is that rank's file of the run (`<run_id>.rank<N>.jsonl`
+    or a second writer's `<run_id>.rank<N>.<pid>.jsonl`), and `<run_id>.rank<N>.settings.json` in its
+    folder for a file of another name."""
+    records_file = Path(records_file)
+    found = _RANK_FILE.fullmatch(records_file.name)
+    stem = records_file.name[: -len(".jsonl")]
+    if found is not None and found.group("run_id") == run_id:
+        rest = stem[len(run_id):]  # `.rank<N>` or `.rank<N>.<pid>`
+        if rest.split(".")[1] == f"rank{rank}":
+            return records_file.with_name(stem + RANK_SETTINGS_SUFFIX)
+    return records_file.parent / f"{run_id}.rank{rank}{RANK_SETTINGS_SUFFIX}"
+
+
+def _put_back(path: Path) -> Any:
+    """An undo step that puts `path` back as it is now: its bytes, or no file. Never raises."""
+    try:
+        before: bytes | None = path.read_bytes()
+    except OSError:
+        before = None
+
+    def restore() -> None:
+        try:
+            if before is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(before)
+        except OSError:
+            pass
+
+    return restore
+
+
+def write_rank_settings(records_file: str | Path | None, run_id: Any, rank: Any, undo: list[Any]) -> bool:
+    """Write rank `rank`'s numerical settings beside `records_file` (`rank_settings_path`), by a
+    temporary file and a rename, and add to `undo` what puts the file back as it was. Nothing is
+    written for rank 0 (its settings are in the run manifest), for a sink with no file, or with no
+    run ID. Never raises: a file that cannot be written is said once and the run goes on."""
+    if records_file is None or not run_id or not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+        return False
+    path: Any = records_file  # what the warning names if the path itself cannot be made
+    scratch: Path | None = None
+    try:
+        path = rank_settings_path(records_file, str(run_id), rank)
+        undo.append(_put_back(path))
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        document: dict[str, Any] = {
+            "schema_version": RANK_SETTINGS_SCHEMA_VERSION, "run_id": str(run_id), "rank": rank,
+            NUMERICAL_SETTINGS_KEY: {**numerical_settings_block(), "read_at_utc": now, "starts": 1},
+        }
+        earlier = read_manifest(path)
+        if earlier and earlier.get("run_id") == document["run_id"] and earlier.get("rank") == rank:
+            # A rank started again keeps its earlier starts' settings that differ (item 8).
+            document = merge_numerical_settings(earlier, document)
+        scratch = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        scratch.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        os.replace(scratch, path)
+        return True
+    except Exception as error:  # noqa: BLE001  nothing here may stop a run
+        if scratch is not None:
+            try:
+                scratch.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+        # Four frames up is the caller of `tensorquill.init`, as for `write_manifest`.
+        _say(f"tensorquill could not write rank {rank}'s numerical settings to {path} ({error}); the run goes on, "
+             "and only rank 0's settings are recorded for it.", stacklevel=4)
+        return False
+
+
+def read_rank_settings(path: str | Path) -> dict[str, Any] | None:
+    """The settings file at `path` (`write_rank_settings`), or None when there is no such file, it is
+    not a JSON object, or it does not name a run ID and a rank. `numerical_settings` reads its block
+    as it reads a manifest's."""
+    found = read_manifest(path)
+    if found is None or not isinstance(found.get("run_id"), str):
+        return None
+    rank = found.get("rank")
+    return found if isinstance(rank, int) and not isinstance(rank, bool) else None
+
+
+def rank_settings(folder: str | Path, run_id: str) -> dict[int, dict[str, Any]]:
+    """Every rank's settings file of run `run_id` in `folder`, by rank: the first writer's
+    `<run_id>.rank<N>.settings.json` of each rank whose document names that run ID and rank. A second
+    writer's file (with a pid) is not one of them; `rank_settings_path` of its records file names it.
+    Never raises."""
+    folder = Path(folder)
+    pattern = re.compile(re.escape(run_id) + r"\.rank([0-9]+)" + re.escape(RANK_SETTINGS_SUFFIX))
+    found: dict[int, dict[str, Any]] = {}
+    try:
+        names = sorted(entry.name for entry in os.scandir(folder))
+    except OSError:
+        return {}
+    for name in names:
+        matched = pattern.fullmatch(name)
+        if matched is None:
+            continue
+        document = read_rank_settings(folder / name)
+        if document is not None and document["run_id"] == run_id and document["rank"] == int(matched.group(1)):
+            found[document["rank"]] = document
+    return dict(sorted(found.items()))

@@ -64,6 +64,8 @@ def test_init_writes_the_manifest_beside_the_records_with_every_field(toy_moe, t
     assert written.pop("created_at").endswith("Z")
     # The numerical settings as `init` found them (test_lane_aq6_numerical_settings.py).
     assert written.pop("numerical_settings")["read_at"] == "init"
+    # The pinned-flush switch as `init` was given it (test_lane_ar6_settings_tidy.py).
+    assert written.pop("pinned_flush") is False
     assert written == {
         "schema_version": 1, "project": "granite", "name": "baseline", "run_id": "run-1", "group": "sweep-a",
         "tags": ["moe", "bf16"], "world_size": 1, "sdk_version": tensorquill.__version__,
@@ -306,7 +308,8 @@ def test_a_two_process_run_writes_one_manifest_and_both_ranks_read_it(tmp_path):
     assert said == {0: "manifest", 1: "none"}
     out = tmp_path / "tensorquill-out"
     assert sorted(p.name for p in out.iterdir()) == [
-        "two.rank0.end.json", "two.rank0.jsonl", "two.rank1.end.json", "two.rank1.jsonl", "two.run.json"]
+        "two.rank0.end.json", "two.rank0.jsonl", "two.rank1.end.json", "two.rank1.jsonl", "two.rank1.settings.json",
+        "two.run.json"]
     written = json.loads((out / "two.run.json").read_text())
     assert (written["world_size"], written["name"], written["config"]) == (2, "pair", {"lr": 0.01})
     block = {"project": "granite", "name": "pair", "run_id": "two"}
@@ -321,7 +324,7 @@ def test_a_two_process_run_writes_one_manifest_and_both_ranks_read_it(tmp_path):
     assert opened["records"]["ranks"] == {0: str(out / "two.rank0.jsonl"), 1: str(out / "two.rank1.jsonl")}
 
 
-def test_another_rank_checks_its_arguments_and_writes_nothing(toy_moe, tmp_path, monkeypatch):
+def test_another_rank_checks_its_arguments_and_writes_no_manifest(toy_moe, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("RANK", "1")
     with pytest.raises(ValueError, match="project"):
@@ -329,7 +332,9 @@ def test_another_rank_checks_its_arguments_and_writes_nothing(toy_moe, tmp_path,
     session = tensorquill.init(toy_moe, run_id="r", project="granite")
     session.close()
     assert session.manifest is None
-    assert sorted(p.name for p in (tmp_path / "tensorquill-out").iterdir()) == ["r.rank1.end.json", "r.rank1.jsonl"]
+    # Its numerical settings, beside its records (lane AR-6): rank 0's are in the manifest.
+    assert sorted(p.name for p in (tmp_path / "tensorquill-out").iterdir()) == [
+        "r.rank1.end.json", "r.rank1.jsonl", "r.rank1.settings.json"]
 
 
 # --- The sender ---------------------------------------------------------------------------------
