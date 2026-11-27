@@ -52,9 +52,12 @@ def _status(missing: list[int], omitted: int | None = None, world: int | None = 
 
 
 def _unknown(status: dict, judged=(0, 1)) -> list[int]:
+    return _unknown_reason(status, judged).get("ranks", [])
+
+
+def _unknown_reason(status: dict, judged=(0, 1)) -> dict:
     found = run_state(incidents=[], steps_judged=True, status=status, judged_ranks=list(judged))
-    reason = next((r for r in found["reasons"] if r["code"] == "ranks_unknown"), None)
-    return reason["ranks"] if reason else []
+    return next((r for r in found["reasons"] if r["code"] == "ranks_unknown"), {})
 
 
 # --- A status with no such key reads exactly as before ---------------------------------------------
@@ -106,13 +109,17 @@ def test_the_run_state_counts_the_ranks_the_status_counts_and_does_not_list():
     """No world size, ranks 0 and 1501 connected: the status lists 1 to 1000 and counts 1001 to 1500."""
     ranks = [_rank(0), _rank(1501)]
     status = _status(list(range(1, 1001)), 500, ranks=ranks)
-    assert _unknown(status, judged=(0, 1501)) == list(range(1, 1501))
+    # Since lane AS-1 the reason lists the lowest 1,000 of the 1,500 and counts the others, as the server's.
+    reason = _unknown_reason(status, judged=(0, 1501))
+    assert (reason["ranks"], reason["ranks_omitted"]) == (list(range(1, 1001)), 500)
+    assert reason["detail"].startswith("1500 ranks without a current report"), reason["detail"]
 
 
 def test_the_counted_ranks_stop_at_the_limit():
     ranks = [_rank(0), _rank(MAX_EXPECTED_RANKS - 1)]
     status = _status(list(range(1, 1001)), MAX_EXPECTED_RANKS - 1002, ranks=ranks)
-    assert _unknown(status, judged=(0, MAX_EXPECTED_RANKS - 1)) == list(range(1, MAX_EXPECTED_RANKS - 1))
+    reason = _unknown_reason(status, judged=(0, MAX_EXPECTED_RANKS - 1))
+    assert (reason["ranks"], reason["ranks_omitted"]) == (list(range(1, 1001)), MAX_EXPECTED_RANKS - 1002)
     # A rank over the limit names nothing below it, as the server's `rank_taken`.
     over = _status(list(range(1, 1001)), 7, ranks=[_rank(0), _rank(MAX_EXPECTED_RANKS + 5)])
     assert _unknown(over, judged=(0,)) == [*range(1, 1001)]
@@ -151,7 +158,7 @@ needs_server = pytest.mark.skipif(BINARY is None, reason="tensorquill-server is 
 def test_the_python_run_state_counts_what_the_servers_counts(tmp_path, monkeypatch):
     """Rank 1500 alone, with no world size: the server lists 1,000 of the 1,500 ranks below it and
     counts the rest. Its run state (Rust, in `watchdog.json`) and Python's, from the same status,
-    name the same unknown ranks: Rust lists the lowest 1,000 and counts the others, Python lists all."""
+    name the same unknown ranks: each lists the lowest 1,000 and counts the others (lane AS-1)."""
     import torch
 
     import tensorquill
@@ -196,12 +203,14 @@ def test_the_python_run_state_counts_what_the_servers_counts(tmp_path, monkeypat
         # from this status alone with the connected rank judged.
         whole = tensorquill.build_evidence(store / "runs" / "many")
         python_whole = next((r for r in whole["run_state"]["reasons"] if r["code"] == "ranks_unknown"), {})
-        python = _unknown(status, judged=[r["rank"] for r in status["ranks"]])
+        python = _unknown_reason(status, judged=[r["rank"] for r in status["ranks"]])
         session.close()
     finally:
         server.terminate()
-    assert python == list(range(1500))  # before this item: the listed 1,000 only
-    # Rust lists the lowest 1,000 of the 1,500 and counts the other 500; Python lists all 1,500, from
-    # the status alone and in its engine over the store.
-    assert rust["ranks"] == python[:1000] and rust["ranks_omitted"] == 500, rust
-    assert python_whole["ranks"] == python, python_whole.get("detail")
+    # Before this item Python counted the listed 1,000 only. Since lane AS-1 both engines list the
+    # lowest 1,000 of the 1,500 and count the other 500, Python from the status alone and in its
+    # engine over the store.
+    assert (python["ranks"], python["ranks_omitted"]) == (list(range(1000)), 500), python.get("detail")
+    assert python["detail"].startswith("1500 ranks without a current report"), python["detail"]
+    assert rust["ranks"] == python["ranks"] and rust["ranks_omitted"] == 500, rust
+    assert (python_whole["ranks"], python_whole.get("ranks_omitted")) == (python["ranks"], 500), python_whole.get("detail")

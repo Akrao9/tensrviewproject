@@ -2188,6 +2188,8 @@ mod lane_ad8_tests;
 #[cfg(test)]
 mod lane_ar4_tests;
 #[cfg(test)]
+mod lane_as1_tests;
+#[cfg(test)]
 mod wave_ah_tests;
 
 #[cfg(test)]
