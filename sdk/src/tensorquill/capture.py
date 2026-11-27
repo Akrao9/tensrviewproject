@@ -545,7 +545,8 @@ def _warn(message: str, stacklevel: int = 2) -> None:
     on the `tensorquill` logger, which prints it to stderr when no handler is set, and the
     caller goes on. A filter that ignores the warning still silences it."""
     try:
-        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel + 1)
+        # While `init` runs, at its caller's line (`manifest.at_the_caller`, lane AR-7).
+        warnings.warn(message, RuntimeWarning, stacklevel=_manifest._pointing(stacklevel + 1))
     except Exception:  # noqa: BLE001
         try:
             _log.warning("%s", message)
@@ -5716,6 +5717,7 @@ def _close_stream(sink: Any) -> None:
 
 
 @torch.compiler.disable
+@_manifest.at_the_caller  # every warning `init` gives names the line that called it (lane AR-7)
 def init(
     model: nn.Module,
     *,

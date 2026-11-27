@@ -25,6 +25,7 @@ import math
 import os
 import re
 import sys
+import threading
 import unicodedata
 import warnings
 from collections.abc import Mapping
@@ -60,6 +61,59 @@ MANIFEST_SEND_BYTES = 60_000
 _RANK_FILE = re.compile(r"^(?P<run_id>.+)\.rank[0-9]+(?:\.[0-9]+)?\.jsonl$")
 
 
+# The frame that called `tensorquill.init`, on this thread, while that call runs (`at_the_caller`), or
+# None. Every warning `init` gives points there (lane AR-7): `init` runs under `torch.compiler.disable`,
+# whose wrapper adds frames that a fixed `stacklevel` cannot count on every PyTorch version.
+_caller = threading.local()
+
+
+def at_the_caller(function: Any) -> Any:
+    """`function` (`capture.init`), made to keep the frame that called it while it runs, for
+    `_pointing`: the first frame above it that is not in PyTorch's own folder, so the wrapper of
+    `torch.compiler.disable` around it, however many frames that is, is passed over. Kept per thread,
+    and put back as it was when the call ends, so a warning given after `init` points where it did."""
+    import functools
+
+    @functools.wraps(function)
+    def kept(*args: Any, **kwargs: Any) -> Any:
+        before = getattr(_caller, "frame", None)
+        frame = None
+        try:
+            frame = sys._getframe(1)
+            torch = sys.modules.get("torch")
+            folder = os.path.dirname(getattr(torch, "__file__", None) or "") if torch is not None else ""
+            while folder and frame is not None and frame.f_code.co_filename.startswith(folder + os.sep):
+                frame = frame.f_back
+        except Exception:  # noqa: BLE001  a frame not found leaves each warning's own stacklevel
+            frame = None
+        _caller.frame = frame
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _caller.frame = before
+            del frame
+
+    return kept
+
+
+def _pointing(stacklevel: int) -> int:
+    """The `stacklevel` for `warnings.warn`, called by the function that calls this one: one that
+    names the caller of `tensorquill.init` while that call runs on this thread (`at_the_caller`),
+    else `stacklevel`. Never raises."""
+    try:
+        target = getattr(_caller, "frame", None)
+        if target is None:
+            return stacklevel
+        frame, level = sys._getframe(1), 1
+        while frame is not None:
+            if frame is target:
+                return level
+            frame, level = frame.f_back, level + 1
+    except Exception:  # noqa: BLE001
+        pass
+    return stacklevel
+
+
 def _say(message: str, stacklevel: int = 2) -> None:
     """`warnings.warn(message, RuntimeWarning)`, which never raises (lane Y6, XC3). Under
     `python -W error` (or a filter that makes a RuntimeWarning an error) the message is logged
@@ -70,7 +124,7 @@ def _say(message: str, stacklevel: int = 2) -> None:
     does. The same as `tracker._say` and `capture._warn`, kept here since this module imports
     nothing else of the package; `flight.py` uses it too."""
     try:
-        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel + 1)
+        warnings.warn(message, RuntimeWarning, stacklevel=_pointing(stacklevel + 1))
     except Exception:  # noqa: BLE001  nothing here may stop a run
         try:
             import logging

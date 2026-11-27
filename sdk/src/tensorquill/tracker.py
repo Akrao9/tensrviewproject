@@ -506,7 +506,9 @@ def _say(message: str, stacklevel: int = 2) -> None:
     saying that something was passed over never becomes the failure it reports. `stacklevel`
     counts from the caller, as `warnings.warn`'s does."""
     try:
-        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel + 1)
+        from .manifest import _pointing  # the caller of `tensorquill.init`, while it runs (lane AR-7)
+
+        warnings.warn(message, RuntimeWarning, stacklevel=_pointing(stacklevel + 1))
     except Exception:  # noqa: BLE001  nothing here may stop a run
         try:
             logging.getLogger("tensorquill").warning("%s", message)
