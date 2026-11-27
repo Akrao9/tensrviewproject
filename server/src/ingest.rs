@@ -1248,6 +1248,8 @@ impl Ingest {
             let rows = batch.num_rows();
             buffer.rows += rows;
             buffer.bytes += bytes;
+            #[cfg(test)]
+            injected::here(&key.0, injected::Point::Accept);
             buffer.batches.push(batch);
             return Ok((Some((last, rows)), not_newer));
         }
@@ -1841,17 +1843,16 @@ impl Ingest {
                 if let Some(descriptor) = &message.inner.flight_descriptor {
                     let parsed = parse_descriptor(descriptor)?;
                     self.watchdog.stream_opened(&parsed, Instant::now());
-                    self.streams
-                        .lock()
-                        .unwrap()
-                        .entry(parsed.clone())
-                        .or_default()
-                        .push(OpenStream {
-                            id: stream_id,
-                            attempt: None,
-                            counted: true,
-                        });
+                    let mut streams = self.streams.lock().unwrap();
+                    streams.entry(parsed.clone()).or_default().push(OpenStream {
+                        id: stream_id,
+                        attempt: None,
+                        counted: true,
+                    });
                     *key = Some(parsed);
+                    #[cfg(test)]
+                    injected::here(&key.as_ref().unwrap().0, injected::Point::HoldingStreams);
+                    drop(streams);
                 }
             }
             let DecodedPayload::RecordBatch(batch) = message.payload else {
@@ -3210,6 +3211,51 @@ impl FlightService for IngestService {
         unimplemented()
     }
 }
+
+/// Test only (lane AR-4): a panic injected into a stream's task at a chosen point, to show its
+/// clean-up runs on a panic outside the decode. Under `cfg(test)`, so it is compiled into this
+/// crate's own unit tests alone: no build of the server binary, of the library others link, or of
+/// `server/tests/` holds it or its calls.
+#[cfg(test)]
+mod injected {
+    use std::sync::{Mutex, PoisonError};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Point {
+        /// In `accept_attempt`, after the rank's step watermark and its counts were moved for a batch's
+        /// rows and before the rows are held: the buffer is half changed.
+        Accept,
+        /// In `run_stream`, at the stream's first message, while the `streams` mutex is held: it is
+        /// poisoned.
+        HoldingStreams,
+    }
+
+    /// What the injected panic says.
+    pub(super) const MESSAGE: &str = "a panic injected by a lane AR-4 test";
+
+    static ARMED: Mutex<Vec<(String, Point)>> = Mutex::new(Vec::new());
+
+    /// The next stream task of `run` to reach `point` panics there, once. Keyed by run, so tests
+    /// that run at once do not set off each other's.
+    pub(super) fn arm(run: &str, point: Point) {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((run.to_string(), point));
+    }
+
+    pub(super) fn here(run: &str, point: Point) {
+        let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = armed.iter().position(|(armed, at)| armed == run && *at == point) {
+            armed.remove(at);
+            drop(armed);
+            panic!("{MESSAGE}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_ar4_tests;
 
 /// Returns whether a cached watchdog status older than `elapsed` should be rewritten.
 ///
