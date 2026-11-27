@@ -1869,6 +1869,9 @@ class Session:
         self._scaler_verdict_late = False
         self._pending_scalars: dict[str, Any] = {}
         self._late_said = False  # a scalar left out for want of a step in memory was said (`_no_step_for`)
+        # While `close()` runs: what `_no_step_for` would say, held until the writer has ended and said
+        # only if capture did not stop (lane AR-5). None at any other time.
+        self._close_said: list[str] | None = None
         # The mirror's mark (`mirror._log_into`, section Q5): set while it logs a value it brought, and
         # the names it left pending, with the count of steps ended when it did.
         self._mirroring = False
@@ -3147,7 +3150,13 @@ class Session:
         logged under "eval", "close" for one pending at `close()`. A value the mirror brought (its
         mark, `_log_mirrored`) gets one more sentence: the mirror passes no step (Q7). The text is
         the case of the first value left out; later ones are left out silently. This is the one
-        place that decides it."""
+        place that decides it.
+
+        Inside `close()` the warning is held (`_close_said`) until the writer has ended, and given
+        only if capture has not stopped by then (lane AR-5, the coordinator's rule): once capture
+        has stopped for a cause, a value pending at `close()` is lost with the steps after the stop,
+        and the stop's one warning is what the session says. Before, which was said depended on how
+        far the writer thread had got when `close()` took the value as pending."""
         if self._late_said:
             return
         self._late_said = True
@@ -3169,13 +3178,16 @@ class Session:
                                        and any(name in pending for name in names))
         mirror = (" It came from your tracker's log call through mirror_scalars, which cannot pass a step (the "
                   "tracker's own step is ignored): call session.log(..., step=...) yourself for it.") if mirrored else ""
-        _warn(
+        message = (
             f"TensorQuill left out the scalar{'s' if len(names) != 1 else ''} {shown}: {case}, when no step is in "
             "memory. To record it, log it with an explicit step, which writes a scalar-only record: "
             f"session.log({{{names[0]!r}: value}}, step={self._suggested_step()}), {which}.{mirror} Said once per "
-            "session.",
-            stacklevel=4,
+            "session."
         )
+        if self._close_said is not None:
+            self._close_said.append(message)  # said by `close()` once the writer has ended, if nothing stopped
+            return
+        _warn(message, stacklevel=4)
 
     def data(
         self,
@@ -4879,7 +4891,12 @@ class Session:
         the writer, which may be stuck in the sink, is waited for `STOPPED_CLOSE_SECONDS` at most;
         a sink still in a write is not closed under it (only a stream's heartbeat and sender are
         stopped), and the writer, a daemon thread, does not hold the process. Inside `with
-        session:` the training's own exception comes out unchanged."""
+        session:` the training's own exception comes out unchanged.
+
+        A scalar still pending here with no step in memory to take it is said to be left out once
+        the writer has ended, and not at all when capture has stopped by then (`_no_step_for`): the
+        stop's warning is then the one thing `close()` says, whether the sink's failure came before
+        `close()` or during it."""
         if self._closed:
             return
         self._closed = True
@@ -4906,6 +4923,7 @@ class Session:
         deadline = time.monotonic() + CLOSE_SECONDS
         if not self._stopped:
             self._close_by = deadline  # the last block may wait for room, up to the deadline (`_put`)
+            self._close_said = []  # a value left out for want of a step is said below, unless capture stops
             self._take_traced_late()
             self._attach_pending()  # logged after the last step ended: on that step (`log`)
             self._flush(hold_newest=False)  # the public `flush()` does nothing once closed
@@ -4934,6 +4952,11 @@ class Session:
                 self._sink.close()
             except Exception as error:  # noqa: BLE001
                 self._stop(error, reason="sink_error")
+        # Every stop `close()` can make has had its chance: a value left out for want of a step is said
+        # now, and only if capture has not stopped, whose one warning then stands alone (`_no_step_for`).
+        held, self._close_said = self._close_said, None
+        if held and not self._stopped:
+            _warn(held[0], stacklevel=2)
         # A closed session issues no collective again (its optimizer hooks are off), so it lets go of
         # the process group: one that the job destroys is then not kept alive by a session object
         # the caller still holds. So of the store, once the writer can no longer read the launch.
@@ -5762,7 +5785,8 @@ def init(
             or `grpcs://host:port`. Defaults to `TENSORQUILL_ENDPOINT`; when neither is set
             no socket is opened. For custom/self-signed server certificates under `grpcs://`,
             set `TENSORQUILL_TLS_CA` to the PEM CA path. Needs `pip install pyarrow`.
-            See `flight.py`.
+            A second writer of the run's rank (one that found the rank's file held and writes
+            `<run_id>.rank<N>.<pid>.jsonl`) streams nothing and says so once. See `flight.py`.
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
             the model has no repeated blocks. `"all"`: every leaf module with parameters,
