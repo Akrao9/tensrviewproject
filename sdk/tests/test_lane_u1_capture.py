@@ -840,15 +840,13 @@ def test_a_stop_known_before_log_is_the_one_thing_said(tmp_path):
     assert _steps_of(path) == [0, 1, 2]
 
 
-@pytest.mark.xfail(strict=True, reason="today close() also says the scalar was left out for want of a "
-                   "training step, beside the stop's warning (lane AR-5, part 2 a)")
 def test_a_sink_that_fails_after_flush_and_before_close_leaves_the_stop_as_the_one_thing_said(tmp_path):
     """Order 2: the sink's failure comes after `log` and `flush()` (the session has not learnt of it,
     so `log` took the scalar as pending), and before `close()`. The rule (the coordinator's): once
     capture has stopped for a cause, a scalar still pending at `close()` is not reported as left out
     for want of a training step; the stop's warning is the one thing said.
 
-    Before lane AR-5's change, `close()` said two things here, in this order: "TensorQuill left out the
+    Before lane AR-5's change (part 2 b), `close()` said two things here, in this order: "TensorQuill left out the
     scalar 'loss': it was still pending at close() after flush() with no training step since, ...",
     and then the stop's warning, "TensorQuill stopped capturing for this session: its sink raised
     OSError: disk gone. ..." The first gives a reason that is not why the value was lost."""
@@ -874,13 +872,11 @@ def test_a_sink_that_fails_after_flush_and_before_close_leaves_the_stop_as_the_o
     assert _steps_of(path) == [0, 1, 2]
 
 
-@pytest.mark.xfail(strict=True, reason="today close() also says the scalar was left out for want of a "
-                   "training step, beside the stop's warning (lane AR-5, part 2 a)")
 def test_a_sink_that_fails_inside_close_leaves_the_stop_as_the_one_thing_said(tmp_path):
     """Order 3: the sink's failure comes inside `close()`, once `close()` has taken the scalar as
     pending and waits for the writer. The same rule as order 2.
 
-    Before lane AR-5's change, `close()` said the same two things as in order 2."""
+    Before lane AR-5's change (part 2 b), `close()` said the same two things as in order 2."""
     path = tmp_path / "run.rank0.jsonl"
     model = nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
