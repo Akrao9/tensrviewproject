@@ -1777,6 +1777,29 @@ def detect_watchdog_incidents(status: Mapping[str, Any] | None) -> list[dict[str
     return found
 
 
+def _missing_omitted(status: Mapping[str, Any] | None) -> int:
+    """How many missing ranks the status counts and does not list (`missing_ranks_omitted`, written by
+    a server since wave AR, lane AR-4, only when some are left out), or 0."""
+    found = status.get("missing_ranks_omitted") if status else None
+    return found if isinstance(found, int) and not isinstance(found, bool) and found > 0 else 0
+
+
+def _missing_counted(status: Mapping[str, Any] | None) -> list[int]:
+    """The ranks a status counts as missing and does not list, as the server's `run_state` rebuilds
+    them: every rank not seen below the larger of its world size and its highest connected rank plus
+    one, at most `MAX_EXPECTED_RANKS`, less the listed ones. Empty for a status with no count, so such
+    a status reads as before."""
+    if not _missing_omitted(status):
+        return []
+    connected = {r.get("rank") for r in status.get("ranks") or () if isinstance(r, Mapping)}
+    numbers = [r for r in connected if isinstance(r, int) and not isinstance(r, bool) and 0 <= r < MAX_EXPECTED_RANKS]
+    world = status.get("world_size")
+    below = world if isinstance(world, int) and not isinstance(world, bool) and 0 < world <= MAX_EXPECTED_RANKS else 0
+    below = max(below, max(numbers, default=-1) + 1)
+    listed = set(status.get("missing_ranks") or ())
+    return [rank for rank in range(below) if rank not in connected and rank not in listed]
+
+
 def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     if not status or status.get("summary") not in ("stalled", "degraded"):
         return []
@@ -1819,6 +1842,7 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
             "step": max(steps, default=0),
             "ranks": held,
             "missing_ranks": list(status.get("missing_ranks", ())),
+            **({"missing_ranks_omitted": _missing_omitted(status)} if _missing_omitted(status) else {}),
             **common,
             **_capture_stopped_keys(held),
         }]
@@ -1834,6 +1858,7 @@ def _progress_incidents(status: Mapping[str, Any] | None) -> list[dict[str, Any]
         "ranks": affected,
         "other_ranks": others,
         "missing_ranks": list(status.get("missing_ranks", ())),
+        **({"missing_ranks_omitted": _missing_omitted(status)} if _missing_omitted(status) else {}),
         "newest_step": max(steps, default=0),
         **common,
         **_capture_stopped_keys(affected),
@@ -4622,6 +4647,7 @@ def run_state(
         expected = {r for r in status.get("missing_ranks") or () if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(world_size, int) and not isinstance(world_size, bool) and 0 < world_size <= MAX_EXPECTED_RANKS:
             expected |= set(range(world_size)) - listed
+        expected |= set(_missing_counted(status))  # those the status counts and does not list (lane AR-4)
         for rank in sorted(expected - judged):
             unknown.setdefault(rank, "the server's status expects it and it has not connected")
         for rank, why in _not_current_by_status(status, judged_attempts or {}).items():
@@ -4807,7 +4833,7 @@ class _StatusAgeTracker:
 def _status_stamp(status: Mapping[str, Any] | None, status_age: float | None) -> Any:
     return status and (
         status["summary"],
-        tuple(status.get("missing_ranks", ())),
+        tuple(status.get("missing_ranks", ())) + _omitted_stamp(status),
         json.dumps(status.get("pauses", {}), sort_keys=True),
         status.get("recommended_silent_seconds"),
         tuple(
@@ -4819,6 +4845,13 @@ def _status_stamp(status: Mapping[str, Any] | None, status_age: float | None) ->
         # Where each stopped rank is, not for how long: a stack that arrives, or moves, is news.
         tuple((r.get("rank"), stack_signature(r)) for r in status["ranks"] if isinstance(r, Mapping) and r.get("stack")),
     )
+
+
+def _omitted_stamp(status: Mapping[str, Any] | None) -> tuple[Any, ...]:
+    """The count of missing ranks a status does not list, for the watcher's stamps: nothing for a
+    status with no count, so its stamp is as before."""
+    omitted = _missing_omitted(status)
+    return (("omitted", omitted),) if omitted else ()
 
 
 def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None, other_stamp: Any) -> Any:
@@ -4833,7 +4866,7 @@ def _grace_alert_key(status: Mapping[str, Any] | None, status_age: float | None,
     summary = status.get("summary") if status and status.get("summary") in ("stalled", "degraded", "server_stopped") else None
     return (
         summary,
-        tuple(status.get("missing_ranks", ())) if status else (),
+        tuple(status.get("missing_ranks", ())) + _omitted_stamp(status) if status else (),
         json.dumps(incidents, sort_keys=True),
         status_age is not None,
         other_stamp,
@@ -5299,6 +5332,10 @@ def _ranks_without_folder(folders: Mapping[int, Path], status: Mapping[str, Any]
     for number in status.get("missing_ranks") or ():
         if isinstance(number, int) and number not in folders:
             reasons[number] = "the server's status lists this rank as never connected, and nothing is stored for it"
+    for number in _missing_counted(status):
+        if number not in folders:
+            reasons.setdefault(number, "the server's status counts this rank as never connected (beyond the ranks it "
+                                       "lists), and nothing is stored for it")
     return reasons
 
 
@@ -8746,8 +8783,12 @@ def _describe_stream(incident: Mapping[str, Any]) -> str:
             continue
         parts.append(f"rank {r['rank']} sent no new step since step {r['last_step']} ({_how_stopped(r)})")
     if incident["missing_ranks"]:
-        parts.append("ranks " + ", ".join(str(r) for r in incident["missing_ranks"][:8]) + " never connected"
-                     " (if only some ranks call tensorquill.init, ignore this)")
+        shown = incident["missing_ranks"][:8]
+        omitted = incident.get("missing_ranks_omitted")
+        more = (len(incident["missing_ranks"]) - len(shown) + omitted
+                if isinstance(omitted, int) and not isinstance(omitted, bool) and omitted > 0 else 0)
+        parts.append("ranks " + ", ".join(str(r) for r in shown) + (f" and {more} more" if more else "")
+                     + " never connected (if only some ranks call tensorquill.init, ignore this)")
     return (
         f"Ranks out of step with the job: {'; '.join(parts)} while others reached step {incident['newest_step']}."
         + (_lost_text(incident) if incident.get("assessment") == "lost_connection" else

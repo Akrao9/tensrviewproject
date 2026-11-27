@@ -182,16 +182,26 @@ def test_the_python_run_state_counts_what_the_servers_counts(tmp_path, monkeypat
                 status = json.loads(status_file.read_text())
             except (FileNotFoundError, ValueError):
                 status = None
-            if status and status.get("missing_ranks_omitted"):
+            unknown = next((r for r in (status or {}).get("run_state", {}).get("reasons", ())
+                            if r.get("code") == "ranks_unknown"), None)
+            # The count is there, and the server's report of rank 1500 is current (it is judged).
+            if status and status.get("missing_ranks_omitted") and unknown \
+                    and len(unknown["ranks"]) + unknown.get("ranks_omitted", 0) == 1500:
                 break
             time.sleep(0.2)
         assert status and status.get("missing_ranks_omitted") == 500, status
         assert status["missing_ranks"] == list(range(1000))
         rust = next(r for r in status["run_state"]["reasons"] if r["code"] == "ranks_unknown")
-        rust_ranks = set(rust["ranks"]) | set(range(1000, 1000 + rust.get("ranks_omitted", 0)))
+        # Python's own engine over the store (it reads the same `watchdog.json`), and its run state
+        # from this status alone with the connected rank judged.
+        whole = tensorquill.build_evidence(store / "runs" / "many")
+        python_whole = next((r for r in whole["run_state"]["reasons"] if r["code"] == "ranks_unknown"), {})
         python = _unknown(status, judged=[r["rank"] for r in status["ranks"]])
         session.close()
     finally:
         server.terminate()
-    assert len(rust["ranks"]) == 1000 and rust["ranks"] == python[:1000]
-    assert set(python) == rust_ranks == set(range(1500))
+    assert python == list(range(1500))  # before this item: the listed 1,000 only
+    # Rust lists the lowest 1,000 of the 1,500 and counts the other 500; Python lists all 1,500, from
+    # the status alone and in its engine over the store.
+    assert rust["ranks"] == python[:1000] and rust["ranks_omitted"] == 500, rust
+    assert python_whole["ranks"] == python, python_whole.get("detail")
