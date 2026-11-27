@@ -14,9 +14,10 @@ already is. No capture writes such a number." With it the same bound on `overflo
 `evidence.head_logit_trends`. Rust's `int` (`detect/data.rs`) reads a whole number that is an `i64`
 and nothing else, so Python is brought to Rust: the three `_int` cases moved from `STILL_DIFFER`
 to `AGREE`, and `BOUNDS` checks each integer `_int` reads that a rule reports from at `2**63 - 1`,
-`2**63`, `-(2**63)`, `-(2**63) - 1` and `2**64`. Rust reads `overflow_positions` as a `u64`
-(`HeadTrends::row`), so there the int64 bound leaves `2**63` to `2**64 - 1` read by Rust only
-(`test_head_trends_past_int64_still_differ_on_the_raw_route`; the lane's report).
+`2**63`, `-(2**63)`, `-(2**63) - 1` and `2**64`. Rust's `HeadTrends::row` reads
+`overflow_positions` within int64 too (the coordinator's choice, Nov 27, 2026; until then it read any
+`u64`). Their sums part only past `2**64 - 1`, where Rust's saturates: held as a strict expected
+failure.
 
 `STILL_DIFFER` holds what the author left as it is (Nov 27, 2026), each a strict expected failure:
 where Python writes an oversized value as text, `str(10**400)` is its digits and Rust writes the
@@ -231,16 +232,26 @@ def _raw_head_trends(records: list[dict[str, Any]], tmp_path: Path) -> tuple[Any
     return python, rust
 
 
-@pytest.mark.parametrize("n", [1, INT64_MAX, 2**64, BIG], ids=["1", "2**63 - 1", "2**64", "10**400"])
-def test_head_trends_within_int64_or_past_u64_agree_on_the_raw_route(n, tmp_path):
+@pytest.mark.parametrize("n", [1, INT64_MAX, 2**63, 2**64 - 1, 2**64, BIG],
+                         ids=["1", "2**63 - 1", "2**63", "2**64 - 1", "2**64", "10**400"])
+def test_head_trends_read_overflow_positions_alike_on_the_raw_route(n, tmp_path):
+    # Nov 27, 2026: Rust's `HeadTrends::row` reads the count only from 1 to 2**63 - 1 as well (the
+    # coordinator's choice of the two ways in the lane's report). Until then it read any u64, and
+    # from 2**63 to 2**64 - 1 only Rust read it.
     python, rust = _raw_head_trends([_record(0, probe={"head": {"mean": 1.0, "overflow_positions": n}})], tmp_path)
     assert python == rust
 
 
+def test_head_trends_sum_two_counts_of_the_largest_int64_alike_on_the_raw_route(tmp_path):
+    python, rust = _raw_head_trends([_record(s, probe={"head": {"mean": 1.0, "overflow_positions": INT64_MAX}})
+                                     for s in range(2)], tmp_path)
+    assert python == rust and python["overflow_positions"]["positions"] == 2**64 - 2
+
+
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "Rust's HeadTrends::row reads overflow_positions as a u64, so 2**63 to 2**64 - 1 is read there and "
-    "not by Python's int64 bound (the author's, Nov 27, 2026); the lane's report gives the two ways to close it"))
-def test_head_trends_past_int64_still_differ_on_the_raw_route(tmp_path):
-    python, rust = _raw_head_trends([_record(0, probe={"head": {"mean": 1.0, "overflow_positions": 2**63}})],
-                                    tmp_path)
+    "positions past 2**64 - 1 (three counts of 2**63 - 1): Python writes the exact sum, Rust's u64 sum "
+    "saturates at 2**64 - 1. A known difference, as D5: no capture counts that many positions"))
+def test_head_trends_sum_past_the_largest_u64_still_differs_on_the_raw_route(tmp_path):
+    python, rust = _raw_head_trends([_record(s, probe={"head": {"mean": 1.0, "overflow_positions": INT64_MAX}})
+                                     for s in range(3)], tmp_path)
     assert python == rust

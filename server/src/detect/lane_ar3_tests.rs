@@ -290,6 +290,57 @@ fn d2_a_head_probe_keeps_the_valid_siblings_of_an_oversized_integer() {
     );
 }
 
+/// The report's `head_trends.overflow_positions` for probes whose `overflow_positions` are
+/// `counts`, written as JSON number texts.
+fn overflow_positions(counts: &[&str]) -> Value {
+    let rows: Vec<Row> = counts
+        .iter()
+        .enumerate()
+        .map(|(step, count)| {
+            let text = format!(r#"{{"head": {{"mean": 1.0, "overflow_positions": {count}}}}}"#);
+            row(step as i64, "probe_json", &text)
+        })
+        .collect();
+    report_of(&rows)["head_trends"]["overflow_positions"].clone()
+}
+
+#[test]
+fn a_head_probes_overflow_positions_are_read_only_from_1_to_the_largest_i64() {
+    // Nov 27, 2026: Python's `head_logit_trends` reads the count only within int64 (the author:
+    // "bound Python's `data_checks._int` at int64 ... with `overflow_positions`"), and Rust reads it
+    // so too (the coordinator's choice of the two ways in lane AR-3's report): until then Rust read
+    // any `u64`, and from 2**63 to 2**64 - 1 only Rust read it.
+    assert_eq!(
+        overflow_positions(&["9223372036854775807"]),
+        json!({"probes": 1, "positions": 9223372036854775807_u64, "most": 9223372036854775807_u64,
+               "first_step": 0, "latest_step": 0})
+    );
+    for count in [
+        "9223372036854775808",
+        "18446744073709551615",
+        "18446744073709551616",
+        "0",
+        "-1",
+        "2.0",
+        "true",
+    ] {
+        assert_eq!(overflow_positions(&[count]), Value::Null, "{count}");
+    }
+}
+
+#[test]
+fn the_positions_of_head_probes_sum_exactly_up_to_the_largest_u64() {
+    // Two counts of 2**63 - 1 sum to 2**64 - 2, held exactly. A sum past 2**64 - 1 needs three
+    // such probes: Rust then writes 2**64 - 1 and Python the exact sum, a known difference (no
+    // capture counts that many positions).
+    let most = "9223372036854775807";
+    assert_eq!(
+        overflow_positions(&[most, most])["positions"],
+        json!(18446744073709551614_u64)
+    );
+    assert_eq!(overflow_positions(&[most, most, most])["positions"], json!(u64::MAX));
+}
+
 // --- checkpoint_json ------------------------------------------------------------------------------
 
 #[test]
