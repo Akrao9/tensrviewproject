@@ -51,7 +51,10 @@ METADATA_KEY = "run_manifest"  # the key in a Flight batch's app_metadata
 # (`MANIFEST_MAX_BYTES` in `server/src/ingest.rs`); this is below it, since the two write
 # numbers a little differently.
 MANIFEST_SEND_BYTES = 60_000
-_RANK_FILE = re.compile(r"^(?P<run_id>.+)\.rank\d+\.jsonl$")
+# A rank's records file, `<run_id>.rank<N>.jsonl`, or a second writer's of the same rank,
+# `<run_id>.rank<N>.<pid>.jsonl` (`sink.JsonlSink`, lane AQ-2): read from the right, ASCII digits
+# only, as `sink.records_file_parts` reads it (lane AR-6). The run ID may hold dots.
+_RANK_FILE = re.compile(r"^(?P<run_id>.+)\.rank[0-9]+(?:\.[0-9]+)?\.jsonl$")
 
 
 def _say(message: str, stacklevel: int = 2) -> None:
@@ -599,9 +602,10 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> bool:
 
 
 def run_id_of_file(path: str | Path) -> str | None:
-    """The run ID a file named `<run_id>.rank<N>.jsonl` carries. The match is anchored at the
-    end, since a run ID may hold dots (`run-slurm1234.0`)."""
-    found = _RANK_FILE.match(Path(path).name)
+    """The run ID a file named `<run_id>.rank<N>.jsonl` or `<run_id>.rank<N>.<pid>.jsonl` (a second
+    writer's) carries. The match is anchored at the end, since a run ID may hold dots
+    (`run-slurm1234.0`)."""
+    found = _RANK_FILE.fullmatch(Path(path).name)
     return found.group("run_id") if found else None
 
 
