@@ -162,9 +162,31 @@ def test_two_writers_of_one_rank_both_given_an_endpoint_make_one_stream_of_that_
             session.close()
 
 
-def test_a_third_writer_in_this_process_does_not_stream_either(here):
+@pytest.fixture
+def an_earlier_stream_still_ending(request):
+    """For `earlier="still_ending"`: a thread named as a sender's of rank 0, alive through the test, as
+    the sender thread of the test before (closed with `close(0.0)`, not waited for) was still ending
+    under the gate's load of Nov 27, 2026. A stand-in, so that the linger is certain."""
+    if request.param != "still_ending":
+        yield None
+        return
+    done = threading.Event()
+    thread = threading.Thread(target=done.wait, name="tensorquill-flight-rank0", daemon=True)
+    thread.start()
+    try:
+        yield thread
+    finally:
+        done.set()
+        thread.join(5)
+
+
+@pytest.mark.parametrize("an_earlier_stream_still_ending", ["none", "still_ending"], indirect=True)
+def test_a_third_writer_in_this_process_does_not_stream_either(here, an_earlier_stream_still_ending):
     """The third writer writes into the second's pid file, unlocked (lane AQ-2's choice 6): it is
-    still not the rank's first writer, so it streams nothing."""
+    still not the rank's first writer, so it streams nothing.
+
+    The gate of Nov 27, 2026 on 1dddcce, side by side with the whole suite: this test counted one
+    `tensorquill-flight-rank0` thread, the sender of the test before, still ending."""
     one, _, _, _ = _init("same")
     two, _, _, _ = _init("same", endpoint=NOWHERE)
     three, said, model, _ = _init("same", endpoint=NOWHERE)
