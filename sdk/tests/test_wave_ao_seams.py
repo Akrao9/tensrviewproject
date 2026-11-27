@@ -837,13 +837,17 @@ def test_both_engines_judge_a_memory_count_rust_cannot_hold_alike(place, value):
 
 
 def test_a_step_too_large_for_a_float_gives_no_trend_and_raises_nothing():
-    """A step is any integer of 0 or more to the readers; past a float's range no trend can place
-    it (`robust_trend`), so there is none, and the rest of the evidence is read."""
+    """Past a float's range no trend can place a step (`robust_trend`), so there is none. Since wave AR
+    (AQ5-D6, `WAVE_AF_CONTRACT.md` section 12) a step past Int64 is not valid: the readers refuse the
+    records by name, as they refuse a negative step, where before they judged them."""
+    from tensorquill.identity import MalformedRecordError
+
     rows = [{"schema_version": 1, "run_id": "r", "rank": 0, "step": step, "grad_norm": 1.0} for step in range(30)]
     rows.append({"schema_version": 1, "run_id": "r", "rank": 0, "step": BIG, "grad_norm": 1.0})
     assert evidence.robust_trend([*range(29), BIG], [1.0] * 30) is None
-    found = evidence.build_evidence(rows, detectors="python")
-    assert found["run_state"]["state"] == "healthy"
+    with pytest.raises(MalformedRecordError) as raised:
+        evidence.build_evidence(rows, detectors="python")
+    assert raised.value.field == "step" and raised.value.where == "record 30 of the records passed"
 
 
 def _replica_records(fp_of_rank_1: list) -> list[dict]:
