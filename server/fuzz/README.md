@@ -41,8 +41,9 @@ its error exit; the guard keeps the panic hook quiet for them. So:
 - `decode_put` treats that status as an error like any other. An `INTERNAL` status saying the decode
   panicked is a panic the guard caught outside Arrow: the target panics on it, so the run stops there.
 - `detect_stream` runs `detect::detect_stream` inside `decode_guard::offline`, as `main` runs
-  `detect`. The reads are in `src/detect.rs`, so `detect_stream` alone still panics where Arrow's
-  reader does; the command, and this target, do not.
+  `detect`. Since lane AR-7 the reads in `src/detect.rs` are guarded themselves
+  (`decode_guard::collect_batches`), so `detect_stream` alone returns the malformed-batch error too;
+  `offline` stands behind it, as it does in `main`.
 
 libFuzzer's own hook aborts on a panic. The guard's hook is installed after it, at the first guarded
 call, and is kept quiet only for a panic raised in an Arrow crate during a guarded call, which it lets
