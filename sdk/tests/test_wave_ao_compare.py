@@ -209,27 +209,38 @@ def test_the_summary_names_grad_norm_the_total_gradient_norm():
 # --- BUG-29: the listing ------------------------------------------------------------------------
 
 
-def test_a_resumed_files_last_step_at_or_above_2_63_is_the_one_compare_gives(tmp_path):
+# Wave AR, lane AR-2 (AQ5-D6, the author: "identity.check bounded at int64"): a step past Int64 is no
+# longer read, so these three no longer hold the listing to compare's last step. Compare refuses the
+# file by name, as it refuses a negative step, and the listing does not raise and shows the step as
+# written, as it shows a negative one (WAVE_AF_CONTRACT.md sections 1 and 12).
+def _past_int64_refused_by_compare_and_listed(path: Path, listed: int, line: int) -> None:
+    from tensorquill.identity import MalformedRecordError
+
+    (row,) = runs.list_runs(path.parent)
+    assert row["last_step"] == listed
+    with pytest.raises(MalformedRecordError) as raised:
+        open_run(path)
+    assert raised.value.field == "step" and raised.value.where == f"{path}, line {line}"
+
+
+def test_a_resumed_files_last_step_at_or_above_2_63_is_listed_and_refused_by_compare(tmp_path):
     big = 2**63 + 9
     path = write(tmp_path / "runs" / "far.rank0.jsonl",
                  [step_row("far", 1, 0), step_row("far", 1, 1), step_row("far", 2, 1), step_row("far", 2, big)])
-    (row,) = runs.list_runs(tmp_path / "runs")
-    assert row["last_step"] == open_run(path)["last_step"] == big
+    _past_int64_refused_by_compare_and_listed(path, big, 4)
 
 
-def test_a_resumed_file_whose_later_attempt_resumed_above_2_63_rolls_back_from_there(tmp_path):
+def test_a_resumed_file_whose_later_attempt_resumed_above_2_63_is_listed_from_there_and_refused_by_compare(tmp_path):
     big = 2**63
     path = write(tmp_path / "runs" / "far.rank0.jsonl",
                  [step_row("far", 1, s) for s in (0, big + 1, big + 5)] + [step_row("far", 2, big + 2)])
-    (row,) = runs.list_runs(tmp_path / "runs")
-    assert row["last_step"] == open_run(path)["last_step"] == big + 2
+    _past_int64_refused_by_compare_and_listed(path, big + 2, 2)
 
 
-def test_one_attempts_last_step_at_or_above_2_63_is_kept_as_before(tmp_path):
+def test_one_attempts_last_step_at_or_above_2_63_is_listed_and_refused_by_compare(tmp_path):
     big = 2**63 + 3
     path = write(tmp_path / "runs" / "far.rank0.jsonl", [step_row("far", 1, 0), step_row("far", 1, big)])
-    (row,) = runs.list_runs(tmp_path / "runs")
-    assert row["last_step"] == open_run(path)["last_step"] == big
+    _past_int64_refused_by_compare_and_listed(path, big, 2)
 
 
 def test_a_resumed_files_last_step_below_2_63_is_unchanged(tmp_path):

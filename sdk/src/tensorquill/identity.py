@@ -8,12 +8,15 @@ engine is chosen, and refuses the whole input on the first record that is not va
 | Field            | Absent                    | Valid when present                     |
 |------------------|---------------------------|----------------------------------------|
 | `schema_version` | read as 0, the legacy one | the integer 0, 1 or 2 (`SCHEMA_VERSIONS`); 2 for a scalar-only record alone |
-| `rank`           | read as on the base       | an integer of 0 or more                |
-| `attempt`        | read as 0                 | an integer of 0 or more                |
-| `step`           | not valid                 | an integer of 0 or more                |
+| `rank`           | read as on the base       | an integer of 0 or more that Int32 holds |
+| `attempt`        | read as 0                 | an integer of 0 or more that Int64 holds |
+| `step`           | not valid                 | an integer of 0 or more that Int64 holds |
 
 A Boolean, a float (also a whole one, `1.0`), text and `null` are not integers. `run_id` is not
-looked at. There is no upper bound here: a value too large for its column is Arrow's to refuse.
+looked at. The upper bounds are the columns' (`BOUNDS`: Int64 for `step` and `attempt`, Int32 for
+`rank`; `WAVE_AF_CONTRACT.md` section 12, AQ5-D6): a value past one is not valid, so a record either
+engine cannot read is refused by both, by name, where before Python judged it and the Rust route
+raised a bare `OverflowError` or `ArrowInvalid`. `seq` is not bounded here (`flight._seq` bounds it).
 
 Record version 2 is the scalar-only record (`WAVE_AL_CONTRACT.md` sections 3 and 4.2): a record of
 version 2 is valid only with `"record": "scalars"` and a `seq` that is an integer of 0 or more,
@@ -40,6 +43,9 @@ SCALAR_VERSION = 2
 SCALAR_RECORD = "scalars"
 # Checked in this order; the first field that is not valid is the one named.
 FIELDS = ("schema_version", "rank", "attempt", "step")
+# The largest value each integer field's column holds (`flight.flight_schema()`), and the column's type:
+# a larger value is not valid (`WAVE_AF_CONTRACT.md` section 12; AQ5-D6, the author's answer).
+BOUNDS = {"rank": (2**31 - 1, "Int32"), "attempt": (2**63 - 1, "Int64"), "step": (2**63 - 1, "Int64")}
 _ABSENT = object()
 
 
@@ -133,6 +139,9 @@ def check(record: Mapping[str, Any], where: str | None = None, fields: tuple[str
             continue
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise MalformedRecordError(field, value, where, "tensorquill reads an integer of 0 or more")
+        bound, column = BOUNDS[field]
+        if value > bound:
+            raise MalformedRecordError(field, value, where, f"tensorquill reads an integer of 0 or more that {column} holds")
     if scalar:
         value = record.get("seq", _ABSENT)
         if value is _ABSENT or isinstance(value, bool) or not isinstance(value, int) or value < 0:

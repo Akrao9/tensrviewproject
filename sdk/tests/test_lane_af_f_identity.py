@@ -66,8 +66,13 @@ def test_the_first_field_in_the_fixed_order_is_named():
     assert raised.value.field == "rank"
 
 
-def test_no_upper_bound_and_run_id_is_not_looked_at():
-    assert check({**GOOD, "step": 2**70, "rank": 2**40, "attempt": 2**63}) is None
+def test_the_bounds_are_the_columns_and_run_id_is_not_looked_at():
+    # Wave AR, AQ5-D6 (WAVE_AF_CONTRACT.md section 12): before, there was no upper bound.
+    assert check({**GOOD, "step": 2**63 - 1, "rank": 2**31 - 1, "attempt": 2**63 - 1}) is None
+    for field, value in (("step", 2**70), ("rank", 2**40), ("attempt", 2**63)):
+        with pytest.raises(MalformedRecordError) as raised:
+            check({**GOOD, field: value})
+        assert raised.value.field == field
     assert check({"step": 5, "run_id": None}) is None
     assert check({"step": 0, "schema_version": 0}) is None
 

@@ -301,6 +301,15 @@ def _weight_check(record: Mapping[str, Any]) -> bool:
     return isinstance(norms, Mapping) and any(_wire_float(v) is not _UNCARRIED for v in norms.values())
 
 
+def _held_update_sizes(record: Mapping[str, Any]) -> bool:
+    """Whether a record carries `update_rms` as both engines count it: a map with at least one entry
+    its column holds (`_wire_float`; a null counts, as Rust's map column keeps the entry). A map whose
+    every entry is refused (a text that is not the sink's spelling, a bool, an integer too large for
+    a float) is an absent key (WAVE_AJ_CONTRACT.md section 2; AQ5-D1): the column is null in Rust."""
+    sizes = record.get("update_rms")
+    return isinstance(sizes, Mapping) and any(_wire_float(v) is not _UNCARRIED for v in sizes.values())
+
+
 def effective_overload_threshold(
     n_experts: int,
     routed_tokens: int,
@@ -1914,7 +1923,9 @@ def detect_stalled_weights(
       history, so a later streak can still fire.
 
     A row whose total gradient norm is not finite adds nothing to a streak (mixed-precision
-    loss scaling skips those optimizer steps on purpose) but its resets apply. A skipped
+    loss scaling skips those optimizer steps on purpose) but its resets apply. A `grad_norm` the
+    float64 column refuses (a bool, other text, a list, an integer too large for a float) is read
+    as left out, as Rust reads it (AQ5-D3): it does not stop the streak. A skipped
     update (`step_skipped`), whoever reported it, is read the same way: the weights were not
     meant to move (STEP_AND_EVIDENCE_CONTRACT.md, section 1): a streak carries across it. So is
     a step on which the scaler skipped some optimizers and applied others (`step_skipped_part`,
@@ -1971,8 +1982,12 @@ def detect_stalled_weights(
         unchanged = _unchanged_names(record)
         if unchanged is None:
             continue
-        evidence = (_finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None) \
-            and skipped_by(record) is None
+        # A step whose total gradient norm is not finite is no evidence of a stall (`non_finite` is
+        # its finding). A value the column refuses (a bool, other text, a list, an integer too large
+        # for a float) is absent, as Rust reads it, and so is evidence (AQ5-D3, the author: "a top-level
+        # grad_norm that is not a number is absent in Python too").
+        total = _wire_float(record.get("grad_norm"))
+        evidence = (total is None or total is _UNCARRIED or math.isfinite(total)) and skipped_by(record) is None
         grads = _object(record, "grad_norms")
         unchanged_set = set(unchanged)
         for name in streak:
@@ -3631,10 +3646,9 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         norms, layers = bool(_object(record, "grad_norms")), bool(layer_entries(record))
         counts["grad_total"] += total
         # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
-        counts["update"] += (
-            total and isinstance(record.get("update_rms"), Mapping) and bool(record["update_rms"])
-            and not record.get("step_skipped")
-        )
+        # A map with no entry its column holds is an absent key (WAVE_AJ_CONTRACT.md section 2;
+        # AQ5-D1, the author: "Python brought to Rust"), as `_weight_check` reads `weight_norms`.
+        counts["update"] += total and _held_update_sizes(record) and not record.get("step_skipped")
         counts["weight_check"] += _unchanged_names(record) is not None and norms
         # A skip only the caller reported is not the loss scale's to judge unless the scaler was seen
         # to apply that update (`detect_loss_scale_trouble`).
