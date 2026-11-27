@@ -1170,10 +1170,12 @@ def _next_attempt() -> int:
 
 
 def _coming_attempt() -> int:
-    """The attempt `_next_attempt` would give now, without taking it: what `init` checks against the
-    server's bound before the stream starts (`flight.attach`), as the session takes its attempt later.
-    It can only be smaller than the one taken, by a session started in between on another thread."""
-    return max(time.time_ns() // 1_000_000, _last_attempt + 1)
+    """The least attempt `_next_attempt` can give next, without taking it or reading the clock: what
+    `init` checks against the server's Int64 bound before the stream starts (`flight.attach`), as the
+    session takes its attempt later. Past the bound it is exactly the one taken, since the clock in
+    milliseconds is far below it; a session started in between on another thread can only make the
+    one taken larger. It reads no clock, so a caller that replaces this module's `time` changes nothing."""
+    return _last_attempt + 1
 
 
 # The attempt of the session handing its work counter to a heartbeat on this thread, while it does
