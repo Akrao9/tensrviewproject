@@ -105,6 +105,9 @@ D7_CASES = {
     "a text and a bool beside a number": [
         _record(115, scalars={"flag": True, "train/loss": "text", "acc": 0.5}), _record(115)],
     "a text beside the sink's nan": [_record(115, scalars={"train/loss": "text", "acc": "nan"}), _record(115)],
+    # Seed 3569, which AQ-5 filed under D7: a null, which the column holds as null and Rust's context
+    # skips. Python leaves it out too (lane AR-1's choice: a null is no value, as in its median).
+    "a null beside a number": [_record(115, scalars={"train/loss": None, "acc": 0.5}), _record(115)],
     "the records before the step hold a text too": (
         [_record(s, scalars={"acc": float(s), "train/loss": "text"}) for s in range(5)]
         + [_record(5, scalars={"acc": 9.0, "train/loss": [1]}), _record(5)]),
@@ -126,19 +129,20 @@ def test_d7_the_context_holds_the_sibling_and_not_the_refused_entry(engine):
     assert context(D7_CASES["a text beside a number"]) == sibling
     assert context(D7_CASES["a number too large for a float beside a number"]) == sibling
     assert context(D7_CASES["a text and a bool beside a number"]) == sibling
+    assert context(D7_CASES["a null beside a number"]) == sibling
     assert context(D7_CASES["AQ5-D7 a scalars entry the column refuses, a text"]) is None
     assert context(D7_CASES["the records before the step hold a text too"]) == {
         "acc": {"value": 9.0, "median_before": 2.0}}
 
 
 def test_d7_python_reads_what_the_column_holds_under_scalars():
-    """`scalar_context` alone: a number, a null and the sink's "nan" are held as before; a text, a list,
-    an object, a bool and a number too large for a float are absent."""
+    """`scalar_context` alone: a number and the sink's "nan" are shown as before; a text, a list, an
+    object, a bool and a number too large for a float are absent, and so is a null (no value)."""
     records = [_record(0, scalars={"a": 1.0, "b": None, "c": "nan", "d": "NaN", "e": [1], "f": {}, "g": True,
                                    "h": HUGE, "i": 3})]
     assert evidence.scalar_context(records, 0) == {
-        "a": {"value": 1.0, "median_before": None}, "b": {"value": None, "median_before": None},
-        "c": {"value": "nan", "median_before": None}, "i": {"value": 3, "median_before": None}}
+        "a": {"value": 1.0, "median_before": None}, "c": {"value": "nan", "median_before": None},
+        "i": {"value": 3, "median_before": None}}
 
 
 # --- AQ5-D7: the sender's row and its read-back -------------------------------------------------------
