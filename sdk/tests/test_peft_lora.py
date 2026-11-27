@@ -11,9 +11,10 @@ counts when any parameter given is a trainable one; a healthy run raises nothing
 only a plain `nn.Linear` head and refuses any other without raising; an adapter-only state dict
 is compared, its frozen absences raise nothing and a trainable tensor left out of it is named; and
 a resume from an adapter folder that left nothing out raises nothing. The adapter file that
-`save_pretrained` writes names its tensors without the adapter's name (`lora_A.weight`, where the
-model has `lora_A.default.weight`); whether such a file should be compared with the model is not
-decided, so nothing is asserted about whether it is.
+`save_pretrained` writes, and `get_peft_model_state_dict`'s dict, name their tensors without the
+adapter's name (`lora_A.weight`, where the model has `lora_A.default.weight`), so neither is
+compared with the model today: the last three tests pin what that gives, and are expected to
+change when `peft`'s saved names are mapped onto the model's.
 
 Each test takes `transformers` and `peft` with `pytest.importorskip` inside the test, so the file
 collects everywhere and skips test by test where either is absent.
@@ -259,8 +260,9 @@ def test_an_adapter_folder_resume_that_left_nothing_out_raises_nothing(monkeypat
     weights are left out on purpose), beside the optimizer's state and the other files the
     `Trainer` writes. A second attempt builds the base again, loads the adapter with
     `PeftModel.from_pretrained`, restores the optimizer and resumes. Nothing is raised, and nothing
-    of the model is named missing or of another shape. Whether the adapter file's tensors are
-    compared with the model is not decided, and is not held."""
+    of the model is named missing or of another shape. That the adapter file's tensors are not
+    compared with the model today is pinned below
+    (`test_a_lora_tensor_missing_from_a_peft_adapter_folder_is_not_named_today`)."""
     transformers, peft = _libraries(monkeypatch)
     model = _lora_model(transformers, peft)
     optimizer = _adamw(model)
@@ -350,3 +352,127 @@ def test_an_adapter_tensor_left_out_of_an_adapter_only_state_dict_is_named(monke
     _, evidence = _adapter_dict_resume(transformers, peft, drop=dropped)
     missing = [f for f in _model_findings(evidence) if f["finding"] == "missing_tensors"]
     assert missing == [{"component": "model", "finding": "missing_tensors", "count": 1, "tensors": [dropped]}]
+
+
+# ---- what `peft`'s own saved names give today -------------------------------------------------
+#
+# `peft` saves its tensors without the adapter's name (`…q_proj.lora_A.weight`, where the model
+# holds `…q_proj.lora_A.default.weight`), so neither the folder `save_pretrained` writes nor
+# `get_peft_model_state_dict`'s dict is compared with the model. The three tests below pin that, as
+# the README says it; each is expected to change when `peft`'s saved names are mapped onto the
+# model's.
+
+DROPPED_SAVED = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+DROPPED_IN_MODEL = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
+
+
+def test_a_lora_tensor_missing_from_a_peft_adapter_folder_is_not_named_today(monkeypatch, tmp_path):
+    """Pins today's behaviour; expected to change when `peft`'s saved names are mapped.
+
+    The folder as the `Trainer` leaves it, with one LoRA tensor deleted from
+    `adapter_model.safetensors` before the resume. `peft` loads the rest and leaves that tensor as
+    the new base initialised it, so the resumed model really lost it. The load reads `unavailable`,
+    `not_identified`: nothing names the tensor, no incident is raised and the run reads healthy."""
+    transformers, peft = _libraries(monkeypatch)
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    model = _lora_model(transformers, peft)
+    optimizer = _adamw(model)
+    folder = tmp_path / "checkpoint-4"
+    first, second = tensorquill.MemorySink(), tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=first, run_id="peft-folder-drop", **QUIET)
+    _train(model, optimizer, 4)
+    model.save_pretrained(folder)
+    saved = safetensors_torch.load_file(folder / "adapter_model.safetensors")
+    assert DROPPED_SAVED in saved and DROPPED_IN_MODEL not in saved  # the adapter's name is not saved
+    del saved[DROPPED_SAVED]
+    safetensors_torch.save_file(saved, folder / "adapter_model.safetensors")
+    torch.save(optimizer.state_dict(), folder / "optimizer.pt")
+    for name in ("scheduler.pt", "rng_state.pth"):
+        (folder / name).write_bytes(b"")
+    (folder / "trainer_state.json").write_text("{}")
+    session.checkpoint_files(folder, event="save")
+    session.close()
+
+    time.sleep(0.01)
+    torch.manual_seed(1)
+    base = transformers.LlamaForCausalLM(model.base_model.model.config)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # peft's own "Found missing adapter keys" names it; TensorQuill does not
+        resumed = peft.PeftModel.from_pretrained(base, folder, is_trainable=True)
+    assert not torch.equal(resumed.get_parameter(DROPPED_IN_MODEL), model.get_parameter(DROPPED_IN_MODEL).detach())
+    optimizer = _adamw(resumed)
+    optimizer.load_state_dict(torch.load(folder / "optimizer.pt"))
+    session = tensorquill.init(resumed, sink=second, run_id="peft-folder-drop", start_step=4, **QUIET)
+    session.checkpoint_files(folder, event="load")
+    _train(resumed, optimizer, 2, first=4)
+    session.close()
+
+    [load] = [r["checkpoint"]["load"] for r in second.records if "load" in r.get("checkpoint", {})]
+    assert "model" in load["components"]
+    assert load["tensors"] == {"state": "unavailable", "why": "not_identified"}
+    evidence = ev.build_evidence(first.records + second.records, detectors="python")
+    assert [(e["state"], e["why"]) for e in evidence["checkpoint_tensors"]["entries"]] == [("unavailable", "not_identified")]
+    assert evidence["incidents"] == [] and evidence["run_state"]["state"] == "healthy"
+
+
+def _peft_dict_resume(transformers, peft, *, model_state: bool):
+    """Four steps, then a second attempt that restores the adapter from `peft`'s own dict
+    (`get_peft_model_state_dict`, loaded back with `set_peft_model_state_dict`) and the optimizer,
+    recorded with `session.checkpoint(state, event="load")`, with or without `model_state=`."""
+    model = _lora_model(transformers, peft)
+    optimizer = _adamw(model)
+    first, second = tensorquill.MemorySink(), tensorquill.MemorySink()
+    session = tensorquill.init(model, sink=first, run_id="peft-own-dict", **QUIET)
+    _train(model, optimizer, 4)
+    saved = peft.get_peft_model_state_dict(model)
+    assert DROPPED_SAVED in saved and len(saved) == len(_trainable(model))
+    state = {"model": saved, "optimizer": optimizer.state_dict()}
+    session.checkpoint(state, event="save")
+    session.close()
+    time.sleep(0.01)
+    resumed = _lora_model(transformers, peft, seed=1)
+    peft.set_peft_model_state_dict(resumed, saved)
+    for name in _trainable(model):  # the resume is healthy: every adapter weight is back
+        assert torch.equal(resumed.get_parameter(name), model.get_parameter(name).detach()), name
+    optimizer = _adamw(resumed)
+    optimizer.load_state_dict(state["optimizer"])
+    session = tensorquill.init(resumed, sink=second, run_id="peft-own-dict", start_step=4, **QUIET)
+    if model_state:
+        session.checkpoint(state, event="load", model_state=saved)
+    else:
+        session.checkpoint(state, event="load")
+    _train(resumed, optimizer, 2, first=4)
+    session.close()
+    [load] = [r["checkpoint"]["load"] for r in second.records if "load" in r.get("checkpoint", {})]
+    return load, ev.build_evidence(first.records + second.records, detectors="python")
+
+
+def test_a_healthy_resume_from_peft_s_own_dict_reports_the_model_not_identified_today(monkeypatch):
+    """Pins today's behaviour; expected to change when `peft`'s saved names are mapped.
+
+    Without `model_state=`, the dict's entry is not taken for the model's (it is listed under
+    `other`), so `resume_incomplete` gains `{"component": "model", "finding": "not_identified"}`,
+    an observation, and the run stays healthy. `rng` and `data` are named missing too, which is
+    true: this checkpoint holds neither."""
+    transformers, peft = _libraries(monkeypatch)
+    load, evidence = _peft_dict_resume(transformers, peft, model_state=False)
+    assert sorted(load["components"]) == ["optimizer"]
+    assert load["other"] == ["model"]
+    assert load["tensors"] == {"state": "unavailable", "why": "not_identified"}
+    assert _model_findings(evidence) == [{"component": "model", "finding": "not_identified"}]
+    assert [i["kind"] for i in evidence["incidents"]] == ["resume_incomplete"]
+    assert ev.INCIDENT_CLASSES["resume_incomplete"] == "observation"
+    assert evidence["run_state"]["state"] == "healthy"
+
+
+def test_peft_s_own_dict_named_with_model_state_reads_names_differ_today(monkeypatch):
+    """Pins today's behaviour; expected to change when `peft`'s saved names are mapped.
+
+    With `model_state=` the entry is the model's, but none of its 8 names is one of the model's,
+    so the tensors read `unavailable`, `names_differ`, and nothing of the model is named."""
+    transformers, peft = _libraries(monkeypatch)
+    load, evidence = _peft_dict_resume(transformers, peft, model_state=True)
+    assert load["tensors"] == {"state": "unavailable", "why": "names_differ",
+                               "closest": {"entry": "model", "checkpoint": 8, "matched": 0}}
+    assert _model_findings(evidence) == []
+    assert evidence["run_state"]["state"] == "healthy"
