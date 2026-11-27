@@ -382,7 +382,7 @@ There are four, not three.
 
 - **Its keys are these nine and no others.**
   - `step` is the x-axis: an integer of 0 or more, as `identity.check` requires of every record.
-  - `seq` is an integer of 0 or more, counted per session (so per attempt) from 0, in the order of the `log` calls.
+  - `seq` is an integer of 0 or more that Int64 holds, counted per session (so per attempt) from 0, in the order of the `log` calls. A record whose `seq` is past Int64 is refused by every reader (`identity.check`, Nov 27, 2026).
   - `ts` is when `log` was called, in Unix seconds.
   - `scalars` holds numbers only, as `Session._scalar_values` gives them. A non-finite value is written as the sink's string.
 - **The capture writes one for an explicit `step=`.** It never writes one for a value logged without it that a step in memory takes, even one naming the step in progress.

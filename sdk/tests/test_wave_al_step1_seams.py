@@ -482,7 +482,7 @@ def test_the_identity_rules_name_the_row_versions_detect_reads():
     identity_section = flat(README[README.index("**A record's identity fields.**"):
                                    README.index("**Several refused batches in a row.**")])
     assert ("| `schema_version` | read as 0, the legacy version | the integer 0 or 1, or 2 for a scalar-only record: "
-            '`"record": "scalars"` and a `seq` that is an integer of 0 or more |') in identity_section
+            '`"record": "scalars"` and a `seq` that is an integer of 0 or more that Int64 holds |') in identity_section
     assert "a row the server stores carries row version 2, with the record's own in `record_version`" in identity_section
     assert "and a `schema_version` other than 0, 1 or 2." in identity_section
     assert "other than 0 or 1" not in identity_section
