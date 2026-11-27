@@ -96,6 +96,11 @@ jobs:
           python packaging/requirements.py dev lightning huggingface rerun flight nvml > "$RUNNER_TEMP/requirements.txt"
           pip install -r "$RUNNER_TEMP/requirements.txt"
           pip install --no-deps -e .
+          # peft, for tests/test_peft_lora.py only, so not an extra of the package. Its requirements are lower bounds
+          # (torch>=1.13, accelerate>=0.21, transformers with none) that the lines above already meet, and pip leaves a
+          # met requirement as it is: torch, transformers and accelerate do not move. The next line shows them.
+          pip install "peft==0.22.0"
+          python -c "import torch, transformers, accelerate, peft; print(torch.__version__, transformers.__version__, accelerate.__version__, peft.__version__)"
       - name: Tests
         run: pytest -ra
       - name: Gate 1 fixtures through the SDK pipeline

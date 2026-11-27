@@ -158,11 +158,13 @@ def _histc_counts(values: torch.Tensor, bins: int, lo: float, hi: float) -> list
 def _not_plain_linear(module: nn.Module) -> str | None:
     """Why `module` cannot be read as the head, or None. Only `nn.Linear`'s own forward is
     known to compute `x @ weight.T + bias`; a subclass with its own forward (quantized,
-    sharded, soft-capped) may compute something else, so it is refused, not guessed."""
+    sharded, soft-capped) may compute something else, so it is refused, not guessed. The class is
+    named with its module: `peft`'s LoRA layer is called `Linear` too."""
+    named = f"{type(module).__module__}.{type(module).__qualname__}"
     if not isinstance(module, nn.Linear):
-        return f"is a {type(module).__name__}, not an nn.Linear"
+        return f"is a {named}, not an nn.Linear"
     if type(module).forward is not nn.Linear.forward:
-        return f"is a {type(module).__name__}, a subclass of nn.Linear with its own forward"
+        return f"is a {named}, a subclass of nn.Linear with its own forward"
     if not module.weight.is_floating_point():
         return f"has a {module.weight.dtype} weight"
     return None
