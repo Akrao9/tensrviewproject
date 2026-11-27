@@ -596,13 +596,17 @@ def scalar_context(
     """Values logged with `session.log` at `step`, each with the median of its finite
     values over the previous `window` records, so an incident shows what the loss did.
     A bool logged as a scalar is left out (DET-16): it is not a measurement, and the row sent
-    to the Rust detectors, whose scalars are numbers, cannot carry it either."""
+    to the Rust detectors, whose scalars are numbers, cannot carry it either. So is every other
+    entry the `scalars` column cannot hold (`_wire_float`: a text other than the sink's "nan",
+    "inf" and "-inf", an integer too large for a float, a list, an object) and a name Arrow cannot
+    encode, and its siblings are kept, as Rust reads them (AQ5-D7, the author, Nov 26, 2026;
+    `WAVE_AJ_CONTRACT.md` section 3). Before, such an entry was shown with its raw value."""
     index = next((i for i, record in enumerate(records) if record.get("step") == step), None)
     if index is None:
         return {}
     context = {}
     for name, value in _object(records[index], "scalars").items():
-        if isinstance(value, bool):
+        if _wire_float(value) is _UNCARRIED or not _encodable(name):
             continue
         before = [
             v for v in (_finite(_object(r, "scalars").get(name)) for r in records[max(0, index - window) : index])
@@ -610,6 +614,17 @@ def scalar_context(
         ]
         context[name] = {"value": value, "median_before": _median(before) if before else None}
     return context
+
+
+def _encodable(name: Any) -> bool:
+    """Whether a map's name is text Arrow can hold as a key: a string without a lone surrogate."""
+    if not isinstance(name, str):
+        return False
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 class _Baseline:

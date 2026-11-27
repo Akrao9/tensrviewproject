@@ -4528,8 +4528,14 @@ impl Scalars {
     }
 
     /// The scalars a row logged, as (name, value), its nulls left out.
+    ///
+    /// A row whose column is null may be one a sender built before AQ5-D7 (`WAVE_AJ_CONTRACT.md`
+    /// section 3; the author, Nov 26, 2026): lane W3's rule moved the whole map to `extra_json` for
+    /// one refused entry. Its entries the column would hold are read from there, as Python reads the
+    /// record back (`aside_scalars`), so its siblings are kept in both engines. A row of today's
+    /// sender with a null column holds no such entry there, and reads as before.
     fn logged(&mut self, columns: &Columns, row: usize, out: &mut Vec<(usize, f64)>) {
-        if let Some(scalars) = &columns.scalars {
+        if let Some(scalars) = columns.scalars.as_ref().filter(|scalars| !scalars.map.is_null(row)) {
             let entries = scalars.row(row);
             let first_entry = entries.start;
             for entry in entries {
@@ -4537,6 +4543,16 @@ impl Scalars {
                     let at = self.name_at(entry - first_entry, scalars.keys.value(entry));
                     out.push((at, scalars.values.value(entry)));
                 }
+            }
+            return;
+        }
+        let Some(Value::Object(aside)) = aside_scalars(columns, row) else {
+            return;
+        };
+        for (guess, (name, value)) in aside.iter().enumerate() {
+            if let Some(value) = held_scalar(value) {
+                let at = self.name_at(guess, name);
+                out.push((at, value));
             }
         }
     }
@@ -4593,6 +4609,33 @@ impl Scalars {
                 self.spare = given_up;
             }
         }
+    }
+}
+
+/// The `scalars` a row's `extra_json` holds, or None when it holds none. `extra_json` is parsed only
+/// on a row that names the key; a number too large for a float in it reads as unreadable
+/// (`extra_json::parse`), so the other entries are kept.
+fn aside_scalars(columns: &Columns, row: usize) -> Option<Value> {
+    let extra = text(columns.extra, row).filter(|extra| extra.contains("\"scalars\""))?;
+    match extra_json::parse(extra)? {
+        Value::Object(mut extra) => extra.remove("scalars"),
+        _ => None,
+    }
+}
+
+/// One `scalars` entry from JSON as the column would hold it (`flight.py`'s `_float`): a number, or
+/// the sink's "nan", "inf" and "-inf". A null is no value, as in the column; a bool, any other text
+/// (the unreadable number among them), a list and an object are refused, and absent.
+fn held_scalar(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => match text.as_str() {
+            "nan" => Some(f64::NAN),
+            "inf" => Some(f64::INFINITY),
+            "-inf" => Some(f64::NEG_INFINITY),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

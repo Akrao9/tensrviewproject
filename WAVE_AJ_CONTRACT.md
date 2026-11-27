@@ -63,10 +63,17 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 
 ## 3. Outside this contract
 
-**`scalars`** keeps lane W3's rule.
-- A bool entry is dropped from the row and does not travel in `extra_json`.
-- Any other refused entry (a string, a number too large) still sends the whole `scalars` map to `extra_json`.
-- This is unchanged in wave AJ, and listed as open.
+**`scalars`: closed, the rule changed (the author, Nov 26, 2026, lane AR-1, AQ5-D7).** The author: "A refused entry of `scalars` is absent and its siblings are kept, in both engines." Lane W3's whole-map rule, kept through wave AJ and listed here as open, is gone.
+- **What the column holds** is what it held before: an entry is held when it is a number that is not a bool and fits a float, `null` (stored as null), or one of the strings `"nan"`, `"inf"`, `"-inf"`, under a name Arrow can encode.
+- **A refused entry leaves the column alone** (the sender's `_scalars`, on `rows_to_send` and on the raw `detect` stream). Refused means a text other than those three, an integer too large for a float, a list, an object, or a name Arrow cannot encode. The held entries stay in the column.
+- **Where it goes.** It travels in `extra_json` under `scalars`, holding only the entries the column does not hold, as the maps of section 1 do. A bool goes there too, and an integer past 2**53 travels there exactly beside its rounded value in the column, both as before (wave AO).
+- **When no entry is held** and one is refused, the whole map goes to `extra_json` and the column is null, as before. A map with nothing refused but bools makes the same row as before, so does a map held whole.
+- **`moved`** names `scalars` once per row when an entry was refused by an overflow or by Arrow, as before. A type refusal (a text, a list) is not counted.
+- **Reading a row back.** `row_to_record` merges `extra_json["scalars"]` into the typed map, so the record comes back whole. The refused entries come after the column's, as a bool does.
+- **What both engines read.** A refused entry is absent from an incident's scalar context and from the median before it, and its siblings are kept: Python's `scalar_context` skips it, and Rust never sees it in the column.
+- **A row stored before the change** has a null `scalars` column and the whole map in `extra_json`. Rust reads such a row's held entries from `extra_json` when the column is null, as Python reads the record back, so both show the siblings there too. A number too large for a float in that text is read as unreadable (`detect/extra_json.rs`), so the rest of the row is kept.
+- **A server built before the change** reads the new sender's rows from the column: it sees the siblings and never the refused entry, which is what the new engines report.
+- A `null` entry is held by the column as null and skipped by Rust's scalar context, while Python's shows it with no value. That predates this change and is not decided here (lane AR-1's report).
 
 **`records_to_batch` and the raw `detect` stream** now build rows as before and redo with Arrow's check only the rows Arrow refuses. A valid record's row is unchanged, and a key column Arrow refuses still raises.
 

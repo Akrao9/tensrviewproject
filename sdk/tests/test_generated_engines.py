@@ -377,17 +377,6 @@ HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
         "as above: Python judges, the Rust path raises ArrowInvalid (found by hand from D6)",
         [_record(3, rank=2**31, grad_norm=1.0)],
     ),
-    # Seed 4082, two records.
-    "AQ5-D7 a scalars entry the column refuses, in an incident's context": (
-        "Python's scalar context of the repeated_steps incident shows the refused value (-10**400, or a "
-        "text); Rust's shows no scalars, the whole map being in extra_json (lane W3's rule, WAVE_AJ_CONTRACT.md "
-        "section 3, listed there as open)",
-        [_record(115, scalars={"train/loss": -(10**400)}), _record(115)],
-    ),
-    "AQ5-D7 a scalars entry the column refuses, a text": (
-        "as above, for a text value",
-        [_record(115, scalars={"train/loss": "text"}), _record(115)],
-    ),
 }
 
 
