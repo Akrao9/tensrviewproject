@@ -88,6 +88,12 @@ def _stream_threads(rank: int = 0) -> dict[str, int]:
     return {kind: names.count(f"tensorquill-{kind}-rank{rank}") for kind in ("flight", "heartbeat")}
 
 
+def _new_stream_threads(before: set[threading.Thread], rank: int = 0) -> dict[str, int]:
+    """`_stream_threads`, counting only the threads not alive in `before`."""
+    names = [thread.name for thread in threading.enumerate() if thread not in before]
+    return {kind: names.count(f"tensorquill-{kind}-rank{rank}") for kind in ("flight", "heartbeat")}
+
+
 def _streams(session) -> bool:
     return hasattr(session._sink, "sender") or hasattr(session._sink, "heartbeat")
 
@@ -162,16 +168,40 @@ def test_two_writers_of_one_rank_both_given_an_endpoint_make_one_stream_of_that_
             session.close()
 
 
-def test_a_third_writer_in_this_process_does_not_stream_either(here):
+@pytest.fixture
+def an_earlier_stream_still_ending(request):
+    """For `earlier="still_ending"`: a thread named as a sender's of rank 0, alive through the test, as
+    the sender thread of the test before (closed with `close(0.0)`, not waited for) was still ending
+    under the gate's load of Nov 27, 2026. A stand-in, so that the linger is certain."""
+    if request.param != "still_ending":
+        yield None
+        return
+    done = threading.Event()
+    thread = threading.Thread(target=done.wait, name="tensorquill-flight-rank0", daemon=True)
+    thread.start()
+    try:
+        yield thread
+    finally:
+        done.set()
+        thread.join(5)
+
+
+@pytest.mark.parametrize("an_earlier_stream_still_ending", ["none", "still_ending"], indirect=True)
+def test_a_third_writer_in_this_process_does_not_stream_either(here, an_earlier_stream_still_ending):
     """The third writer writes into the second's pid file, unlocked (lane AQ-2's choice 6): it is
-    still not the rank's first writer, so it streams nothing."""
+    still not the rank's first writer, so it streams nothing.
+
+    The gate of Nov 27, 2026 on 1dddcce, side by side with the whole suite: this test counted one
+    `tensorquill-flight-rank0` thread, the sender of the test before, still ending. So the count is
+    of the threads started since this test began."""
+    before = set(threading.enumerate())
     one, _, _, _ = _init("same")
     two, _, _, _ = _init("same", endpoint=NOWHERE)
     three, said, model, _ = _init("same", endpoint=NOWHERE)
     try:
         assert three._sink.path == two._sink.path
         assert not _streams(two) and not _streams(three)
-        assert _stream_threads() == {"flight": 0, "heartbeat": 0}
+        assert _new_stream_threads(before) == {"flight": 0, "heartbeat": 0}
         assert len(said) == 2 and "lock" in said[0], said
         _assert_not_streamed_said(said[1], three._sink.path, "same.rank0.jsonl")
         _train(model, 1)

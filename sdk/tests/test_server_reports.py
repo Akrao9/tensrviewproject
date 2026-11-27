@@ -256,15 +256,54 @@ def test_a_report_left_behind_by_a_restart_without_detection_goes_stale(tmp_path
     assert stream.server.terminate() == 0
 
 
+class _ClockAt:
+    """The `time` module, but for `time()`, which gives `at`: `evidence`'s wall clock held at one moment."""
+
+    def __init__(self, at: float) -> None:
+        self.at = at
+
+    def time(self) -> float:
+        return self.at
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+def _written_at(status_file: Path) -> int | None:
+    try:
+        return json.loads(status_file.read_text())["written_at_ms"]
+    except (OSError, ValueError, KeyError):
+        return None  # not there yet, or caught while it is replaced
+
+
+def _rewritten(status_file: Path, since: int | None) -> int:
+    """Wait until the status file is written anew after `since`; its new `written_at_ms`."""
+    deadline = time.monotonic() + 10
+    while (now := _written_at(status_file)) is None or now == since:
+        assert time.monotonic() < deadline, "the server did not write its status again"
+        time.sleep(0.01)
+    return now
+
+
 def test_after_a_kill_the_report_stands_and_the_status_is_called_old(tmp_path, monkeypatch):
+    """Held under load without a timing (lane AS-2; the gate of Nov 27, 2026 on 348ec47 saw "last
+    written 3 s ago" where a fresh status was due, and it passed alone). The look right after the kill
+    reads with `evidence`'s wall clock held at the moment of the kill, so how long the look waits
+    for the processor does not age the status; the kill follows a status the server has just written.
+    The new server is waited for until it has written its status, not a fixed half second. The look
+    once the status is old reads the real clock, as before."""
     records = everything()
     stream = Stream(tmp_path, *FAST, *QUICK_STATUS)
+    status_file = stream.store / "runs" / RUN / "watchdog.json"
     sender = keep_open(stream, records[:200])
     try:
-        time.sleep(0.5)  # a status is written
+        _rewritten(status_file, _written_at(status_file))  # a status is written, just now
+        killed_at = time.time()
         stream.server.kill()
         # Every stored step was judged before the kill, so the report is still the store's.
-        evidence, summary = look(stream, tmp_path)
+        with monkeypatch.context() as at_the_kill:
+            at_the_kill.setattr(ev, "time", _ClockAt(killed_at))
+            evidence, summary = look(stream, tmp_path)
         assert (evidence["detection"]["source"], evidence["detection"]["state"]) == ("server", "current")
         assert differences(reference(records[:200]), evidence["incidents"]) == []
         assert evidence["watchdog"]["summary"] == "active" and "status was last written" not in summary
@@ -278,8 +317,9 @@ def test_after_a_kill_the_report_stands_and_the_status_is_called_old(tmp_path, m
         # A new server takes the run up from the dead one's status, before any rank has reconnected
         # (the watchdog's state survives a restart): it rewrites the status at once, so the reader is
         # no longer told that nothing is watching, and the old report is still current for what is stored.
+        dead = _written_at(status_file)
         stream.server = Server(stream.store, 0, *FAST, *QUICK_STATUS)
-        time.sleep(0.5)
+        _rewritten(status_file, dead)
         evidence, summary = look(stream, tmp_path)
         assert evidence["detection"]["state"] == "current" and "The server's status was last written" not in summary
         assert evidence["watchdog"]["summary"] == "active"
@@ -289,7 +329,6 @@ def test_after_a_kill_the_report_stands_and_the_status_is_called_old(tmp_path, m
     # The rank reconnects: the server rebuilds its state from the store and reports on.
     document = stream.send(records[200:])
     assert document["rebuilds"] == 1
-    status_file = stream.store / "runs" / RUN / "watchdog.json"
     deadline = time.monotonic() + 10
     while json.loads(status_file.read_text())["summary"] != "finished":  # the new server's first status
         assert time.monotonic() < deadline
