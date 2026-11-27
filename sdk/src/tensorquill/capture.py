@@ -6000,11 +6000,16 @@ def init(
             run = _replace(run, run_id=fitted)
         if sink is None:
             sink = _open_default_sink(Path("tensorquill-out") / records_file_name(run.run_id, run.rank), undo)
-        _manifest.write_rank_settings(getattr(sink, "path", None), run.run_id, run.rank, undo)  # ranks above 0 (AR-6)
+        # A second writer of the rank (its file was held: `<run_id>.rank<N>.<pid>.jsonl`) is not a start
+        # of the run: at rank 0 it writes no run manifest (item 8, lane AR-7), and its settings go
+        # beside its own file, as a second writer's of any rank.
+        second_writer = getattr(sink, "other_writer", None) is not None
+        _manifest.write_rank_settings(getattr(sink, "path", None), run.run_id, run.rank, undo,
+                                      second_writer=second_writer)  # ranks above 0 (AR-6), a second writer
         # The project and the name are facts of the run, and a tracker's run exists on rank 0
         # only, so rank 0 alone resolves and writes them: no collective call is needed.
         run_manifest = None
-        if run.rank == 0:
+        if run.rank == 0 and not second_writer:
             labels = tracker_labels()
             run_manifest = _manifest.build_manifest(
                 run_id=run.run_id, run_id_source=run.source,
@@ -6060,5 +6065,5 @@ def init(
     except BaseException:
         _undo(undo)
         raise
-    session.manifest = run_manifest  # the run manifest rank 0 wrote; None on every other rank
+    session.manifest = run_manifest  # the run manifest rank 0 wrote; None on every other rank and a second writer
     return session

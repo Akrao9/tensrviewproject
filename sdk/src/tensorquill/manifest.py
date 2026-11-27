@@ -4,7 +4,7 @@ A run is still identified by its run ID, and every file and folder is still keye
 manifest adds the labels a person lists and compares runs by:
 
 - beside local files it is `<run_id>.run.json`, next to `<run_id>.rank<N>.jsonl`, written by
-  rank 0 at `tensorquill.init`;
+  rank 0 at `tensorquill.init` (not by a second writer of rank 0, whose file another session holds);
 - in a server's store it is `runs/<run_id>/run.json`, written by the server from the copy that
   rides on rank 0's first batch of each stream (`flight.py`).
 
@@ -681,7 +681,8 @@ def run_block(run_id: Any, manifest: Mapping[str, Any] | None) -> dict[str, Any]
 # `<run_id>.rank<N>.settings.json` beside its records at `init` (`write_rank_settings`, one line
 # of `capture.init`). The file follows the sink's file as the end marker does: a second writer of
 # the rank (`<run_id>.rank<N>.<pid>.jsonl`, `sink.JsonlSink`) writes
-# `<run_id>.rank<N>.<pid>.settings.json` and never replaces the first writer's. A rank started
+# `<run_id>.rank<N>.<pid>.settings.json` and never replaces the first writer's; so does a second
+# writer of rank 0, which writes no run manifest (lane AR-7). A rank started
 # again under its run ID keeps an earlier start's settings that differ, as the manifest does
 # (`merge_numerical_settings`). The file is local only: a server's store never sees it.
 # It ends in neither `.jsonl` nor `.run.json`, so no folder scan takes it for records or a manifest.
@@ -724,12 +725,17 @@ def _put_back(path: Path) -> Any:
     return restore
 
 
-def write_rank_settings(records_file: str | Path | None, run_id: Any, rank: Any, undo: list[Any]) -> bool:
+def write_rank_settings(records_file: str | Path | None, run_id: Any, rank: Any, undo: list[Any], *,
+                        second_writer: bool = False) -> bool:
     """Write rank `rank`'s numerical settings beside `records_file` (`rank_settings_path`), by a
     temporary file and a rename, and add to `undo` what puts the file back as it was. Nothing is
-    written for rank 0 (its settings are in the run manifest), for a sink with no file, or with no
-    run ID. Never raises: a file that cannot be written is said once and the run goes on."""
-    if records_file is None or not run_id or not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+    written for rank 0 (its settings are in the run manifest) unless the session is a second writer
+    of it (`second_writer`: its sink writes `<run_id>.rank0.<pid>.jsonl` and it writes no manifest,
+    lane AR-7), for a sink with no file, or with no run ID. Never raises: a file that cannot be
+    written is said once and the run goes on."""
+    if records_file is None or not run_id or not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
+        return False
+    if rank == 0 and not second_writer:
         return False
     path: Any = records_file  # what the warning names if the path itself cannot be made
     scratch: Path | None = None

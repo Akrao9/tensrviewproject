@@ -103,7 +103,7 @@ def test_a_second_writer_at_rank_0_keeps_its_own_settings_beside_its_file(here, 
     assert (document["run_id"], document["rank"]) == ("own", 0)
     assert document["numerical_settings"]["settings"]["os.environ.get('CUBLAS_WORKSPACE_CONFIG')"] == {
         "value": ":16:8"}
-    assert mf.rank_settings_path(two._sink.path, "own", 0) == own
+    assert mf.rank_settings_path(two._sink.path, "own", 0).resolve() == own.resolve()
     # The first writer of rank 0 keeps its settings in the manifest, and writes no settings file.
     assert not (out / "own.rank0.settings.json").exists()
     assert mf.rank_settings(out, "own") == {}
