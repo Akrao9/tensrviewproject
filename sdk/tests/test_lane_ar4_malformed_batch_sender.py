@@ -12,16 +12,24 @@ the refusal is made by a stand-in server in this process, as in `test_rs10_sende
 it is sent, and ends the stream with the server's status on the batch that holds a chosen step, for as
 long as it is told to. The file is written in three parts so that each is one batch: A, B and C.
 
-What these tests hold, as the sender does it today (no change to `flight.py`):
+What these tests hold:
 - the sender keeps its last confirmed offset and sends the same bytes again, at its backoff, for as
   long as the server refuses them; nothing past them is sent; the batch is not counted as refused;
-- it says once on stderr that streaming is failing, with the server's message;
+- it says once on stderr, on a line of its own and not the generic outage line (lane AR-7, item 6 of
+  the author's list), that the server could not decode the batch from that byte, that it is sent
+  again at the backoff, that the local file stays complete, and that if it repeats the sender is
+  encoding a batch the server cannot read and it should be reported; a different outage later is
+  still said once with the generic line;
 - once the server takes the bytes (the damage was on the way), the rest follows and the offset moves.
+
+The SDK matches the refusal by its copy of the server's message (`flight.MALFORMED_BATCH`), held here
+equal to `MALFORMED_BATCH` in `server/src/ingest.rs`.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -32,6 +40,7 @@ pytest.importorskip("pyarrow")
 import pyarrow as pa  # noqa: E402
 import pyarrow.flight as pa_flight  # noqa: E402
 
+from tensorquill import flight  # noqa: E402
 from tensorquill.flight import BatchRefused, FlightSender, OlderServer, offset_path, read_binding  # noqa: E402
 from test_flight import append, record, wait_for  # noqa: E402
 
@@ -52,6 +61,7 @@ class Malformed(pa_flight.FlightServerBase):
         self.refuse = refuse
         self.refusing = threading.Event()
         self.refusing.set()
+        self.unavailable = False  # end the stream at that batch as a server going away, not as malformed
         self.lock = threading.Lock()
         self.stored: list[int] = []
         self.batches: list[dict] = []
@@ -78,6 +88,8 @@ class Malformed(pa_flight.FlightServerBase):
             with self.lock:
                 self.batches.append({"steps": steps, "end": end})
                 if self.refuse in steps and self.refusing.is_set():
+                    if self.unavailable:
+                        raise pa_flight.FlightUnavailableError("the server is going away for a moment")
                     raise pa.ArrowInvalid(MALFORMED)
                 self.stored += [s for s in steps if s not in self.stored]
                 self.held = end
@@ -96,13 +108,19 @@ class Malformed(pa_flight.FlightServerBase):
 @pytest.fixture
 def server():
     one = Malformed(B[0])
+    one.senders = []  # closed before the server stops, so a test that fails part way does not hang it
     yield one
+    one.refusing.clear()
+    one.unavailable = False
+    for sender in one.senders:
+        sender.close(timeout=2.0)
     one.stop()
 
 
 def test_a_batch_refused_as_malformed_is_sent_again_from_the_last_confirmed_offset(tmp_path: Path, server, capfd):
     path = tmp_path / "run-a.rank0.jsonl"
     sender = FlightSender(path, server.endpoint, "run-a", 0, batch_seconds=0.05, poll_seconds=0.02, backoff_cap=0.2)
+    server.senders.append(sender)
     append(path, [record(step) for step in A])
     wait_for(lambda: server.held == path.stat().st_size)
     after_a = path.stat().st_size
@@ -119,10 +137,18 @@ def test_a_batch_refused_as_malformed_is_sent_again_from_the_last_confirmed_offs
     assert sender.refused_batches == 0 and sender.last_refused is None
     error = sender.last_error
     assert not isinstance(error, (BatchRefused, OlderServer)), repr(error)
+    assert isinstance(error, flight.MalformedBatch), repr(error)
     assert "a malformed record batch" in str(error), repr(error)
     said = capfd.readouterr().err
-    assert said.count("streaming to") == 1, said
-    assert "a malformed record batch" in said, said
+    assert said.count("streaming to") == 0, said  # not the generic outage line
+    assert said.count("tensorquill:") == 1, said
+    assert said.startswith(f"tensorquill: the server at {server.endpoint} could not decode the record batch this "
+                           f"sender sent from byte {after_a} of {path}: {MALFORMED}. "), said
+    assert (f"It is sent again from byte {after_a} at the backoff, and {path} stays complete. If this repeats, "
+            "this tensorquill is encoding a record batch the server cannot read: please report it. Training "
+            "continues; said once.") in said, said
+    wait_for(lambda: server.seen(B) >= 5)
+    assert capfd.readouterr().err == ""  # said once
 
     # The damage was on the way: the server takes B now, and C follows.
     server.refusing.clear()
@@ -131,3 +157,36 @@ def test_a_batch_refused_as_malformed_is_sent_again_from_the_last_confirmed_offs
     assert server.stored == [*A, *B, *C]
     assert read_binding(offset_path(path))["offset"] == after_c
     assert sender.refused_batches == 0
+
+
+def test_a_different_outage_after_the_malformed_line_still_gets_the_generic_line_once(tmp_path: Path, server, capfd):
+    path = tmp_path / "run-a.rank0.jsonl"
+    sender = FlightSender(path, server.endpoint, "run-a", 0, batch_seconds=0.05, poll_seconds=0.02, backoff_cap=0.2)
+    server.senders.append(sender)
+    append(path, [record(step) for step in A])
+    wait_for(lambda: (read_binding(offset_path(path)) or {}).get("offset") == path.stat().st_size)
+    append(path, [record(step) for step in B])
+    wait_for(lambda: server.seen(B) >= 3)
+    first = capfd.readouterr().err
+    assert first.count("could not decode the record batch") == 1 and "streaming to" not in first, first
+    server.unavailable = True
+    seen = server.seen(B)
+    wait_for(lambda: server.seen(B) >= seen + 3)
+    second = capfd.readouterr().err
+    assert second.count("streaming to") == 1 and "is failing" in second, second
+    assert "could not decode" not in second, second
+    server.unavailable = False
+    seen = server.seen(B)
+    wait_for(lambda: server.seen(B) >= seen + 3)
+    assert capfd.readouterr().err == ""  # neither line again: each is said once
+    assert isinstance(sender.last_error, flight.MalformedBatch)
+    server.refusing.clear()
+    assert sender.close(timeout=5.0) is True
+    assert server.stored == [*A, *B]
+
+
+def test_the_sdks_copy_of_the_servers_malformed_batch_message_is_the_servers():
+    source = (Path(__file__).resolve().parents[2] / "server" / "src" / "ingest.rs").read_text(encoding="utf-8")
+    (literal,) = re.findall(r'^const MALFORMED_BATCH: &str = "((?:[^"\\]|\\.|\\\n)*)";$', source, re.M | re.S)
+    text = re.sub(r"\\\n\s*", "", literal)  # a Rust string's line continuations
+    assert text == flight.MALFORMED_BATCH == MALFORMED
