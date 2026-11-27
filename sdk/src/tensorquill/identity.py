@@ -3,7 +3,9 @@
 `check(record, where)` is the only Python code that decides whether a record's `schema_version`,
 `rank`, `attempt` and `step` are valid. A reader calls it where records are loaded, before either
 engine is chosen, and refuses the whole input on the first record that is not valid with
-`MalformedRecordError`. It never runs inside a training step or the capture.
+`MalformedRecordError`. It never runs on the training thread: in a training process its one caller is the
+sender's thread (`flight.rows_to_send`), which catches the refusal, leaves the line out, counts it and sends
+the rest.
 
 | Field            | Absent                    | Valid when present                     |
 |------------------|---------------------------|----------------------------------------|
@@ -16,11 +18,15 @@ A Boolean, a float (also a whole one, `1.0`), text and `null` are not integers. 
 looked at. The upper bounds are the columns' (`BOUNDS`: Int64 for `step` and `attempt`, Int32 for
 `rank`; `WAVE_AF_CONTRACT.md` section 12, AQ5-D6): a value past one is not valid, so a record either
 engine cannot read is refused by both, by name, where before Python judged it and the Rust route
-raised a bare `OverflowError` or `ArrowInvalid`. `seq` is not bounded here (`flight._seq` bounds it).
+raised a bare `OverflowError` or `ArrowInvalid`. A scalar-only record's `seq` is bounded the same way, at
+Int64 (lane AS-6, Nov 27, 2026): before, it was bounded only on the sender's path (`flight._seq`), so a
+records file whose `seq` was past Int64 was read by the local readers while the sender left that line out.
+Now one such line refuses the whole local file, as a negative step does; live, the sender skips it and
+sends the rest.
 
 Record version 2 is the scalar-only record (`WAVE_AL_CONTRACT.md` sections 3 and 4.2): a record of
-version 2 is valid only with `"record": "scalars"` and a `seq` that is an integer of 0 or more,
-checked after `step`. A step record stays version 0 or 1, and a key `record` on one is read as
+version 2 is valid only with `"record": "scalars"` and a `seq` that is an integer of 0 or more that
+Int64 holds, checked after `step`. A step record stays version 0 or 1, and a key `record` on one is read as
 before. `is_scalar_record` says which a record is; every reader sets such records apart where
 records are loaded, after this check and before any engine (section 4.6). Other keys of a
 scalar-only record are not looked at here: a reader that does not know one ignores it.
@@ -45,7 +51,8 @@ SCALAR_RECORD = "scalars"
 FIELDS = ("schema_version", "rank", "attempt", "step")
 # The largest value each integer field's column holds (`flight.flight_schema()`), and the column's type:
 # a larger value is not valid (`WAVE_AF_CONTRACT.md` section 12; AQ5-D6, the author's answer).
-BOUNDS = {"rank": (2**31 - 1, "Int32"), "attempt": (2**63 - 1, "Int64"), "step": (2**63 - 1, "Int64")}
+BOUNDS = {"rank": (2**31 - 1, "Int32"), "attempt": (2**63 - 1, "Int64"), "step": (2**63 - 1, "Int64"),
+          "seq": (2**63 - 1, "Int64")}
 # The most ranks a run has: the server's `watchdog::MAX_RANKS`, which refuses a stream of a rank at or
 # over it and a batch of a larger `world_size` (wave AR, lane AR-4). A reader takes no larger
 # `world_size` as a list to expand (`evidence`, `compare`, `runs`), and the sender streams nothing of a
@@ -123,8 +130,8 @@ def check(record: Mapping[str, Any], where: str | None = None, fields: tuple[str
     version 2 it checks `schema_version` too, so one that is not a whole scalar-only record is not sent.
 
     With `schema_version` checked, a record of version 2 must be a scalar-only record: `record`
-    `"scalars"`, else `schema_version` is named; and, after `step`, `seq` an integer of 0 or more,
-    else `seq` is named."""
+    `"scalars"`, else `schema_version` is named; and, after `step`, `seq` an integer of 0 or more that
+    Int64 holds, else `seq` is named."""
     scalar = False
     for field in (name for name in FIELDS if name in fields):
         value = record.get(field, _ABSENT) if isinstance(record, Mapping) else _ABSENT
@@ -151,3 +158,7 @@ def check(record: Mapping[str, Any], where: str | None = None, fields: tuple[str
         value = record.get("seq", _ABSENT)
         if value is _ABSENT or isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise MalformedRecordError("seq", value, where, "a scalar-only record needs a seq, an integer of 0 or more")
+        bound, column = BOUNDS["seq"]
+        if value > bound:
+            raise MalformedRecordError(
+                "seq", value, where, f"a scalar-only record needs a seq, an integer of 0 or more that {column} holds")
