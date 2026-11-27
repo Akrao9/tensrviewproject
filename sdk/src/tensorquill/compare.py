@@ -17,7 +17,8 @@ The result has four parts, in this order, and the printed summary keeps the orde
    that differs (`numerical_settings.<what was read>`, as `init` found them on rank 0; a run
    whose manifest is older than them is `numerical_settings_not_recorded`, never compared). A run
    started again is compared by its latest start, and `numerical_settings_starts_differ` names a
-   run whose own starts differ in them.
+   run whose own starts differ in them. `init`'s `pinned_flush` switch differs as `pinned_flush`
+   between runs that recorded it; a run whose manifest is older is `pinned_flush_not_recorded`.
 2. `checked`: the runs' `kind_checks` side by side. A kind checked in one run and not
    configured, unavailable or not yet with enough history in another is listed here, before
    any incident, so "no incident" in one run is never set against "not looked for" in another.
@@ -839,6 +840,13 @@ def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[st
                     **({"not_set_in": missing} if missing else {}),
                 })
         same_config = [key for key in keys if not any(d["field"] == f"config.{key}" for d in differs)]
+    # `init`'s pinned-flush switch (lane AR-6): compared among the runs whose manifest records it; a
+    # manifest older than it says so, and is never read as off.
+    switches = [(label, _manifest.pinned_flush_of(m)) for label, m in known]
+    with_switch = [(label, value) for label, value in switches if value is not None]
+    switch_unknown = [label for label, value in switches if value is None] if with_switch else []
+    if len(with_switch) > 1 and _differ([value for _, value in with_switch]):
+        differs.append({"field": _manifest.PINNED_FLUSH_KEY, "values": dict(with_switch)})
     settings_same, settings_unknown = _compare_numerical_settings(known, differs)
     # A run whose own starts differ in them (a run started again): said, and compared by its latest start.
     starts_differ = {}
@@ -852,6 +860,7 @@ def compare_setup(opened: list[Mapping[str, Any]], labels: list[str]) -> dict[st
         "same": same,
         "config_keys_same": same_config,
         **({"config_not_known": config_unknown} if config_unknown else {}),
+        **({"pinned_flush_not_recorded": switch_unknown} if switch_unknown else {}),
         "numerical_settings_same": settings_same,
         **({"numerical_settings_not_recorded": settings_unknown} if settings_unknown else {}),
         **({"numerical_settings_starts_differ": starts_differ} if starts_differ else {}),
@@ -1570,6 +1579,9 @@ def summary_text(result: Mapping[str, Any]) -> str:
     if setup["no_manifest"]:
         lines.append(f"   no run manifest for {', '.join(setup['no_manifest'])}: "
                      "its setup is not known and is left out of the differences")
+    if setup.get("pinned_flush_not_recorded"):
+        lines.append(f"   pinned_flush not recorded for {', '.join(setup['pinned_flush_not_recorded'])}: its manifest was "
+                     "written before TensorQuill recorded the switch, so it is left out of the differences")
     if setup.get("numerical_settings_not_recorded"):
         lines.append(f"   numerical settings not recorded for {', '.join(setup['numerical_settings_not_recorded'])}: "
                      "its manifest was written before TensorQuill recorded them, so they are left out of the "

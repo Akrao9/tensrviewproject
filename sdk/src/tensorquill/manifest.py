@@ -298,6 +298,7 @@ def _versions() -> tuple[str | None, str | None]:
 # these reads initialises CUDA: they are flags of the process and of the C++ context.
 
 NUMERICAL_SETTINGS_KEY = "numerical_settings"
+PINNED_FLUSH_KEY = "pinned_flush"  # `init(pinned_flush=...)` as it was given (lane AR-6)
 NOT_RECORDED = "the run manifest was written before TensorQuill recorded the run's numerical settings"
 SETTING_TEXT_MAX = 256  # an environment variable's value, or a value's text, kept to this many characters
 _ERROR_TEXT_MAX = 200
@@ -498,10 +499,15 @@ def build_manifest(
     config: dict[str, Any] | None = None,
     world_size: int | None = None,
     created_at: str | None = None,
+    pinned_flush: bool | None = None,
 ) -> dict[str, Any]:
+    """The run manifest. `pinned_flush` is `init`'s switch as it was given (lane AR-6): the path the
+    flush then took may still have fallen back to the blocking copy (no CUDA, a failed copy), which
+    the session says once. Left out (None), as by a caller that is not `init`, the manifest has no
+    `pinned_flush` key, so it never claims the switch was off (`PINNED_FLUSH_KEY`)."""
     sdk_version, torch_version = _versions()
     created_at = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {
+    document = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "project": project,
         "name": name,
@@ -520,6 +526,16 @@ def build_manifest(
         # with the same settings and keeps an earlier start's that differ, `merge_numerical_settings`).
         NUMERICAL_SETTINGS_KEY: {**numerical_settings_block(), "read_at_utc": created_at, "starts": 1},
     }
+    if pinned_flush is not None:
+        document[PINNED_FLUSH_KEY] = bool(pinned_flush)
+    return document
+
+
+def pinned_flush_of(manifest: Mapping[str, Any] | None) -> bool | None:
+    """The `pinned_flush` switch a run manifest records, or None for a manifest that does not record
+    it (one written before lane AR-6, or not by `init`): never read as off."""
+    found = manifest.get(PINNED_FLUSH_KEY) if isinstance(manifest, Mapping) else None
+    return found if isinstance(found, bool) else None
 
 
 def manifest_to_send(manifest: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, str | None]:

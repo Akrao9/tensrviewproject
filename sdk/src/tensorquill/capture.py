@@ -5971,6 +5971,7 @@ def init(
                 project=_manifest.resolve_project(project, labels.get("project")),
                 name=_manifest.resolve_name(name, run.run_id, labels.get("name")),
                 group=group or labels.get("group"), tags=tags, config=config, world_size=_world_size(),
+                pinned_flush=pinned_flush,
             )
             records_file = getattr(sink, "path", None)
             if records_file is not None and run.run_id:
