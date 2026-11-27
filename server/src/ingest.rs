@@ -69,14 +69,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, BooleanArray, BooleanBuilder, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
+use arrow_flight::decode::{DecodedFlightData, DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
@@ -84,7 +84,7 @@ use arrow_flight::{
     PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::BoxStream;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -399,6 +399,10 @@ struct StreamTally {
     /// a way hyper ends a request body for alike (a reset with `NO_ERROR`; a call whose deadline passed
     /// was seen so, with the response already closed).
     half_closed: AtomicBool,
+    /// One more than the rank buffer's `faults` when this stream first took a batch, or 0 before it
+    /// did: a stream that took one before what the server held of its rank was dropped after a panic
+    /// (`HeldBuffer`) is ended (`after_a_fault`).
+    faults: AtomicU64,
 }
 
 /// The response of one `DoPut` stream, and the tally of what was acknowledged on it.
@@ -419,6 +423,64 @@ impl AckSender {
         if self.responses.send(Ok(result)).is_ok() {
             self.tally.acknowledged.fetch_max(offset, Ordering::SeqCst);
         }
+    }
+}
+
+/// A rank's buffer, locked (`Ingest::hold`). If a panic unwinds while it is held, in a stream's task
+/// or in a timed flush, the buffer is set back to what a restart leaves before the lock is let go
+/// (lane AR-4), so nothing waiting for the lock, another stream of the rank or a flush, is given it
+/// half changed: what the server held of the rank and had not stored is dropped, its bytes given back
+/// to the quota, as a restart drops it, and every other stream of the rank that took a batch is ended
+/// at its next batch or at its end, as a restart ends it (`after_a_fault`). Nothing of what is dropped
+/// was acknowledged: an offset is acknowledged only once what it covers is stored, so each sender
+/// sends it again from the offset last acknowledged to it, and the watermarks, read again from the
+/// store, take it.
+///
+/// Why: the panic may have left the buffer half changed (a step watermark moved past rows it does not
+/// hold, a count or a bound not updated), and rows sent again would then be refused as not newer and
+/// never stored, though acknowledged, or stored in a part named for steps it does not hold. A restart
+/// is the state the server is known to be sound from. The rank's detectors are rebuilt from the store
+/// at its next part, as after a restart. Kept: the counts that pace rebuilds and whether the detectors
+/// are off for the rank, which a restart clears but which hold nothing of the rows.
+struct HeldBuffer<'a> {
+    guard: tokio::sync::MutexGuard<'a, RankBuffer>,
+    used: &'a AtomicUsize,
+}
+
+impl std::ops::Deref for HeldBuffer<'_> {
+    type Target = RankBuffer;
+    fn deref(&self) -> &RankBuffer {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for HeldBuffer<'_> {
+    fn deref_mut(&mut self) -> &mut RankBuffer {
+        &mut self.guard
+    }
+}
+
+impl Drop for HeldBuffer<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let buffer = &mut *self.guard;
+        // Saturating: the counts may be what the panic left. A panic between taking a batch's bytes
+        // out of the quota and counting them in the buffer leaves them out of the quota until a
+        // restart, at most one batch.
+        let held = buffer.bytes + buffer.scalars.bytes;
+        let _ = self.used.try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            Some(used.saturating_sub(held))
+        });
+        *buffer = RankBuffer {
+            faults: buffer.faults + 1,
+            rebuilds: buffer.rebuilds,
+            detect_off: buffer.detect_off,
+            replay_failures: buffer.replay_failures,
+            replay_after: buffer.replay_after,
+            ..RankBuffer::default()
+        };
     }
 }
 
@@ -485,6 +547,9 @@ struct RankBuffer {
     seq_watermarks: HashMap<i64, Option<i64>>,
     /// The scalar-only rows waiting to be stored, apart from the step rows (section 4.5).
     scalars: ScalarBuffer,
+    /// How many times what this server held of the rank and had not stored was dropped after a panic
+    /// while it was held (`HeldBuffer`, lane AR-4).
+    faults: u64,
 }
 
 /// A rank's buffered scalar-only rows: the rows whose `seq` is not null, of one attempt.
@@ -759,7 +824,7 @@ impl Ingest {
     /// is not counted again, so the count is of batches, not of retries.
     async fn batch_refused(&self, key: &Key, column: &'static str, end_byte_offset: i64) {
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if buffer.last_refused == Some((column, end_byte_offset)) {
             return;
         }
@@ -803,7 +868,7 @@ impl Ingest {
             return;
         };
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if self.flush(key, &mut buffer).await.is_err() {
             return;
         }
@@ -881,11 +946,11 @@ impl Ingest {
             Some(key) => self
                 .end_log
                 .lock()
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .entry((key.clone(), status.is_some()))
                 .or_default()
                 .due(now),
-            None => self.error_log.lock().unwrap().due(now),
+            None => self.error_log.lock().unwrap_or_else(PoisonError::into_inner).due(now),
         };
         let Some(held) = due else {
             return;
@@ -948,7 +1013,13 @@ impl Ingest {
     /// How many runs anything is held in memory for.
     pub fn runs_held(&self) -> usize {
         let mut runs: std::collections::BTreeSet<String> = self.watchdog.run_ids();
-        runs.extend(self.buffers.lock().unwrap().keys().map(|key| key.0.clone()));
+        runs.extend(
+            self.buffers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keys()
+                .map(|key| key.0.clone()),
+        );
         runs.extend(self.reports.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.extend(self.stored.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.extend(self.data_windows.lock().unwrap().keys().cloned());
@@ -956,7 +1027,13 @@ impl Ingest {
         runs.extend(self.manifests.lock().unwrap().keys().cloned());
         runs.extend(self.written.lock().unwrap().keys().cloned());
         runs.extend(self.dropped_log.lock().unwrap().keys().map(|key| key.0.clone()));
-        runs.extend(self.end_log.lock().unwrap().keys().map(|(key, _)| key.0.clone()));
+        runs.extend(
+            self.end_log
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keys()
+                .map(|(key, _)| key.0.clone()),
+        );
         runs.len()
     }
 
@@ -966,7 +1043,12 @@ impl Ingest {
     /// waits for the rank's buffer, so a flush of the rank in progress finishes first.
     pub async fn trend_computations(&self, run_id: &str, rank: i32) -> Option<u64> {
         let key = (run_id.to_string(), rank);
-        let buffer = self.buffers.lock().unwrap().get(&key).cloned()?;
+        let buffer = self
+            .buffers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned()?;
         let buffer = buffer.lock().await;
         buffer
             .detectors
@@ -980,11 +1062,16 @@ impl Ingest {
     }
 
     fn buffer(&self, key: &Key) -> Arc<tokio::sync::Mutex<RankBuffer>> {
-        self.buffers.lock().unwrap().entry(key.clone()).or_default().clone()
+        self.buffers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.clone())
+            .or_default()
+            .clone()
     }
 
     fn all_buffers(&self) -> Vec<(Key, Arc<tokio::sync::Mutex<RankBuffer>>)> {
-        let buffers = self.buffers.lock().unwrap();
+        let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         buffers
             .iter()
             .map(|(key, buffer)| (key.clone(), buffer.clone()))
@@ -1053,10 +1140,11 @@ impl Ingest {
         // one batch, and a point the next attempt rolled back came back in its series.
         self.place(key, sender, &attempts).await?;
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if self.closed.load(Ordering::SeqCst) {
             return Err(Status::unavailable("the server is shutting down"));
         }
+        after_a_fault(&buffer, &ack.tally)?;
         // The owner attempt's highest step kept is its progress. Rows of any other attempt are
         // stored and counted, never progress (RS05; until Nov 19, 2026 the last attempt of the batch
         // to keep rows was taken as the rank's).
@@ -1248,6 +1336,8 @@ impl Ingest {
             let rows = batch.num_rows();
             buffer.rows += rows;
             buffer.bytes += bytes;
+            #[cfg(test)]
+            injected::here(&key.0, injected::Point::Accept);
             buffer.batches.push(batch);
             return Ok((Some((last, rows)), not_newer));
         }
@@ -1652,7 +1742,7 @@ impl Ingest {
 
     async fn flush_key(&self, key: &Key) -> Result<(), Status> {
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         self.flush(key, &mut buffer).await
     }
 
@@ -1700,7 +1790,7 @@ impl Ingest {
     pub async fn flush_due(&self) {
         futures::stream::iter(self.all_buffers())
             .for_each_concurrent(FLUSH_CONCURRENCY, |(key, buffer)| async move {
-                let mut buffer = buffer.lock().await;
+                let mut buffer = self.hold(&buffer).await;
                 if *self.stopping.borrow() {
                     // After `stop`, a rank this round has not started on is left to `shutdown`,
                     // so a stop waits for the writes in progress, not for a whole round.
@@ -1763,7 +1853,7 @@ impl Ingest {
         self.closed.store(true, Ordering::SeqCst);
         let results: Vec<Result<(), Status>> = futures::stream::iter(self.all_buffers())
             .map(|(key, buffer)| async move {
-                let mut buffer = buffer.lock().await;
+                let mut buffer = self.hold(&buffer).await;
                 let tried = buffer.retries_tried();
                 let flushed = self.flush(&key, &mut buffer).await;
                 if flushed.is_ok() && self.config.detect && buffer.retry_pending() && buffer.retries_tried() == tried {
@@ -1809,7 +1899,7 @@ impl Ingest {
     /// offset it was owed goes with it: the next stream is told only its own (L4).
     async fn detach(&self, key: &Key, ack: &AckSender) {
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if buffer.ack.as_ref().is_some_and(|held| held.same_channel(ack)) {
             buffer.ack = None;
             buffer.pending_offset = None;
@@ -1818,16 +1908,22 @@ impl Ingest {
 
     async fn run_stream(
         &self,
-        stream: Streaming<FlightData>,
+        mut stream: Streaming<FlightData>,
         key: &mut Option<Key>,
         stream_id: u64,
         ack: &AckSender,
     ) -> Result<(), Status> {
-        let mut decoder = FlightDataDecoder::new(stream.map_err(FlightError::from));
+        let mut decoder = Decoder::new();
         let mut named = false;
         let tally = &ack.tally;
-        while let Some(message) = decoder.next().await {
-            let message = message.map_err(stream_error)?;
+        while let Some(data) = stream.next().await {
+            // A message is read from the transport first, then decoded on its own, so the guard around
+            // the decode covers Arrow's reader and nothing of the transport (`Decoder`). A malformed
+            // batch ends the stream here with `INVALID_ARGUMENT`, before anything of it is counted,
+            // placed or kept, and `do_put` cleans up as for any stream that ends in an error.
+            let Some(message) = decoder.decode(data?)? else {
+                continue;
+            };
             let inner = &message.inner;
             let bytes = inner.data_header.len() + inner.data_body.len() + inner.app_metadata.len();
             tally.bytes.fetch_add(bytes as u64, Ordering::SeqCst);
@@ -1835,17 +1931,16 @@ impl Ingest {
                 if let Some(descriptor) = &message.inner.flight_descriptor {
                     let parsed = parse_descriptor(descriptor)?;
                     self.watchdog.stream_opened(&parsed, Instant::now());
-                    self.streams
-                        .lock()
-                        .unwrap()
-                        .entry(parsed.clone())
-                        .or_default()
-                        .push(OpenStream {
-                            id: stream_id,
-                            attempt: None,
-                            counted: true,
-                        });
+                    let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+                    streams.entry(parsed.clone()).or_default().push(OpenStream {
+                        id: stream_id,
+                        attempt: None,
+                        counted: true,
+                    });
                     *key = Some(parsed);
+                    #[cfg(test)]
+                    injected::here(&key.as_ref().unwrap().0, injected::Point::HoldingStreams);
+                    drop(streams);
                 }
             }
             let DecodedPayload::RecordBatch(batch) = message.payload else {
@@ -1863,7 +1958,7 @@ impl Ingest {
                 if let Some(open) = self
                     .streams
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get_mut(key)
                     .and_then(|streams| streams.iter_mut().find(|open| open.id == stream_id))
                 {
@@ -1885,9 +1980,21 @@ impl Ingest {
         }
         tally.half_closed.store(true, Ordering::SeqCst);
         if let Some(key) = key {
+            if tally.faults.load(Ordering::SeqCst) != 0 {
+                after_a_fault(&*self.buffer(key).lock().await, tally)?;
+            }
             self.flush_key(key).await?; // end of stream
         }
         Ok(())
+    }
+
+    /// The rank buffer `buffer`, locked, set back to what a restart leaves if a panic unwinds while it
+    /// is held (`HeldBuffer`).
+    async fn hold<'a>(&'a self, buffer: &'a tokio::sync::Mutex<RankBuffer>) -> HeldBuffer<'a> {
+        HeldBuffer {
+            guard: buffer.lock().await,
+            used: &self.used,
+        }
     }
 
     /// Writes `runs/<run_id>/run.json` when the manifest is new for this run or differs from
@@ -1958,7 +2065,7 @@ impl Ingest {
     /// nothing (contract 1).
     fn stream_ended(&self, key: &Key, stream_id: u64, clean: bool) {
         let counted = {
-            let mut streams = self.streams.lock().unwrap();
+            let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let open = streams.get_mut(key);
             let counted = open
                 .as_ref()
@@ -1983,7 +2090,7 @@ impl Ingest {
             return;
         };
         let now = Instant::now();
-        let mut streams = self.streams.lock().unwrap();
+        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
         for open in streams.get_mut(key).into_iter().flatten() {
             if open.counted && open.attempt.is_some_and(|attempt| attempt != owner) {
                 open.counted = false;
@@ -2240,7 +2347,7 @@ impl Ingest {
     /// buffer no flush would ever find. The map stays locked until every trace of the run is gone,
     /// so a stream of it that starts meanwhile finds nothing and starts afresh.
     fn evict_run(&self, run_id: &str, now: Instant) -> bool {
-        let mut buffers = self.buffers.lock().unwrap();
+        let mut buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         let keys: Vec<Key> = buffers.keys().filter(|key| key.0 == run_id).cloned().collect();
         for key in &keys {
             let buffer = &buffers[key];
@@ -2277,7 +2384,10 @@ impl Ingest {
         self.written.lock().unwrap().remove(run_id);
         self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
         self.dropped_log.lock().unwrap().retain(|key, _| key.0 != run_id);
-        self.end_log.lock().unwrap().retain(|(key, _), _| key.0 != run_id);
+        self.end_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(key, _), _| key.0 != run_id);
         drop(buffers);
         true
     }
@@ -2339,6 +2449,7 @@ impl Ingest {
                 "summary": status["summary"],
                 "running": status["server_running"],
                 "missing": status["missing_ranks"],
+                "missing_omitted": status["missing_ranks_omitted"],
                 "pauses": status["pauses"],
                 "abandoned": status["abandoned"],
                 "duplicates": status["duplicate_batches"],
@@ -2419,7 +2530,8 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
     let [runs, run_id, rank] = descriptor.path.as_slice() else {
         return Err(bad());
     };
-    let rank: i32 = rank
+    // Read as an `i64`, so a rank over the limit that no `i32` holds is refused by the limit's words.
+    let rank: i64 = rank
         .strip_prefix("rank=")
         .and_then(|rank| rank.parse().ok())
         .ok_or_else(bad)?;
@@ -2433,7 +2545,62 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
             "run_id may hold only letters, digits, '-', '_' and '.'",
         ));
     }
+    if !crate::watchdog::rank_taken(rank) {
+        return Err(Status::invalid_argument(over_the_limit(
+            rank,
+            "nothing of this stream is stored",
+        )));
+    }
+    let rank = i32::try_from(rank).map_err(|_| bad())?;
     Ok((run_id.clone(), rank))
+}
+
+/// The integer at `key` of the JSON object `body` when it is one the server's limit refuses
+/// (`taken` false), read when the object could not be read whole: a rank or a world size no `i32`
+/// holds is refused by the limit's words, not by the parser's.
+fn integer_over(body: &[u8], key: &str, taken: fn(i64) -> bool) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get(key)?.as_i64().filter(|number| !taken(*number))
+}
+
+fn world_refused(world_size: i64) -> Status {
+    Status::invalid_argument(format!(
+        "world_size {world_size} is over this server's limit of {} ranks a run; nothing of this batch is stored",
+        crate::watchdog::MAX_RANKS
+    ))
+}
+
+/// The status of a `DoPut` stream whose task panicked outside the decode (lane AR-4): a fault of
+/// the server, whose log names it (the panic hook prints it); nothing of the panic is in it.
+const STREAM_FAULT: &str = "the server failed on this stream, a fault of the server that its log names; what it held of this rank and had not stored is dropped, and is to be sent again from the offset last acknowledged";
+
+/// The status of another stream of that rank, ended at its next batch or its end (`after_a_fault`).
+const FAULT_ELSEWHERE: &str = "the server dropped what it held of this rank and had not stored, after a fault on another of its streams; send again from the offset last acknowledged";
+
+/// Ends a stream that took a batch before what the server held of its rank was dropped after a panic
+/// (`HeldBuffer`), with `UNAVAILABLE`: it may be owed an offset over rows the server no longer
+/// holds. A stream takes the rank buffer's count at its first batch.
+fn after_a_fault(buffer: &RankBuffer, tally: &StreamTally) -> Result<(), Status> {
+    let now = buffer.faults + 1;
+    match tally
+        .faults
+        .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+    {
+        Ok(_) => Ok(()),
+        Err(seen) if seen == now => Ok(()),
+        Err(_) => Err(Status::unavailable(FAULT_ELSEWHERE)),
+    }
+}
+
+/// The refusal of a rank at or over the server's limit of ranks a run (`watchdog::MAX_RANKS`), at
+/// its stream's first message or at a heartbeat, with what is not taken (lane AR-4). A sender reads
+/// the words "over this server's limit of".
+fn over_the_limit(rank: i64, not_taken: &str) -> String {
+    let limit = crate::watchdog::MAX_RANKS;
+    format!(
+        "rank {rank} is over this server's limit of {limit} ranks a run (ranks 0 to {}); {not_taken}",
+        limit - 1
+    )
 }
 
 /// Rows dropped from a batch, by the key column that was null.
@@ -2726,11 +2893,68 @@ fn stream_error(error: FlightError) -> Status {
     }
 }
 
+/// The status a stream ends with when Arrow's IPC reader panics on one of its messages (AQ5-R1, AQ5-R2):
+/// what the client is told, with nothing of the panic. The words before the first `": "` are what the
+/// server's line for the stream shows of an `INVALID_ARGUMENT` (`stream_closed`), so there are none.
+const MALFORMED_BATCH: &str = "a malformed record batch, which the Arrow IPC reader cannot decode (its header names \
+                               bytes or a layout its body does not hold); nothing of it is stored and the stream ends here";
+
+/// Arrow Flight's decoder, given a stream's messages one at a time and each decode guarded (lane AR-4,
+/// AQ5-R1 and AQ5-R2). `run_stream` and `decode_put` both decode through it.
+///
+/// The decoder reads from a channel this holds the sending end of: [`Decoder::decode`] puts one message
+/// in and polls the decoder once, synchronously, inside [`crate::decode_guard::guard`]. The poll reaches
+/// the message at once, so it runs Arrow's reader and nothing of the transport, and the guard's flag
+/// never spans an `.await`. A message that only changes the decoder's state (a dictionary batch) gives
+/// `None`, and the next message is read, as the decoder did when it read the transport itself.
+struct Decoder {
+    feed: futures::channel::mpsc::UnboundedSender<Result<FlightData, FlightError>>,
+    decoder: FlightDataDecoder,
+}
+
+impl Decoder {
+    fn new() -> Self {
+        let (feed, messages) = futures::channel::mpsc::unbounded();
+        Self {
+            feed,
+            decoder: FlightDataDecoder::new(messages),
+        }
+    }
+
+    /// `data` decoded, `None` for a message that only changed the decoder's state, or the status the
+    /// stream ends with: the decoder's own error as before (`stream_error`), `MALFORMED_BATCH` for a
+    /// panic raised in Arrow, and `INTERNAL` for any other panic, which the panic hook prints.
+    fn decode(&mut self, data: FlightData) -> Result<Option<DecodedFlightData>, Status> {
+        if self.feed.unbounded_send(Ok(data)).is_err() {
+            return Err(Status::internal("the stream's decoder has ended"));
+        }
+        let decoder = &mut self.decoder;
+        // Sound to catch (`AssertUnwindSafe`): the poll touches only this stream's decoder, its
+        // channel and the message's own buffers; it holds no lock and changes nothing of `Ingest`. After
+        // a panic the caller ends the stream with the error and drops the decoder unpolled.
+        let polled = crate::decode_guard::guard(std::panic::AssertUnwindSafe(|| decoder.next().now_or_never()));
+        match polled {
+            Ok(Some(Some(decoded))) => decoded.map(Some).map_err(stream_error),
+            // Waiting for the next message (a dictionary batch was read), or, which cannot be while this
+            // holds the channel, the decoder's end.
+            Ok(Some(None) | None) => Ok(None),
+            Err(crate::decode_guard::Caught::Arrow(_)) => Err(Status::invalid_argument(MALFORMED_BATCH)),
+            Err(crate::decode_guard::Caught::Other(_)) => {
+                Err(Status::internal("the decode of a message of the stream panicked"))
+            }
+        }
+    }
+}
+
 /// A batch's `app_metadata`, read and checked against the stream's run and rank: a version this
 /// server does not read, or another run or rank than the descriptor's, refuses the stream.
 fn batch_metadata(key: &Key, app_metadata: &[u8]) -> Result<BatchMetadata, Status> {
-    let metadata: BatchMetadata = serde_json::from_slice(app_metadata)
-        .map_err(|error| Status::invalid_argument(format!("bad app_metadata: {error}")))?;
+    let metadata: BatchMetadata = serde_json::from_slice(app_metadata).map_err(|error| {
+        match integer_over(app_metadata, "world_size", crate::watchdog::world_size_taken) {
+            Some(world_size) => world_refused(world_size),
+            None => Status::invalid_argument(format!("bad app_metadata: {error}")),
+        }
+    })?;
     if !SCHEMA_VERSIONS.contains(&metadata.schema_version) {
         return Err(Status::invalid_argument(format!(
             "schema_version {} is not supported; this server reads versions 1 and 2",
@@ -2741,6 +2965,14 @@ fn batch_metadata(key: &Key, app_metadata: &[u8]) -> Result<BatchMetadata, Statu
         return Err(Status::invalid_argument(
             "app_metadata names another run or rank than the descriptor",
         ));
+    }
+    // A world size over the limit would name ranks the watchdog cannot walk (lane AR-4): the batch is
+    // refused before anything of it is placed, counted or kept.
+    if let Some(world_size) = metadata
+        .world_size
+        .filter(|size| !crate::watchdog::world_size_taken(i64::from(*size)))
+    {
+        return Err(world_refused(i64::from(world_size)));
     }
     Ok(metadata)
 }
@@ -2811,46 +3043,47 @@ pub struct DecodedBatch {
 /// a schema, record batches with their `app_metadata`), each data batch's rows out as the server takes
 /// them apart before placing or keeping anything. The first error ends it, with the status the
 /// stream would end with. Made for tests that drive the decode with generated bytes (lane AQ-5, SV7):
-/// it calls what `run_stream` and `accept` call, in their order (`stream_error`, `parse_descriptor`,
-/// `batch_metadata`, `decoded_rows`), and nothing of a store, a watchdog or an acknowledgement.
+/// it calls what `run_stream` and `accept` call, in their order (the guarded `Decoder`, `parse_descriptor`,
+/// `batch_metadata`, `decoded_rows`), and nothing of a store, a watchdog or an acknowledgement. A batch
+/// Arrow's reader panics on gives the status `run_stream` ends its stream with, never a panic.
 pub fn decode_put(messages: Vec<FlightData>) -> Result<Vec<DecodedBatch>, Status> {
-    futures::executor::block_on(async move {
-        let mut decoder = FlightDataDecoder::new(futures::stream::iter(messages.into_iter().map(Ok)));
-        let mut key: Option<Key> = None;
-        let mut out = Vec::new();
-        while let Some(message) = decoder.next().await {
-            let message = message.map_err(stream_error)?;
-            if key.is_none() {
-                if let Some(descriptor) = &message.inner.flight_descriptor {
-                    key = Some(parse_descriptor(descriptor)?);
-                }
+    let mut decoder = Decoder::new();
+    let mut key: Option<Key> = None;
+    let mut out = Vec::new();
+    for data in messages {
+        let Some(message) = decoder.decode(data)? else {
+            continue;
+        };
+        if key.is_none() {
+            if let Some(descriptor) = &message.inner.flight_descriptor {
+                key = Some(parse_descriptor(descriptor)?);
             }
-            let DecodedPayload::RecordBatch(batch) = message.payload else {
-                continue;
-            };
-            let key = key
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
-            let metadata = batch_metadata(key, &message.inner.app_metadata)?;
-            let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
-            let rows = if question {
-                DecodedRows::default()
-            } else {
-                decoded_rows(batch, metadata.schema_version).map_err(|refused| refused.status)?
-            };
-            out.push(DecodedBatch {
-                run_id: key.0.clone(),
-                rank: key.1,
-                schema_version: metadata.schema_version,
-                end_byte_offset: metadata.end_byte_offset,
-                step_rows: rows.pieces,
-                scalar_rows: rows.scalar_pieces,
-                dropped: rows.dropped,
-                attempts: rows.attempts,
-            });
         }
-        Ok(out)
-    })
+        let DecodedPayload::RecordBatch(batch) = message.payload else {
+            continue;
+        };
+        let key = key
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
+        let metadata = batch_metadata(key, &message.inner.app_metadata)?;
+        let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
+        let rows = if question {
+            DecodedRows::default()
+        } else {
+            decoded_rows(batch, metadata.schema_version).map_err(|refused| refused.status)?
+        };
+        out.push(DecodedBatch {
+            run_id: key.0.clone(),
+            rank: key.1,
+            schema_version: metadata.schema_version,
+            end_byte_offset: metadata.end_byte_offset,
+            step_rows: rows.pieces,
+            scalar_rows: rows.scalar_pieces,
+            dropped: rows.dropped,
+            attempts: rows.attempts,
+        });
+    }
+    Ok(out)
 }
 
 /// The kept rows of a batch, their first and last step, and the steps of the rows not kept.
@@ -3052,13 +3285,31 @@ impl FlightService for IngestService {
                 said: false,
             };
             let stream_id = ingest.next_stream.fetch_add(1, Ordering::SeqCst);
-            let result = ingest.run_stream(stream, &mut end.key, stream_id, &ack).await;
+            // A panic anywhere in the stream's task, outside the decode too (the decode's own is
+            // caught there, `Decoder`), is caught here (lane AR-4), so the clean-up below runs as for
+            // any stream that ends in an error, and the client's call ends. The panic hook has
+            // printed it, a fault of the server. Sound to catch (`AssertUnwindSafe`): what the task
+            // may have left half changed is the rank's buffer, which `HeldBuffer` set back to what a
+            // restart leaves as the panic unwound, before its lock was let go; the stream, its
+            // decoder and the call are dropped; the mutexes the clean-up takes are taken whether a
+            // panic poisoned them or not, each held only for one change of a map that a stop at any
+            // point leaves whole.
+            let run = std::panic::AssertUnwindSafe(ingest.run_stream(stream, &mut end.key, stream_id, &ack))
+                .catch_unwind()
+                .await;
+            let panicked = run.is_err();
+            let result = run.unwrap_or_else(|_| Err(Status::internal(STREAM_FAULT)));
+            if panicked {
+                // Told first: nothing below can then keep the call open, not even a clean-up that
+                // panics in its turn.
+                let _ = ack.responses.send(Err(Status::internal(STREAM_FAULT)));
+            }
             if let Some(key) = &end.key {
                 ingest.stream_ended(key, stream_id, result.is_ok());
                 ingest.detach(key, &ack).await;
             }
             end.say(result.as_ref().err());
-            if let Err(status) = result {
+            if let (false, Err(status)) = (panicked, result) {
                 let _ = ack.responses.send(Err(status));
             }
         });
@@ -3096,10 +3347,22 @@ impl FlightService for IngestService {
                 action.r#type
             )));
         }
-        let mut beat: Heartbeat = serde_json::from_slice(&action.body)
-            .map_err(|error| Status::invalid_argument(format!("bad heartbeat: {error}")))?;
+        let mut beat: Heartbeat = serde_json::from_slice(&action.body).map_err(|error| {
+            match integer_over(&action.body, "rank", |rank| {
+                rank < i64::from(crate::watchdog::MAX_RANKS)
+            }) {
+                Some(rank) => Status::invalid_argument(over_the_limit(rank, "the heartbeat is not taken")),
+                None => Status::invalid_argument(format!("bad heartbeat: {error}")),
+            }
+        })?;
         if !plain_run_id(&beat.run_id) || beat.rank < 0 {
             return Err(Status::invalid_argument("bad run_id or rank in the heartbeat"));
+        }
+        if !crate::watchdog::rank_taken(i64::from(beat.rank)) {
+            return Err(Status::invalid_argument(over_the_limit(
+                i64::from(beat.rank),
+                "the heartbeat is not taken",
+            )));
         }
         // A stack is what the sender says it is, so it is kept only as a JSON object of a
         // bounded size: it goes into the status file as it came.
@@ -3115,6 +3378,51 @@ impl FlightService for IngestService {
         unimplemented()
     }
 }
+
+/// Test only (lane AR-4): a panic injected into a stream's task at a chosen point, to show its
+/// clean-up runs on a panic outside the decode. Under `cfg(test)`, so it is compiled into this
+/// crate's own unit tests alone: no build of the server binary, of the library others link, or of
+/// `server/tests/` holds it or its calls.
+#[cfg(test)]
+mod injected {
+    use std::sync::{Mutex, PoisonError};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Point {
+        /// In `accept_attempt`, after the rank's step watermark and its counts were moved for a batch's
+        /// rows and before the rows are held: the buffer is half changed.
+        Accept,
+        /// In `run_stream`, at the stream's first message, while the `streams` mutex is held: it is
+        /// poisoned.
+        HoldingStreams,
+    }
+
+    /// What the injected panic says.
+    pub(super) const MESSAGE: &str = "a panic injected by a lane AR-4 test";
+
+    static ARMED: Mutex<Vec<(String, Point)>> = Mutex::new(Vec::new());
+
+    /// The next stream task of `run` to reach `point` panics there, once. Keyed by run, so tests
+    /// that run at once do not set off each other's.
+    pub(super) fn arm(run: &str, point: Point) {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((run.to_string(), point));
+    }
+
+    pub(super) fn here(run: &str, point: Point) {
+        let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = armed.iter().position(|(armed, at)| armed == run && *at == point) {
+            armed.remove(at);
+            drop(armed);
+            panic!("{MESSAGE}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_ar4_tests;
 
 /// Returns whether a cached watchdog status older than `elapsed` should be rewritten.
 ///

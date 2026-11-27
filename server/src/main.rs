@@ -384,13 +384,16 @@ async fn main() -> ExitCode {
             samples,
             run,
             follow,
-        }) => detect(
-            input,
-            samples,
-            run,
-            follow,
-            &Arc::new(args.thresholds.take().unwrap_or_default()),
-        ),
+        }) => {
+            let thresholds = Arc::new(args.thresholds.take().unwrap_or_default());
+            // A record batch that Arrow's reader panics on (AQ5-R1, AQ5-R2) ends `detect` with its
+            // ordinary error exit, 1, and one line naming the malformed batch, as an input it cannot
+            // read does; any other panic goes on as before (`decode_guard::offline`). Nothing the call
+            // held is used after it (`AssertUnwindSafe`): the process prints the error and exits.
+            tensorquill_server::decode_guard::offline(std::panic::AssertUnwindSafe(|| {
+                detect(input, samples, run, follow, &thresholds)
+            }))
+        }
         Some(Command::Protocol) => {
             println!("{PROTOCOL}");
             Ok(())

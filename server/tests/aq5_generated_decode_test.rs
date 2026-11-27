@@ -29,6 +29,7 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{FlightData, FlightDescriptor};
 use futures::TryStreamExt;
 use serde_json::{json, Value};
+use tensorquill_server::decode_guard;
 use tensorquill_server::detect::{self, Thresholds};
 use tensorquill_server::ingest::decode_put;
 
@@ -390,10 +391,25 @@ fn thresholds() -> Arc<Thresholds> {
     Arc::new(Thresholds::default())
 }
 
-/// The decode of a `DoPut` stream, and the detectors over its step rows: never a panic.
-fn put_then_judge(messages: Vec<FlightData>) {
-    let Ok(decoded) = decode_put(messages) else {
-        return;
+/// How a check ended without a panic: the kind, counted by `never_panics`.
+type Outcome = Result<&'static str, String>;
+
+/// The status `decode_put` (the live `run_stream` path) gives for a batch Arrow's reader panicked on.
+fn is_malformed(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::InvalidArgument && status.message().starts_with("a malformed record batch")
+}
+
+/// The decode of a `DoPut` stream, and the detectors over its step rows. A panic in the decode that
+/// was not raised in Arrow comes back as an `INTERNAL` status (the guard ends the stream with it):
+/// that is an `Err` here, and fails the test as a panic does.
+fn put_then_judge(messages: Vec<FlightData>) -> Outcome {
+    let decoded = match decode_put(messages) {
+        Ok(decoded) => decoded,
+        Err(status) if is_malformed(&status) => return Ok("refused as a malformed record batch"),
+        Err(status) if status.code() == tonic::Code::Internal && status.message().contains("panicked") => {
+            return Err(format!("the decode panicked outside Arrow: {status:?}"));
+        }
+        Err(_) => return Ok("refused"),
     };
     let steps: Vec<RecordBatch> = decoded
         .iter()
@@ -402,40 +418,20 @@ fn put_then_judge(messages: Vec<FlightData>) {
     if let Ok(detectors) = detect::judge(0, &steps, &thresholds()) {
         let _ = detect::report(RUN, 0, &detectors, 0);
     }
+    Ok("decoded")
 }
 
-fn detect_bytes(bytes: &[u8]) {
-    let _ = detect::detect_stream(Cursor::new(bytes), &thresholds());
-}
-
-/// The panics found by this lane, each held by an ignored test below and listed in the lane's report.
-/// Both are raised inside arrow's IPC reader (`arrow-ipc` 60.1.0 reading a record batch message whose
-/// header names buffers its body does not hold, through `arrow-buffer`), on both entries: the server's
-/// `DoPut` decode and `tensorquill-server detect`. A panic whose message holds none of these fails the
-/// test it happens in.
-const KNOWN_PANICS: [(&str, &str); 2] = [
-    (
-        "AQ5-R1",
-        "the offset of the new Buffer cannot exceed the existing length",
-    ),
-    ("AQ5-R2", "assertion failed: prefix.is_empty() && suffix.is_empty()"),
-];
-
-thread_local! {
-    /// Set while a check runs, so the panic hook stays quiet for the panics `catch_unwind` takes.
-    static CHECKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn quiet_hook() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let default = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !CHECKING.with(std::cell::Cell::get) {
-                default(info);
-            }
-        }));
-    });
+/// `tensorquill-server detect` on `bytes`, as `main` runs it: `detect::detect_stream` inside
+/// `decode_guard::offline`. The reads are inside `detect.rs`, so the library function alone still
+/// panics where Arrow's reader does; the command does not.
+fn detect_bytes(bytes: &[u8]) -> Outcome {
+    match decode_guard::offline(AssertUnwindSafe(|| {
+        detect::detect_stream(Cursor::new(bytes), &thresholds())
+    })) {
+        Ok(_) => Ok("judged"),
+        Err(error) if error.starts_with(decode_guard::MALFORMED_INPUT) => Ok("refused as a malformed record batch"),
+        Err(_) => Ok("refused"),
+    }
 }
 
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
@@ -446,51 +442,45 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "a panic without a message".into())
 }
 
-/// The finding of a known panic, or None.
-fn known(text: &str) -> Option<&'static str> {
-    KNOWN_PANICS
-        .iter()
-        .find(|(_, words)| text.contains(words))
-        .map(|(finding, _)| *finding)
+/// `check` on `input`: its outcome, or the text of a panic.
+fn run<T>(check: &impl Fn(T) -> Outcome, input: T) -> Outcome {
+    catch_unwind(AssertUnwindSafe(|| check(input))).unwrap_or_else(|payload| Err(panic_text(payload.as_ref())))
 }
 
-/// `check` on `input`: Ok, or the text of the panic.
-fn run<T>(check: &impl Fn(T), input: T) -> Result<(), String> {
-    quiet_hook();
-    CHECKING.with(|flag| flag.set(true));
-    let result = catch_unwind(AssertUnwindSafe(|| check(input)));
-    CHECKING.with(|flag| flag.set(false));
-    result.map_err(|payload| panic_text(payload.as_ref()))
-}
-
-/// Runs `check` on each input `make` gives for `iterations()` iterations. A panic of `KNOWN_PANICS`
-/// is counted and printed; any other fails the test, naming its seed and iteration.
-fn never_panics<T>(test: &str, seed: u64, mut make: impl FnMut(&mut Rng, u64) -> (T, String), check: impl Fn(T)) {
+/// Runs `check` on each input `make` gives for `iterations()` iterations. Every input must give an
+/// outcome; a panic, or a panic the guard caught outside Arrow, fails the test naming its seed and
+/// iteration. Until wave AR (lane AR-4) the panics of AQ5-R1 and AQ5-R2 were counted here by their
+/// message and let pass; since then the decode never panics on them. The outcomes are printed with
+/// their counts.
+fn never_panics<T>(
+    test: &str,
+    seed: u64,
+    mut make: impl FnMut(&mut Rng, u64) -> (T, String),
+    check: impl Fn(T) -> Outcome,
+) {
     let mut rng = Rng::new(seed);
-    let mut unknown = Vec::new();
-    let mut held: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    let mut panicked = Vec::new();
+    let mut outcomes: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
     for iteration in 0..iterations() {
         let (input, what) = make(&mut rng, iteration);
         trace(test, seed, iteration, &what);
-        if let Err(text) = run(&check, input) {
-            match known(&text) {
-                Some(finding) => held.entry(finding).or_default().push(iteration),
-                None => unknown.push(format!("seed {seed} iteration {iteration}: {what}: {text}")),
-            }
+        match run(&check, input) {
+            Ok(outcome) => outcomes.entry(outcome).or_default().push(iteration),
+            Err(text) => panicked.push(format!("seed {seed} iteration {iteration}: {what}: {text}")),
         }
     }
-    for (finding, iterations) in &held {
+    for (outcome, iterations) in &outcomes {
         eprintln!(
-            "{test}: {} inputs gave the known panic {finding} (seed {seed}, iterations {:?})",
+            "{test}: {} inputs {outcome} (seed {seed}, first iterations {:?})",
             iterations.len(),
             &iterations[..iterations.len().min(10)]
         );
     }
     assert!(
-        unknown.is_empty(),
+        panicked.is_empty(),
         "{test}: {} inputs panicked:\n{}",
-        unknown.len(),
-        unknown.join("\n")
+        panicked.len(),
+        panicked.join("\n")
     );
 }
 
@@ -615,7 +605,13 @@ fn mutated_column_values_never_panic_the_detectors() {
     );
 }
 
-// --- the panics found, each held at a case that shows it ------------------------------------------
+// --- the panics found by lane AQ-5, each held at a case that shows it -----------------------------
+//
+// AQ5-R1 and AQ5-R2 are panics of `arrow-ipc` 60.1.0's reader (through `arrow-buffer`) on a record
+// batch message whose header names buffers its body does not hold. Until wave AR they were held here by
+// their message (`KNOWN_PANICS`), with two ignored tests for the wanted behaviour and two that checked
+// the cases still panicked. Since lane AR-4 the decode is guarded (`decode_guard`): the live stream
+// ends with `INVALID_ARGUMENT` naming a malformed record batch, and `detect` with its error exit.
 
 /// A record batch message whose body is cut short of what its header names.
 fn cut_body() -> Vec<FlightData> {
@@ -626,47 +622,118 @@ fn cut_body() -> Vec<FlightData> {
     messages
 }
 
-#[test]
-#[ignore = "AQ5-R1: arrow-ipc 60.1.0 panics (arrow-buffer Buffer::slice) on a record batch message whose \
-            body is shorter than its header says, so a client's malformed batch panics the server's \
-            stream task in place of ending the stream with an error; held for the author, not fixed here"]
-fn a_put_batch_whose_body_is_cut_short_is_refused_without_a_panic() {
-    let found = run(&|messages| put_then_judge(messages), cut_body());
-    assert_eq!(found, Ok(()), "the decode panicked");
-    assert!(decode_put(cut_body()).is_err(), "a batch cut short is refused");
+/// Whether Arrow's own stream reader, unguarded by TensorQuill, panics on `bytes`. Run inside the
+/// guard only so the hook stays quiet for it; the reader itself is arrow's.
+fn arrow_reader_panics(bytes: &[u8]) -> Option<String> {
+    let read = AssertUnwindSafe(|| {
+        arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)
+            .map(|reader| reader.collect::<Result<Vec<_>, _>>().is_ok())
+            .is_ok()
+    });
+    match decode_guard::guard(read) {
+        Ok(_) => None,
+        Err(decode_guard::Caught::Arrow(text)) => Some(text),
+        Err(decode_guard::Caught::Other(payload)) => Some(panic_text(payload.as_ref())),
+    }
+}
+
+/// Whether Arrow Flight's own decoder, unguarded by TensorQuill, panics on `messages`: the decoder over
+/// the messages as one stream, polled to its end, as `run_stream` polled it before wave AR. Run inside
+/// the guard only so the hook stays quiet for it.
+fn arrow_decoder_panics(messages: Vec<FlightData>) -> Option<String> {
+    let read = AssertUnwindSafe(|| {
+        futures::executor::block_on(async {
+            let mut decoder =
+                arrow_flight::decode::FlightDataDecoder::new(futures::stream::iter(messages.into_iter().map(Ok)));
+            while let Some(message) = futures::StreamExt::next(&mut decoder).await {
+                if message.is_err() {
+                    break;
+                }
+            }
+        })
+    });
+    match decode_guard::guard(read) {
+        Ok(()) => None,
+        Err(decode_guard::Caught::Arrow(text)) => Some(text),
+        Err(decode_guard::Caught::Other(payload)) => Some(panic_text(payload.as_ref())),
+    }
 }
 
 #[test]
-fn the_cut_body_case_still_panics_with_the_known_message() {
-    // What keeps the ignored test above honest: the case still gives AQ5-R1 today. When arrow or the
-    // server stops panicking here, this fails, and the ignored test is to be turned on.
-    let found = run(&|messages| put_then_judge(messages), cut_body()).unwrap_err();
-    assert_eq!(known(&found), Some("AQ5-R1"), "{found}");
-}
-
-#[test]
-#[ignore = "AQ5-R1 and AQ5-R2 on `tensorquill-server detect`: arrow-ipc 60.1.0's stream reader panics \
-            on a mutated record batch header, so a malformed Arrow stream given to `detect` panics in \
-            place of an error; held for the author, not fixed here"]
-fn mutated_ipc_streams_that_panic_today_give_an_error() {
-    let mut rng = Rng::new(12);
+fn mutated_put_streams_that_panic_arrow_s_decoder_give_the_malformed_batch_status() {
+    // AQ5-R1 and AQ5-R2 on the live path: every mutated `DoPut` stream of seed 14 on which Arrow
+    // Flight's own decoder panics is refused by `decode_put` (the guarded decode `run_stream` runs)
+    // with the malformed-batch status, counted by Arrow's message.
+    let mut rng = Rng::new(14);
     let mut found = Vec::new();
+    let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
     for iteration in 0..iterations() {
-        let (bytes, what) = mutated_ipc(&mut rng, iteration);
-        if let Err(text) = run(&|bytes: Vec<u8>| detect_bytes(&bytes), bytes) {
-            found.push(format!("iteration {iteration}: {what}: {text}"));
+        let (messages, what) = mutated_put(&mut rng, iteration);
+        let Some(arrow_text) = arrow_decoder_panics(messages.clone()) else {
+            continue;
+        };
+        *kinds
+            .entry(arrow_text.split(':').next().unwrap_or_default().to_string())
+            .or_default() += 1;
+        match decode_put(messages) {
+            Err(status) if is_malformed(&status) => {}
+            other => found.push(format!(
+                "iteration {iteration}: {what}: arrow said {arrow_text:?}; decode_put gave {:?}",
+                other.map(|batches| batches.len())
+            )),
         }
     }
+    for (kind, count) in &kinds {
+        eprintln!("seed 14: {count} mutated DoPut streams panic arrow's decoder with {kind:?}");
+    }
+    assert!(
+        !kinds.is_empty(),
+        "no mutated DoPut stream of seed 14 panics arrow's decoder any more"
+    );
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
 #[test]
-fn a_known_detect_case_still_panics_with_a_known_message() {
+fn a_put_batch_whose_body_is_cut_short_is_refused_without_a_panic() {
+    // AQ5-R1 on the live path (turned on in wave AR, lane AR-4).
+    let found = run(&put_then_judge, cut_body());
+    assert_eq!(found, Ok("refused as a malformed record batch"));
+    let status = decode_put(cut_body()).unwrap_err();
+    assert!(is_malformed(&status), "{status:?}");
+}
+
+#[test]
+fn mutated_ipc_streams_that_panic_arrow_s_reader_give_detect_s_error() {
+    // AQ5-R1 and AQ5-R2 on `tensorquill-server detect` (turned on in wave AR, lane AR-4): every mutated
+    // stream of seed 12 that panics arrow's own reader ends `detect` with its malformed-batch error, no
+    // panic. The first such input is also what the rest of this file rests on: at the default number
+    // of iterations seed 12 still gives one, and when an arrow release stops panicking this says so.
     let mut rng = Rng::new(12);
-    let first = (0..iterations()).find_map(|iteration| {
-        let (bytes, _) = mutated_ipc(&mut rng, iteration);
-        run(&|bytes: Vec<u8>| detect_bytes(&bytes), bytes).err()
-    });
-    let text = first.expect("seed 12 still gives a panic among its mutated streams");
-    assert!(known(&text).is_some(), "{text}");
+    let mut found = Vec::new();
+    let mut panicking = 0;
+    let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
+    for iteration in 0..iterations() {
+        let (bytes, what) = mutated_ipc(&mut rng, iteration);
+        let Some(arrow_text) = arrow_reader_panics(&bytes) else {
+            continue;
+        };
+        panicking += 1;
+        *kinds
+            .entry(arrow_text.split(':').next().unwrap_or_default().to_string())
+            .or_default() += 1;
+        let outcome = run(&|bytes: Vec<u8>| detect_bytes(&bytes), bytes);
+        if outcome != Ok("refused as a malformed record batch") {
+            found.push(format!(
+                "iteration {iteration}: {what}: arrow said {arrow_text:?}; detect gave {outcome:?}"
+            ));
+        }
+    }
+    for (kind, count) in &kinds {
+        eprintln!("seed 12: {count} mutated streams panic arrow's reader with {kind:?}");
+    }
+    assert!(
+        panicking > 0,
+        "no mutated stream of seed 12 panics arrow's reader any more"
+    );
+    assert!(found.is_empty(), "{}", found.join("\n"));
 }
