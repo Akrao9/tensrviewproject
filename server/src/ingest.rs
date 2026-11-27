@@ -76,7 +76,7 @@ use arrow::array::{Array, BooleanArray, BooleanBuilder, Int32Array, Int64Array, 
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
+use arrow_flight::decode::{DecodedFlightData, DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
@@ -84,7 +84,7 @@ use arrow_flight::{
     PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::BoxStream;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -1818,16 +1818,22 @@ impl Ingest {
 
     async fn run_stream(
         &self,
-        stream: Streaming<FlightData>,
+        mut stream: Streaming<FlightData>,
         key: &mut Option<Key>,
         stream_id: u64,
         ack: &AckSender,
     ) -> Result<(), Status> {
-        let mut decoder = FlightDataDecoder::new(stream.map_err(FlightError::from));
+        let mut decoder = Decoder::new();
         let mut named = false;
         let tally = &ack.tally;
-        while let Some(message) = decoder.next().await {
-            let message = message.map_err(stream_error)?;
+        while let Some(data) = stream.next().await {
+            // A message is read from the transport first, then decoded on its own, so the guard around
+            // the decode covers Arrow's reader and nothing of the transport (`Decoder`). A malformed
+            // batch ends the stream here with `INVALID_ARGUMENT`, before anything of it is counted,
+            // placed or kept, and `do_put` cleans up as for any stream that ends in an error.
+            let Some(message) = decoder.decode(data?)? else {
+                continue;
+            };
             let inner = &message.inner;
             let bytes = inner.data_header.len() + inner.data_body.len() + inner.app_metadata.len();
             tally.bytes.fetch_add(bytes as u64, Ordering::SeqCst);
@@ -2726,6 +2732,59 @@ fn stream_error(error: FlightError) -> Status {
     }
 }
 
+/// The status a stream ends with when Arrow's IPC reader panics on one of its messages (AQ5-R1, AQ5-R2):
+/// what the client is told, with nothing of the panic. The words before the first `": "` are what the
+/// server's line for the stream shows of an `INVALID_ARGUMENT` (`stream_closed`), so there are none.
+const MALFORMED_BATCH: &str = "a malformed record batch, which the Arrow IPC reader cannot decode (its header names \
+                               bytes or a layout its body does not hold); nothing of it is stored and the stream ends here";
+
+/// Arrow Flight's decoder, given a stream's messages one at a time and each decode guarded (lane AR-4,
+/// AQ5-R1 and AQ5-R2). `run_stream` and `decode_put` both decode through it.
+///
+/// The decoder reads from a channel this holds the sending end of: [`Decoder::decode`] puts one message
+/// in and polls the decoder once, synchronously, inside [`crate::decode_guard::guard`]. The poll reaches
+/// the message at once, so it runs Arrow's reader and nothing of the transport, and the guard's flag
+/// never spans an `.await`. A message that only changes the decoder's state (a dictionary batch) gives
+/// `None`, and the next message is read, as the decoder did when it read the transport itself.
+struct Decoder {
+    feed: futures::channel::mpsc::UnboundedSender<Result<FlightData, FlightError>>,
+    decoder: FlightDataDecoder,
+}
+
+impl Decoder {
+    fn new() -> Self {
+        let (feed, messages) = futures::channel::mpsc::unbounded();
+        Self {
+            feed,
+            decoder: FlightDataDecoder::new(messages),
+        }
+    }
+
+    /// `data` decoded, `None` for a message that only changed the decoder's state, or the status the
+    /// stream ends with: the decoder's own error as before (`stream_error`), `MALFORMED_BATCH` for a
+    /// panic raised in Arrow, and `INTERNAL` for any other panic, which the panic hook prints.
+    fn decode(&mut self, data: FlightData) -> Result<Option<DecodedFlightData>, Status> {
+        if self.feed.unbounded_send(Ok(data)).is_err() {
+            return Err(Status::internal("the stream's decoder has ended"));
+        }
+        let decoder = &mut self.decoder;
+        // Sound to catch (`AssertUnwindSafe`): the poll touches only this stream's decoder, its
+        // channel and the message's own buffers; it holds no lock and changes nothing of `Ingest`. After
+        // a panic the caller ends the stream with the error and drops the decoder unpolled.
+        let polled = crate::decode_guard::guard(std::panic::AssertUnwindSafe(|| decoder.next().now_or_never()));
+        match polled {
+            Ok(Some(Some(decoded))) => decoded.map(Some).map_err(stream_error),
+            // Waiting for the next message (a dictionary batch was read), or, which cannot be while this
+            // holds the channel, the decoder's end.
+            Ok(Some(None) | None) => Ok(None),
+            Err(crate::decode_guard::Caught::Arrow(_)) => Err(Status::invalid_argument(MALFORMED_BATCH)),
+            Err(crate::decode_guard::Caught::Other(_)) => {
+                Err(Status::internal("the decode of a message of the stream panicked"))
+            }
+        }
+    }
+}
+
 /// A batch's `app_metadata`, read and checked against the stream's run and rank: a version this
 /// server does not read, or another run or rank than the descriptor's, refuses the stream.
 fn batch_metadata(key: &Key, app_metadata: &[u8]) -> Result<BatchMetadata, Status> {
@@ -2811,46 +2870,47 @@ pub struct DecodedBatch {
 /// a schema, record batches with their `app_metadata`), each data batch's rows out as the server takes
 /// them apart before placing or keeping anything. The first error ends it, with the status the
 /// stream would end with. Made for tests that drive the decode with generated bytes (lane AQ-5, SV7):
-/// it calls what `run_stream` and `accept` call, in their order (`stream_error`, `parse_descriptor`,
-/// `batch_metadata`, `decoded_rows`), and nothing of a store, a watchdog or an acknowledgement.
+/// it calls what `run_stream` and `accept` call, in their order (the guarded `Decoder`, `parse_descriptor`,
+/// `batch_metadata`, `decoded_rows`), and nothing of a store, a watchdog or an acknowledgement. A batch
+/// Arrow's reader panics on gives the status `run_stream` ends its stream with, never a panic.
 pub fn decode_put(messages: Vec<FlightData>) -> Result<Vec<DecodedBatch>, Status> {
-    futures::executor::block_on(async move {
-        let mut decoder = FlightDataDecoder::new(futures::stream::iter(messages.into_iter().map(Ok)));
-        let mut key: Option<Key> = None;
-        let mut out = Vec::new();
-        while let Some(message) = decoder.next().await {
-            let message = message.map_err(stream_error)?;
-            if key.is_none() {
-                if let Some(descriptor) = &message.inner.flight_descriptor {
-                    key = Some(parse_descriptor(descriptor)?);
-                }
+    let mut decoder = Decoder::new();
+    let mut key: Option<Key> = None;
+    let mut out = Vec::new();
+    for data in messages {
+        let Some(message) = decoder.decode(data)? else {
+            continue;
+        };
+        if key.is_none() {
+            if let Some(descriptor) = &message.inner.flight_descriptor {
+                key = Some(parse_descriptor(descriptor)?);
             }
-            let DecodedPayload::RecordBatch(batch) = message.payload else {
-                continue;
-            };
-            let key = key
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
-            let metadata = batch_metadata(key, &message.inner.app_metadata)?;
-            let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
-            let rows = if question {
-                DecodedRows::default()
-            } else {
-                decoded_rows(batch, metadata.schema_version).map_err(|refused| refused.status)?
-            };
-            out.push(DecodedBatch {
-                run_id: key.0.clone(),
-                rank: key.1,
-                schema_version: metadata.schema_version,
-                end_byte_offset: metadata.end_byte_offset,
-                step_rows: rows.pieces,
-                scalar_rows: rows.scalar_pieces,
-                dropped: rows.dropped,
-                attempts: rows.attempts,
-            });
         }
-        Ok(out)
-    })
+        let DecodedPayload::RecordBatch(batch) = message.payload else {
+            continue;
+        };
+        let key = key
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("the first message needs a FlightDescriptor"))?;
+        let metadata = batch_metadata(key, &message.inner.app_metadata)?;
+        let question = batch.num_rows() == 0 && metadata.end_byte_offset == 0;
+        let rows = if question {
+            DecodedRows::default()
+        } else {
+            decoded_rows(batch, metadata.schema_version).map_err(|refused| refused.status)?
+        };
+        out.push(DecodedBatch {
+            run_id: key.0.clone(),
+            rank: key.1,
+            schema_version: metadata.schema_version,
+            end_byte_offset: metadata.end_byte_offset,
+            step_rows: rows.pieces,
+            scalar_rows: rows.scalar_pieces,
+            dropped: rows.dropped,
+            attempts: rows.attempts,
+        });
+    }
+    Ok(out)
 }
 
 /// The kept rows of a batch, their first and last step, and the steps of the rows not kept.

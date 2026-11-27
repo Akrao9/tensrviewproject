@@ -2,6 +2,7 @@
 //! rows it already has for `(run_id, rank, step)`, and writes immutable Zstd Parquet parts
 //! through `object_store`.
 
+pub mod decode_guard;
 pub mod detect;
 pub mod ingest;
 pub mod server;
