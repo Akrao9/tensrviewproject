@@ -1417,7 +1417,8 @@ def head_logit_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     numbers, apart from positions with a NaN or an Inf): how many probes did, how many positions
     in all, the most in one probe, and the first and latest step of one, over every probe that
     has a `head` entry, read or not (C22, Nov 19, 2026; until then the count was in the records
-    only, so a number taken over fewer positions than the probe saw did not say so).
+    only, so a number taken over fewer positions than the probe saw did not say so). A count is an
+    integer above 0 that is an `i64`, as `data_checks._int` reads one (the author, Nov 27, 2026).
     """
     seen: list[tuple[int, dict[str, Any]]] = []
     for record in sorted(records, key=lambda r: r["step"]):
@@ -1443,7 +1444,8 @@ def head_logit_trends(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         trends["not_read"] = {"probes": len(skipped), "first_step": skipped[0][0],
                               "reason": str(skipped[0][1]["not_read"])}
     overflowed = [(step, count) for step, head in seen
-                  if isinstance(count := head.get("overflow_positions"), int) and not isinstance(count, bool) and count > 0]
+                  if isinstance(count := head.get("overflow_positions"), int) and not isinstance(count, bool)
+                  and 0 < count < 2**63]
     if overflowed:
         trends["overflow_positions"] = {
             "probes": len(overflowed), "positions": sum(count for _, count in overflowed),

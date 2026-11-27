@@ -45,7 +45,14 @@ def _data(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 
 def _int(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+    """A whole number, as Rust's `int` (`detect/data.rs`) reads one: an integer that is an `i64`. A
+    bool is none, and so is an integer outside `i64` (such as 10**400 or 2**64), as `_count` in
+    `evidence_system.py` reads a count. The author (Nov 27, 2026): "bound Python's
+    `data_checks._int` at int64, as its sibling `_count` already is. No capture writes such a
+    number." Until then Python kept any integer, and the engines differed on one past `i64`."""
+    if isinstance(value, int) and not isinstance(value, bool) and -(2**63) <= value < 2**63:
+        return value
+    return None
 
 
 def _hash(data: Mapping[str, Any]) -> str | None:
