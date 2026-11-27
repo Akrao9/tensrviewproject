@@ -120,11 +120,12 @@ def test_a_second_writer_with_an_endpoint_starts_no_sender_and_no_heartbeat(here
         assert not _streams(two)
         assert _stream_threads() == before == {"flight": 0, "heartbeat": 0}
         # Two statements at init: the sink's (which file, and why), and the stream's (nothing of
-        # the file is streamed). Both point at this file's `init` call.
+        # the file is streamed). The stream's points where the sink's does (`init`'s caller, or the
+        # `torch.compiler.disable` frame around `init`, as every warning of `init` does).
         assert said_one == [] and len(said_two) == 2, said_two
         assert "held by another writer" in said_two[0]
         _assert_not_streamed_said(said_two[1], pid_file, "same.rank0.jsonl")
-        assert {Path(w.filename).name for w in caught} == {Path(__file__).name}
+        assert len({(w.filename, w.lineno) for w in caught}) == 1, [(w.filename, w.lineno) for w in caught]
         with warnings.catch_warnings(record=True) as later:
             warnings.simplefilter("always")
             _train(model_two, 3)

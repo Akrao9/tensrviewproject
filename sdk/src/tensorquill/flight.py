@@ -2280,11 +2280,28 @@ def attach(
     manifest: Mapping[str, Any] | None = None,
 ) -> Any:
     """Start streaming `sink`'s file when `endpoint` or `TENSORQUILL_ENDPOINT` is set;
-    otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported."""
+    otherwise return `sink` unchanged, with no socket opened and `pyarrow` not imported.
+
+    A second writer of the run's rank is never streamed (the author's answer, wave AR): a sink that
+    found the rank's file held by another writer and writes a file of its own beside it
+    (`sink.JsonlSink.other_writer`) is returned unchanged, with no sender and no heartbeat started,
+    and that is said once. Its records carry the same run ID and rank as the first writer's, so a
+    stream of them would put a second writer's rows into the first's rank on the server. The
+    session then behaves as one with no endpoint. Where the lock is quiet (no `fcntl`, or a lock
+    that fails) no second writer is found and the file is streamed as before."""
     endpoint = endpoint or os.environ.get(ENDPOINT_ENV)
     if not endpoint:
         return sink
     _location(endpoint)
+    other = getattr(sink, "other_writer", None)
+    if other is not None:
+        name = Path(getattr(sink, "path", "")).name
+        _say(f"tensorquill.init: another writer holds rank {rank} of run {run_id!r} ({Path(other).name}), so "
+             f"nothing of {name}, which this session writes instead, is streamed to {endpoint}: no sender and no "
+             "heartbeat are started. The file is written here as usual. There is no supported way to send it to "
+             "the server on its own later: tensorquill.flight.send_file would store its rows in the same run and "
+             "rank as the first writer's, as another attempt of that rank.", stacklevel=3)
+        return sink
     path = getattr(sink, "path", None)
     if path is None:
         raise ValueError(

@@ -192,7 +192,9 @@ class JsonlSink:
     the sink writes its file unlocked and says so once. Where Python has no `fcntl` (Windows) the
     file is written unlocked and nothing is said. Opening never waits and never raises for any of
     this. `path` is the file written; `locked` whether the lock is held; `created` whether this
-    sink made the file. A sink made with the default `lock=False` takes no lock, as before.
+    sink made the file; `other_writer` the file another writer holds when this sink writes a second
+    writer's file beside it (None otherwise), which `flight.attach` reads: a second writer is never
+    streamed. A sink made with the default `lock=False` takes no lock, as before.
 
     A file whose last line was left half written (the process that wrote it was killed in the
     middle of a step) is first given the newline that line lacks, so the first new step starts a
@@ -208,6 +210,7 @@ class JsonlSink:
     def __init__(self, path: str | Path, *, lock: bool = False) -> None:
         self.path = Path(path)
         self.locked = False
+        self.other_writer: Path | None = None  # set when another writer holds `path` (`_take_lock`)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.created = not self.path.exists()
         # Locked, the file is opened for reading too, so the torn-line checks read it through this
@@ -263,6 +266,7 @@ class JsonlSink:
             return False
         self._file.close()
         self._file, self.path, self.created = file, second, created
+        self.other_writer = first
         state, error = _try_lock(file)
         self.locked = state == "held"
         if state == "busy":  # a third writer of this run ID and rank in this one process

@@ -5762,7 +5762,8 @@ def init(
             or `grpcs://host:port`. Defaults to `TENSORQUILL_ENDPOINT`; when neither is set
             no socket is opened. For custom/self-signed server certificates under `grpcs://`,
             set `TENSORQUILL_TLS_CA` to the PEM CA path. Needs `pip install pyarrow`.
-            See `flight.py`.
+            A second writer of the run's rank (one that found the rank's file held and writes
+            `<run_id>.rank<N>.<pid>.jsonl`) streams nothing and says so once. See `flight.py`.
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
             the model has no repeated blocks. `"all"`: every leaf module with parameters,
