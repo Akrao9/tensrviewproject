@@ -5,10 +5,10 @@
 //! `non_finite`; `replica.rs`: the observation, its scope and the spread's
 //! fallback), and of the four other JSON columns (lane AR-3, Nov 26, 2026, AQ5-D2; the author:
 //! "The Nov 22 reading of an oversized integer extended to `system_json`, `data_json`,
-//! `probe_json`, `checkpoint_json` in Rust"): `system.rs`'s reading of `system_json`
-//! ([`read_column`]), `data.rs`'s of `data_json` ([`read_column`]) and `checkpoint_json`
-//! ([`parse`]), and `detect.rs`'s two of `probe_json`, the head's ([`parse`]) and the attention
-//! rules' and `attention_trends`' typed one ([`parse_into`]). Every route reads them there: the raw
+//! `probe_json`, `checkpoint_json` in Rust"): `system.rs`'s reading of `system_json` and
+//! `data.rs`'s of `data_json` and `checkpoint_json` (each [`read_column`]), and `detect.rs`'s two
+//! of `probe_json`, the head's ([`parse`]) and the attention rules' and `attention_trends`' typed
+//! one ([`parse_into`]). Every route reads them there: the raw
 //! file `tensorquill-server detect` reads, the live detectors, and the rows a restart reads back
 //! from the store, which holds each column's text as it was sent.
 //!
@@ -56,7 +56,7 @@ pub(crate) struct Column {
 impl Column {
     /// `value`, a part of this column, as text, as Python's `isinstance(value, str)` takes it: in a
     /// column whose oversized numbers were read as [`UNREADABLE`], that string is a number and no
-    /// text. So an oversized integer is no batch hash and no throttle reason. In a text that
+    /// text. So an oversized integer is no batch hash, throttle reason or tensor name. In a text that
     /// parses, every string is text, those words included.
     pub(crate) fn text<'v>(&self, value: &'v Value) -> Option<&'v str> {
         value.as_str().filter(|text| !(self.oversized && *text == UNREADABLE))
