@@ -263,7 +263,7 @@ def test_on_a_second_rank_the_shared_id_is_the_string(tmp_path):
     out = work / "tensorquill-out"
     assert sorted(p.name for p in out.iterdir()) == [
         "shared.rank0.end.json", "shared.rank0.jsonl", "shared.rank1.end.json", "shared.rank1.jsonl",
-        "shared.run.json"]
+        "shared.rank1.settings.json", "shared.run.json"]
 
 
 def test_a_second_rank_given_the_integer_by_an_older_rank_0_records_its_text(tmp_path):
@@ -274,7 +274,8 @@ def test_a_second_rank_given_the_integer_by_an_older_rank_0_records_its_text(tmp
     assert one["error"] == "None", one
     assert one["warnings"] == ["rank 0's run_id gives a run ID that is not a string (int); the run is recorded "
                                "under its text, '123'. Pass run_id= to choose the ID."], one
-    assert sorted(p.name for p in (work / "tensorquill-out").iterdir()) == ["123.rank1.end.json", "123.rank1.jsonl"]
+    assert sorted(p.name for p in (work / "tensorquill-out").iterdir()) == [
+        "123.rank1.end.json", "123.rank1.jsonl", "123.rank1.settings.json"]
 
 
 # ---- a tracker object that is not the real one --------------------------------------------------

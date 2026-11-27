@@ -193,3 +193,255 @@ def test_two_older_manifests_compare_as_before(here):
     result = tensorquill.compare_runs("old1", "old2", source=out)
     assert "pinned_flush_not_recorded" not in result["setup"]
     assert "pinned_flush" not in result["summary"]
+
+
+# --- Item 1: each rank above 0 writes its numerical settings beside its records ------------------
+#
+# The author's answer to item 9 (option A of lane AQ-6): `<run_id>.rank<N>.settings.json` beside each
+# rank's records, written at `init` by one line of `capture.py`. Rank 0's settings are in the run
+# manifest, so rank 0 writes no such file.
+
+SETTING = "os.environ.get('CUBLAS_WORKSPACE_CONFIG')"
+
+
+def _as_rank(monkeypatch, rank: int, world: int = 2) -> None:
+    monkeypatch.setenv("RANK", str(rank))
+    monkeypatch.setenv("WORLD_SIZE", str(world))
+
+
+def _read(path: Path) -> dict:
+    import json
+
+    return json.loads(path.read_text())
+
+
+def test_a_rank_above_0_writes_its_settings_beside_its_records(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    session, said, model = _init("two")
+    _train(model, 1)
+    session.close()
+    out = here / "tensorquill-out"
+    assert sorted(p.name for p in out.iterdir()) == ["two.rank1.end.json", "two.rank1.jsonl", "two.rank1.settings.json"]
+    assert session.manifest is None and not [s for s in said if "settings" in s]
+    written = _read(out / "two.rank1.settings.json")
+    assert (written["schema_version"], written["run_id"], written["rank"]) == (1, "two", 1)
+    block = written["numerical_settings"]
+    assert block["read_at"] == "init" and block["starts"] == 1 and block["read_at_utc"].endswith("Z")
+    assert block["settings"][SETTING] == {"value": ":4096:8"}
+    # The same block as the manifest's on rank 0, read by the same reader.
+    assert set(block["settings"]) == set(mf.numerical_settings_block()["settings"])
+    assert mf.numerical_settings(written)["recorded"] is True
+    assert mf.read_rank_settings(out / "two.rank1.settings.json") == written
+    assert mf.rank_settings(out, "two") == {1: written}
+    assert mf.rank_settings_path(out / "two.rank1.jsonl", "two", 1) == out / "two.rank1.settings.json"
+
+
+def test_rank_0_writes_no_settings_file_its_settings_are_in_the_manifest(here, monkeypatch):
+    _as_rank(monkeypatch, 0)
+    _run("two")
+    out = here / "tensorquill-out"
+    assert not list(out.glob("*.settings.json"))
+    assert mf.read_manifest(out / "two.run.json")["numerical_settings"]["read_at"] == "init"
+    assert mf.rank_settings(out, "two") == {}
+
+
+def test_a_second_writer_of_a_rank_writes_its_own_settings_file_and_leaves_the_first_writers(here, monkeypatch):
+    _as_rank(monkeypatch, 2, 4)
+    one, _, _ = _init("w")
+    out = here / "tensorquill-out"
+    first = (out / "w.rank2.settings.json").read_bytes()
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    two, said, _ = _init("w")
+    try:
+        assert two._sink.path.name == f"w.rank2.{os.getpid()}.jsonl" and len(said) == 1, said
+    finally:
+        two.close()
+        one.close()
+    assert (out / "w.rank2.settings.json").read_bytes() == first
+    second = _read(out / f"w.rank2.{os.getpid()}.settings.json")
+    assert (second["run_id"], second["rank"]) == ("w", 2)
+    assert second["numerical_settings"]["settings"][SETTING] == {"value": ":16:8"}
+    assert mf.rank_settings_path(two._sink.path, "w", 2) == out / f"w.rank2.{os.getpid()}.settings.json"
+    # The reader of a folder gives each rank's first writer's file.
+    assert mf.rank_settings(out, "w") == {2: _read(out / "w.rank2.settings.json")}
+
+
+def test_a_resume_keeps_both_starts_settings_when_they_differ(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    _run("again")
+    out = here / "tensorquill-out"
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    _run("again")
+    block = _read(out / "again.rank1.settings.json")["numerical_settings"]
+    assert block["settings"][SETTING] == {"value": ":16:8"} and block["starts"] == 1
+    (earlier,) = block["earlier_starts"]
+    assert earlier["settings"][SETTING] == {"value": ":4096:8"} and earlier["starts"] == 1
+
+
+def test_a_resume_with_the_same_settings_counts_the_start(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    _run("same")
+    _run("same")
+    block = _read(here / "tensorquill-out" / "same.rank1.settings.json")["numerical_settings"]
+    assert block["starts"] == 2 and "earlier_starts" not in block
+
+
+def test_another_runs_settings_file_at_the_path_is_replaced_not_merged(tmp_path):
+    path = tmp_path / "r.rank1.settings.json"
+    path.write_text('{"schema_version": 1, "run_id": "other", "rank": 1, "numerical_settings": '
+                    '{"read_at": "init", "settings": {}, "starts": 5}}')
+    undo: list = []
+    mf.write_rank_settings(tmp_path / "r.rank1.jsonl", "r", 1, undo)
+    written = _read(path)
+    assert written["run_id"] == "r" and written["numerical_settings"]["starts"] == 1
+    assert "earlier_starts" not in written["numerical_settings"]
+
+
+def test_a_settings_file_that_cannot_be_written_never_raises_and_is_said_once(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    out = here / "tensorquill-out"
+    (out / "bad.rank1.settings.json").mkdir(parents=True)  # a folder where the file would go
+    session, said, model = _init("bad")
+    _train(model, 2)
+    session.close()
+    about = [s for s in said if "bad.rank1.settings.json" in s]
+    assert len(about) == 1 and "the run goes on" in about[0], said
+    assert (out / "bad.rank1.settings.json").is_dir()
+    assert not [p for p in out.iterdir() if p.name.endswith(".tmp")]
+    assert [p.name for p in out.glob("bad.rank1.jsonl")] == ["bad.rank1.jsonl"]
+
+
+def test_a_settings_file_that_cannot_be_written_never_raises_under_w_error(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    out = here / "tensorquill-out"
+    (out / "e.rank1.settings.json").mkdir(parents=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        session = tensorquill.init(nn.Linear(2, 1), run_id="e", every=1, heartbeat_seconds=None,
+                                   stack_seconds=None)
+    session.close()
+
+
+def test_a_failed_init_takes_the_settings_file_back(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    import tensorquill.flight as flight
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("no stream today")
+
+    monkeypatch.setattr(flight, "attach", refuse)
+    with pytest.raises(RuntimeError, match="no stream today"):
+        _init("undone")
+    out = here / "tensorquill-out"
+    assert not (out / "undone.rank1.settings.json").exists()
+    # A file that was there before the failed init is put back as it was.
+    monkeypatch.undo()
+    _as_rank(monkeypatch, 1)
+    _run("undone")
+    before = (out / "undone.rank1.settings.json").read_bytes()
+    monkeypatch.setattr(flight, "attach", refuse)
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    with pytest.raises(RuntimeError, match="no stream today"):
+        _init("undone")
+    assert (out / "undone.rank1.settings.json").read_bytes() == before
+
+
+def test_a_sink_with_no_file_writes_no_settings_file(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    session, _, model = _init("mem", sink=tensorquill.MemorySink())
+    _train(model, 1)
+    session.close()
+    assert not (here / "tensorquill-out").exists() or not list((here / "tensorquill-out").iterdir())
+
+
+def test_a_sink_of_a_name_of_its_own_gets_the_ranks_settings_file_beside_it(here, monkeypatch):
+    _as_rank(monkeypatch, 1)
+    folder = here / "mine"
+    folder.mkdir()
+    session, _, model = _init("own", sink=tensorquill.JsonlSink(folder / "learner.jsonl"))
+    _train(model, 1)
+    session.close()
+    assert _read(folder / "own.rank1.settings.json")["rank"] == 1
+
+
+def test_the_reader_takes_only_files_of_the_run_and_rank_their_names_say(tmp_path):
+    def put(name: str, run_id: str, rank: int) -> None:
+        (tmp_path / name).write_text('{"schema_version": 1, "run_id": "%s", "rank": %d, "numerical_settings": '
+                                     '{"read_at": "init", "settings": {}}}' % (run_id, rank))
+
+    put("r.rank1.settings.json", "r", 1)
+    put("r.rank2.settings.json", "r", 3)  # its document names another rank: not rank 2's
+    put("r.rank1.rank3.settings.json", "r.rank1", 3)  # run `r.rank1`, not run `r`
+    put("r.rank4.77.settings.json", "r", 4)  # a second writer's
+    (tmp_path / "r.rank5.settings.json").write_text("not json")
+    found = mf.rank_settings(tmp_path, "r")
+    assert list(found) == [1]
+    assert list(mf.rank_settings(tmp_path, "r.rank1")) == [3]
+    assert mf.read_rank_settings(tmp_path / "r.rank5.settings.json") is None
+    assert mf.read_rank_settings(tmp_path / "missing.settings.json") is None
+
+
+def _two_ranks(monkeypatch, run_id: str, rank1_env: str | None = None) -> None:
+    _as_rank(monkeypatch, 0)
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    _run(run_id)
+    _as_rank(monkeypatch, 1)
+    if rank1_env is not None:
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", rank1_env)
+    _run(run_id)
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    for name in ("RANK", "WORLD_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_the_folder_readers_do_not_take_the_settings_file_for_records_or_a_manifest(here, monkeypatch):
+    from tensorquill import runs as _runs
+
+    _two_ranks(monkeypatch, "pair")
+    out = here / "tensorquill-out"
+    assert (out / "pair.rank1.settings.json").is_file()
+    (found,) = _runs.discover_runs(out)
+    assert found["run_id"] == "pair" and sorted(found["files"]) == [0, 1]
+    assert "more_files" not in found and "other_writers" not in found
+    assert _sink.writers_of(out / "pair.rank1.jsonl") == [out / "pair.rank1.jsonl"]
+    (with_file,) = tensorquill.list_runs(out)
+    hidden = here / "aside.settings.json"
+    (out / "pair.rank1.settings.json").rename(hidden)
+    (without,) = tensorquill.list_runs(out)
+    hidden.rename(out / "pair.rank1.settings.json")
+    assert with_file == without
+    with pytest.raises(ValueError, match="not a folder of runs or a .jsonl capture"):
+        _runs.discover_runs(out / "pair.rank1.settings.json")
+    # The file given alone is a rank's records, and the evidence of rank 1's file is as it was.
+    assert tensorquill.build_evidence(out / "pair.rank1.jsonl")["run"]["run_id"] == "pair"
+
+
+def test_compare_says_when_a_rank_differs_from_rank_0_in_its_settings(here, monkeypatch):
+    _two_ranks(monkeypatch, "base")
+    _two_ranks(monkeypatch, "odd", rank1_env=":4096:8")
+    result = tensorquill.compare_runs("base", "odd", source=here / "tensorquill-out")
+    by_rank = result["setup"]["numerical_settings_ranks"]
+    assert by_rank == {"A": {"compared_with_rank_0": [1]},
+                       "B": {"compared_with_rank_0": [1], "differ": [{"rank": 1, "settings": [SETTING]}]}}
+    assert (f"   B's rank 1 differs from its rank 0 in its numerical settings: {SETTING}"
+            in result["summary"].splitlines())
+
+
+def test_compare_says_when_the_other_ranks_settings_were_not_recorded(here, monkeypatch):
+    _two_ranks(monkeypatch, "base")
+    _two_ranks(monkeypatch, "older")
+    out = here / "tensorquill-out"
+    (out / "older.rank1.settings.json").unlink()  # as a run recorded before the file existed
+    result = tensorquill.compare_runs("base", "older", source=out)
+    assert result["setup"]["numerical_settings_ranks"]["B"] == {"compared_with_rank_0": [], "not_recorded": [1]}
+    assert any(line.startswith("   numerical settings of B's rank 1 not recorded") for line in
+               result["summary"].splitlines())
+
+
+def test_compare_of_runs_of_one_rank_adds_nothing_for_the_other_ranks(here):
+    _run("solo1")
+    _run("solo2")
+    setup = tensorquill.compare_runs("solo1", "solo2", source=here / "tensorquill-out")["setup"]
+    assert "numerical_settings_ranks" not in setup
