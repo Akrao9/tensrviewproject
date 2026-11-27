@@ -3,7 +3,14 @@
 //! `moe_refused`, `update_not_read`, the stalled-weight onset's notes, `grads_not_read`,
 //! `layers_not_read`, `moe_source` and, in protocol 5's layout, a layer's refused fields for
 //! `non_finite`; `replica.rs`: the observation, its scope and the spread's
-//! fallback).
+//! fallback), and of the four other JSON columns (lane AR-3, Nov 26, 2026, AQ5-D2; the author:
+//! "The Nov 22 reading of an oversized integer extended to `system_json`, `data_json`,
+//! `probe_json`, `checkpoint_json` in Rust"): `system.rs`'s reading of `system_json`
+//! ([`read_column`]), `data.rs`'s of `data_json` ([`read_column`]) and `checkpoint_json`
+//! ([`parse`]), and `detect.rs`'s two of `probe_json`, the head's ([`parse`]) and the attention
+//! rules' and `attention_trends`' typed one ([`parse_into`]). Every route reads them there: the raw
+//! file `tensorquill-server detect` reads, the live detectors, and the rows a restart reads back
+//! from the store, which holds each column's text as it was sent.
 //!
 //! A number no `f64` can hold, such as the `10**400` a refused map entry carries (the sender keeps
 //! the integer in full, so that Python reads it back exactly), made serde_json refuse the whole
@@ -18,6 +25,7 @@
 //! The alternative, serde_json's `arbitrary_precision`, would change how every number the server
 //! parses is held and written again, so it is not used.
 
+use serde::Deserialize;
 use serde_json::Value;
 
 #[cfg(test)]
@@ -33,6 +41,53 @@ pub(crate) fn parse(text: &str) -> Option<Value> {
     match serde_json::from_str(text) {
         Ok(value) => Some(value),
         Err(_) => serde_json::from_str(&without_oversized(text)?).ok(),
+    }
+}
+
+/// A JSON column's text read as [`parse`] reads it, and whether a number in it was read as
+/// [`UNREADABLE`].
+pub(crate) struct Column {
+    pub(crate) value: Value,
+    /// A number too large for a float was read as [`UNREADABLE`]: a string equal to it is then
+    /// that number, not text (see [`Column::text`]).
+    pub(crate) oversized: bool,
+}
+
+impl Column {
+    /// `value`, a part of this column, as text, as Python's `isinstance(value, str)` takes it: in a
+    /// column whose oversized numbers were read as [`UNREADABLE`], that string is a number and no
+    /// text. So an oversized integer is no batch hash and no throttle reason. In a text that
+    /// parses, every string is text, those words included.
+    pub(crate) fn text<'v>(&self, value: &'v Value) -> Option<&'v str> {
+        value.as_str().filter(|text| !(self.oversized && *text == UNREADABLE))
+    }
+}
+
+/// The column's text as JSON, as [`parse`] reads it, or None when it is not JSON for any reason
+/// but a number too large for a float.
+pub(crate) fn read_column(text: &str) -> Option<Column> {
+    match serde_json::from_str(text) {
+        Ok(value) => Some(Column {
+            value,
+            oversized: false,
+        }),
+        Err(_) => serde_json::from_str(&without_oversized(text)?)
+            .ok()
+            .map(|value| Column { value, oversized: true }),
+    }
+}
+
+/// [`parse`] for a typed reader that borrows from the text (`probe_json`'s `Probe`): `T` read from
+/// `text`, or, when only a number too large for a float keeps the text from parsing, from the text
+/// with each such number written as [`UNREADABLE`], held in `rewritten` for `T` to borrow from. A
+/// text that parses is read from itself, and nothing is held.
+pub(crate) fn parse_into<'t, T: Deserialize<'t>>(text: &'t str, rewritten: &'t mut Option<String>) -> Option<T> {
+    match serde_json::from_str(text) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            let rewritten: &'t str = Option::insert(rewritten, without_oversized(text)?);
+            serde_json::from_str(rewritten).ok()
+        }
     }
 }
 

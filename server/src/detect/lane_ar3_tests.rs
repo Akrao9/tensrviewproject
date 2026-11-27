@@ -218,11 +218,8 @@ fn d2_probe_json_with_an_oversized_integer_is_read() {
         ),
     )]);
     assert_eq!(checks(&found, &ATTENTION), checked(&ATTENTION, 1), "{found}");
-    assert_eq!(
-        found["attention_trends"]["listed"][0]["first"],
-        json!(3.956723686),
-        "{found}"
-    );
+    // One probe is no trend, in Python's `attention_trends` too; ten are, below.
+    assert_eq!(found["attention_trends"], Value::Null, "{found}");
 }
 
 #[test]
@@ -404,4 +401,38 @@ fn d2_a_text_that_is_not_json_for_another_reason_is_still_not_read() {
         json!(0),
         "{found}"
     );
+}
+
+// --- the reading itself ---------------------------------------------------------------------------
+
+#[test]
+fn d2_a_typed_reader_borrowing_from_the_text_reads_the_rewritten_text() {
+    let text = format!(r#"{{"a": 1.5, "b": {}}}"#, big());
+    assert!(serde_json::from_str::<Value>(&text).is_err());
+    let mut held = None;
+    let read: Option<std::collections::BTreeMap<&str, Value>> = super::parse_into(&text, &mut held);
+    let read = read.expect("read with the oversized number as the unreadable text");
+    assert_eq!(read["a"], json!(1.5));
+    assert_eq!(read["b"], json!(super::UNREADABLE));
+    // A text that parses is read from itself, and nothing is held.
+    let mut held = None;
+    let read: Option<std::collections::BTreeMap<&str, Value>> = super::parse_into(r#"{"a": 2}"#, &mut held);
+    assert_eq!(read.unwrap()["a"], json!(2));
+    assert!(held.is_none());
+    // Not JSON for another reason: nothing.
+    let mut held = None;
+    let read: Option<Value> = super::parse_into(&format!("[{}, ]", big()), &mut held);
+    assert!(read.is_none());
+}
+
+#[test]
+fn d2_the_unreadable_text_is_text_only_where_it_was_written_as_text() {
+    let rewritten = super::read_column(&format!(r#"{{"hash": {}}}"#, big())).unwrap();
+    assert!(rewritten.oversized);
+    assert_eq!(rewritten.text(&rewritten.value["hash"]), None);
+    // The same words written as a string, in a text that parses, are text.
+    let written = super::read_column(&format!(r#"{{"hash": "{}"}}"#, super::UNREADABLE)).unwrap();
+    assert!(!written.oversized);
+    assert_eq!(written.text(&written.value["hash"]), Some(super::UNREADABLE));
+    assert_eq!(written.text(&json!(5)), None);
 }

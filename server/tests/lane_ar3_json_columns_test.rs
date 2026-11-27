@@ -181,15 +181,15 @@ async fn d2_oversized_integers_in_the_json_columns_are_stored_as_sent_and_read_l
     {
         let server = start(root).await;
         let mut put = open(&server.address, RUN, 0, schema()).await;
-        put.send(batch(0..4), 100).await;
+        put.send(batch(0..6), 100).await;
         assert_eq!(put.ack().await, 100);
         put.finish().await;
-        assert_read(&report_through(root, 3).await, 4);
+        assert_read(&report_through(root, 5).await, 6);
         server.ingest.shutdown().await.unwrap();
     }
     // The stored rows hold the text as sent: the integer's 401 digits, not a float or a placeholder.
     for (at, column) in COLUMNS.iter().enumerate() {
-        let expected: Vec<Option<String>> = (0..4).map(|step| texts(step)[at].clone()).collect();
+        let expected: Vec<Option<String>> = (0..6).map(|step| texts(step)[at].clone()).collect();
         assert_eq!(stored(root, column), expected, "{column}");
     }
     assert!(stored(root, "system_json")[0].as_deref().unwrap().contains(&big()));
@@ -197,10 +197,10 @@ async fn d2_oversized_integers_in_the_json_columns_are_stored_as_sent_and_read_l
     // A restart: the detectors are rebuilt from the stored parts, then read the new rows.
     let server = start(root).await;
     let mut put = open(&server.address, RUN, 0, schema()).await;
-    put.send(batch(4..6), 200).await;
+    put.send(batch(6..8), 200).await;
     assert_eq!(put.ack().await, 200);
     put.finish().await;
-    let report = report_through(root, 5).await;
+    let report = report_through(root, 7).await;
     assert_eq!(report["rebuilds"], 1, "{report}");
-    assert_read(&report, 6);
+    assert_read(&report, 8);
 }

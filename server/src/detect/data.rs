@@ -14,6 +14,7 @@ use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
+use super::extra_json;
 use super::{column, judge, text, with_classes, Columns, Scalars, Thresholds, Wanted};
 
 // The same values as the constants of the same names in data_checks.py.
@@ -93,13 +94,15 @@ pub(super) struct DataRow {
 
 impl DataRow {
     pub(super) fn read(columns: &Columns, row: usize) -> Option<Self> {
-        let parsed: Value = serde_json::from_str(text(columns.data, row)?).ok()?;
-        let fields = parsed.as_object()?;
+        // An integer too large for a float is no number and no hash, and the rest of the row's
+        // `data` is kept (AQ5-D2): before, it lost the whole `data_json`.
+        let parsed = extra_json::read_column(text(columns.data, row)?)?;
+        let fields = parsed.value.as_object()?;
         let get = |key: &str| fields.get(key).unwrap_or(&Value::Null);
         Some(Self {
             batches: int(get("batches")),
-            hash: get("batch_hash")
-                .as_str()
+            hash: parsed
+                .text(get("batch_hash"))
                 .filter(|hash| !hash.is_empty())
                 .map(str::to_owned),
             epoch: int(get("epoch")),
@@ -562,7 +565,7 @@ impl ResumeRow {
 pub(super) fn checkpoint(columns: &Columns, row: usize) -> Option<Value> {
     text(columns.checkpoint, row)
         .filter(|text| text.trim_start().starts_with('{')) // an object, if anything, and no parse for the rest
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(extra_json::parse) // an integer too large for a float is unreadable, the rest kept (AQ5-D2)
         .filter(Value::is_object)
 }
 
