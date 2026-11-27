@@ -636,3 +636,21 @@ fn detect_follow_answers_its_good_frame_then_ends_with_its_error_exit_at_the_cut
     let answer: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(answer["follow"]["mode"], "full", "{answer}");
 }
+
+#[test]
+fn collect_batches_names_the_cut_short_stream_malformed_and_reads_the_whole_one() {
+    // `decode_guard::collect_batches`, which `detect.rs`'s readers can call in place of `collect`
+    // (proposed to the lanes that own them): the same error as the command's, from the read itself.
+    let rows = steps("ar4_detect", 0..4);
+    let read = |bytes: Vec<u8>| {
+        tensorquill_server::decode_guard::collect_batches(
+            arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None).unwrap(),
+        )
+    };
+    assert_eq!(read(ipc(&rows)).unwrap().len(), 1);
+    let error = read(ipc_cut_short(&rows)).unwrap_err();
+    assert!(
+        error.starts_with(tensorquill_server::decode_guard::MALFORMED_INPUT),
+        "{error}"
+    );
+}

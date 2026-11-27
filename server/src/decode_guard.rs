@@ -108,6 +108,25 @@ pub fn offline<T, E: From<String>>(call: impl FnOnce() -> Result<T, E> + UnwindS
     }
 }
 
+/// The record batches an Arrow IPC stream reader gives, collected inside [`guard`]: what `detect.rs`'s
+/// readers (`read_batches`, `detect_rows_counted`, `follow_append`) can call in place of
+/// `reader.collect()`, so a malformed batch is an error of the read itself and not a panic, and
+/// [`offline`] then only stands behind them. A panic in Arrow is the error [`MALFORMED_INPUT`] with
+/// Arrow's message; any other error is the reader's own error's text, as `collect` gave it (the caller adds its own words, as now). Any other panic goes on
+/// unwinding.
+pub fn collect_batches<R: std::io::Read>(
+    reader: arrow::ipc::reader::StreamReader<R>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    // Sound to catch: the reader is consumed by the call and nothing of it is used after a panic.
+    match guard(std::panic::AssertUnwindSafe(|| reader.collect::<Result<Vec<_>, _>>())) {
+        Ok(read) => read.map_err(|error| error.to_string()),
+        Err(Caught::Arrow(text)) => Err(format!(
+            "{MALFORMED_INPUT}, and the Arrow reader stopped on it ({text})"
+        )),
+        Err(Caught::Other(payload)) => panic::resume_unwind(payload),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +171,32 @@ mod tests {
         assert!(found.unwrap_err().starts_with(MALFORMED_INPUT));
         let other = panic::catch_unwind(|| offline::<(), String>(|| panic!("a detector's fault")));
         assert!(other.is_err());
+    }
+
+    #[test]
+    fn collect_batches_gives_the_batches_or_the_reader_s_error() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![Field::new("step", DataType::Int64, false)]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        let read = |bytes: &[u8]| {
+            collect_batches(
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None).unwrap(),
+            )
+        };
+        assert_eq!(read(&bytes).unwrap(), vec![batch]);
+        // Cut inside the batch's body: the reader's own error, not the malformed-batch one.
+        let error = read(&bytes[..bytes.len() - 12]).unwrap_err();
+        assert!(!error.starts_with(MALFORMED_INPUT), "{error}");
     }
 }
