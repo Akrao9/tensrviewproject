@@ -364,16 +364,6 @@ HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
         [_record(step, moe={"r1": [68, 64, 70, 66, 61, 65, 64, 62]}) for step in range(49)]
         + [_record(49, moe={"r1": [68, 64, 2**53 + 1, 66, 61, 65, 64, 62]})],
     ),
-    # Seed 572.
-    "AQ5-D6 a step above int64": (
-        "Python judges the record; the Rust path raises a bare OverflowError. WAVE_AF_CONTRACT.md "
-        "section 1: one identity check so the engines cannot disagree",
-        [_record(9223372036854775808, grad_norm=1.0)],
-    ),
-    "AQ5-D6 a rank above int32": (
-        "as above: Python judges, the Rust path raises ArrowInvalid (found by hand from D6)",
-        [_record(3, rank=2**31, grad_norm=1.0)],
-    ),
     # Seed 4082, two records.
     "AQ5-D7 a scalars entry the column refuses, in an incident's context": (
         "Python's scalar context of the repeated_steps incident shows the refused value (-10**400, or a "
@@ -428,6 +418,15 @@ SETTLED_AR2: dict[str, tuple[str, list[dict[str, Any]]]] = {
     "AQ5-D3 a grad_norm of the wrong type, a bool": (
         "as above, for true",
         _stall(True),
+    ),
+    # Seed 572.
+    "AQ5-D6 a step above int64": (
+        "identity.check is bounded at Int64: both engines refuse the record by name (MalformedRecordError)",
+        [_record(9223372036854775808, grad_norm=1.0)],
+    ),
+    "AQ5-D6 a rank above int32": (
+        "identity.check is bounded at Int32 for rank: both engines refuse the record by name",
+        [_record(3, rank=2**31, grad_norm=1.0)],
     ),
 }
 

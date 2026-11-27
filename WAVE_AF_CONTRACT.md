@@ -44,9 +44,9 @@ All of it was run on `76a3b5d`; each case's `today` in `cases.json` is the recor
 | Field | Absent | Valid when present |
 |---|---|---|
 | `schema_version` | Read as 0, the legacy version, as on the base | The integer 0 or 1 (the versions the server stores) |
-| `rank` | Read as on the base (0, or the reader's default rank) | An integer of 0 or more |
-| `attempt` | Read as 0, as on the base | An integer of 0 or more |
-| `step` | **Not valid** | An integer of 0 or more |
+| `rank` | Read as on the base (0, or the reader's default rank) | An integer of 0 or more, at most 2**31 - 1 (Int32; section 12) |
+| `attempt` | Read as 0, as on the base | An integer of 0 or more, at most 2**63 - 1 (Int64; section 12) |
+| `step` | **Not valid** | An integer of 0 or more, at most 2**63 - 1 (Int64; section 12) |
 | `run_id` | As on the base | As on the base: this page does not change how a missing, null or non-text run ID is read (pins `run_id_absent`, `run_id_null`, `run_id_number`) |
 
 - A Boolean is not an integer. A float is not an integer, **also when it is whole** (`1.0`): this page's reading, the stricter of what the two engines do today.
@@ -181,6 +181,25 @@ This section corrects section 1's rows "Live ingest" and "The sender reading its
 ## 11. Entered with the above, no code
 
 Lane E enters, once the code is in the trial tree: the sentences the lanes left for the documents, section 10's corrected paragraph, and two stated behaviours from the audit, each checked against the code first: with `auto_step=False` the gradient norms are read at `session.step()`, so `zero_grad()` goes after it (AUD-2); a checkpoint load inside one attempt is recorded and compared but judged by no detector (AUD-3).
+
+## 12. The upper bounds of `step`, `attempt` and `rank` (wave AR, lane AR-2; AQ5-D6)
+
+**Added Nov 26, 2026, on the author's word:** "`identity.check` bounded at int64 (`step`, `attempt`) and int32 (`rank`); never raising into training". This section amends section 1's table, whose rows now give the bounds.
+
+**The fault.** `identity.check` took any integer of 0 or more. A record with `step` or `attempt` of 2**63, or `rank` of 2**31, was judged by the Python detectors, while the Rust route raised a bare `OverflowError` or `ArrowInvalid` from building the Arrow row (lane AQ-5's D6, seeds 572, 1599, 2018, 3234, 3259, 3436, 4316). The columns are Int64 (`step`, `attempt`) and Int32 (`rank`), so the one check said "valid" of a record one engine cannot read.
+
+**What is valid.** `step` and `attempt` up to 2**63 - 1, `rank` up to 2**31 - 1, each an integer of 0 or more as before. A value past its bound raises `MalformedRecordError` naming the field, with the reason "tensorquill reads an integer of 0 or more that Int64 holds" (Int32 for `rank`). The other refusals, their order (`schema_version`, `rank`, `attempt`, `step`) and their reasons are unchanged. `seq` is not bounded by `identity.check` (the author's answer names the three fields); the sender's and `flight.record_to_row`'s own check of `seq` bounds it at Int64 as before.
+
+**At each boundary.**
+
+| Boundary | A record past a bound |
+|---|---|
+| Every reader of section 1 (`build_evidence`, `load_records`, `watch`, `first_divergence`, `compare`, the command line, the MCP tools), with either engine | Refused as any record that is not valid: `MalformedRecordError`, exit status 2, a `ToolError`. One such line makes the whole local file refused |
+| `flight.record_to_row`, `server_detect.records_stream` (and `server_report`, `server_run_report`) | `MalformedRecordError` naming the field, before Arrow is reached |
+| The sender (`rows_to_send`) | Skipped and counted as a line whose key cannot be stored, and said once with the same words as before ("its column in the stream cannot hold it"); the lines after it are sent |
+| Offline `tensorquill-server detect` | Unchanged: an Arrow stream cannot hold such a value. The same bits read as the column's type are negative, which section 1 already refuses |
+| A Parquet part of a store | Cannot hold such a value (the columns are Int64 and Int32) |
+| The training process | Unchanged, and nothing raises: no caller of `identity.check` runs in the training thread. `session.log(step=)` and `init(start_step=)` take any integer of 0 or more as before, and the file keeps the record as written. A `rank` past Int32 (from `RANK`) is written to its file; the server refuses that stream's descriptor and the sender says so on close |
 
 ## Not on this page
 
