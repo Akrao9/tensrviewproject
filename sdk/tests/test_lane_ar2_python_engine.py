@@ -108,3 +108,77 @@ def test_d1_a_refused_map_is_absent_to_the_update_readers_too(tmp_path):
     alone, _ = _both(_write(tmp_path / "alone", held))
     assert python.get("update_trends") == alone.get("update_trends")
     assert _check(python, "update_spike")[1] == _check(alone, "update_spike")[1] == 12
+
+
+# --- AQ5-D3: a top-level grad_norm that is not a number is absent -------------------------------
+
+_ABSENT = object()
+
+
+def _stall(grad_norm: Any) -> list[dict[str, Any]]:
+    middle = {} if grad_norm is _ABSENT else {"grad_norm": grad_norm}
+    return [_record(35, grad_norms={"p0.weight": 0.49}, weights_unchanged=["p0.weight"]),
+            _record(36, **middle, grad_norms={"p0.weight": 0.48}, weights_unchanged=["p0.weight"]),
+            _record(37, grad_norms={"p0.weight": 0.51}, weights_unchanged=["p0.weight"])]
+
+
+# The middle record's `grad_norm`, and the incidents both engines report. A value the float64 column
+# refuses is absent, as when the key is left out; a non-finite value the column carries (the sink's
+# "nan", "inf") is `non_finite`'s, and the stall's evidence is not taken from that step.
+STALL_GRAD_NORMS = {
+    "absent": (_ABSENT, ["stalled_weights"]),
+    "null": (None, ["stalled_weights"]),
+    "a number": (1.0, ["stalled_weights"]),
+    "the sink's nan": ("nan", ["non_finite"]),
+    "the sink's inf": ("inf", ["non_finite"]),
+    "the text NAN": ("NAN", ["stalled_weights"]),
+    "a text": ("x", ["stalled_weights"]),
+    "a bool": (True, ["stalled_weights"]),
+    "a list": ([1.0], ["stalled_weights"]),
+    "an object": ({"a": 1}, ["stalled_weights"]),
+    "an integer too large for a float": (10**400, ["stalled_weights"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(STALL_GRAD_NORMS))
+def test_d3_a_refused_grad_norm_does_not_break_a_stall_in_python(name):
+    grad_norm, kinds = STALL_GRAD_NORMS[name]
+    found = evidence.detect_stalled_weights(_stall(grad_norm))
+    assert (found is not None) == ("stalled_weights" in kinds)
+
+
+@pytest.mark.parametrize("name", sorted(STALL_GRAD_NORMS))
+def test_d3_both_engines_report_the_stall_alike(name, tmp_path):
+    grad_norm, kinds = STALL_GRAD_NORMS[name]
+    python, rust = _both(_write(tmp_path, _stall(grad_norm)))
+    assert sorted(i["kind"] for i in python["incidents"]) == sorted(i["kind"] for i in rust["incidents"]) == kinds
+
+
+def _gradient_run(refused: Any) -> list[dict[str, Any]]:
+    """Forty steps of a gradient norm and update sizes with a spike at step 30, and the given value in
+    place of `grad_norm` at steps 10, 20 and 31 (`_ABSENT` leaves the key out)."""
+    records = []
+    for step in range(40):
+        norm: Any = 50.0 if step == 30 else 1.0 + 0.01 * (step % 5)
+        fields: dict[str, Any] = {"grad_norms": {"w": norm}, "update_rms": {"w": 1e-3 * (1 + 0.02 * (step % 3))}}
+        if step in (10, 20, 31):
+            norm = refused
+        if norm is not _ABSENT:
+            fields["grad_norm"] = norm
+        records.append(_record(step, **fields))
+    return records
+
+
+@pytest.mark.parametrize("refused", ["NAN", True, [1.0], 10**400], ids=["text", "bool", "list", "big"])
+def test_d3_every_reader_of_grad_norm_reads_a_refused_value_as_absent(refused, tmp_path):
+    """`grad_spike`, `update_spike`, `gradient_trend`, `non_finite` and the input counts read a refused
+    `grad_norm` as they read a left-out one, in both engines."""
+    (tmp_path / "refused").mkdir()
+    (tmp_path / "absent").mkdir()
+    python, rust = _both(_write(tmp_path / "refused", _gradient_run(refused)))
+    left_out, _ = _both(_write(tmp_path / "absent", _gradient_run(_ABSENT)))
+    for document in (python, rust):
+        assert ([(i["kind"], i.get("step")) for i in document["incidents"]]
+                == [(i["kind"], i.get("step")) for i in left_out["incidents"]])
+        assert document["kind_checks"] == left_out["kind_checks"]
+        assert document.get("gradient_trend") == left_out.get("gradient_trend")
