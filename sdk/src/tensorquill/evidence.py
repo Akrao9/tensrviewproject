@@ -4510,6 +4510,11 @@ _STATUS_HEALTHY = ("active", "finished")
 # `capture_stopped`). A reader meeting another one says so and never calls the run healthy.
 RANK_STATES = ("active", "starting", "paused", "silent", "unresponsive", "reconnecting", "lost", "finished",
                "capture_stopped")
+# The most rank numbers the `ranks_unknown` reason lists: the lowest; `ranks_omitted` counts the others,
+# a key written only when some are left out, and the reason's `detail` gives the whole count. The
+# server's `LISTED_RANKS` in watchdog.rs (wave AR, lane AR-4), matched here by lane AS-1 of wave AS;
+# both are held to `sdk/tests/fixtures/ranks_unknown/cases.json`.
+LISTED_RANKS = 1_000
 
 
 def _reason(state: str, code: str, detail: str, **extra: Any) -> dict[str, Any]:
@@ -4610,7 +4615,9 @@ def run_state(
     version does not know among them, to `incidents`. Codes are stable: `incidents`;
     `no_steps`, `report_not_current`, `ranks_unknown`, `status_old`, `server_stopped`,
     `status_summary`, `capture_stopped`, `rank_state_unknown`; `no_status`, `not_checked`;
-    `observations`.
+    `observations`. `ranks_unknown` lists the lowest `LISTED_RANKS` (1,000) of its ranks and counts
+    the others in `ranks_omitted`, written only when some are left out; its `detail` gives the whole
+    count, as the server's (lane AS-1).
 
     `capture_stopped` (contract 3, Nov 19, 2026): a rank whose attempt stopped capture while
     training went on is not judged, whatever state it reads (`capture_stopped`, or
@@ -4653,10 +4660,13 @@ def run_state(
         for rank, why in _not_current_by_status(status, judged_attempts or {}).items():
             unknown.setdefault(rank, why)
     if unknown:
+        # The count and the ranges from every unknown rank; the lowest `LISTED_RANKS` listed and the
+        # others counted, as the server's `run_state` writes the reason.
         ranks = sorted(unknown)
         reasons.append(_reason("unknown", "ranks_unknown", f"{len(ranks)} rank{'s' if len(ranks) != 1 else ''} without"
                                f" a current report ({_rank_ranges(ranks, 8)}): nothing is said about incidents on"
-                               " them", ranks=ranks))
+                               " them", ranks=ranks[:LISTED_RANKS],
+                               **({"ranks_omitted": len(ranks) - LISTED_RANKS} if len(ranks) > LISTED_RANKS else {})))
     if status is not None:
         entries = [r for r in status.get("ranks") or () if isinstance(r, Mapping)]
         stopped = {r.get("rank"): r["capture_stopped"] for r in entries if r.get("capture_stopped") is not None}
