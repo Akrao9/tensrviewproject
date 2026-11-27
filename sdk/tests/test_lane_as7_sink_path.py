@@ -131,6 +131,65 @@ def test_clear_end_marker_never_raises(path):
     assert _sink.clear_end_marker(path) is None
 
 
+# --- The one rule: `sink.records_file_of` ---------------------------------------------------------
+
+
+class _RaisingPath(MemorySink):
+    @property
+    def path(self):
+        raise OSError("gone")
+
+
+class _StrFspath:
+    def __fspath__(self):
+        return "out/r.rank0.jsonl"
+
+
+def test_records_file_of_reads_a_path_and_takes_anything_else_as_no_file(tmp_path):
+    assert _sink.records_file_of(MemorySink()) is None
+    assert _sink.records_file_of(_PathSink(None)) is None
+    assert _sink.records_file_of(_PathSink("out/r.rank0.jsonl")) == Path("out/r.rank0.jsonl")
+    assert _sink.records_file_of(_PathSink(_StrFspath())) == Path("out/r.rank0.jsonl")
+    sink = JsonlSink(tmp_path / "r.rank0.jsonl")
+    try:
+        assert _sink.records_file_of(sink) == tmp_path / "r.rank0.jsonl"
+    finally:
+        sink.close()
+    for param in NOT_PATHS:
+        assert _sink.records_file_of(_PathSink(param.values[0])) is None, param.id
+    assert _sink.records_file_of(_RaisingPath()) is None
+
+
+def test_records_file_of_says_only_a_path_that_is_set_and_is_no_files():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _sink.records_file_of(MemorySink(), say=True)
+        _sink.records_file_of(_PathSink(None), say=True)
+        _sink.records_file_of(_PathSink("out/r.rank0.jsonl"), say=True)
+        _sink.records_file_of(_PathSink(42))  # not asked to say
+    assert caught == []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _sink.records_file_of(_RaisingPath(), say=True)
+    said = [str(w.message) for w in caught]
+    assert len(said) == 1 and "reading it raised OSError: gone" in said[0] and "_RaisingPath" in said[0], said
+
+
+def test_records_file_of_never_raises_when_warnings_are_errors(caplog):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _sink.records_file_of(_PathSink(42), say=True) is None
+    assert "is not a records file" in caplog.text
+
+
+def test_write_end_marker_given_no_files_path_says_so_and_returns_false():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert _sink.write_end_marker(42, run_id="as7", rank=0, attempt=1) is False
+    said = [str(w.message) for w in caught]
+    assert len(said) == 1 and "could not write the end marker 42" in said[0], said
+
+
 # --- The controls ---------------------------------------------------------------------------------
 
 
@@ -200,3 +259,5 @@ def test_under_python_w_error_init_and_close_do_not_raise():
                            _W_ERROR_SCRIPT], capture_output=True, text=True, env=env, timeout=300)
     assert done.returncode == 0, done.stderr[-3000:]
     assert "trained []" in done.stdout, done.stdout
+    # Said once a session, on the logger's stderr: two ranks, four sinks.
+    assert done.stderr.count("is not a records file") == 8, done.stderr[-3000:]
