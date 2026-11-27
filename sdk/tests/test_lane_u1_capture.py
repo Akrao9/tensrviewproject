@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import time
 import warnings
@@ -772,6 +773,161 @@ def test_after_a_stop_no_end_marker_the_cause_kept_and_exactly_one_warning(tmp_p
     assert len([w for w in said if "TensorQuill" in str(w.message)]) == 1
     steps = [json.loads(line)["step"] for line in path.read_text().splitlines()]
     assert steps == [0, 1, 2]  # an unbroken run of steps, then nothing
+
+
+# The test above passes or fails by how far the writer thread has got (about 5 runs in 2,000 fail,
+# lane AR-5): whether the session has learnt of the sink's failure before `close()` takes the
+# scalar logged after the last step as pending. The tests below force each order, with no sleep and
+# no luck: a sink that holds its failing write until the test lets it go.
+
+STOPPED = "TensorQuill stopped capturing for this session"
+LEFT_OUT_AT_CLOSE = "it was still pending at close() after flush() with no training step since"
+
+
+class GatedFailingJsonl(tensorquill.JsonlSink):
+    """`good` writes, then one that waits for `gate` and raises; `raised` is set just before it raises."""
+
+    def __init__(self, path: Path, good: int) -> None:
+        super().__init__(path)
+        self.good = good
+        self.gate = threading.Event()
+        self.raised = threading.Event()
+
+    def write(self, records):
+        if self.good <= 0:
+            assert self.gate.wait(DEADLINE), "never let go"
+            self.raised.set()
+            raise OSError("disk gone")
+        self.good -= 1
+        super().write(records)
+
+
+def _ten_steps(model: nn.Module, opt: torch.optim.Optimizer) -> None:
+    for _ in range(10):
+        opt.zero_grad()
+        model(torch.ones(2, 4)).sum().backward()
+        opt.step()
+
+
+def _tq(said) -> list[str]:
+    return [str(w.message) for w in said if "TensorQuill" in str(w.message)]
+
+
+def _steps_of(path: Path) -> list[int]:
+    return [json.loads(line)["step"] for line in path.read_text().splitlines()]
+
+
+def test_a_stop_known_before_log_is_the_one_thing_said(tmp_path):
+    """Order 1: the session has learnt of the sink's failure (it has stopped) before `log`. Today and
+    after: `log`, `flush()` and `close()` do nothing, and the stop's warning is the one thing said."""
+    path = tmp_path / "run.rank0.jsonl"
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=FailingJsonl(path, good=3), run_id="run", every=1)
+        deadline = time.monotonic() + DEADLINE
+        while not session._stopped and time.monotonic() < deadline:  # as `_stopped_by_a_failing_sink`
+            _ten_steps(model, opt)
+        assert session._stopped
+        session.log({"loss": 1.0})
+        session.flush()
+        session.close()
+    said = _tq(said)
+    assert len(said) == 1 and said[0].startswith(STOPPED), said
+    assert isinstance(session.writer_error, OSError)
+    assert not (tmp_path / "run.rank0.end.json").exists()
+    assert _steps_of(path) == [0, 1, 2]
+
+
+@pytest.mark.xfail(strict=True, reason="today close() also says the scalar was left out for want of a "
+                   "training step, beside the stop's warning (lane AR-5, part 2 a)")
+def test_a_sink_that_fails_after_flush_and_before_close_leaves_the_stop_as_the_one_thing_said(tmp_path):
+    """Order 2: the sink's failure comes after `log` and `flush()` (the session has not learnt of it,
+    so `log` took the scalar as pending), and before `close()`. The rule (the coordinator's): once
+    capture has stopped for a cause, a scalar still pending at `close()` is not reported as left out
+    for want of a training step; the stop's warning is the one thing said.
+
+    Before lane AR-5's change, `close()` said two things here, in this order: "TensorQuill left out the
+    scalar 'loss': it was still pending at close() after flush() with no training step since, ...",
+    and then the stop's warning, "TensorQuill stopped capturing for this session: its sink raised
+    OSError: disk gone. ..." The first gives a reason that is not why the value was lost."""
+    path = tmp_path / "run.rank0.jsonl"
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = GatedFailingJsonl(path, good=3)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=sink, run_id="run", every=1)
+        _ten_steps(model, opt)
+        session.log({"loss": 1.0})
+        session.flush()
+        assert not session._stopped and session._pending_scalars  # the session has not learnt of it
+        sink.gate.set()
+        assert sink.raised.wait(DEADLINE)  # the sink has failed before close() begins
+        session.close()
+    said = _tq(said)
+    assert not any(LEFT_OUT_AT_CLOSE in message for message in said), said
+    assert len(said) == 1 and said[0].startswith(STOPPED), said
+    assert isinstance(session.writer_error, OSError)
+    assert not (tmp_path / "run.rank0.end.json").exists()
+    assert _steps_of(path) == [0, 1, 2]
+
+
+@pytest.mark.xfail(strict=True, reason="today close() also says the scalar was left out for want of a "
+                   "training step, beside the stop's warning (lane AR-5, part 2 a)")
+def test_a_sink_that_fails_inside_close_leaves_the_stop_as_the_one_thing_said(tmp_path):
+    """Order 3: the sink's failure comes inside `close()`, once `close()` has taken the scalar as
+    pending and waits for the writer. The same rule as order 2.
+
+    Before lane AR-5's change, `close()` said the same two things as in order 2."""
+    path = tmp_path / "run.rank0.jsonl"
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    sink = GatedFailingJsonl(path, good=3)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=sink, run_id="run", every=1)
+        _ten_steps(model, opt)
+        session.log({"loss": 1.0})
+        session.flush()
+        worker, join = session._worker, session._worker.join
+
+        def let_go_then_join(timeout=None):  # close() waits for the writer here, after the scalar
+            sink.gate.set()
+            return join(timeout)
+
+        worker.join = let_go_then_join
+        session.close()
+    assert sink.raised.is_set()
+    said = _tq(said)
+    assert not any(LEFT_OUT_AT_CLOSE in message for message in said), said
+    assert len(said) == 1 and said[0].startswith(STOPPED), said
+    assert isinstance(session.writer_error, OSError)
+    assert not (tmp_path / "run.rank0.end.json").exists()
+    assert _steps_of(path) == [0, 1, 2]
+
+
+@pytest.mark.parametrize("kind", ["jsonl", "memory"])
+def test_with_no_stop_a_scalar_pending_at_close_is_still_said_left_out_once_at_the_close(tmp_path, kind):
+    """A guard: with no stop, a scalar logged after `flush()` with no training step since is left out
+    at `close()`, said once (`WAVE_AL_CONTRACT.md` section Q5), pointing at the `close()` call."""
+    sink = tensorquill.JsonlSink(tmp_path / "run.rank0.jsonl") if kind == "jsonl" else tensorquill.MemorySink()
+    model = nn.Linear(4, 4)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        session = tensorquill.init(model, sink=sink, run_id="run", every=1)
+        _ten_steps(model, opt)
+        session.log({"loss": 1.0})
+        session.flush()
+        session.close(); line = sys._getframe().f_lineno  # noqa: E702
+    found = [w for w in said if "TensorQuill" in str(w.message)]
+    assert len(found) == 1 and LEFT_OUT_AT_CLOSE in str(found[0].message), [str(w.message) for w in found]
+    assert (Path(found[0].filename).name, found[0].lineno) == (Path(__file__).name, line)
+    assert session.writer_error is None
+    if kind == "jsonl":
+        assert (tmp_path / "run.rank0.end.json").exists()
 
 
 def test_after_a_stop_the_optimizer_hooks_do_nothing_and_close_takes_them_off():
