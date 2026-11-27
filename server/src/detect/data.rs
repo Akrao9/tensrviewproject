@@ -14,6 +14,7 @@ use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Map, Value};
 
+use super::extra_json::{self, Column};
 use super::{column, judge, text, with_classes, Columns, Scalars, Thresholds, Wanted};
 
 // The same values as the constants of the same names in data_checks.py.
@@ -93,13 +94,15 @@ pub(super) struct DataRow {
 
 impl DataRow {
     pub(super) fn read(columns: &Columns, row: usize) -> Option<Self> {
-        let parsed: Value = serde_json::from_str(text(columns.data, row)?).ok()?;
-        let fields = parsed.as_object()?;
+        // An integer too large for a float is no number and no hash, and the rest of the row's
+        // `data` is kept (AQ5-D2): before, it lost the whole `data_json`.
+        let parsed = extra_json::read_column(text(columns.data, row)?)?;
+        let fields = parsed.value.as_object()?;
         let get = |key: &str| fields.get(key).unwrap_or(&Value::Null);
         Some(Self {
             batches: int(get("batches")),
-            hash: get("batch_hash")
-                .as_str()
+            hash: parsed
+                .text(get("batch_hash"))
                 .filter(|hash| !hash.is_empty())
                 .map(str::to_owned),
             epoch: int(get("epoch")),
@@ -541,7 +544,8 @@ pub(super) struct ResumeRow {
     pub data: Option<DataRow>,
     pub scale: Option<f64>,
     pub lr: Option<Vec<f64>>,
-    pub checkpoint: Option<Value>,
+    /// Its `checkpoint_json`, read as [`checkpoint`] reads it.
+    pub checkpoint: Option<Column>,
 }
 
 impl ResumeRow {
@@ -559,11 +563,14 @@ impl ResumeRow {
 /// A row's checkpoint manifest: its `checkpoint_json` when that is a JSON object, as Python's
 /// `isinstance(record["checkpoint"], Mapping)`. What the resume check reads and what
 /// `kind_checks` counts (RS11, lane V7, Nov 19, 2026: text that does not parse counted).
-pub(super) fn checkpoint(columns: &Columns, row: usize) -> Option<Value> {
+///
+/// An integer too large for a float is unreadable where a number is wanted and no tensor's name,
+/// and the rest of the manifest is read (AQ5-D2): before, it lost the row's whole manifest.
+pub(super) fn checkpoint(columns: &Columns, row: usize) -> Option<Column> {
     text(columns.checkpoint, row)
         .filter(|text| text.trim_start().starts_with('{')) // an object, if anything, and no parse for the rest
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .filter(Value::is_object)
+        .and_then(extra_json::read_column)
+        .filter(|checkpoint| checkpoint.value.is_object())
 }
 
 /// The `tensors` of a resume's load manifest when it is an object: what the SDK recorded of the
@@ -573,6 +580,7 @@ fn load_tensors(first: &ResumeRow) -> Option<&Map<String, Value>> {
     first
         .checkpoint
         .as_ref()?
+        .value
         .get("load")?
         .as_object()?
         .get("tensors")?
@@ -580,14 +588,21 @@ fn load_tensors(first: &ResumeRow) -> Option<&Map<String, Value>> {
 }
 
 /// One of the lists of `tensors`, read only when its `count` is a positive whole number (as
-/// `_int` reads it): the count, unchanged, and the strings of `names`, anything else dropped.
-fn tensor_list(tensors: &Map<String, Value>, name: &str) -> Option<(i64, Vec<Value>)> {
+/// `_int` reads it): the count, unchanged, and the strings of `names`, anything else dropped. An
+/// integer too large for a float in `checkpoint`, the manifest `tensors` is part of, is no string.
+fn tensor_list(tensors: &Map<String, Value>, name: &str, checkpoint: &Column) -> Option<(i64, Vec<Value>)> {
     let list = tensors.get(name)?.as_object()?;
     let count = list.get("count").and_then(int).filter(|count| *count > 0)?;
     let names = list
         .get("names")
         .and_then(Value::as_array)
-        .map(|names| names.iter().filter(|name| name.is_string()).cloned().collect())
+        .map(|names| {
+            names
+                .iter()
+                .filter(|name| checkpoint.text(name).is_some())
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default();
     Some((count, names))
 }
@@ -666,7 +681,7 @@ impl ResumeFound {
     /// A judged resume's entry in `checkpoint_tensors`: its step, rank and attempt, then the keys
     /// the record has of [`TENSOR_KEYS`], and each list of [`TENSOR_LISTS`] that is read. It
     /// changes no finding and no kind's value.
-    fn add_tensors(&mut self, step: i64, rank: i32, attempt: i64, tensors: &Map<String, Value>) {
+    fn add_tensors(&mut self, step: i64, rank: i32, attempt: i64, tensors: &Map<String, Value>, checkpoint: &Column) {
         if !matches!(
             tensors.get("state").and_then(Value::as_str),
             Some("compared" | "unavailable")
@@ -683,7 +698,7 @@ impl ResumeFound {
             }
         }
         for name in TENSOR_LISTS {
-            if let Some((count, names)) = tensor_list(tensors, name) {
+            if let Some((count, names)) = tensor_list(tensors, name, checkpoint) {
                 entry.insert(name.into(), json!({"count": count, "names": names}));
             }
         }
@@ -769,8 +784,8 @@ impl ResumePass {
         }
         let (findings, source, saved, checked) = self.state_findings(first, step, run_start);
         if source == Some("load") {
-            if let Some(tensors) = load_tensors(first) {
-                found.add_tensors(step, rank, attempt, tensors);
+            if let (Some(tensors), Some(checkpoint)) = (load_tensors(first), &first.checkpoint) {
+                found.add_tensors(step, rank, attempt, tensors, checkpoint);
             }
         }
         if !findings.is_empty() {
@@ -858,7 +873,7 @@ impl ResumePass {
         run_start: i64,
     ) -> (Vec<Value>, Option<&'static str>, Option<i64>, bool) {
         let empty = Value::Null;
-        let checkpoint = first.checkpoint.as_ref().unwrap_or(&empty);
+        let checkpoint = first.checkpoint.as_ref().map_or(&empty, |checkpoint| &checkpoint.value);
         let mut findings = Vec::new();
         let mut checked = false;
         // The last save written among those after the latest step before the resume.
@@ -951,9 +966,9 @@ impl ResumePass {
         if source == Some("load") {
             let compared =
                 load_tensors(first).filter(|tensors| tensors.get("state").and_then(Value::as_str) == Some("compared"));
-            if let Some(tensors) = compared {
+            if let (Some(tensors), Some(read)) = (compared, &first.checkpoint) {
                 for (list, finding) in TENSOR_FINDINGS {
-                    if let Some((count, names)) = tensor_list(tensors, list) {
+                    if let Some((count, names)) = tensor_list(tensors, list, read) {
                         findings
                             .push(json!({"component": "model", "finding": finding, "count": count, "tensors": names}));
                     }
@@ -994,7 +1009,7 @@ impl ResumePass {
             self.lrs.insert(step, lr);
         }
         if let Some(checkpoint) = row.checkpoint {
-            if let Some(save) = checkpoint.get("save").filter(|save| save.is_object()) {
+            if let Some(save) = checkpoint.value.get("save").filter(|save| save.is_object()) {
                 let after = int(&save["after_step"]).unwrap_or(step);
                 self.saves.push((after, save.clone()));
             }

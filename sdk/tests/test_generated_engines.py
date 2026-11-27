@@ -317,26 +317,6 @@ def _stall(grad_norm: Any) -> list[dict[str, Any]]:
 # Each disagreement found, at the smallest input shrinking reached (or a shorter one made from it by
 # hand), with the seed it was found at. Each must still disagree: a strict expected failure.
 HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
-    # Seeds 93, 340, 731, 750, 1490.
-    "AQ5-D2 system with an oversized integer": (
-        "Python reads the system block (memory_growth, memory_pressure, allocator_retries checked); Rust "
-        "loses the whole system_json of the row to one integer too large for a float",
-        [_record(39, system={"cuda": {"ooms": 10**400}})],
-    ),
-    # Seeds 366, 729, 1352, 1413.
-    "AQ5-D2 data with an oversized integer": (
-        "the same for data_json: data_stalled, epoch_order_repeated and resume_data_mismatch",
-        [_record(37, data={"sampler_epoch": 10**400})],
-    ),
-    # Seeds 482, 760, 1424; at 1371 Rust misses an attention_collapse incident Python reports.
-    "AQ5-D2 probe with an oversized integer": (
-        "the same for probe_json: the three attention kinds",
-        [_record(0, probe={"attention": {"blk1": {"max_logit": [3.943363681, -(10**400), 3.956723686]}}})],
-    ),
-    "AQ5-D2 checkpoint with an oversized integer": (
-        "the same for checkpoint_json: resume_incomplete (found by hand from D2, not by a seed)",
-        [_record(0, checkpoint={"save": {"after_step": 10**400}})],
-    ),
     # Seeds 13, 210, 357, 376, 413, 542, 563, 592, 653, 674, 753, 1032, 1281, 1379.
     "AQ5-D5 a router count above 2**53": (
         "the MoE sample's diversity and starved_shares differ in the last digits: Python divides the "

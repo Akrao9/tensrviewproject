@@ -2842,7 +2842,8 @@ impl HeadTrends {
         let Some(text) = text(columns.probe, row).filter(|text| text.contains("\"head\"")) else {
             return;
         };
-        let Ok(Value::Object(probe)) = serde_json::from_str::<Value>(text) else {
+        // An integer too large for a float is unreadable, the rest kept (AQ5-D2).
+        let Some(Value::Object(probe)) = extra_json::parse(text) else {
             return;
         };
         if probe.contains_key("error") {
@@ -3433,7 +3434,10 @@ impl Attention {
     ) {
         let Some(text) = text(columns.probe, row) else { return };
         self.asked += u64::from(text.trim_start().starts_with('{'));
-        let Ok(probe) = serde_json::from_str::<Probe>(text) else {
+        // An integer too large for a float is unreadable where a number is wanted, and the rest of
+        // the probe is read (AQ5-D2): before, it lost the whole probe.
+        let mut rewritten = None;
+        let Some(probe) = extra_json::parse_into::<Probe>(text, &mut rewritten) else {
             return;
         };
         if let Some(why) = &probe.not_run {

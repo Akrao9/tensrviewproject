@@ -16,6 +16,7 @@ use arrow::array::{Float64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Value};
 
+use super::extra_json::{self, Column};
 use super::{column, median, text, value};
 
 // The same values as the constants of the same names in evidence_system.py.
@@ -103,11 +104,13 @@ impl System {
             self.baseline = None;
         }
         let before = self.found_mask();
-        let system: Option<Value> = text(columns.system, row).and_then(|text| serde_json::from_str(text).ok());
+        // An integer too large for a float is unreadable where a number is wanted, and the rest
+        // of the reading is kept (AQ5-D2): before, it lost the row's whole `system_json`.
+        let system: Option<Column> = text(columns.system, row).and_then(extra_json::read_column);
         let part = |name: &str| {
             system
                 .as_ref()
-                .and_then(|system| system.get(name))
+                .and_then(|system| system.value.get(name))
                 .filter(|part| part.is_object())
         };
         let (cuda, nvml) = (part("cuda"), part("nvml"));
@@ -117,8 +120,8 @@ impl System {
         if let Some(cuda) = cuda {
             self.memory_reading(step, cuda);
         }
-        if let Some(nvml) = nvml {
-            self.nvml_reading(step, nvml);
+        if let (Some(nvml), Some(system)) = (nvml, &system) {
+            self.nvml_reading(step, nvml, system);
         }
         let wait = value(columns.data_wait, row).filter(|wait| wait.is_finite());
         let took = value(columns.step_time, row).filter(|took| took.is_finite());
@@ -212,7 +215,7 @@ impl System {
         }
     }
 
-    fn nvml_reading(&mut self, step: i64, nvml: &Value) {
+    fn nvml_reading(&mut self, step: i64, nvml: &Value, system: &Column) {
         let ecc = count(nvml.get("ecc_uncorrected"));
         if self.ecc_start.is_none() {
             self.ecc_start = ecc;
@@ -235,7 +238,7 @@ impl System {
         let reasons: Vec<&str> = nvml
             .get("throttle")
             .and_then(Value::as_array)
-            .map(|reasons| reasons.iter().filter_map(Value::as_str).collect())
+            .map(|reasons| reasons.iter().filter_map(|reason| system.text(reason)).collect())
             .unwrap_or_default();
         if self.found[4].is_none() && reasons.iter().any(|reason| THROTTLE_REPORTED.contains(reason)) {
             let mut incident = json!({"kind": "gpu_throttled", "step": step, "reasons": reasons});
