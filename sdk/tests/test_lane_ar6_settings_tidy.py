@@ -503,3 +503,16 @@ def test_the_readme_names_the_harness_as_gate_2s_overhead_instrument():
     assert "three paired rounds of 200 steps" not in profile
     assert "the verdict of `examples/overhead_harness.py` on a GPU shown to be unshared" in profile
     assert "`--model toy --device cpu` checks the script itself" in profile
+
+
+def test_a_sink_whose_path_is_not_a_path_never_fails_init(here, monkeypatch):
+    # A caller's sink may carry any `path`: the settings file is then not written, said once.
+    _as_rank(monkeypatch, 1)
+
+    class Odd(tensorquill.MemorySink):
+        path = object()
+
+    session, said, model = _init("odd", sink=Odd())
+    _train(model, 1)
+    session.close()
+    assert len([s for s in said if "numerical settings" in s]) == 1, said
