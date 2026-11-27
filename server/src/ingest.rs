@@ -69,7 +69,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, BooleanArray, BooleanBuilder, Int32Array, Int64Array, StringArray};
@@ -399,6 +399,10 @@ struct StreamTally {
     /// a way hyper ends a request body for alike (a reset with `NO_ERROR`; a call whose deadline passed
     /// was seen so, with the response already closed).
     half_closed: AtomicBool,
+    /// One more than the rank buffer's `faults` when this stream first took a batch, or 0 before it
+    /// did: a stream that took one before what the server held of its rank was dropped after a panic
+    /// (`Ingest::drop_held`) is ended (`Ingest::after_a_fault`).
+    faults: AtomicU64,
 }
 
 /// The response of one `DoPut` stream, and the tally of what was acknowledged on it.
@@ -485,6 +489,9 @@ struct RankBuffer {
     seq_watermarks: HashMap<i64, Option<i64>>,
     /// The scalar-only rows waiting to be stored, apart from the step rows (section 4.5).
     scalars: ScalarBuffer,
+    /// How many times what this server held of the rank and had not stored was dropped after a panic
+    /// in one of its streams' tasks (`Ingest::drop_held`, lane AR-4).
+    faults: u64,
 }
 
 /// A rank's buffered scalar-only rows: the rows whose `seq` is not null, of one attempt.
@@ -881,11 +888,11 @@ impl Ingest {
             Some(key) => self
                 .end_log
                 .lock()
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .entry((key.clone(), status.is_some()))
                 .or_default()
                 .due(now),
-            None => self.error_log.lock().unwrap().due(now),
+            None => self.error_log.lock().unwrap_or_else(PoisonError::into_inner).due(now),
         };
         let Some(held) = due else {
             return;
@@ -948,7 +955,13 @@ impl Ingest {
     /// How many runs anything is held in memory for.
     pub fn runs_held(&self) -> usize {
         let mut runs: std::collections::BTreeSet<String> = self.watchdog.run_ids();
-        runs.extend(self.buffers.lock().unwrap().keys().map(|key| key.0.clone()));
+        runs.extend(
+            self.buffers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keys()
+                .map(|key| key.0.clone()),
+        );
         runs.extend(self.reports.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.extend(self.stored.lock().unwrap().keys().map(|key| key.0.clone()));
         runs.extend(self.data_windows.lock().unwrap().keys().cloned());
@@ -956,7 +969,13 @@ impl Ingest {
         runs.extend(self.manifests.lock().unwrap().keys().cloned());
         runs.extend(self.written.lock().unwrap().keys().cloned());
         runs.extend(self.dropped_log.lock().unwrap().keys().map(|key| key.0.clone()));
-        runs.extend(self.end_log.lock().unwrap().keys().map(|(key, _)| key.0.clone()));
+        runs.extend(
+            self.end_log
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keys()
+                .map(|(key, _)| key.0.clone()),
+        );
         runs.len()
     }
 
@@ -966,7 +985,12 @@ impl Ingest {
     /// waits for the rank's buffer, so a flush of the rank in progress finishes first.
     pub async fn trend_computations(&self, run_id: &str, rank: i32) -> Option<u64> {
         let key = (run_id.to_string(), rank);
-        let buffer = self.buffers.lock().unwrap().get(&key).cloned()?;
+        let buffer = self
+            .buffers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned()?;
         let buffer = buffer.lock().await;
         buffer
             .detectors
@@ -980,11 +1004,16 @@ impl Ingest {
     }
 
     fn buffer(&self, key: &Key) -> Arc<tokio::sync::Mutex<RankBuffer>> {
-        self.buffers.lock().unwrap().entry(key.clone()).or_default().clone()
+        self.buffers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.clone())
+            .or_default()
+            .clone()
     }
 
     fn all_buffers(&self) -> Vec<(Key, Arc<tokio::sync::Mutex<RankBuffer>>)> {
-        let buffers = self.buffers.lock().unwrap();
+        let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         buffers
             .iter()
             .map(|(key, buffer)| (key.clone(), buffer.clone()))
@@ -1057,6 +1086,7 @@ impl Ingest {
         if self.closed.load(Ordering::SeqCst) {
             return Err(Status::unavailable("the server is shutting down"));
         }
+        after_a_fault(&buffer, &ack.tally)?;
         // The owner attempt's highest step kept is its progress. Rows of any other attempt are
         // stored and counted, never progress (RS05; until Nov 19, 2026 the last attempt of the batch
         // to keep rows was taken as the rank's).
@@ -1843,7 +1873,7 @@ impl Ingest {
                 if let Some(descriptor) = &message.inner.flight_descriptor {
                     let parsed = parse_descriptor(descriptor)?;
                     self.watchdog.stream_opened(&parsed, Instant::now());
-                    let mut streams = self.streams.lock().unwrap();
+                    let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
                     streams.entry(parsed.clone()).or_default().push(OpenStream {
                         id: stream_id,
                         attempt: None,
@@ -1870,7 +1900,7 @@ impl Ingest {
                 if let Some(open) = self
                     .streams
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get_mut(key)
                     .and_then(|streams| streams.iter_mut().find(|open| open.id == stream_id))
                 {
@@ -1892,9 +1922,46 @@ impl Ingest {
         }
         tally.half_closed.store(true, Ordering::SeqCst);
         if let Some(key) = key {
+            if tally.faults.load(Ordering::SeqCst) != 0 {
+                after_a_fault(&*self.buffer(key).lock().await, tally)?;
+            }
             self.flush_key(key).await?; // end of stream
         }
         Ok(())
+    }
+
+    /// After a panic in one of the rank's streams' tasks (lane AR-4): what this server held of the
+    /// rank and had not stored is dropped, its bytes given back to the quota, as a restart drops it,
+    /// and every other stream of the rank that took a batch is ended at its next batch or at its end,
+    /// as a restart ends it (`after_a_fault`). Nothing of it was acknowledged: an offset is
+    /// acknowledged only once what it covers is stored, so each sender sends it again from the offset
+    /// last acknowledged to it, and the watermarks, read again from the store, take it.
+    ///
+    /// Why: the panic may have left the buffer half changed (a step watermark moved past rows it does
+    /// not hold, a count or a bound not updated), and rows sent again would then be refused as not
+    /// newer and never stored, though acknowledged. A restart is the state the server is known to be
+    /// sound from. The rank's detectors are rebuilt from the store at its next part, as after a
+    /// restart. Kept: the counts that pace rebuilds and whether the detectors are off for the rank,
+    /// which a restart clears but which hold nothing of the rows.
+    async fn drop_held(&self, key: &Key) {
+        let buffer = self.buffer(key);
+        let mut buffer = buffer.lock().await;
+        // Saturating: the counts may be what the panic left. A panic between taking a batch's bytes
+        // out of the quota and counting them in the buffer leaves them out of the quota until a
+        // restart, at most one batch.
+        let held = buffer.bytes + buffer.scalars.bytes;
+        let _ = self.used.try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            Some(used.saturating_sub(held))
+        });
+        let kept = RankBuffer {
+            faults: buffer.faults + 1,
+            rebuilds: buffer.rebuilds,
+            detect_off: buffer.detect_off,
+            replay_failures: buffer.replay_failures,
+            replay_after: buffer.replay_after,
+            ..RankBuffer::default()
+        };
+        *buffer = kept;
     }
 
     /// Writes `runs/<run_id>/run.json` when the manifest is new for this run or differs from
@@ -1965,7 +2032,7 @@ impl Ingest {
     /// nothing (contract 1).
     fn stream_ended(&self, key: &Key, stream_id: u64, clean: bool) {
         let counted = {
-            let mut streams = self.streams.lock().unwrap();
+            let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let open = streams.get_mut(key);
             let counted = open
                 .as_ref()
@@ -1990,7 +2057,7 @@ impl Ingest {
             return;
         };
         let now = Instant::now();
-        let mut streams = self.streams.lock().unwrap();
+        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
         for open in streams.get_mut(key).into_iter().flatten() {
             if open.counted && open.attempt.is_some_and(|attempt| attempt != owner) {
                 open.counted = false;
@@ -2247,7 +2314,7 @@ impl Ingest {
     /// buffer no flush would ever find. The map stays locked until every trace of the run is gone,
     /// so a stream of it that starts meanwhile finds nothing and starts afresh.
     fn evict_run(&self, run_id: &str, now: Instant) -> bool {
-        let mut buffers = self.buffers.lock().unwrap();
+        let mut buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         let keys: Vec<Key> = buffers.keys().filter(|key| key.0 == run_id).cloned().collect();
         for key in &keys {
             let buffer = &buffers[key];
@@ -2284,7 +2351,10 @@ impl Ingest {
         self.written.lock().unwrap().remove(run_id);
         self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
         self.dropped_log.lock().unwrap().retain(|key, _| key.0 != run_id);
-        self.end_log.lock().unwrap().retain(|(key, _), _| key.0 != run_id);
+        self.end_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(key, _), _| key.0 != run_id);
         drop(buffers);
         true
     }
@@ -2448,6 +2518,28 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
         )));
     }
     Ok((run_id.clone(), rank))
+}
+
+/// The status of a `DoPut` stream whose task panicked outside the decode (lane AR-4): a fault of
+/// the server, whose log names it (the panic hook prints it); nothing of the panic is in it.
+const STREAM_FAULT: &str = "the server failed on this stream, a fault of the server that its log names; what it held of this rank and had not stored is dropped, and is to be sent again from the offset last acknowledged";
+
+/// The status of another stream of that rank, ended at its next batch or its end (`after_a_fault`).
+const FAULT_ELSEWHERE: &str = "the server dropped what it held of this rank and had not stored, after a fault on another of its streams; send again from the offset last acknowledged";
+
+/// Ends a stream that took a batch before what the server held of its rank was dropped after a panic
+/// (`Ingest::drop_held`), with `UNAVAILABLE`: it may be owed an offset over rows the server no longer
+/// holds. A stream takes the rank buffer's count at its first batch.
+fn after_a_fault(buffer: &RankBuffer, tally: &StreamTally) -> Result<(), Status> {
+    let now = buffer.faults + 1;
+    match tally
+        .faults
+        .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+    {
+        Ok(_) => Ok(()),
+        Err(seen) if seen == now => Ok(()),
+        Err(_) => Err(Status::unavailable(FAULT_ELSEWHERE)),
+    }
 }
 
 /// The refusal of a rank at or over the server's limit of ranks a run (`watchdog::MAX_RANKS`), at
@@ -3142,13 +3234,33 @@ impl FlightService for IngestService {
                 said: false,
             };
             let stream_id = ingest.next_stream.fetch_add(1, Ordering::SeqCst);
-            let result = ingest.run_stream(stream, &mut end.key, stream_id, &ack).await;
+            // A panic anywhere in the stream's task, outside the decode too (the decode's own is
+            // caught there, `Decoder`), is caught here (lane AR-4), so the clean-up below runs as for
+            // any stream that ends in an error, and the client's call ends. The panic hook has
+            // printed it, a fault of the server. Sound to catch (`AssertUnwindSafe`): what the task
+            // may have left half changed is the rank's buffer, which `drop_held` sets back to what a
+            // restart leaves, under its lock; the stream, its decoder and the call are dropped; the
+            // mutexes the clean-up takes are taken whether a panic poisoned them or not, each held
+            // only for one change of a map that a stop at any point leaves whole.
+            let run = std::panic::AssertUnwindSafe(ingest.run_stream(stream, &mut end.key, stream_id, &ack))
+                .catch_unwind()
+                .await;
+            let panicked = run.is_err();
+            let result = run.unwrap_or_else(|_| Err(Status::internal(STREAM_FAULT)));
+            if panicked {
+                // Told first: nothing below can then keep the call open, not even a clean-up that
+                // panics in its turn.
+                let _ = ack.responses.send(Err(Status::internal(STREAM_FAULT)));
+            }
             if let Some(key) = &end.key {
+                if panicked {
+                    ingest.drop_held(key).await;
+                }
                 ingest.stream_ended(key, stream_id, result.is_ok());
                 ingest.detach(key, &ack).await;
             }
             end.say(result.as_ref().err());
-            if let Err(status) = result {
+            if let (false, Err(status)) = (panicked, result) {
                 let _ = ack.responses.send(Err(status));
             }
         });

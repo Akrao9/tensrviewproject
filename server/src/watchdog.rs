@@ -203,7 +203,7 @@
 //! `rows_not_newer`, which counts step rows only.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -1005,6 +1005,11 @@ pub struct Watchdog {
     /// Orders read from the store for ranks not held yet: taken up when the rank is (a beat that
     /// was refused, or a read before the rank's first event, leaves no rank behind). Locked after
     /// `ranks`, never before.
+    ///
+    /// Both are taken whether a panic poisoned them or not (lane AR-4): a stream's clean-up after a
+    /// panic tells the watchdog the stream ended, and a poisoned lock would end every status pass of
+    /// every run. A panic inside an event leaves at most that rank's record half changed, until its
+    /// next event changes it again; the status is written from it again at every pass.
     pending_orders: Mutex<HashMap<Key, AttemptOrder>>,
 }
 
@@ -1067,7 +1072,7 @@ impl Watchdog {
         if restored.is_empty() {
             return Ok(false);
         }
-        let mut ranks = self.ranks.lock().unwrap();
+        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
         for (key, progress) in restored {
             ranks.entry(key).or_insert(progress);
         }
@@ -1075,10 +1080,15 @@ impl Watchdog {
     }
 
     fn with<R>(&self, key: &Key, now: Instant, f: impl FnOnce(&mut Progress) -> R) -> R {
-        let mut ranks = self.ranks.lock().unwrap();
+        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
         f(ranks.entry(key.clone()).or_insert_with(|| {
             let mut progress = Progress::new(now);
-            if let Some(order) = self.pending_orders.lock().unwrap().remove(key) {
+            if let Some(order) = self
+                .pending_orders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(key)
+            {
                 progress.attempt = order.newest().unwrap_or(0);
                 progress.order = order;
                 progress.order_loaded = true;
@@ -1148,16 +1158,20 @@ impl Watchdog {
 
     /// Whether the rank's order has been read from the store since this server took it up.
     pub fn order_loaded(&self, key: &Key) -> bool {
-        let ranks = self.ranks.lock().unwrap();
+        let ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
         match ranks.get(key) {
             Some(p) => p.order_loaded,
-            None => self.pending_orders.lock().unwrap().contains_key(key),
+            None => self
+                .pending_orders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(key),
         }
     }
 
     /// The rank's order of attempts, as the watchdog holds it (empty for a rank it does not hold).
     pub fn order(&self, key: &Key) -> AttemptOrder {
-        let ranks = self.ranks.lock().unwrap();
+        let ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
         match ranks.get(key) {
             Some(p) => p.order.clone(),
             None => self
@@ -1174,7 +1188,7 @@ impl Watchdog {
     pub fn shown_attempt(&self, key: &Key) -> Option<i64> {
         self.ranks
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(key)
             .filter(|p| p.attempt != 0 || p.last_step.is_some() || p.attempt_since.is_some())
             .map(|p| p.attempt)
@@ -1182,11 +1196,15 @@ impl Watchdog {
 
     /// The attempt that owns the rank, none for a rank not held or with no attempt known.
     pub fn owner(&self, key: &Key) -> Option<i64> {
-        self.ranks.lock().unwrap().get(key).and_then(|p| {
-            p.order
-                .newest()
-                .or((p.attempt != 0 || p.last_step.is_some()).then_some(p.attempt))
-        })
+        self.ranks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .and_then(|p| {
+                p.order
+                    .newest()
+                    .or((p.attempt != 0 || p.last_step.is_some()).then_some(p.attempt))
+            })
     }
 
     /// The order the store holds for the rank, read since this server took it up (at a restart, or
@@ -1196,9 +1214,12 @@ impl Watchdog {
     /// every few seconds).
     pub fn load_order(&self, key: &Key, order: AttemptOrder, now: Instant) {
         let window = self.config.start_limit;
-        let mut ranks = self.ranks.lock().unwrap();
+        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(p) = ranks.get_mut(key) else {
-            self.pending_orders.lock().unwrap().insert(key.clone(), order);
+            self.pending_orders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key.clone(), order);
             return;
         };
         {
@@ -1215,14 +1236,17 @@ impl Watchdog {
     /// The rank's order after `Ingest` stored it with a new attempt placed. Who owns the rank
     /// changes at the claim (`attempt_seen`) or the owner's rows (`batch`), not here.
     pub fn set_order(&self, key: &Key, order: AttemptOrder, _now: Instant) {
-        let mut ranks = self.ranks.lock().unwrap();
+        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
         match ranks.get_mut(key) {
             Some(p) => {
                 p.order = order;
                 p.order_loaded = true;
             }
             None => {
-                self.pending_orders.lock().unwrap().insert(key.clone(), order);
+                self.pending_orders
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key.clone(), order);
             }
         }
     }
@@ -1327,7 +1351,7 @@ impl Watchdog {
     pub fn rank_keys(&self, run_id: &str) -> Vec<Key> {
         self.ranks
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .keys()
             .filter(|(run, _)| run == run_id)
             .cloned()
@@ -1446,7 +1470,7 @@ impl Watchdog {
     /// lock a stream takes to open, so a rank that comes back meanwhile keeps the run. True when
     /// it was let go of, or nothing of it was held.
     pub fn evict(&self, run_id: &str, now: Instant) -> bool {
-        let mut ranks = self.ranks.lock().unwrap();
+        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
         let settled = {
             let mut members: Vec<(i32, &Progress)> = ranks
                 .iter()
@@ -1462,7 +1486,10 @@ impl Watchdog {
         };
         if settled {
             ranks.retain(|(run, _), _| run != run_id);
-            self.pending_orders.lock().unwrap().retain(|(run, _), _| run != run_id);
+            self.pending_orders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(run, _), _| run != run_id);
         }
         settled
     }
@@ -1471,7 +1498,7 @@ impl Watchdog {
     pub fn run_ids(&self) -> std::collections::BTreeSet<String> {
         self.ranks
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .keys()
             .map(|(run_id, _)| run_id.clone())
             .collect()
@@ -1508,7 +1535,7 @@ impl Watchdog {
     fn snapshot(&self) -> Vec<(Key, Progress)> {
         self.ranks
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .map(|(key, progress)| (key.clone(), progress.clone()))
             .collect()
