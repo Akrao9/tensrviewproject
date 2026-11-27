@@ -1906,7 +1906,9 @@ def detect_stalled_weights(
       history, so a later streak can still fire.
 
     A row whose total gradient norm is not finite adds nothing to a streak (mixed-precision
-    loss scaling skips those optimizer steps on purpose) but its resets apply. A skipped
+    loss scaling skips those optimizer steps on purpose) but its resets apply. A `grad_norm` the
+    float64 column refuses (a bool, other text, a list, an integer too large for a float) is read
+    as left out, as Rust reads it (AQ5-D3): it does not stop the streak. A skipped
     update (`step_skipped`), whoever reported it, is read the same way: the weights were not
     meant to move (STEP_AND_EVIDENCE_CONTRACT.md, section 1): a streak carries across it. So is
     a step on which the scaler skipped some optimizers and applied others (`step_skipped_part`,
@@ -1963,8 +1965,12 @@ def detect_stalled_weights(
         unchanged = _unchanged_names(record)
         if unchanged is None:
             continue
-        evidence = (_finite(record.get("grad_norm")) is not None or record.get("grad_norm") is None) \
-            and skipped_by(record) is None
+        # A step whose total gradient norm is not finite is no evidence of a stall (`non_finite` is
+        # its finding). A value the column refuses (a bool, other text, a list, an integer too large
+        # for a float) is absent, as Rust reads it, and so is evidence (AQ5-D3, the author: "a top-level
+        # grad_norm that is not a number is absent in Python too").
+        total = _wire_float(record.get("grad_norm"))
+        evidence = (total is None or total is _UNCARRIED or math.isfinite(total)) and skipped_by(record) is None
         grads = _object(record, "grad_norms")
         unchanged_set = set(unchanged)
         for name in streak:

@@ -343,16 +343,6 @@ HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
         "the same for checkpoint_json: resume_incomplete (found by hand from D2, not by a seed)",
         [_record(0, checkpoint={"save": {"after_step": 10**400}})],
     ),
-    # Seed 69.
-    "AQ5-D3 a grad_norm of the wrong type hides a stall from Python": (
-        "Python reports no stalled_weights; Rust, which reads the refused value as absent, reports one, "
-        "as both do when grad_norm is absent",
-        _stall("NAN"),
-    ),
-    "AQ5-D3 a grad_norm of the wrong type hides a stall from Python, a bool": (
-        "as above, for true",
-        _stall(True),
-    ),
     # Seed 1863, two records.
     "AQ5-D4 a MoE incident at a step written twice": (
         "Rust's scalar context of the moe_imbalance incident takes the step's first writing as a value "
@@ -429,6 +419,15 @@ SETTLED_AR2: dict[str, tuple[str, list[dict[str, Any]]]] = {
     "AQ5-D1 update_rms with no held entry, an oversized integer": (
         "as above, for 10**400",
         [_record(112, grad_norm=1.036979024, update_rms={"p0.weight": 10**400})],
+    ),
+    # Seed 69.
+    "AQ5-D3 a grad_norm of the wrong type, a text": (
+        "a top-level grad_norm that is not a number is absent in Python too: both report the stall",
+        _stall("NAN"),
+    ),
+    "AQ5-D3 a grad_norm of the wrong type, a bool": (
+        "as above, for true",
+        _stall(True),
     ),
 }
 
