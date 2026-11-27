@@ -65,6 +65,12 @@ AGREE: dict[str, list[dict[str, Any]]] = {
         *(_attempt(1, s) for s in range(3)),
         _attempt(2, 2, checkpoint={"load": {"components": {"model": {}, "optimizer": {"entries": 0}, "rng": {}},
                                             "note": BIG}})],
+    "checkpoint: an oversized integer is no tensor name": [
+        *(_attempt(1, s) for s in range(3)),
+        _attempt(2, 2, checkpoint={"load": {
+            "components": {"model": {}, "optimizer": {"entries": 3}, "rng": {}, "data": {}},
+            "tensors": {"state": "compared", "missing": {"count": 2, "names": ["a", BIG]},
+                        "unexpected": {"count": 1, "names": [BIG]}}}})],
     # AQ-5 found these agree, and they must go on agreeing: each fits a float.
     "the integers that fit a float, in all four columns": [
         _record(s, system={"cuda": {"ooms": n, "alloc_retries": 1}}, data={"batches": 1, "batch_hash": "v2:b", "epoch": n},
@@ -78,6 +84,11 @@ STILL_DIFFER: dict[str, tuple[str, list[dict[str, Any]]]] = {
         "Python's data_checks._int keeps 10**400 as a count, so the rows drew and stall; Rust's int "
         "reads no integer outside i64, so they drew nothing",
         [_record(s, data={"batches": BIG, "batch_hash": "v2:aa"}) for s in range(4)],
+    ),
+    "data: a batches count past int64, which differed before D2 too": (
+        "Python's data_checks._int keeps 2**64 as a count, so the rows drew and stall; Rust's int reads "
+        "no integer outside i64. The text parses, so this is not D2: the same gap as the oversized count",
+        [_record(s, data={"batches": 2**64, "batch_hash": "v2:aa"}) for s in range(4)],
     ),
     "checkpoint: an oversized scheduler last_epoch": (
         "Python's data_checks._int keeps 10**400 and reports the scheduler's position with its digits; "

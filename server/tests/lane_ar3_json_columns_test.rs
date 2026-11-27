@@ -5,7 +5,8 @@
 //! - The stored part holds each column's text as it was sent, the integer's digits included: the
 //!   server stores the batch as received and does not parse the JSON columns.
 //! - The live detectors read each row with its valid siblings, and the oversized value is
-//!   unreadable where a number is wanted (`detect/extra_json.rs`).
+//!   unreadable where a number is wanted (`detect/extra_json.rs`), both when the rank's first batch
+//!   builds them from the store and when a later batch continues the rows held in memory.
 //! - After a restart, the detectors rebuilt from the stored parts read the same.
 
 mod lane_aa3_support;
@@ -183,13 +184,22 @@ async fn d2_oversized_integers_in_the_json_columns_are_stored_as_sent_and_read_l
         let mut put = open(&server.address, RUN, 0, schema()).await;
         put.send(batch(0..6), 100).await;
         assert_eq!(put.ack().await, 100);
+        // A rank's first batch builds its detectors from the store (a rebuild of what is stored).
+        let first = report_through(root, 5).await;
+        assert_read(&first, 6);
+        // The live route: a batch that continues the rows read so far is read by the detectors
+        // held in memory (`RankDetectors::append`), with no rebuild.
+        put.send(batch(6..8), 200).await;
+        assert_eq!(put.ack().await, 200);
+        let live = report_through(root, 7).await;
+        assert_eq!(live["rebuilds"], first["rebuilds"], "no rebuild: {live}");
+        assert_read(&live, 8);
         put.finish().await;
-        assert_read(&report_through(root, 5).await, 6);
         server.ingest.shutdown().await.unwrap();
     }
     // The stored rows hold the text as sent: the integer's 401 digits, not a float or a placeholder.
     for (at, column) in COLUMNS.iter().enumerate() {
-        let expected: Vec<Option<String>> = (0..6).map(|step| texts(step)[at].clone()).collect();
+        let expected: Vec<Option<String>> = (0..8).map(|step| texts(step)[at].clone()).collect();
         assert_eq!(stored(root, column), expected, "{column}");
     }
     assert!(stored(root, "system_json")[0].as_deref().unwrap().contains(&big()));
@@ -197,10 +207,10 @@ async fn d2_oversized_integers_in_the_json_columns_are_stored_as_sent_and_read_l
     // A restart: the detectors are rebuilt from the stored parts, then read the new rows.
     let server = start(root).await;
     let mut put = open(&server.address, RUN, 0, schema()).await;
-    put.send(batch(6..8), 200).await;
-    assert_eq!(put.ack().await, 200);
+    put.send(batch(8..10), 300).await;
+    assert_eq!(put.ack().await, 300);
     put.finish().await;
-    let report = report_through(root, 7).await;
+    let report = report_through(root, 9).await;
     assert_eq!(report["rebuilds"], 1, "{report}");
-    assert_read(&report, 8);
+    assert_read(&report, 10);
 }

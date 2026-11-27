@@ -346,6 +346,47 @@ fn d2_a_resume_is_judged_from_a_load_manifest_beside_an_oversized_integer() {
     );
 }
 
+#[test]
+fn d2_an_oversized_integer_is_not_a_tensor_name() {
+    // Python's `tensor_list` keeps only the strings of a list of names: the integer is left out of
+    // the resume's `missing_tensors` and of `checkpoint_tensors`. Read as the unreadable text, it
+    // must not become a name.
+    let mut rows: Vec<Row> = (0..3)
+        .map(|step| Row {
+            attempt: 1,
+            step,
+            columns: vec![],
+        })
+        .collect();
+    rows.push(Row {
+        attempt: 2,
+        step: 2,
+        columns: vec![(
+            "checkpoint_json",
+            format!(
+                r#"{{"load": {{"components": {{"model": {{}}, "optimizer": {{"entries": 3}}, "rng": {{}}, "data": {{}}}}, "tensors": {{"state": "compared", "missing": {{"count": 2, "names": ["a", {0}]}}, "unexpected": {{"count": 1, "names": [{0}]}}}}}}}}"#,
+                big()
+            ),
+        )],
+    });
+    let found = report_of(&rows);
+    let resume = incidents(&found, "resume_incomplete");
+    assert_eq!(resume.len(), 1, "{found}");
+    assert_eq!(
+        resume[0]["changes"][0]["findings"],
+        json!([{"component": "model", "finding": "missing_tensors", "count": 2, "tensors": ["a"]}]),
+        "{found}"
+    );
+    assert_eq!(
+        found["checkpoint_tensors"],
+        json!({"resumes": 1, "entries": [{
+            "step": 2, "rank": 0, "attempt": 2, "state": "compared",
+            "missing": {"count": 2, "names": ["a"]}, "unexpected": {"count": 1, "names": []},
+        }]}),
+        "{found}"
+    );
+}
+
 // --- what does not change -------------------------------------------------------------------------
 
 #[test]
