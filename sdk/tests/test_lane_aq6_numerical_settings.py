@@ -247,8 +247,9 @@ def test_a_failure_of_the_whole_read_still_gives_a_manifest(monkeypatch):
         raise MemoryError("no room")
 
     monkeypatch.setattr(mf, "_read_numerical_settings", broken)
-    built = manifest()
-    assert built[KEY] == {"read_at": "init", "not_read": "reading them raised MemoryError: no room"}
+    built = manifest(created_at="2026-11-26T10:00:00Z")
+    assert built[KEY] == {"read_at": "init", "not_read": "reading them raised MemoryError: no room",
+                          "read_at_utc": "2026-11-26T10:00:00Z", "starts": 1}
     assert built["project"] == "p"
 
 
@@ -283,15 +284,25 @@ def test_a_real_init_writes_the_settings_into_the_manifest_beside_the_records(to
     assert session.manifest[KEY] == written[KEY]
 
 
-def test_a_run_started_again_records_the_settings_of_the_later_start(toy_moe, tmp_path, monkeypatch):
+def test_a_run_started_again_with_other_settings_keeps_the_first_starts_beside_the_later(toy_moe, tmp_path,
+                                                                                         monkeypatch):
     path = tmp_path / "run-1.rank0.jsonl"
     _run(toy_moe, path, "run-1")
     first = json.loads((tmp_path / "run-1.run.json").read_text())
+    assert first[KEY]["starts"] == 1 and "earlier_starts" not in first[KEY]
     monkeypatch.setenv(ENV[1], "1")
-    _run(toy_moe, path, "run-1")
+    session = _run(toy_moe, path, "run-1")
     again = json.loads((tmp_path / "run-1.run.json").read_text())
     assert again["created_at"] == first["created_at"]
+    # The latest start is where it always was, so a reader of `settings` reads the latest start.
     assert first[KEY]["settings"][NAMES[9]] == {"value": None} and again[KEY]["settings"][NAMES[9]] == {"value": "1"}
+    assert again[KEY]["earlier_starts"] == [{k: first[KEY][k] for k in ("read_at_utc", "starts", "settings")}]
+    assert session.manifest[KEY] == again[KEY], "what is streamed is what was written"
+    # A third start with the second's settings adds nothing but a count.
+    _run(toy_moe, path, "run-1")
+    third = json.loads((tmp_path / "run-1.run.json").read_text())
+    assert third[KEY]["earlier_starts"] == again[KEY]["earlier_starts"] and third[KEY]["starts"] == 2
+    assert third[KEY]["read_at_utc"] == again[KEY]["read_at_utc"]
 
 
 def test_the_copy_sent_without_its_config_keeps_the_settings():
@@ -437,3 +448,135 @@ def test_two_long_values_cut_alike_but_of_other_lengths_differ(tmp_path):
     setup = tensorquill.compare_runs("run-1", "run-2", source=folder)["setup"]
     assert setup["differs"] == [{"field": f"{KEY}.{NAMES[8]}", "values": {"A": cut, "B": cut},
                                  "cut_from_length": {"A": 300, "B": 400}}]
+
+
+# --- A run started again: every start's settings that differ from the next ----------------------
+
+
+def _start(path: Path, when: str, run_id: str = "r", **changes) -> dict:
+    """One start under `run_id` with these settings (`_settings(**changes)`), written as `init` writes
+    it, and the manifest as it is on disk afterwards."""
+    document = manifest(created_at=when)
+    document["run_id"] = run_id
+    document[KEY] = {**document[KEY], "settings": _settings(**changes)}
+    assert mf.write_manifest(path, document)
+    return json.loads(path.read_text())
+
+
+def test_starts_with_the_same_settings_add_only_a_count(tmp_path):
+    path = tmp_path / "r.run.json"
+    for hour in range(10, 15):
+        written = _start(path, f"2026-11-26T{hour}:00:00Z")
+    assert written[KEY]["starts"] == 5 and written[KEY]["read_at_utc"] == "2026-11-26T10:00:00Z"
+    assert "earlier_starts" not in written[KEY]
+    assert written["created_at"] == "2026-11-26T10:00:00Z"
+
+
+def test_each_run_of_starts_with_settings_of_their_own_is_kept_oldest_first(tmp_path):
+    path = tmp_path / "r.run.json"
+    _start(path, "2026-11-26T10:00:00Z")
+    _start(path, "2026-11-26T11:00:00Z")
+    _start(path, "2026-11-26T12:00:00Z", s3=True)
+    _start(path, "2026-11-26T13:00:00Z", s3=True)
+    # A warning while reading is no other setting.
+    _start(path, "2026-11-26T14:00:00Z", s3=True, s4={"value": False, "warning": "UserWarning: deprecated"})
+    written = _start(path, "2026-11-26T15:00:00Z")
+    block = written[KEY]
+    assert block["settings"] == _settings() and block["starts"] == 1
+    assert block["read_at_utc"] == "2026-11-26T15:00:00Z"
+    assert [(e["read_at_utc"], e["starts"], e["settings"][NAMES[3]]) for e in block["earlier_starts"]] == [
+        ("2026-11-26T10:00:00Z", 2, {"value": False}), ("2026-11-26T12:00:00Z", 3, {"value": True})]
+    assert "earlier_starts_left_out" not in block
+    # The code that reads `numerical_settings` reads the latest start.
+    assert mf.numerical_settings(written)["settings"] == _settings()
+
+
+@pytest.mark.parametrize("heavy", [False, True], ids=["by-count", "by-size"])
+def test_the_starts_kept_are_capped_and_the_first_start_is_never_dropped(tmp_path, heavy):
+    path = tmp_path / "r.run.json"
+    long = {"value": "x" * mf.SETTING_TEXT_MAX, "cut_from_length": 5000}
+    # The largest an entry can be: a cut value and a warning of the longest kept.
+    warned = {**long, "warning": "w" * 200} if heavy else long
+    every = {f"s{i}": warned for i in (0, 1, 2, 4, 5, 6, 7, 8, 9)} if heavy else {"s8": long, "s9": long}
+    for start in range(30):
+        written = _start(path, f"2026-11-{start // 24 + 1:02d}T{start % 24:02d}:00:00Z",
+                         s3={**warned, "value": bool(start % 2)} if heavy else bool(start % 2), **every)
+    block = written[KEY]
+    assert len(block["earlier_starts"]) <= mf.EARLIER_STARTS_MAX
+    assert block["earlier_starts"][0]["read_at_utc"] == "2026-11-01T00:00:00Z", "the first start stays"
+    assert block["earlier_starts"][-1]["read_at_utc"] == "2026-11-02T04:00:00Z", "and the one before the latest"
+    assert block["earlier_starts_left_out"] == 29 - len(block["earlier_starts"])
+    size = len(json.dumps(block, separators=(",", ":"), ensure_ascii=False).encode())
+    assert size <= mf.NUMERICAL_SETTINGS_MAX_BYTES < mf.MANIFEST_SEND_BYTES // 2
+    if heavy:
+        assert len(block["earlier_starts"]) < mf.EARLIER_STARTS_MAX, "the size, not the count, decided"
+    # A whole manifest with them still goes on a stream with its config.
+    assert mf.manifest_to_send(written) == (written, None)
+
+
+def test_a_start_whose_settings_were_not_recorded_is_said_and_another_runs_manifest_is_not_merged(tmp_path):
+    path = tmp_path / "r.run.json"
+    older = {"schema_version": 1, "project": "p", "name": "n", "run_id": "r", "created_at": "2026-11-25T10:00:00Z"}
+    path.write_text(json.dumps(older))
+    written = _start(path, "2026-11-26T10:00:00Z")
+    assert written[KEY]["earlier_starts_not_recorded"] is True and "earlier_starts" not in written[KEY]
+    # It stays said at the next start with other settings.
+    written = _start(path, "2026-11-26T11:00:00Z", s3=True)
+    assert written[KEY]["earlier_starts_not_recorded"] is True and len(written[KEY]["earlier_starts"]) == 1
+    # A manifest of another run ID at the path is replaced, not merged.
+    written = _start(path, "2026-11-26T12:00:00Z", run_id="other")
+    assert set(written[KEY]) == {"read_at", "read_at_utc", "starts", "settings"}
+
+
+def test_compare_says_when_a_runs_own_starts_differ_and_compares_runs_by_their_latest_start(tmp_path):
+    folder = tmp_path / "out"
+    _local(folder, "run-1", _settings(s3=True))
+    _local(folder, "run-2", _settings(s3=True))
+    path = folder / "run-2.run.json"
+    first = json.loads(path.read_text())
+    resumed = {**first, KEY: {**first[KEY], "settings": _settings(s3=True, s9="1"), "starts": 1,
+                              "earlier_starts": [{"read_at_utc": "2026-11-26T10:00:00Z", "starts": 1,
+                                                  "settings": _settings()}]}}
+    path.write_text(json.dumps(resumed))
+    result = tensorquill.compare_runs("run-1", "run-2", source=folder)
+    setup = result["setup"]
+    # By the latest start: run-2 now has CUDA_DEVICE_MAX_CONNECTIONS set; benchmark is the same.
+    assert setup["differs"] == [{"field": f"{KEY}.{NAMES[9]}", "values": {"A": None, "B": "1"}}]
+    assert setup["numerical_settings_starts_differ"] == {
+        "B": {"earlier_starts": 1, "settings": [NAMES[3], NAMES[9]]}}
+    assert ("B's own starts differ in their numerical settings: " + f"{NAMES[3]}, {NAMES[9]}") in result["summary"]
+    assert "compared by its latest start" in result["summary"]
+
+
+def test_compare_counts_the_starts_left_out_and_a_start_not_recorded(tmp_path):
+    folder = tmp_path / "out"
+    _local(folder, "run-1", _settings())
+    _local(folder, "run-2", _settings())
+    path = folder / "run-2.run.json"
+    document = json.loads(path.read_text())
+    document[KEY].update({"earlier_starts": [{"settings": _settings(s0=True)}], "earlier_starts_left_out": 4,
+                          "earlier_starts_not_recorded": True})
+    path.write_text(json.dumps(document))
+    setup = tensorquill.compare_runs("run-1", "run-2", source=folder)["setup"]
+    assert setup["differs"] == []
+    assert setup["numerical_settings_starts_differ"] == {"B": {
+        "earlier_starts": 1, "earlier_starts_left_out": 4, "earlier_starts_not_recorded": True,
+        "settings": [NAMES[0]]}}
+
+
+def test_a_streamed_run_started_again_keeps_both_starts_in_the_servers_run_json(toy_moe, tmp_path, monkeypatch):
+    from test_run_manifest import real_server, streamed
+
+    store = tmp_path / "store"
+    server = real_server(store)
+    try:
+        streamed(toy_moe, tmp_path, monkeypatch, server.endpoint, "run-1", project="granite", name="baseline")
+        monkeypatch.setenv(ENV[1], "1")
+        streamed(toy_moe, tmp_path, monkeypatch, server.endpoint, "run-1", project="granite", name="baseline")
+    finally:
+        assert server.terminate() == 0
+    local = json.loads((tmp_path / "local" / "run-1.run.json").read_text())
+    stored = json.loads((store / "runs" / "run-1" / "run.json").read_text())
+    assert stored[KEY] == local[KEY]
+    assert stored[KEY]["settings"][NAMES[9]] == {"value": "1"}
+    assert [e["settings"][NAMES[9]] for e in stored[KEY]["earlier_starts"]] == [{"value": None}]
