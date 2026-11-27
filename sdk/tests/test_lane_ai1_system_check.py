@@ -4,7 +4,8 @@
 The three judges are shown passing and failing on made-up readings, the CUDA and NVML ones too (no GPU
 is needed to judge numbers): an allocator reading off by more than the tolerance, `nvidia-smi` using
 less than TensorQuill says is reserved, an NVML temperature off, no `nvidia-smi` sample near a reading,
-and `nvidia-ml-py` absent, which is not proven rather than failed. Then the script runs on CPU: NVML
+and `nvidia-ml-py` absent, which is not proven rather than failed. Lane AS-3 changed two rules these
+tests state (the slack on top of the loader's own delay, power over a window), and their pins with them. Then the script runs on CPU: NVML
 and CUDA memory absent and said to be by TensorQuill, the data wait checked, exit 3 (not proven); a
 data-wait failure there exits 1, not 3.
 """
@@ -64,7 +65,7 @@ def test_data_wait_below_the_sleep_or_far_over_it_fails():
     late = judged(gs.check_data_wait, waits(d, overrides={4: 0.2}), d, 0.015)[1]
     assert "data_wait is at most the sleep plus 100 ms on every step" in late
     many = judged(gs.check_data_wait, waits(d, extra=0.03), d, 0.015)[1]
-    assert many == ["data_wait is at most the sleep plus 15 ms on 98% of steps"]
+    assert many == ["data_wait is at most the sleep plus the loader's own delay plus 15 ms on 98% of steps"]  # none given: 0
     gone = [r for r in waits(d) if r["step"] != 7]
     assert judged(gs.check_data_wait, gone, d, 0.015)[1] == ["every step has a data_wait"]
 
@@ -104,7 +105,10 @@ def nvml_case(temp=60, dt=0.2, note=None):
 
 def test_nvml_against_nvidia_smi_by_read_at():
     checks, failed = judged(gs.check_nvml, *nvml_case())
-    assert not failed and not checks.not_proven and len(checks.items) == 1 + 3 * 4  # ECC [N/A]: left out
+    # ECC [N/A]: left out. Power is judged over a window, not reading by reading (lane AS-3), and this
+    # case's three samples leave two in it: not proven, which test_lane_as3_system_check.py covers.
+    assert not failed and len(checks.items) == 1 + 3 * 3
+    assert len(checks.not_proven) == 1 and "power" in checks.not_proven[0]
     hot = judged(gs.check_nvml, *nvml_case(temp=70))[1]
     assert len(hot) == 3 and all("temperature_c" in name for name in hot)
     far = judged(gs.check_nvml, *nvml_case(dt=5.0))[1]
