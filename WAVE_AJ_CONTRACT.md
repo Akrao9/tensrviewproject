@@ -73,7 +73,7 @@ Every other entry is refused. This includes `true`, any other string (`"NaN"` to
 - **What both engines read.** A refused entry is absent from an incident's scalar context and from the median before it, and its siblings are kept: Python's `scalar_context` skips it, and Rust never sees it in the column.
 - **A row stored before the change** has a null `scalars` column and the whole map in `extra_json`. Rust reads such a row's held entries from `extra_json` when the column is null, as Python reads the record back, so both show the siblings there too. A number too large for a float in that text is read as unreadable (`detect/extra_json.rs`), so the rest of the row is kept.
 - **A server built before the change** reads the new sender's rows from the column: it sees the siblings and never the refused entry, which is what the new engines report.
-- A `null` entry is held by the column as null and skipped by Rust's scalar context, while Python's shows it with no value. That predates this change and is not decided here (lane AR-1's report).
+- **A `null` entry** is held by the column as null, as before, and is absent from an incident's scalar context in both engines: Rust's context skipped it already, and Python's now does (lane AR-1's choice, seed 3569, which AQ-5 filed under D7; before, Python showed it as a value of `None`). A null is no value, as in the median before an incident in both engines.
 
 **`records_to_batch` and the raw `detect` stream** now build rows as before and redo with Arrow's check only the rows Arrow refuses. A valid record's row is unchanged, and a key column Arrow refuses still raises.
 

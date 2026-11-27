@@ -600,13 +600,15 @@ def scalar_context(
     entry the `scalars` column cannot hold (`_wire_float`: a text other than the sink's "nan",
     "inf" and "-inf", an integer too large for a float, a list, an object) and a name Arrow cannot
     encode, and its siblings are kept, as Rust reads them (AQ5-D7, the author, Nov 26, 2026;
-    `WAVE_AJ_CONTRACT.md` section 3). Before, such an entry was shown with its raw value."""
+    `WAVE_AJ_CONTRACT.md` section 3). Before, such an entry was shown with its raw value. A null is
+    no value, as in the median before it, and is left out too, as Rust's context skips the column's
+    null (seed 3569, filed under AQ5-D7; before, it was shown as a value of None)."""
     index = next((i for i, record in enumerate(records) if record.get("step") == step), None)
     if index is None:
         return {}
     context = {}
     for name, value in _object(records[index], "scalars").items():
-        if _wire_float(value) is _UNCARRIED or not _encodable(name):
+        if value is None or _wire_float(value) is _UNCARRIED or not _encodable(name):
             continue
         before = [
             v for v in (_finite(_object(r, "scalars").get(name)) for r in records[max(0, index - window) : index])
