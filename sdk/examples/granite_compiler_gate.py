@@ -35,16 +35,19 @@ parameters it watches against the model's trainable ones, and the samples it too
 The overhead of an arm is, per round, its mean step time over the timed steps (the block's wall
 time over its steps, as `moe_dogfood.py` times it, so the flush and sample steps count) over the
 `off` arm's in the same round, minus one; the arm's overhead is the median of those. The same
-ratio of per-step medians is written beside it. The median of the paired rounds' overheads is the
-primary 1% criterion (the author, Nov 22, 2026); the ratio of the arms' median rounds, the figure
+ratio of per-step medians is written beside it. The median of the paired rounds' overheads was the
+primary 1% criterion (the author, Nov 22, 2026); since the author's change of Nov 26, 2026 it is
+measured and reported here and no longer scored: Gate 2's overhead line is scored by
+`overhead_harness.py`'s verdict (met, not met, cannot tell), because three paired rounds cannot tell
+1% under the noise recorded between fresh processes. The ratio of the arms' median rounds, the figure
 `moe_dogfood.py` printed, is reported alongside for comparison with earlier results and never scored
 (said aloud when it falls on the other side of the line). `gate.json` says which is which
 (`overhead_criterion`).
 The slowest timed step of every arm and round is reported with how far it is over that round's
 median step (`worst_step_by_round`), and every step's time is kept in the arm's file (`step_ms`):
 a passing median does not show one slow step. None of that is scored. The pass line, for the TensorQuill
-arm only: median overhead 1% or less, zero graph breaks, zero recompiles after warm-up, zero
-CUDA-graph skips under `reduce-overhead`, and its capture checks. Exit 0 when it passes, 1 when
+arm only: zero graph breaks, zero recompiles after warm-up, zero CUDA-graph skips under
+`reduce-overhead`, and its capture checks; the median overhead line is written beside them, not judged. Exit 0 when it passes, 1 when
 it does not. With `--toy`, `--eager` or without CUDA, the timing and CUDA-graph lines are not
 established and are written as such (`dry_run`): exit 0 then rests on the capture checks and the
 compile counters only. On a GPU without CUDA graphs (`--mode default`) every line but the
@@ -490,12 +493,30 @@ def summarize(args, results: dict[str, list[dict]]) -> dict[str, Any]:
 
 # The author, Nov 22, 2026: "record the median of the three paired overheads as the primary 1% criterion.
 # Report the ratio of arm medians alongside it for comparison with earlier results."
+# Changed by the author, Nov 26, 2026 (SV3): Gate 2's overhead line is scored by the verdict of
+# examples/overhead_harness.py (met, not met, cannot tell), not by this median of three paired rounds,
+# which three rounds cannot make tell 1% under the noise recorded between fresh processes (paired SD 0.4% to
+# 1.6% on the A100). The median is still measured and reported here; its line reads "not judged here".
+#
+# Amendment, Nov 26, 2026 (the author, SV3), to criterion (2)'s CUDA-graph line, as GPU_RUN_SHEET.md states it:
+# on the A100 (compute capability 8.0) Granite cannot be recorded under CUDA graphs with no tool attached,
+# because `torch._grouped_mm` takes PyTorch's fallback path there, which copies the group offsets to the host
+# (read in the PyTorch source at v2.14.0 and at its head). Granite's recording failed on the RTX PRO 6000 too;
+# no record explains why. Zero CUDA-graph skips is judged only where capture off itself can be recorded;
+# elsewhere the scored mode is Inductor without CUDA graphs and the CUDA-graph line is not established. A run
+# whose capture off fails in round 1 stops and reads not proven (`baseline_stopped`).
 OVERHEAD_CRITERION = {
     "primary": "overhead_median: the median of the paired rounds' overheads (each round's mean step time over "
-               "capture off's in the same round, minus one), 1% or less; this is the scored figure",
+               "capture off's in the same round, minus one), 1% or less; the scored figure until Nov 26, 2026, "
+               "now measured and reported, not scored",
     "alongside": "overhead_of_median_rounds: the ratio of the arms' median rounds, as moe_dogfood.py printed it on "
                  "earlier runs; reported for comparison, never scored",
+    "scored_by": "examples/overhead_harness.py: met when the top of the 95% distribution-free interval for the "
+                 "median paired overhead is at most the limit, on a GPU shown to be unshared, the round count fixed "
+                 "in advance (the author, Nov 26, 2026)",
 }
+NOT_JUDGED_HERE = ("not judged here: Gate 2's overhead line is scored by examples/overhead_harness.py "
+                   "(the author, Nov 26, 2026)")
 
 
 def worst_step(result: dict, warmup: int) -> dict[str, Any]:
@@ -520,8 +541,8 @@ def verdict(args, arms: dict[str, Any], established: bool) -> tuple[str, list[di
     tq, off = arms.get("tensorquill", {}), arms.get("off", {})
     criteria: list[dict] = []
 
-    def criterion(name: str, ok: bool | None, detail: str) -> None:
-        criteria.append({"name": name, "ok": ok, "detail": detail})
+    def criterion(name: str, ok: bool | None, detail: str, scored: bool = True) -> None:
+        criteria.append({"name": name, "ok": ok, "detail": detail, "scored": scored})
 
     measured = tq.get("states") == ["measured"] and off.get("states") == ["measured"]
     criterion("capture off and TensorQuill measured in every round", measured,
@@ -534,24 +555,25 @@ def verdict(args, arms: dict[str, Any], established: bool) -> tuple[str, list[di
     criterion("zero recompiles after warm-up", tq["recompiles_after_warmup"] == 0, str(tq["recompiles_after_warmup"]))
     overhead = tq["overhead_median"]
     if established:
-        criterion(f"median overhead {100 * OVERHEAD_LIMIT:g}% or less", overhead <= OVERHEAD_LIMIT,
-                  f"{100 * overhead:+.2f}% (rounds {[f'{100 * r:+.2f}%' for r in tq['overhead_by_round']]}; "
+        criterion(f"median overhead {100 * OVERHEAD_LIMIT:g}% or less", None,
+                  f"{NOT_JUDGED_HERE}; measured: {100 * overhead:+.2f}% (rounds {[f'{100 * r:+.2f}%' for r in tq['overhead_by_round']]}; "
                   f"by each arm's median round, as moe_dogfood.py printed it: {100 * tq['overhead_of_median_rounds']:+.2f}%"
                   + ("" if (tq["overhead_of_median_rounds"] <= OVERHEAD_LIMIT) == (overhead <= OVERHEAD_LIMIT)
-                     else ", WHICH FALLS ON THE OTHER SIDE OF THE LINE") + ")")
+                     else ", WHICH FALLS ON THE OTHER SIDE OF THE LINE") + ")", scored=False)
     else:
         criterion(f"median overhead {100 * OVERHEAD_LIMIT:g}% or less", None,
-                  f"not established ({'toy' if args.toy else 'eager' if args.eager else 'no CUDA'}): "
-                  f"{100 * overhead:+.2f}% measured")
+                  f"{NOT_JUDGED_HERE}; not established ({'toy' if args.toy else 'eager' if args.eager else 'no CUDA'}): "
+                  f"{100 * overhead:+.2f}% measured", scored=False)
     if tq["cudagraph_skips"] is None:
         criterion("zero CUDA-graph skips under reduce-overhead", None, "not checked: CUDA graphs were off")
     else:
         criterion("zero CUDA-graph skips under reduce-overhead", tq["cudagraph_skips"] == 0, str(tq["cudagraph_skips"]))
-    if any(c["ok"] is False for c in criteria):
+    scored = [c for c in criteria if c["scored"]]
+    if any(c["ok"] is False for c in scored):
         return "fail", criteria
     if not established:
         return "dry_run", criteria
-    return ("pass" if all(c["ok"] for c in criteria) else "not_proven"), criteria
+    return ("pass" if all(c["ok"] for c in scored) else "not_proven"), criteria
 
 
 def baseline_stopped(args, out: Path, device: str, results: dict[str, list[dict]], off: dict) -> int:
@@ -616,7 +638,8 @@ def driver_main(args) -> int:
             "steps": args.steps, "torch": torch.__version__, "device": device,
             "tensorquill_file": tensorquill.__file__, "arms": summary,
             "overhead_criterion": OVERHEAD_CRITERION,
-            "claim": {"pass": "established", "fail": "failed",
+            "claim": {"pass": "established for the scored lines; the overhead is overhead_harness.py's to score",
+                      "fail": "failed",
                       "not_proven": "not established: the CUDA-graph line was not checked (CUDA graphs off)",
                       "dry_run": "not established: a CPU, toy or eager dry run checks the harness, not the GPU claim"}[status]}
     (out / "gate.json").write_text(json.dumps(gate, indent=1, default=str))
@@ -634,7 +657,7 @@ def driver_main(args) -> int:
             print(f"{arm:<12}{','.join(entry['states']):<12}  {entry.get('reason') or entry.get('errors')}")
     print()
     for c in criteria:
-        mark = {True: "PASS", False: "FAIL", None: "NOT ESTABLISHED"}[c["ok"]]
+        mark = {True: "PASS", False: "FAIL", None: "NOT ESTABLISHED"}[c["ok"]] if c.get("scored", True) else "REPORTED"
         print(f"{mark}: {c['name']}: {c['detail']}")
     print("\nSlowest timed step of each round (reported, not scored; every step's time is in the arm's file):")
     for arm, entry in summary.items():
