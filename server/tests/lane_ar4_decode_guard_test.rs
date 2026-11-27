@@ -493,3 +493,146 @@ async fn the_binary_refuses_a_batch_cut_short_without_a_panic_in_its_log() {
     assert!(log.contains("malformed"), "{log}");
     assert_eq!(parts(dir.path(), run), vec![(0, 2), (3, 5)]);
 }
+
+// --- `tensorquill-server detect` -------------------------------------------------------------------
+
+/// `rows` as one Arrow IPC stream, as `detect` reads them.
+fn ipc(rows: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut out, &schema()).unwrap();
+    writer.write(&batch(rows)).unwrap();
+    writer.finish().unwrap();
+    drop(writer);
+    out
+}
+
+/// AQ5-R1 in an Arrow IPC stream: `rows` as one stream whose record batch header says its body is
+/// half as long as the buffers it names reach, and whose body is cut to that. The stream reader reads
+/// the shorter body and the decode of its buffers runs past it.
+fn ipc_cut_short(rows: &[Value]) -> Vec<u8> {
+    let whole = ipc(rows);
+    // Each message: 0xFFFFFFFF, the header's length, the header (a flatbuffer `Message`), its body.
+    let message_at = |at: usize| -> (usize, usize) {
+        assert_eq!(whole[at..at + 4], [0xff; 4]);
+        let length = u32::from_le_bytes(whole[at + 4..at + 8].try_into().unwrap()) as usize;
+        (at + 8, length)
+    };
+    let (schema_header, schema_length) = message_at(0);
+    let (header_at, header_length) = message_at(schema_header + schema_length);
+    let mut header = whole[header_at..header_at + header_length].to_vec();
+    let message = arrow::ipc::root_as_message(&header).unwrap();
+    assert!(message.header_as_record_batch().is_some());
+    let body = message.bodyLength() as usize;
+    let half = (body / 2) & !7;
+    // `bodyLength`, the `Message` table's fourth field, found through the table's vtable.
+    let u16_at = |at: usize| u16::from_le_bytes(header[at..at + 2].try_into().unwrap()) as usize;
+    let table = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let back = i32::from_le_bytes(header[table..table + 4].try_into().unwrap()) as isize;
+    let vtable = (table as isize - back) as usize;
+    let at = table + u16_at(vtable + 4 + 2 * 3);
+    assert_eq!(i64::from_le_bytes(header[at..at + 8].try_into().unwrap()), body as i64);
+    header[at..at + 8].copy_from_slice(&(half as i64).to_le_bytes());
+    assert_eq!(arrow::ipc::root_as_message(&header).unwrap().bodyLength(), half as i64);
+    let body_at = header_at + header_length;
+    let mut out = whole[..header_at].to_vec();
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&whole[body_at..body_at + half]);
+    out.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+    out
+}
+
+/// `tensorquill-server detect` with `args`, given `input` on standard input.
+fn detect(args: &[&str], input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensorquill-server"))
+        .arg("detect")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let output = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    output
+}
+
+/// `detect`'s ordinary error exit: code 1 and one line `tensorquill-server: <why>` naming a
+/// malformed record batch, with no panic. On `ce9da4a` every mode exited with 101 and the panic hook's
+/// lines, which name arrow-buffer's source file in the local cargo registry.
+fn assert_detect_refused(output: &std::process::Output, mode: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let seen = format!("{mode}: exit {:?}, standard error:\n{stderr}", output.status.code());
+    assert_eq!(output.status.code(), Some(1), "{seen}");
+    assert!(!stderr.contains("panicked"), "{seen}");
+    assert!(!stderr.contains(".rs:"), "{seen}");
+    assert!(
+        stderr.starts_with("tensorquill-server: cannot read the Arrow IPC stream: a record batch in it is malformed"),
+        "{seen}"
+    );
+    assert_eq!(stderr.trim_end().lines().count(), 1, "{seen}");
+}
+
+#[test]
+fn the_cut_short_stream_panics_arrow_s_own_reader() {
+    // What the tests below rest on: the input is AQ5-R1 for arrow 60.1.0's stream reader itself, and
+    // the whole stream (before the cut) is read without an error.
+    let rows = steps("ar4_detect", 0..4);
+    let read = |bytes: Vec<u8>| {
+        arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+    };
+    assert_eq!(read(ipc(&rows)).unwrap().len(), 1);
+    let panicked = std::panic::catch_unwind(|| read(ipc_cut_short(&rows))).unwrap_err();
+    let text = panicked
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panicked.downcast_ref::<&str>().map(|text| text.to_string()))
+        .unwrap_or_default();
+    assert!(
+        text.contains("the offset of the new Buffer cannot exceed the existing length"),
+        "{text}"
+    );
+}
+
+#[test]
+fn detect_on_a_cut_short_stream_ends_with_its_error_exit_in_every_mode() {
+    let rows = steps("ar4_detect", 0..4);
+    let bad = ipc_cut_short(&rows);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cut.arrow");
+    std::fs::write(&file, &bad).unwrap();
+    let file = file.to_str().unwrap();
+    assert_detect_refused(&detect(&[], &bad), "detect (standard input)");
+    assert_detect_refused(&detect(&[file], b""), "detect <file>");
+    assert_detect_refused(&detect(&["--samples"], &bad), "detect --samples");
+    assert_detect_refused(&detect(&["--run", file], b""), "detect --run <file>");
+    assert_detect_refused(&detect(&["--run"], &bad), "detect --run (standard input)");
+    // The whole stream is judged as before.
+    let good = detect(&[], &ipc(&rows));
+    assert!(good.status.success(), "{}", String::from_utf8_lossy(&good.stderr));
+}
+
+#[test]
+fn detect_follow_answers_its_good_frame_then_ends_with_its_error_exit_at_the_cut_one() {
+    let frame = |bytes: Vec<u8>| {
+        let mut out = (bytes.len() as u64).to_le_bytes().to_vec();
+        out.extend(bytes);
+        out
+    };
+    let mut input = frame(ipc(&steps("ar4_detect", 0..4)));
+    input.extend(frame(ipc_cut_short(&steps("ar4_detect", 4..8))));
+    let output = detect(&["--follow"], &input);
+    assert_detect_refused(&output, "detect --follow");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "one answer, for the good frame: {stdout}");
+    let answer: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(answer["follow"]["mode"], "full", "{answer}");
+}
