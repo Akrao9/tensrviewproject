@@ -70,6 +70,14 @@ D4_CASES = {
         _record(26, scalars={"loss": 2.4}), _record(26, scalars={"loss": 3.0}, moe=IMBALANCED)],
     "only the first writing logs a scalar": [_record(26, scalars={"loss": 2.4}), _record(26, moe=IMBALANCED)],
     "only the second writing logs a scalar": [_record(26), _record(26, scalars={"loss": 3.0}, moe=IMBALANCED)],
+    "a step written many times": (
+        [_record(s, scalars={"loss": 5.0}) for s in range(10)] + [_record(10, scalars={"loss": 1.0})]
+        + [_record(10, scalars={"loss": float(at)}) for at in range(2, 201)]
+        + [_record(11, scalars={"loss": 9.0}, moe=IMBALANCED)]),
+    "a step written many times, the incident on its last writing": (
+        [_record(s, scalars={"loss": 5.0}) for s in range(10)] + [_record(10, scalars={"loss": 1.0})]
+        + [_record(10, scalars={"loss": float(at)}) for at in range(2, 200)]
+        + [_record(10, scalars={"loss": 200.0}, moe=IMBALANCED)]),
     "a gradient spike on a step's second writing": (
         [_record(s, grad_norm=1.0, scalars={"loss": 1.0 + s}) for s in range(30)]
         + [_record(30, grad_norm=1.0, scalars={"loss": 2.4}), _record(30, grad_norm=100.0, scalars={"loss": 3.0})]),

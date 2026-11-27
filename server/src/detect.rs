@@ -4516,6 +4516,9 @@ struct Scalars {
     /// The scalars of the last `SPIKE_WINDOW` records before the last step read, and of every
     /// writing of that step, as (step, [(name, value)]).
     recent: VecDeque<(i64, Vec<(usize, f64)>)>,
+    /// The last step read and how many of its writings `recent` holds: its first and at most the
+    /// last `SPIKE_WINDOW` (only those are ever read), so a step written many times costs no more.
+    current: Option<(i64, usize)>,
     /// A list `recent` gave up, kept so that a row needs no new one.
     spare: Vec<(usize, f64)>,
     scratch: Vec<f64>,
@@ -4557,9 +4560,12 @@ impl Scalars {
         }
     }
 
-    /// How many of the last rows read are writings of `step`.
+    /// How many writings of `step` end `recent`: none unless it is the last step read.
     fn writings(&self, step: i64) -> usize {
-        self.recent.iter().rev().take_while(|(known, _)| *known == step).count()
+        match self.current {
+            Some((known, writings)) if known == step => writings,
+            _ => 0,
+        }
     }
 
     fn context(&mut self, columns: &Columns, row: usize) -> Option<Value> {
@@ -4602,9 +4608,17 @@ impl Scalars {
         logged.clear();
         self.logged(columns, row, &mut logged);
         self.recent.push_back((step, logged));
+        let mut writings = self.writings(step) + 1;
+        if writings > SPIKE_WINDOW + 1 {
+            // A writing between the first and the last `SPIKE_WINDOW` is never read again.
+            if let Some((_, given_up)) = self.recent.remove(self.recent.len() - writings + 1) {
+                self.spare = given_up;
+            }
+            writings -= 1;
+        }
+        self.current = Some((step, writings));
         // Kept: the step's writings, and the `SPIKE_WINDOW` records before its first one.
-        let keep = SPIKE_WINDOW + self.writings(step);
-        while self.recent.len() > keep {
+        while self.recent.len() > SPIKE_WINDOW + writings {
             if let Some((_, given_up)) = self.recent.pop_front() {
                 self.spare = given_up;
             }

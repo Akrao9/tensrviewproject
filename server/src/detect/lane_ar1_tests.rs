@@ -189,6 +189,31 @@ fn d4_a_later_step_counts_both_writings_before_it() {
     }
 }
 
+/// A step written many times: a later writing still shows the first one's value and the median of
+/// the records before it, and the next step's median is over the last `SPIKE_WINDOW` writings, as
+/// Python's window of the previous records gives them.
+#[test]
+fn d4_a_step_written_many_times() {
+    let rows = |last_imbalanced: bool| {
+        let mut rows: Vec<Row> = (0..10).map(|step| row(step, &[("loss", 5.0)])).collect();
+        rows.push(row(10, &[("loss", 1.0)]));
+        rows.extend((2..=200).map(|at| row(10, &[("loss", f64::from(at))])));
+        if last_imbalanced {
+            let last = rows.pop().unwrap();
+            rows.push(last.imbalanced());
+        } else {
+            rows.push(row(11, &[("loss", 9.0)]).imbalanced());
+        }
+        rows
+    };
+    for got in contexts(&rows(true), "moe_imbalance") {
+        assert_eq!(got, json!({"loss": {"value": 1.0, "median_before": 5.0}}));
+    }
+    for got in contexts(&rows(false), "moe_imbalance") {
+        assert_eq!(got, json!({"loss": {"value": 9.0, "median_before": 175.5}}));
+    }
+}
+
 // --- AQ5-D7: a row stored before the change -------------------------------------------------
 
 /// A row a sender built before this change: the column null, the whole map in `extra_json`. The
