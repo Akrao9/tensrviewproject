@@ -492,7 +492,7 @@ Today's readers refuse the whole input, naming the line: "schema_version is 2 at
   - every public call returns at once;
   - `close()` drains nothing.
   
-  A value in `_late_traced` belongs to the newest step (rule 5), which is in the ring or held. So it is lost together with that step: no record is left for it to reach. The stop's own warning already says it: "the steps already handed to the writer are written, no later step is".
+  A value in `_late_traced` belongs to the newest step (rule 5), which is in the ring or held. So it is lost together with that step: no record is left for it to reach. The stop's own warning already says it: "no later step is written, nor a scalar still pending" (its words since lane AR-7, for every cause; before, "the steps already handed to the writer are written, no later step is").
 - **It cannot be closed** without writing after a stop, which wave C03's decision rules out: a stopped writer takes nothing, and a scalar-only record would have to pass through the same writer.
 - **So it stays a stated limit,** and no "left out" warning is added: the stop's warning is the one said. Case `scalar_compiled_late_at_a_stop`, which the base already gives.
 - **Lane AK-5's report words this differently.** Its item 11 puts the stop with the cases that leave the value out "with the one warning". At `f71d8e0` that warning is the stop's own, not `_no_step_for`'s:

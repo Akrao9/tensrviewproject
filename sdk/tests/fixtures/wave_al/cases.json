@@ -17791,7 +17791,7 @@
     "left_out_warnings": 0,
     "stop_warnings": 1,
     "warning_contains": [
-     "the steps already handed to the writer are written, no later step is"
+     "no later step is written, nor a scalar still pending"
     ]
    },
    "today": {

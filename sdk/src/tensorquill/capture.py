@@ -545,7 +545,8 @@ def _warn(message: str, stacklevel: int = 2) -> None:
     on the `tensorquill` logger, which prints it to stderr when no handler is set, and the
     caller goes on. A filter that ignores the warning still silences it."""
     try:
-        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel + 1)
+        # While `init` runs, at its caller's line (`manifest.at_the_caller`, lane AR-7).
+        warnings.warn(message, RuntimeWarning, stacklevel=_manifest._pointing(stacklevel + 1))
     except Exception:  # noqa: BLE001
         try:
             _log.warning("%s", message)
@@ -1166,6 +1167,15 @@ def _next_attempt() -> int:
     global _last_attempt
     _last_attempt = max(time.time_ns() // 1_000_000, _last_attempt + 1)
     return _last_attempt
+
+
+def _coming_attempt() -> int:
+    """The least attempt `_next_attempt` can give next, without taking it or reading the clock: what
+    `init` checks against the server's Int64 bound before the stream starts (`flight.attach`), as the
+    session takes its attempt later. Past the bound it is exactly the one taken, since the clock in
+    milliseconds is far below it; a session started in between on another thread can only make the
+    one taken larger. It reads no clock, so a caller that replaces this module's `time` changes nothing."""
+    return _last_attempt + 1
 
 
 # The attempt of the session handing its work counter to a heartbeat on this thread, while it does
@@ -4744,12 +4754,24 @@ class Session:
             self._unwatch_scaler()
         except Exception:  # noqa: BLE001
             pass
+        on_writer = cause is self._error
         if what is None:
-            what = f"its sink raised {_short(cause)}" if cause is self._error else str(cause)
+            what = f"its sink raised {_short(cause)}" if on_writer else str(cause)
+        # What the file holds depends on the cause (`_drain`): after the writer's own failure (a sink
+        # write, or the pinned path's settle) or the sink's close, every block queued after it is passed
+        # over; after a writer behind or a flush that raised here, what was queued is still written; a
+        # writer not finished at `close()` writes what it was handed only as far as it gets.
+        if on_writer or reason == "sink_error":
+            kept = "the records written before that are kept, the steps still queued for the writer are passed over"
+        elif reason == "close_timeout":
+            kept = ("the writer has not finished, so the steps already handed to it are written only as far as it "
+                    "gets before the process ends")
+        else:
+            kept = "the steps already handed to the writer are still written while the sink takes them"
         _warn(
-            f"TensorQuill stopped capturing for this session: {what}. Training goes on and does not wait; "
-            "the steps already handed to the writer are written, no later step is, and the records file gets "
-            "no end marker, so it reads as cut off. The cause is session.writer_error.",
+            f"TensorQuill stopped capturing for this session: {what}. Training goes on and does not wait; {kept}, "
+            "no later step is written, nor a scalar still pending, and the records file gets no end marker, so it "
+            "reads as cut off. The cause is session.writer_error.",
             stacklevel=4,
         )
 
@@ -5697,6 +5719,7 @@ def _close_stream(sink: Any) -> None:
 
 
 @torch.compiler.disable
+@_manifest.at_the_caller  # every warning `init` gives names the line that called it (lane AR-7)
 def init(
     model: nn.Module,
     *,
@@ -5787,7 +5810,9 @@ def init(
             no socket is opened. For custom/self-signed server certificates under `grpcs://`,
             set `TENSORQUILL_TLS_CA` to the PEM CA path. Needs `pip install pyarrow`.
             A second writer of the run's rank (one that found the rank's file held and writes
-            `<run_id>.rank<N>.<pid>.jsonl`) streams nothing and says so once. See `flight.py`.
+            `<run_id>.rank<N>.<pid>.jsonl`) streams nothing and says so once. So does a session the
+            server would refuse: a rank of 100,000 or more, a world size over 100,000, or an
+            attempt past Int64 (`flight.attach`). See `flight.py`.
         layers: which modules' outputs to summarize. In full capture, `"blocks"`: each repeated
             block, such as each transformer layer, or every leaf module with parameters if
             the model has no repeated blocks. `"all"`: every leaf module with parameters,
@@ -5988,11 +6013,16 @@ def init(
             run = _replace(run, run_id=fitted)
         if sink is None:
             sink = _open_default_sink(Path("tensorquill-out") / records_file_name(run.run_id, run.rank), undo)
-        _manifest.write_rank_settings(getattr(sink, "path", None), run.run_id, run.rank, undo)  # ranks above 0 (AR-6)
+        # A second writer of the rank (its file was held: `<run_id>.rank<N>.<pid>.jsonl`) is not a start
+        # of the run: at rank 0 it writes no run manifest (item 8, lane AR-7), and its settings go
+        # beside its own file, as a second writer's of any rank.
+        second_writer = getattr(sink, "other_writer", None) is not None
+        _manifest.write_rank_settings(getattr(sink, "path", None), run.run_id, run.rank, undo,
+                                      second_writer=second_writer)  # ranks above 0 (AR-6), a second writer
         # The project and the name are facts of the run, and a tracker's run exists on rank 0
         # only, so rank 0 alone resolves and writes them: no collective call is needed.
         run_manifest = None
-        if run.rank == 0:
+        if run.rank == 0 and not second_writer:
             labels = tracker_labels()
             run_manifest = _manifest.build_manifest(
                 run_id=run.run_id, run_id_source=run.source,
@@ -6013,7 +6043,7 @@ def init(
         given = sink
         sink = attach(
             sink, run.run_id, run.rank, endpoint, world_size=_world_size(), heartbeat_seconds=heartbeat_seconds,
-            stack_seconds=stack_seconds, manifest=run_manifest,
+            stack_seconds=stack_seconds, manifest=run_manifest, attempt=_coming_attempt(),
         )
         if sink is not given:
             undo.append(lambda: _close_stream(sink))
@@ -6048,5 +6078,5 @@ def init(
     except BaseException:
         _undo(undo)
         raise
-    session.manifest = run_manifest  # the run manifest rank 0 wrote; None on every other rank
+    session.manifest = run_manifest  # the run manifest rank 0 wrote; None on every other rank and a second writer
     return session

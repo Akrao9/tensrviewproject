@@ -95,8 +95,10 @@ pub const MALFORMED_INPUT: &str = "cannot read the Arrow IPC stream: a record ba
 /// nothing), which `main` prints and ends with exit code 1, as for any input it cannot read. Any other
 /// panic (a fault of the detectors) goes on unwinding, as before, with its trace and exit code 101.
 ///
-/// The call spans the detectors as well as the reader, because the reads are inside `detect.rs`; a
-/// panic in Arrow raised by the detectors' own use of an array would be named a malformed input too.
+/// Since lane AR-7 of wave AR the reads in `detect.rs` and `detect/data.rs` are guarded themselves
+/// ([`collect_batches`]), so the library functions return this error and do not panic; `main`'s call
+/// stays as a backstop. The call spans the detectors as well as the reader, so a panic in Arrow raised
+/// by the detectors' own use of an array would still be named a malformed input here (none is known).
 /// Sound to catch: the caller ends with the error and uses nothing the call held.
 pub fn offline<T, E: From<String>>(call: impl FnOnce() -> Result<T, E> + UnwindSafe) -> Result<T, E> {
     match guard(call) {
@@ -109,8 +111,8 @@ pub fn offline<T, E: From<String>>(call: impl FnOnce() -> Result<T, E> + UnwindS
 }
 
 /// The record batches an Arrow IPC stream reader gives, collected inside [`guard`]: what `detect.rs`'s
-/// readers (`read_batches`, `detect_rows_counted`, `follow_append`) can call in place of
-/// `reader.collect()`, so a malformed batch is an error of the read itself and not a panic, and
+/// readers (`read_batches`, `detect_rows_counted`, `follow_append`) call in place of
+/// `reader.collect()` (since lane AR-7), so a malformed batch is an error of the read itself and not a panic, and
 /// [`offline`] then only stands behind them. A panic in Arrow is the error [`MALFORMED_INPUT`] with
 /// Arrow's message; any other error is the reader's own error's text, as `collect` gave it (the caller adds its own words, as now). Any other panic goes on
 /// unwinding.

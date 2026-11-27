@@ -5495,7 +5495,7 @@ pub fn detect_follow(
                 (0, rows as u64, "full")
             }
             Some((run_id, rank, detectors)) => match in_frame(&mut input, length, |frame| {
-                Ok(follow_append(run_id, *rank, detectors, frame))
+                follow_append(run_id, *rank, detectors, frame)
             })? {
                 Ok((from_rows, rows)) => (from_rows, rows, "append"),
                 Err(why) => {
@@ -5572,20 +5572,38 @@ fn in_frame<T>(
 /// grown. Every row is checked before any is read. Gives the rows that counted before the frame
 /// (where its samples start) and the rows it held, or why it was refused. A refusal after the rows
 /// were read (a router new or grown) leaves the detectors not to be used again; the caller ends.
+///
+/// The outer error ends the command as an error, as for the first frame: a record batch Arrow's reader
+/// cannot decode (`MALFORMED_INPUT`; lane AR-7 of wave AR, where until then it panicked and `main`'s
+/// `decode_guard::offline` made it that error). Every other reason is a refusal, the inner error.
 fn follow_append(
     run_id: &str,
     rank: i32,
     detectors: &mut RankDetectors,
     frame: &mut dyn std::io::Read,
+) -> Result<Result<(usize, u64), String>, String> {
+    let reader = match arrow::ipc::reader::StreamReader::try_new(frame, None) {
+        Ok(reader) => reader,
+        Err(error) => return Ok(Err(format!("the frame is not an Arrow IPC stream: {error}"))),
+    };
+    let batches = match crate::decode_guard::collect_batches(reader) {
+        Ok(batches) => batches,
+        Err(error) if error.starts_with(crate::decode_guard::MALFORMED_INPUT) => return Err(error),
+        Err(error) => return Ok(Err(format!("cannot read the frame's Arrow IPC stream: {error}"))),
+    };
+    Ok(follow_rows(run_id, rank, detectors, &batches))
+}
+
+/// [`follow_append`] on the frame's record batches, once they are read.
+fn follow_rows(
+    run_id: &str,
+    rank: i32,
+    detectors: &mut RankDetectors,
+    batches: &[RecordBatch],
 ) -> Result<(usize, u64), String> {
-    let reader = arrow::ipc::reader::StreamReader::try_new(frame, None)
-        .map_err(|error| format!("the frame is not an Arrow IPC stream: {error}"))?;
-    let batches = reader
-        .collect::<Result<Vec<RecordBatch>, _>>()
-        .map_err(|error| format!("cannot read the frame's Arrow IPC stream: {error}"))?;
     let mut last = detectors.last_step();
     let mut before = 0;
-    for batch in &batches {
+    for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
@@ -5636,7 +5654,7 @@ fn follow_append(
         routers(detectors),
         detectors.moe.kept.as_ref().map_or(0, |kept| kept.rows.len()),
     );
-    for batch in &batches {
+    for batch in batches {
         detectors.observe(batch);
     }
     if routers(detectors) != known {
@@ -5745,9 +5763,14 @@ fn detect_rows_counted(
 ) -> Result<(String, i32, RankDetectors, usize), String> {
     let reader = arrow::ipc::reader::StreamReader::try_new(input, None)
         .map_err(|error| format!("the input is not an Arrow IPC stream: {error}"))?;
-    let batches = reader
-        .collect::<Result<Vec<RecordBatch>, _>>()
-        .map_err(|error| format!("cannot read the Arrow IPC stream: {error}"))?;
+    // Guarded (lane AR-7): a record batch Arrow's reader panics on is the error `MALFORMED_INPUT`.
+    let batches = crate::decode_guard::collect_batches(reader).map_err(|error| {
+        if error.starts_with(crate::decode_guard::MALFORMED_INPUT) {
+            error
+        } else {
+            format!("cannot read the Arrow IPC stream: {error}")
+        }
+    })?;
     let mut whose: Option<(String, i32)> = None;
     let mut before = 0;
     for batch in &batches {

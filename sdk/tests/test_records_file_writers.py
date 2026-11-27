@@ -314,9 +314,10 @@ def test_a_session_whose_init_fails_removes_the_empty_pid_file(here, monkeypatch
     from tensorquill import capture
 
     def fails(*args, **kwargs):
-        raise RuntimeError("the manifest could not be built")
+        raise RuntimeError("the session could not be made")
 
-    monkeypatch.setattr(capture._manifest, "build_manifest", fails)
+    # A second writer of rank 0 builds no run manifest (lane AR-7), so its `init` is made to fail later.
+    monkeypatch.setattr(capture, "Session", fails)
     with pytest.raises(RuntimeError):
         _init("undone")
     one.close()

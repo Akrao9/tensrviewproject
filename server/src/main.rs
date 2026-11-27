@@ -225,9 +225,15 @@ fn detect(
         }
         for path in named {
             let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-            batches.extend(
-                read_batches(std::io::BufReader::new(file)).map_err(|error| format!("{}: {error}", path.display()))?,
-            );
+            // A malformed record batch is said as it was when `offline` below made it the error (lane
+            // AR-7 of wave AR moved the guard into `read_batches`): the command's words stay the same.
+            batches.extend(read_batches(std::io::BufReader::new(file)).map_err(|error| {
+                if error.starts_with(tensorquill_server::decode_guard::MALFORMED_INPUT) {
+                    error
+                } else {
+                    format!("{}: {error}", path.display())
+                }
+            })?);
         }
         println!("{}", detect_run(&batches, thresholds)?);
         return Ok(());
@@ -390,6 +396,8 @@ async fn main() -> ExitCode {
             // ordinary error exit, 1, and one line naming the malformed batch, as an input it cannot
             // read does; any other panic goes on as before (`decode_guard::offline`). Nothing the call
             // held is used after it (`AssertUnwindSafe`): the process prints the error and exits.
+            // Since lane AR-7 the reads in `detect.rs` are guarded themselves
+            // (`decode_guard::collect_batches`), so this stands only behind them, as a backstop.
             tensorquill_server::decode_guard::offline(std::panic::AssertUnwindSafe(|| {
                 detect(input, samples, run, follow, &thresholds)
             }))

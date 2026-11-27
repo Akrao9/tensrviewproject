@@ -421,17 +421,30 @@ fn put_then_judge(messages: Vec<FlightData>) -> Outcome {
     Ok("decoded")
 }
 
-/// `tensorquill-server detect` on `bytes`, as `main` runs it: `detect::detect_stream` inside
-/// `decode_guard::offline`. The reads are inside `detect.rs`, so the library function alone still
-/// panics where Arrow's reader does; the command does not.
-fn detect_bytes(bytes: &[u8]) -> Outcome {
-    match decode_guard::offline(AssertUnwindSafe(|| {
-        detect::detect_stream(Cursor::new(bytes), &thresholds())
-    })) {
+/// What `detect::detect_stream` gave, as an outcome.
+fn detect_outcome(result: Result<Value, String>) -> Outcome {
+    match result {
         Ok(_) => Ok("judged"),
         Err(error) if error.starts_with(decode_guard::MALFORMED_INPUT) => Ok("refused as a malformed record batch"),
         Err(_) => Ok("refused"),
     }
+}
+
+/// `tensorquill-server detect` on `bytes`, twice: as `main` runs it, `detect::detect_stream` inside
+/// `decode_guard::offline`; and the library function called directly, with no guard around it (since
+/// wave AR, lane AR-7, its reads are guarded themselves: `decode_guard::collect_batches`). The two
+/// must give the same outcome; a panic of the direct call fails the test as any panic does.
+fn detect_bytes(bytes: &[u8]) -> Outcome {
+    let command = detect_outcome(decode_guard::offline(AssertUnwindSafe(|| {
+        detect::detect_stream(Cursor::new(bytes), &thresholds())
+    })));
+    let direct = detect_outcome(detect::detect_stream(Cursor::new(bytes), &thresholds()));
+    if direct != command {
+        return Err(format!(
+            "called directly, detect_stream gave {direct:?}; inside offline, {command:?}"
+        ));
+    }
+    command
 }
 
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
