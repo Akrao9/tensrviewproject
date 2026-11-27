@@ -378,11 +378,23 @@ def test_the_gpu_busy_while_this_run_is_idle_marks_it_not_usable():
     assert seen["status"] == "shared" and not seen["usable"]
 
 
-def test_a_reader_that_cannot_see_processes_is_said_so_not_taken_as_proof():
+def test_a_reader_that_cannot_see_processes_measures_but_scores_nothing():
     """In a container the process list may be empty even for this run's own arm: utilization is all
-    that was checked, and the result says so."""
+    that was checked. The run measures and reports, but a GPU not shown to be unshared scores no
+    limit (the author, Nov 26, 2026: the plan's condition is a GPU that is not shared)."""
     seen = oh.exclusivity([idle(), during(0), during(0), idle()], method="nvidia-smi", device_type="cuda")
-    assert seen["status"] == "utilization only" and seen["usable"] and seen["reasons"]
+    assert seen["status"] == "utilization only" and not seen["usable"]
+    assert any("not shown to be unshared" in r for r in seen["reasons"])
+
+
+def test_a_run_on_a_gpu_not_shown_unshared_reports_its_figures_and_calls_every_limit_cannot_tell():
+    factors = {"cheap": 1.002}
+    seen = oh.exclusivity([idle(), during(0), idle()], method="nvidia-smi", device_type="cuda")
+    result = analyzed(simulate(30, factors, paired_sd=0.004, seed=3), factors, problems=seen["reasons"])
+    cheap = result["arms"]["cheap"]
+    assert cheap["median"] is not None and cheap["interval"] is not None  # measured and reported
+    assert cheap["verdict"] == "cannot tell" and "not shown to be unshared" in cheap["why"]
+    assert oh.overall(result, errors={}, dry_run=False) == ("not_proven", 3)
 
 
 def test_no_reader_on_cuda_is_not_checked_and_not_usable():

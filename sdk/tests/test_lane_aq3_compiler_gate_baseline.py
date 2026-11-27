@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 sys.path.insert(0, str(EXAMPLES))
 import granite_compiler_gate as gate  # noqa: E402
@@ -65,3 +67,43 @@ def test_tensorquill_failing_with_capture_off_measured_is_still_a_failure(tmp_pa
     code, result, ran = run_gate(tmp_path, monkeypatch, failing={"tensorquill"})
     assert len(ran) == 6  # every round ran
     assert code == 1 and result["status"] == "fail"
+
+
+# ---- Gate 2's overhead line is scored by overhead_harness.py, not here (the author, Nov 26, 2026) ----
+
+
+def measured(arm, rnd, ms):
+    return {"arm": arm, "round": rnd, "state": "measured", "median_ms": ms, "mean_ms": ms, "graph_breaks": 0,
+            "recompiles_after_warmup": 0, "cudagraph_skips": 0, "frames_ok": 1, "observes": "x", "samples": "y",
+            "checks": [{"name": "c", "ok": True, "detail": ""}]}
+
+
+def judged(tq_ms, skips=0):
+    results = {"off": [measured("off", r, 100.0) for r in range(3)],
+               "tensorquill": [measured("tensorquill", r, ms) for r, ms in enumerate(tq_ms)]}
+    for r in results["tensorquill"]:
+        r["cudagraph_skips"] = skips
+    args = SimpleNamespace(toy=False, eager=False)
+    return gate.verdict(args, gate.summarize(args, results), True)
+
+
+@pytest.mark.parametrize("tq_ms", [[100.2, 100.3, 100.4], [103.0, 102.0, 104.0]])
+def test_the_three_round_median_is_measured_and_reported_and_never_decides_the_gate(tq_ms):
+    status, criteria = judged(tq_ms)
+    line = next(c for c in criteria if c["name"] == "median overhead 1% or less")
+    assert line["ok"] is None and line["scored"] is False
+    assert "overhead_harness.py" in line["detail"] and "not judged here" in line["detail"]
+    assert "%" in line["detail"]  # the measured figure is still written
+    assert status == "pass"  # over 1% or under, the other criteria decide
+
+
+def test_the_criterion_record_keeps_the_nov_22_instruction_and_names_the_nov_26_change():
+    criterion = gate.OVERHEAD_CRITERION
+    assert criterion["primary"].startswith("overhead_median: the median of the paired rounds")
+    assert "overhead_harness.py" in criterion["scored_by"] and "Nov 26, 2026" in criterion["scored_by"]
+    assert "scored figure" not in criterion["primary"] or "until Nov 26, 2026" in criterion["primary"]
+
+
+def test_a_gpu_run_without_cuda_graphs_is_still_not_proven():
+    status, _ = judged([100.2, 100.3, 100.4], skips=None)
+    assert status == "not_proven"
