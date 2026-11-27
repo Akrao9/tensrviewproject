@@ -836,7 +836,7 @@ def test_both_engines_judge_a_memory_count_rust_cannot_hold_alike(place, value):
     assert _judged(python) == _judged(rust)
 
 
-def test_a_step_too_large_for_a_float_gives_no_trend_and_raises_nothing():
+def test_a_step_too_large_for_a_float_gives_no_trend_and_is_refused_by_name():
     """Past a float's range no trend can place a step (`robust_trend`), so there is none. Since wave AR
     (AQ5-D6, `WAVE_AF_CONTRACT.md` section 12) a step past Int64 is not valid: the readers refuse the
     records by name, as they refuse a negative step, where before they judged them."""

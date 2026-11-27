@@ -223,21 +223,21 @@ def _past_int64_refused_by_compare_and_listed(path: Path, listed: int, line: int
     assert raised.value.field == "step" and raised.value.where == f"{path}, line {line}"
 
 
-def test_a_resumed_files_last_step_at_or_above_2_63_is_the_one_compare_gives(tmp_path):
+def test_a_resumed_files_last_step_at_or_above_2_63_is_listed_and_refused_by_compare(tmp_path):
     big = 2**63 + 9
     path = write(tmp_path / "runs" / "far.rank0.jsonl",
                  [step_row("far", 1, 0), step_row("far", 1, 1), step_row("far", 2, 1), step_row("far", 2, big)])
     _past_int64_refused_by_compare_and_listed(path, big, 4)
 
 
-def test_a_resumed_file_whose_later_attempt_resumed_above_2_63_rolls_back_from_there(tmp_path):
+def test_a_resumed_file_whose_later_attempt_resumed_above_2_63_is_listed_from_there_and_refused_by_compare(tmp_path):
     big = 2**63
     path = write(tmp_path / "runs" / "far.rank0.jsonl",
                  [step_row("far", 1, s) for s in (0, big + 1, big + 5)] + [step_row("far", 2, big + 2)])
     _past_int64_refused_by_compare_and_listed(path, big + 2, 2)
 
 
-def test_one_attempts_last_step_at_or_above_2_63_is_kept_as_before(tmp_path):
+def test_one_attempts_last_step_at_or_above_2_63_is_listed_and_refused_by_compare(tmp_path):
     big = 2**63 + 3
     path = write(tmp_path / "runs" / "far.rank0.jsonl", [step_row("far", 1, 0), step_row("far", 1, big)])
     _past_int64_refused_by_compare_and_listed(path, big, 2)

@@ -499,3 +499,33 @@ def test_d6_a_session_whose_rank_is_past_int32_never_raises(tmp_path, monkeypatc
     with pytest.raises(MalformedRecordError) as raised:
         tensorquill.build_evidence(tmp_path / "tensorquill-out" / f"ar2-rank.rank{2**31}.jsonl")
     assert raised.value.field == "rank"
+
+
+def test_d6_a_session_whose_attempt_is_past_int64_never_raises(tmp_path, monkeypatch):
+    """The session's own attempt past Int64 (`capture._next_attempt`, normally Unix milliseconds): the
+    session trains, flushes and closes without raising and writes its file; the sender sends nothing
+    of it, and every reader refuses the file by name. A pin."""
+    torch = pytest.importorskip("torch")
+    Server = _server()
+    from tensorquill import capture
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TENSORQUILL_TOKEN", raising=False)
+    monkeypatch.delenv("TENSORQUILL_ENDPOINT", raising=False)
+    monkeypatch.setattr(capture, "_last_attempt", 2**63)
+    server = Server(tmp_path / "store")
+    try:
+        model = torch.nn.Linear(8, 4)
+        session = tensorquill.init(model, run_id="ar2-attempt", auto_step=False, endpoint=server.endpoint)
+        assert session.attempt > INT64_MAX
+        _train(session, model, 3)
+        session.close()
+    finally:
+        assert server.terminate() == 0
+    path = tmp_path / "tensorquill-out" / "ar2-attempt.rank0.jsonl"
+    written = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(written) >= 3 and all(r["attempt"] > INT64_MAX for r in written)
+    assert not list((tmp_path / "store").rglob("*.parquet"))
+    with pytest.raises(MalformedRecordError) as raised:
+        tensorquill.build_evidence(path)
+    assert raised.value.field == "attempt"
