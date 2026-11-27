@@ -12,9 +12,16 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-# The same version as the server's, so the decode under test is the one the server runs.
+# The server's version. Cargo.lock is not kept here: copy the server's (README.md), or a fresh resolve
+# takes a newer Arrow 60 release than the one the server runs.
 arrow-flight = "60.1.0"
 tensorquill-server = { path = "..", default-features = false }
+
+# For `examples/seeds.rs` only, which writes seed inputs; the targets do not use them.
+[dev-dependencies]
+arrow = "60.1.0"
+futures = "0.3"
+serde_json = "1"
 
 [workspace]
 members = ["."]
