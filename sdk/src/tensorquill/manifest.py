@@ -284,7 +284,9 @@ def _versions() -> tuple[str | None, str | None]:
 # replica result is only read against them. They are read as `init` finds them, on the rank that
 # writes the manifest (rank 0), and never set. OpGuard's `runtime_policy.py` records the first six
 # before and after it sets them; `CUDA_DEVICE_MAX_CONNECTIONS` is the seventh, since its value hid
-# two DeepSpeed races in their reproductions. Warn-only is its own read of the first setting.
+# two DeepSpeed races in their reproductions. Warn-only is its own read of the first setting, and
+# two more TF32 controls are read beside `allow_tf32`: `cuda.matmul.fp32_precision` (newer
+# PyTorch) and `cudnn.allow_tf32`.
 #
 # Each entry is named by what was read, and is `{"value": v}` (an environment variable that is not
 # set is `{"value": None}`) or `{"not_read": why}`: a setting this PyTorch lacks, or whose read
@@ -304,6 +306,10 @@ _TORCH_SETTINGS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
     ("torch.backends.cudnn.benchmark", ("backends", "cudnn", "benchmark"), False),
     ("torch.backends.cuda.matmul.allow_tf32", ("backends", "cuda", "matmul", "allow_tf32"), False),
     ("torch.utils.deterministic.fill_uninitialized_memory", ("utils", "deterministic", "fill_uninitialized_memory"), False),
+    # The newer control of the same choice as `allow_tf32` (PyTorch 2.9 and later; "none", "ieee" or
+    # "tf32"), and cuDNN's own TF32 switch for convolutions.
+    ("torch.backends.cuda.matmul.fp32_precision", ("backends", "cuda", "matmul", "fp32_precision"), False),
+    ("torch.backends.cudnn.allow_tf32", ("backends", "cudnn", "allow_tf32"), False),
 )
 _ENV_SETTINGS = ("CUBLAS_WORKSPACE_CONFIG", "CUDA_DEVICE_MAX_CONNECTIONS")
 
