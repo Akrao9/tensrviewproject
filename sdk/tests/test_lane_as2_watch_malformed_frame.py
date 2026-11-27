@@ -204,3 +204,6 @@ def test_the_watch_command_reads_a_malformed_later_frame_as_not_checked(binary, 
             except subprocess.TimeoutExpired:
                 job.kill()
                 job.wait()
+        for pipe in (job.stdout, job.stderr):
+            if pipe is not None:
+                pipe.close()
