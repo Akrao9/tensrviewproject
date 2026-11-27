@@ -141,7 +141,8 @@ def test_a_batch_refused_as_malformed_is_sent_again_from_the_last_confirmed_offs
     assert "a malformed record batch" in str(error), repr(error)
     said = capfd.readouterr().err
     assert said.count("streaming to") == 0, said  # not the generic outage line
-    assert said.count("tensorquill:") == 1, said
+    # The one line about the batch (a line before it says the file did not exist yet when the sender started).
+    (said,) = [line for line in said.splitlines() if "could not decode" in line]
     assert said.startswith(f"tensorquill: the server at {server.endpoint} could not decode the record batch this "
                            f"sender sent from byte {after_a} of {path}: {MALFORMED}. "), said
     assert (f"It is sent again from byte {after_a} at the backoff, and {path} stays complete. If this repeats, "

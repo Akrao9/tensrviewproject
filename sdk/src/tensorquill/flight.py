@@ -1116,6 +1116,20 @@ class OlderServer(ConnectionError):
     goes once the server is upgraded; the sender keeps trying."""
 
 
+class MalformedBatch(ConnectionError):
+    """The server ended the stream because it could not decode a record batch this sender sent
+    (`INVALID_ARGUMENT` with `MALFORMED_BATCH`; wave AR, lane AR-4's guard). The sender's `last_error`
+    while it does, said once on stderr on a line of its own (lane AR-7). Not a refusal for good: the
+    server could not read the rows, so the same bytes are sent again at the backoff, from the last
+    confirmed offset, and the local file keeps every line."""
+
+
+# The server's message for a record batch its Arrow IPC reader cannot decode: `MALFORMED_BATCH` in
+# `server/src/ingest.rs`, held equal to it by `test_lane_ar4_malformed_batch_sender.py`.
+MALFORMED_BATCH = ("a malformed record batch, which the Arrow IPC reader cannot decode (its header names bytes or a "
+                   "layout its body does not hold); nothing of it is stored and the stream ends here")
+
+
 # A server's refusal of a batch metadata version it does not read, in either wording: a protocol 4
 # server's singular "this server reads version 1", or a protocol 5 server's plural "this server reads
 # versions 1 and 2" (both pinned in `tests/fixtures/wave_al/refusal.json`, which the server's own test
@@ -1232,6 +1246,7 @@ class FlightSender:
         self.last_refused: dict[str, Any] | None = None
         self._said_refused = False
         self._said_older = False  # a server of an older protocol (`OlderServer`) is said once per sender
+        self._said_malformed = False  # a batch the server could not decode (`MalformedBatch`), once per sender
         self._life: dict[str, Any] | None = None  # the stream now open: when, and what it carried
         self._location = _location(endpoint)
         self._token = token if token is not None else os.environ.get(TOKEN_ENV)
@@ -1394,6 +1409,9 @@ class FlightSender:
                 older = self._older(error)
                 if older is not None:
                     self.last_error = older
+                malformed = self._malformed(error) if older is None else None
+                if malformed is not None:
+                    self.last_error = malformed
                 self._note_stream_end(error)
             if self._progress:
                 self._progress = False
@@ -1407,6 +1425,19 @@ class FlightSender:
                     self._said_older = True
                     try:
                         print(f"tensorquill: {self.last_error}. Training continues; said once.", file=sys.stderr)
+                    except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
+                        pass
+            elif isinstance(self.last_error, MalformedBatch):
+                # Said once per sender, on a line of its own: the generic outage line would read as a
+                # server that is down. `_reported` is left as it is, so a different outage later is
+                # still said once with that line. The retry, the offset and the counts are as for it.
+                if not self._said_malformed and not self._closing.is_set():
+                    self._said_malformed = True
+                    try:
+                        print(f"tensorquill: {self.last_error}. It is sent again from byte {self.last_error.start} "
+                              f"at the backoff, and {self.path} stays complete. If this repeats, this tensorquill is "
+                              "encoding a record batch the server cannot read: please report it. Training "
+                              "continues; said once.", file=sys.stderr)
                     except Exception:  # noqa: BLE001  a closed stderr is not the stream's failure
                         pass
             elif not self._reported and not self._closing.is_set():
@@ -1571,6 +1602,24 @@ class FlightSender:
                 f"{reads} and this tensorquill "
                 f"sends version {SCHEMA_VERSION}, so it acknowledges nothing; {self.path} keeps every line, and "
                 "they are sent once the server is upgraded")
+        except Exception:  # noqa: BLE001  explaining a failure must never be one
+            return None
+
+    def _malformed(self, error: BaseException) -> MalformedBatch | None:
+        """A `MalformedBatch` when the stream that ended with `error` was ended by the server because it
+        could not decode a record batch (its `MALFORMED_BATCH`, in the error itself or behind another,
+        as `_older` reads them), else None. It names the byte the bytes are sent again from: the offset
+        the server last confirmed. Never raises."""
+        try:
+            life = self._life or {}
+            texts = [f"{error}", f"{life.get('ack_error') or ''}", f"{life.get('close_error') or ''}"]
+            if not any(MALFORMED_BATCH in text for text in texts):
+                return None
+            start = read_binding(self.offset_path)["offset"]
+            found = MalformedBatch(f"the server at {self.endpoint} could not decode the record batch this sender sent "
+                                   f"from byte {start} of {self.path}: {MALFORMED_BATCH}")
+            found.start = start
+            return found
         except Exception:  # noqa: BLE001  explaining a failure must never be one
             return None
 
