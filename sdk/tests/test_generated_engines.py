@@ -334,26 +334,6 @@ HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
         "as above, for 10**400",
         [_record(112, grad_norm=1.036979024, update_rms={"p0.weight": 10**400})],
     ),
-    # Seeds 93, 340, 731, 750, 1490.
-    "AQ5-D2 system with an oversized integer": (
-        "Python reads the system block (memory_growth, memory_pressure, allocator_retries checked); Rust "
-        "loses the whole system_json of the row to one integer too large for a float",
-        [_record(39, system={"cuda": {"ooms": 10**400}})],
-    ),
-    # Seeds 366, 729, 1352, 1413.
-    "AQ5-D2 data with an oversized integer": (
-        "the same for data_json: data_stalled, epoch_order_repeated and resume_data_mismatch",
-        [_record(37, data={"sampler_epoch": 10**400})],
-    ),
-    # Seeds 482, 760, 1424; at 1371 Rust misses an attention_collapse incident Python reports.
-    "AQ5-D2 probe with an oversized integer": (
-        "the same for probe_json: the three attention kinds",
-        [_record(0, probe={"attention": {"blk1": {"max_logit": [3.943363681, -(10**400), 3.956723686]}}})],
-    ),
-    "AQ5-D2 checkpoint with an oversized integer": (
-        "the same for checkpoint_json: resume_incomplete (found by hand from D2, not by a seed)",
-        [_record(0, checkpoint={"save": {"after_step": 10**400}})],
-    ),
     # Seed 69.
     "AQ5-D3 a grad_norm of the wrong type hides a stall from Python": (
         "Python reports no stalled_weights; Rust, which reads the refused value as absent, reports one, "

@@ -20,6 +20,10 @@
 
 use serde_json::Value;
 
+#[cfg(test)]
+#[path = "lane_ar3_tests.rs"]
+mod lane_ar3_tests;
+
 /// What a number too large for a float reads as.
 pub(crate) const UNREADABLE: &str = "a number too large for a float";
 
