@@ -92,3 +92,104 @@ def test_a_second_writers_file_finds_the_runs_manifest_with_no_run_id_given(here
         one.close()
     found = mf.find_manifest(second)
     assert found is not None and (found["run_id"], found["project"], found["name"]) == ("pair", "granite", "baseline")
+
+
+# --- Item 3: the `pinned_flush` switch in the run manifest ---------------------------------------
+
+
+def _train(model, steps: int) -> None:
+    import torch
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    for _ in range(steps):
+        model(torch.randn(3, 2)).pow(2).mean().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+
+def _run(run_id: str, steps: int = 2, **options) -> list[str]:
+    session, said, model = _init(run_id, **options)
+    _train(model, steps)
+    session.close()
+    return said
+
+
+@pytest.mark.parametrize("asked", [True, False])
+def test_the_pinned_flush_switch_is_in_the_manifest_as_init_was_given_it(here, asked):
+    # On a CPU the pinned path falls back to the blocking copy, said once: the manifest records
+    # the switch as given, not the path the flush took.
+    session, _, model = _init("p", pinned_flush=asked)
+    _train(model, 1)
+    session.close()
+    written = mf.read_manifest(here / "tensorquill-out" / "p.run.json")
+    assert written["pinned_flush"] is asked and session.manifest["pinned_flush"] is asked
+
+
+def test_the_default_records_pinned_flush_off(here):
+    _run("d")
+    assert mf.read_manifest(here / "tensorquill-out" / "d.run.json")["pinned_flush"] is False
+
+
+def test_a_manifest_built_without_the_switch_has_no_key():
+    # Only `init` knows the switch: a manifest built by another caller does not claim it off.
+    built = mf.build_manifest(run_id="r", run_id_source="explicit", project="p", name="n")
+    assert "pinned_flush" not in built
+    assert mf.build_manifest(run_id="r", run_id_source="explicit", project="p", name="n",
+                             pinned_flush=True)["pinned_flush"] is True
+
+
+def test_the_switch_rides_on_the_stream_copy_of_the_manifest():
+    built = mf.build_manifest(run_id="r", run_id_source="explicit", project="p", name="n", pinned_flush=True,
+                              config={"vocab": "x" * 70_000})
+    sent, why = mf.manifest_to_send(built)
+    assert sent["pinned_flush"] is True and sent["config_left_out"] and why
+
+
+def test_compare_shows_runs_that_differ_in_the_switch(here):
+    _run("off", pinned_flush=False)
+    _run("on", pinned_flush=True)
+    result = tensorquill.compare_runs("off", "on", source=here / "tensorquill-out")
+    setup = result["setup"]
+    assert {"field": "pinned_flush", "values": {"A": False, "B": True}} in setup["differs"]
+    assert "pinned_flush" not in setup["same"] and "pinned_flush_not_recorded" not in setup
+    assert "   pinned_flush: A false, B true" in result["summary"].splitlines()
+
+
+def test_compare_of_runs_with_the_same_switch_says_nothing_of_it(here):
+    _run("one")
+    _run("two")
+    setup = tensorquill.compare_runs("one", "two", source=here / "tensorquill-out")["setup"]
+    assert not [d for d in setup["differs"] if d["field"] == "pinned_flush"]
+    assert setup["same"] == ["project", "group", "world_size", "sdk_version", "torch_version"]
+    assert "pinned_flush_not_recorded" not in setup
+
+
+def _drop_switch(path: Path) -> None:
+    import json
+
+    document = json.loads(path.read_text())
+    del document["pinned_flush"]
+    path.write_text(json.dumps(document))
+
+
+def test_an_older_manifest_without_the_switch_is_not_recorded_never_read_as_off(here):
+    _run("old", pinned_flush=False)
+    _run("new", pinned_flush=False)
+    out = here / "tensorquill-out"
+    _drop_switch(out / "old.run.json")
+    result = tensorquill.compare_runs("old", "new", source=out)
+    setup = result["setup"]
+    assert not [d for d in setup["differs"] if d["field"] == "pinned_flush"]
+    assert setup["pinned_flush_not_recorded"] == ["A"]
+    assert any(line.startswith("   pinned_flush not recorded for A:") for line in result["summary"].splitlines())
+
+
+def test_two_older_manifests_compare_as_before(here):
+    _run("old1")
+    _run("old2")
+    out = here / "tensorquill-out"
+    _drop_switch(out / "old1.run.json")
+    _drop_switch(out / "old2.run.json")
+    result = tensorquill.compare_runs("old1", "old2", source=out)
+    assert "pinned_flush_not_recorded" not in result["setup"]
+    assert "pinned_flush" not in result["summary"]

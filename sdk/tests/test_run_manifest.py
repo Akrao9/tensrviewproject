@@ -64,6 +64,8 @@ def test_init_writes_the_manifest_beside_the_records_with_every_field(toy_moe, t
     assert written.pop("created_at").endswith("Z")
     # The numerical settings as `init` found them (test_lane_aq6_numerical_settings.py).
     assert written.pop("numerical_settings")["read_at"] == "init"
+    # The pinned-flush switch as `init` was given it (test_lane_ar6_settings_tidy.py).
+    assert written.pop("pinned_flush") is False
     assert written == {
         "schema_version": 1, "project": "granite", "name": "baseline", "run_id": "run-1", "group": "sweep-a",
         "tags": ["moe", "bf16"], "world_size": 1, "sdk_version": tensorquill.__version__,
