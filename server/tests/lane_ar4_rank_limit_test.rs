@@ -11,6 +11,10 @@
 //! - a heartbeat from rank 100,000 or more is refused with `INVALID_ARGUMENT` and `beat_refusal`;
 //!   rank 99,999's is taken.
 //!
+//! The same words for any integer up to 2^63 - 1, those no `i32` holds too. A negative rank is
+//! refused as before (a bad descriptor, a bad heartbeat), and a world size of 0 or less is taken as
+//! before, as naming no rank.
+//!
 //! On `ce9da4a` all three were taken: AR-2 stored a run with `rank=2147483647`, and a world size of
 //! 2,147,483,647 made every status of its run walk two thousand million ranks. The tests here use
 //! values a few times the limit, which the base takes without a long walk, and `i32::MAX` once the
@@ -287,7 +291,7 @@ fn status_ranks(ingest: &Ingest, run: &str) -> Vec<i64> {
 async fn a_stream_from_a_rank_over_the_limit_is_refused_and_one_below_it_taken() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path()).await;
-    for rank in [100_000, 400_000, i64::from(i32::MAX)] {
+    for rank in [100_000, 400_000, i64::from(i32::MAX), 1 << 40, i64::MAX] {
         let run = format!("ar4_rank_{rank}");
         let (acks, ended) = put(&server.address, stream(&run, rank, None).await).await;
         let seen = format!(
@@ -311,7 +315,7 @@ async fn a_stream_from_a_rank_over_the_limit_is_refused_and_one_below_it_taken()
 async fn a_batch_naming_a_world_size_over_the_limit_is_refused_and_one_at_it_taken() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path()).await;
-    for world in [100_001, 400_000, i64::from(i32::MAX)] {
+    for world in [100_001, 400_000, i64::from(i32::MAX), 1 << 40, i64::MAX] {
         let run = format!("ar4_world_{world}");
         let (acks, ended) = put(&server.address, stream(&run, 0, Some(world)).await).await;
         let seen = format!(
@@ -336,7 +340,7 @@ async fn a_batch_naming_a_world_size_over_the_limit_is_refused_and_one_at_it_tak
 async fn a_heartbeat_from_a_rank_over_the_limit_is_refused_and_one_below_it_taken() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path()).await;
-    for rank in [100_000, i64::from(i32::MAX)] {
+    for rank in [100_000, i64::from(i32::MAX), 1 << 40, i64::MAX] {
         let run = format!("ar4_beat_{rank}");
         let refused = beat(&server.address, &run, rank).await;
         let seen = format!("{refused:?}; ranks held {:?}", status_ranks(&server.ingest, &run));

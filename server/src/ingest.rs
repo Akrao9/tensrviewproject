@@ -401,7 +401,7 @@ struct StreamTally {
     half_closed: AtomicBool,
     /// One more than the rank buffer's `faults` when this stream first took a batch, or 0 before it
     /// did: a stream that took one before what the server held of its rank was dropped after a panic
-    /// (`Ingest::drop_held`) is ended (`Ingest::after_a_fault`).
+    /// (`HeldBuffer`) is ended (`after_a_fault`).
     faults: AtomicU64,
 }
 
@@ -423,6 +423,64 @@ impl AckSender {
         if self.responses.send(Ok(result)).is_ok() {
             self.tally.acknowledged.fetch_max(offset, Ordering::SeqCst);
         }
+    }
+}
+
+/// A rank's buffer, locked (`Ingest::hold`). If a panic unwinds while it is held, in a stream's task
+/// or in a timed flush, the buffer is set back to what a restart leaves before the lock is let go
+/// (lane AR-4), so nothing waiting for the lock, another stream of the rank or a flush, is given it
+/// half changed: what the server held of the rank and had not stored is dropped, its bytes given back
+/// to the quota, as a restart drops it, and every other stream of the rank that took a batch is ended
+/// at its next batch or at its end, as a restart ends it (`after_a_fault`). Nothing of what is dropped
+/// was acknowledged: an offset is acknowledged only once what it covers is stored, so each sender
+/// sends it again from the offset last acknowledged to it, and the watermarks, read again from the
+/// store, take it.
+///
+/// Why: the panic may have left the buffer half changed (a step watermark moved past rows it does not
+/// hold, a count or a bound not updated), and rows sent again would then be refused as not newer and
+/// never stored, though acknowledged, or stored in a part named for steps it does not hold. A restart
+/// is the state the server is known to be sound from. The rank's detectors are rebuilt from the store
+/// at its next part, as after a restart. Kept: the counts that pace rebuilds and whether the detectors
+/// are off for the rank, which a restart clears but which hold nothing of the rows.
+struct HeldBuffer<'a> {
+    guard: tokio::sync::MutexGuard<'a, RankBuffer>,
+    used: &'a AtomicUsize,
+}
+
+impl std::ops::Deref for HeldBuffer<'_> {
+    type Target = RankBuffer;
+    fn deref(&self) -> &RankBuffer {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for HeldBuffer<'_> {
+    fn deref_mut(&mut self) -> &mut RankBuffer {
+        &mut self.guard
+    }
+}
+
+impl Drop for HeldBuffer<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let buffer = &mut *self.guard;
+        // Saturating: the counts may be what the panic left. A panic between taking a batch's bytes
+        // out of the quota and counting them in the buffer leaves them out of the quota until a
+        // restart, at most one batch.
+        let held = buffer.bytes + buffer.scalars.bytes;
+        let _ = self.used.try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            Some(used.saturating_sub(held))
+        });
+        *buffer = RankBuffer {
+            faults: buffer.faults + 1,
+            rebuilds: buffer.rebuilds,
+            detect_off: buffer.detect_off,
+            replay_failures: buffer.replay_failures,
+            replay_after: buffer.replay_after,
+            ..RankBuffer::default()
+        };
     }
 }
 
@@ -490,7 +548,7 @@ struct RankBuffer {
     /// The scalar-only rows waiting to be stored, apart from the step rows (section 4.5).
     scalars: ScalarBuffer,
     /// How many times what this server held of the rank and had not stored was dropped after a panic
-    /// in one of its streams' tasks (`Ingest::drop_held`, lane AR-4).
+    /// while it was held (`HeldBuffer`, lane AR-4).
     faults: u64,
 }
 
@@ -766,7 +824,7 @@ impl Ingest {
     /// is not counted again, so the count is of batches, not of retries.
     async fn batch_refused(&self, key: &Key, column: &'static str, end_byte_offset: i64) {
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if buffer.last_refused == Some((column, end_byte_offset)) {
             return;
         }
@@ -810,7 +868,7 @@ impl Ingest {
             return;
         };
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if self.flush(key, &mut buffer).await.is_err() {
             return;
         }
@@ -1082,7 +1140,7 @@ impl Ingest {
         // one batch, and a point the next attempt rolled back came back in its series.
         self.place(key, sender, &attempts).await?;
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if self.closed.load(Ordering::SeqCst) {
             return Err(Status::unavailable("the server is shutting down"));
         }
@@ -1684,7 +1742,7 @@ impl Ingest {
 
     async fn flush_key(&self, key: &Key) -> Result<(), Status> {
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         self.flush(key, &mut buffer).await
     }
 
@@ -1732,7 +1790,7 @@ impl Ingest {
     pub async fn flush_due(&self) {
         futures::stream::iter(self.all_buffers())
             .for_each_concurrent(FLUSH_CONCURRENCY, |(key, buffer)| async move {
-                let mut buffer = buffer.lock().await;
+                let mut buffer = self.hold(&buffer).await;
                 if *self.stopping.borrow() {
                     // After `stop`, a rank this round has not started on is left to `shutdown`,
                     // so a stop waits for the writes in progress, not for a whole round.
@@ -1795,7 +1853,7 @@ impl Ingest {
         self.closed.store(true, Ordering::SeqCst);
         let results: Vec<Result<(), Status>> = futures::stream::iter(self.all_buffers())
             .map(|(key, buffer)| async move {
-                let mut buffer = buffer.lock().await;
+                let mut buffer = self.hold(&buffer).await;
                 let tried = buffer.retries_tried();
                 let flushed = self.flush(&key, &mut buffer).await;
                 if flushed.is_ok() && self.config.detect && buffer.retry_pending() && buffer.retries_tried() == tried {
@@ -1841,7 +1899,7 @@ impl Ingest {
     /// offset it was owed goes with it: the next stream is told only its own (L4).
     async fn detach(&self, key: &Key, ack: &AckSender) {
         let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
+        let mut buffer = self.hold(&buffer).await;
         if buffer.ack.as_ref().is_some_and(|held| held.same_channel(ack)) {
             buffer.ack = None;
             buffer.pending_offset = None;
@@ -1930,38 +1988,13 @@ impl Ingest {
         Ok(())
     }
 
-    /// After a panic in one of the rank's streams' tasks (lane AR-4): what this server held of the
-    /// rank and had not stored is dropped, its bytes given back to the quota, as a restart drops it,
-    /// and every other stream of the rank that took a batch is ended at its next batch or at its end,
-    /// as a restart ends it (`after_a_fault`). Nothing of it was acknowledged: an offset is
-    /// acknowledged only once what it covers is stored, so each sender sends it again from the offset
-    /// last acknowledged to it, and the watermarks, read again from the store, take it.
-    ///
-    /// Why: the panic may have left the buffer half changed (a step watermark moved past rows it does
-    /// not hold, a count or a bound not updated), and rows sent again would then be refused as not
-    /// newer and never stored, though acknowledged. A restart is the state the server is known to be
-    /// sound from. The rank's detectors are rebuilt from the store at its next part, as after a
-    /// restart. Kept: the counts that pace rebuilds and whether the detectors are off for the rank,
-    /// which a restart clears but which hold nothing of the rows.
-    async fn drop_held(&self, key: &Key) {
-        let buffer = self.buffer(key);
-        let mut buffer = buffer.lock().await;
-        // Saturating: the counts may be what the panic left. A panic between taking a batch's bytes
-        // out of the quota and counting them in the buffer leaves them out of the quota until a
-        // restart, at most one batch.
-        let held = buffer.bytes + buffer.scalars.bytes;
-        let _ = self.used.try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-            Some(used.saturating_sub(held))
-        });
-        let kept = RankBuffer {
-            faults: buffer.faults + 1,
-            rebuilds: buffer.rebuilds,
-            detect_off: buffer.detect_off,
-            replay_failures: buffer.replay_failures,
-            replay_after: buffer.replay_after,
-            ..RankBuffer::default()
-        };
-        *buffer = kept;
+    /// The rank buffer `buffer`, locked, set back to what a restart leaves if a panic unwinds while it
+    /// is held (`HeldBuffer`).
+    async fn hold<'a>(&'a self, buffer: &'a tokio::sync::Mutex<RankBuffer>) -> HeldBuffer<'a> {
+        HeldBuffer {
+            guard: buffer.lock().await,
+            used: &self.used,
+        }
     }
 
     /// Writes `runs/<run_id>/run.json` when the manifest is new for this run or differs from
@@ -2497,7 +2530,8 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
     let [runs, run_id, rank] = descriptor.path.as_slice() else {
         return Err(bad());
     };
-    let rank: i32 = rank
+    // Read as an `i64`, so a rank over the limit that no `i32` holds is refused by the limit's words.
+    let rank: i64 = rank
         .strip_prefix("rank=")
         .and_then(|rank| rank.parse().ok())
         .ok_or_else(bad)?;
@@ -2511,13 +2545,29 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
             "run_id may hold only letters, digits, '-', '_' and '.'",
         ));
     }
-    if !crate::watchdog::rank_taken(i64::from(rank)) {
+    if !crate::watchdog::rank_taken(rank) {
         return Err(Status::invalid_argument(over_the_limit(
             rank,
             "nothing of this stream is stored",
         )));
     }
+    let rank = i32::try_from(rank).map_err(|_| bad())?;
     Ok((run_id.clone(), rank))
+}
+
+/// The integer at `key` of the JSON object `body` when it is one the server's limit refuses
+/// (`taken` false), read when the object could not be read whole: a rank or a world size no `i32`
+/// holds is refused by the limit's words, not by the parser's.
+fn integer_over(body: &[u8], key: &str, taken: fn(i64) -> bool) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get(key)?.as_i64().filter(|number| !taken(*number))
+}
+
+fn world_refused(world_size: i64) -> Status {
+    Status::invalid_argument(format!(
+        "world_size {world_size} is over this server's limit of {} ranks a run; nothing of this batch is stored",
+        crate::watchdog::MAX_RANKS
+    ))
 }
 
 /// The status of a `DoPut` stream whose task panicked outside the decode (lane AR-4): a fault of
@@ -2528,7 +2578,7 @@ const STREAM_FAULT: &str = "the server failed on this stream, a fault of the ser
 const FAULT_ELSEWHERE: &str = "the server dropped what it held of this rank and had not stored, after a fault on another of its streams; send again from the offset last acknowledged";
 
 /// Ends a stream that took a batch before what the server held of its rank was dropped after a panic
-/// (`Ingest::drop_held`), with `UNAVAILABLE`: it may be owed an offset over rows the server no longer
+/// (`HeldBuffer`), with `UNAVAILABLE`: it may be owed an offset over rows the server no longer
 /// holds. A stream takes the rank buffer's count at its first batch.
 fn after_a_fault(buffer: &RankBuffer, tally: &StreamTally) -> Result<(), Status> {
     let now = buffer.faults + 1;
@@ -2545,7 +2595,7 @@ fn after_a_fault(buffer: &RankBuffer, tally: &StreamTally) -> Result<(), Status>
 /// The refusal of a rank at or over the server's limit of ranks a run (`watchdog::MAX_RANKS`), at
 /// its stream's first message or at a heartbeat, with what is not taken (lane AR-4). A sender reads
 /// the words "over this server's limit of".
-fn over_the_limit(rank: i32, not_taken: &str) -> String {
+fn over_the_limit(rank: i64, not_taken: &str) -> String {
     let limit = crate::watchdog::MAX_RANKS;
     format!(
         "rank {rank} is over this server's limit of {limit} ranks a run (ranks 0 to {}); {not_taken}",
@@ -2899,8 +2949,12 @@ impl Decoder {
 /// A batch's `app_metadata`, read and checked against the stream's run and rank: a version this
 /// server does not read, or another run or rank than the descriptor's, refuses the stream.
 fn batch_metadata(key: &Key, app_metadata: &[u8]) -> Result<BatchMetadata, Status> {
-    let metadata: BatchMetadata = serde_json::from_slice(app_metadata)
-        .map_err(|error| Status::invalid_argument(format!("bad app_metadata: {error}")))?;
+    let metadata: BatchMetadata = serde_json::from_slice(app_metadata).map_err(|error| {
+        match integer_over(app_metadata, "world_size", crate::watchdog::world_size_taken) {
+            Some(world_size) => world_refused(world_size),
+            None => Status::invalid_argument(format!("bad app_metadata: {error}")),
+        }
+    })?;
     if !SCHEMA_VERSIONS.contains(&metadata.schema_version) {
         return Err(Status::invalid_argument(format!(
             "schema_version {} is not supported; this server reads versions 1 and 2",
@@ -2918,10 +2972,7 @@ fn batch_metadata(key: &Key, app_metadata: &[u8]) -> Result<BatchMetadata, Statu
         .world_size
         .filter(|size| !crate::watchdog::world_size_taken(i64::from(*size)))
     {
-        return Err(Status::invalid_argument(format!(
-            "world_size {world_size} is over this server's limit of {} ranks a run; nothing of this batch is stored",
-            crate::watchdog::MAX_RANKS
-        )));
+        return Err(world_refused(i64::from(world_size)));
     }
     Ok(metadata)
 }
@@ -3238,10 +3289,11 @@ impl FlightService for IngestService {
             // caught there, `Decoder`), is caught here (lane AR-4), so the clean-up below runs as for
             // any stream that ends in an error, and the client's call ends. The panic hook has
             // printed it, a fault of the server. Sound to catch (`AssertUnwindSafe`): what the task
-            // may have left half changed is the rank's buffer, which `drop_held` sets back to what a
-            // restart leaves, under its lock; the stream, its decoder and the call are dropped; the
-            // mutexes the clean-up takes are taken whether a panic poisoned them or not, each held
-            // only for one change of a map that a stop at any point leaves whole.
+            // may have left half changed is the rank's buffer, which `HeldBuffer` set back to what a
+            // restart leaves as the panic unwound, before its lock was let go; the stream, its
+            // decoder and the call are dropped; the mutexes the clean-up takes are taken whether a
+            // panic poisoned them or not, each held only for one change of a map that a stop at any
+            // point leaves whole.
             let run = std::panic::AssertUnwindSafe(ingest.run_stream(stream, &mut end.key, stream_id, &ack))
                 .catch_unwind()
                 .await;
@@ -3253,9 +3305,6 @@ impl FlightService for IngestService {
                 let _ = ack.responses.send(Err(Status::internal(STREAM_FAULT)));
             }
             if let Some(key) = &end.key {
-                if panicked {
-                    ingest.drop_held(key).await;
-                }
                 ingest.stream_ended(key, stream_id, result.is_ok());
                 ingest.detach(key, &ack).await;
             }
@@ -3298,14 +3347,20 @@ impl FlightService for IngestService {
                 action.r#type
             )));
         }
-        let mut beat: Heartbeat = serde_json::from_slice(&action.body)
-            .map_err(|error| Status::invalid_argument(format!("bad heartbeat: {error}")))?;
+        let mut beat: Heartbeat = serde_json::from_slice(&action.body).map_err(|error| {
+            match integer_over(&action.body, "rank", |rank| {
+                rank < i64::from(crate::watchdog::MAX_RANKS)
+            }) {
+                Some(rank) => Status::invalid_argument(over_the_limit(rank, "the heartbeat is not taken")),
+                None => Status::invalid_argument(format!("bad heartbeat: {error}")),
+            }
+        })?;
         if !plain_run_id(&beat.run_id) || beat.rank < 0 {
             return Err(Status::invalid_argument("bad run_id or rank in the heartbeat"));
         }
         if !crate::watchdog::rank_taken(i64::from(beat.rank)) {
             return Err(Status::invalid_argument(over_the_limit(
-                beat.rank,
+                i64::from(beat.rank),
                 "the heartbeat is not taken",
             )));
         }
