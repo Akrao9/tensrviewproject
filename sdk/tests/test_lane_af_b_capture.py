@@ -374,16 +374,66 @@ def test_sigterm_with_no_handler_loses_the_steps_not_yet_written_and_leaves_no_m
     assert read_end_marker(path)["state"] == "not_closed"
 
 
+def _sigterm_run_kept(tmp_path: Path, handler: str, every: int) -> tuple[int | None, Path, str]:
+    """`_sigterm_run`, keeping the job's standard error. Read with `communicate`, so a job that says
+    much there cannot block on a full pipe. Warnings are shown once each (`default`), not ignored:
+    TensorQuill says why capture stopped through `warnings`, and an ignore filter silences that. No
+    filter makes one an error, so the job runs as under `_sigterm_run`."""
+    path = tmp_path / f"term-{handler}-{every}.jsonl"
+    env = {**os.environ, "PYTHONPATH": SRC, "PYTHONWARNINGS": "default"}
+    job = subprocess.Popen([sys.executable, "-c", _SIGTERM_JOB, str(path), handler, str(every)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+    err = ""
+    try:
+        ready = job.stdout.readline().strip()
+        if ready != "ready":
+            job.kill()
+            _, err = job.communicate()
+        assert ready == "ready", _sigterm_evidence(tmp_path, path, job.returncode, err)
+        time.sleep(0.2)
+        job.send_signal(signal.SIGTERM)
+        _, err = job.communicate(timeout=60)
+    finally:
+        if job.poll() is None:
+            job.kill()
+            _, err = job.communicate()
+    return job.returncode, path, err
+
+
+def _sigterm_evidence(tmp_path: Path, path: Path, code: int | None, err: str) -> str:
+    """What a failure of the SIGTERM test shows: the job's exit code and standard error, the output
+    folder's listing with sizes, the records file's size and line count, and the `.end.json` text."""
+    listing = [f"{p.name} {p.stat().st_size} bytes" for p in sorted(tmp_path.iterdir())]
+    records = "absent"
+    if path.exists():
+        data = path.read_bytes()
+        lines = data.count(b"\n")
+        records = f"{len(data)} bytes, {lines} lines"
+    marker = end_marker_path(path)
+    marker_text = marker.read_text() if marker.exists() else "absent"
+    return (f"\nexit code: {code}\nrecords file {path.name}: {records}\noutput folder {tmp_path}: {listing}"
+            f"\n{marker.name}: {marker_text}\nstandard error ({len(err)} characters):\n{err}")
+
+
 def test_sigterm_with_a_job_handler_that_raises_closes_the_session(tmp_path):
     """A job that turns SIGTERM into an exception (as `sys.exit` in a handler does) leaves `with
-    session:` by it: every step is written and the marker says raised."""
-    code, path = _sigterm_run(tmp_path, "raise", every=50)
-    assert code == 143
-    steps = [r["step"] for r in _records(path)]
-    assert steps == list(range(len(steps))) and len(steps) >= 7
+    session:` by it: every step is written and the marker says raised.
+
+    Seen once side by side with the whole suite (the gate of Nov 27, 2026, on 348ec47): exit 143 and a
+    records file with no step. It passed alone, and 980 repeats did not show it again. It is held as a
+    possible loss of records, so every assertion here prints what the job left
+    (`_sigterm_evidence`). What is asserted is unchanged."""
+    code, path, err = _sigterm_run_kept(tmp_path, "raise", every=50)
+    said = _sigterm_evidence(tmp_path, path, code, err)
+    assert code == 143, said
+    try:
+        steps = [r["step"] for r in _records(path)]
+    except (OSError, ValueError, KeyError) as error:  # what the bare read raised, now with the evidence
+        raise AssertionError(f"the records file could not be read: {error!r}{said}") from error
+    assert steps == list(range(len(steps))) and len(steps) >= 7, said
     marker = read_end_marker(path)
-    assert marker["state"] == "closed"
-    assert json.loads(end_marker_path(path).read_text())["outcome"] == "raised"
+    assert marker["state"] == "closed", said
+    assert json.loads(end_marker_path(path).read_text())["outcome"] == "raised", said
 
 
 def test_tensorquill_installs_no_signal_handler_and_no_exit_hook(tmp_path):
