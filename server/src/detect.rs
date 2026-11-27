@@ -2851,10 +2851,14 @@ impl HeadTrends {
             return;
         };
         self.probes += 1;
+        // A count from 1 to the largest `i64`, as Python's `head_logit_trends` reads one (Nov 27,
+        // 2026: the author bounded Python at int64; Rust is brought to the same bound, the
+        // coordinator's choice). Until then any `u64` was read here. Each count fits an `i64`, so
+        // two sum exactly; the sum saturates only past `u64::MAX`, where Python's stays exact.
         if let Some(count) = head
             .get("overflow_positions")
             .and_then(Value::as_u64)
-            .filter(|count| *count > 0)
+            .filter(|count| (1..=i64::MAX.unsigned_abs()).contains(count))
         {
             self.overflowed += 1;
             self.positions = self.positions.saturating_add(count);
