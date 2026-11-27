@@ -5961,6 +5961,7 @@ def init(
             run = _replace(run, run_id=fitted)
         if sink is None:
             sink = _open_default_sink(Path("tensorquill-out") / records_file_name(run.run_id, run.rank), undo)
+        _manifest.write_rank_settings(getattr(sink, "path", None), run.run_id, run.rank, undo)  # ranks above 0 (AR-6)
         # The project and the name are facts of the run, and a tracker's run exists on rank 0
         # only, so rank 0 alone resolves and writes them: no collective call is needed.
         run_manifest = None
