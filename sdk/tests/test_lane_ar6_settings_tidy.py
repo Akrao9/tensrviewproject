@@ -262,7 +262,7 @@ def test_a_second_writer_of_a_rank_writes_its_own_settings_file_and_leaves_the_f
     second = _read(out / f"w.rank2.{os.getpid()}.settings.json")
     assert (second["run_id"], second["rank"]) == ("w", 2)
     assert second["numerical_settings"]["settings"][SETTING] == {"value": ":16:8"}
-    assert mf.rank_settings_path(two._sink.path, "w", 2) == out / f"w.rank2.{os.getpid()}.settings.json"
+    assert mf.rank_settings_path(two._sink.path, "w", 2) == two._sink.path.with_name(f"w.rank2.{os.getpid()}.settings.json")
     # The reader of a folder gives each rank's first writer's file.
     assert mf.rank_settings(out, "w") == {2: _read(out / "w.rank2.settings.json")}
 
@@ -328,6 +328,8 @@ def test_a_failed_init_takes_the_settings_file_back(here, monkeypatch):
     _as_rank(monkeypatch, 1)
     import tensorquill.flight as flight
 
+    attach = flight.attach
+
     def refuse(*args, **kwargs):
         raise RuntimeError("no stream today")
 
@@ -337,8 +339,7 @@ def test_a_failed_init_takes_the_settings_file_back(here, monkeypatch):
     out = here / "tensorquill-out"
     assert not (out / "undone.rank1.settings.json").exists()
     # A file that was there before the failed init is put back as it was.
-    monkeypatch.undo()
-    _as_rank(monkeypatch, 1)
+    monkeypatch.setattr(flight, "attach", attach)
     _run("undone")
     before = (out / "undone.rank1.settings.json").read_bytes()
     monkeypatch.setattr(flight, "attach", refuse)
@@ -445,3 +446,60 @@ def test_compare_of_runs_of_one_rank_adds_nothing_for_the_other_ranks(here):
     _run("solo2")
     setup = tensorquill.compare_runs("solo1", "solo2", source=here / "tensorquill-out")["setup"]
     assert "numerical_settings_ranks" not in setup
+
+
+# --- Item 5: the README's and the run page's sentences, held to the code ------------------------
+
+SDK = Path(__file__).resolve().parents[1]
+README = (SDK / "README.md").read_text(encoding="utf-8")
+GUIDE = (SDK / "RUN_ON_YOUR_JOB.md").read_text(encoding="utf-8")
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _section(text: str, title: str) -> str:
+    start = text.index(f"## {title}\n")
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end != -1 else None]
+
+
+def test_the_readme_names_every_numerical_setting_the_manifest_reads():
+    runs = _flat(_section(README, "Projects, run names and comparing runs"))
+    for name in mf.numerical_settings_block()["settings"]:
+        if name == "torch.is_deterministic_algorithms_warn_only_enabled()":  # said in words
+            assert "`torch.are_deterministic_algorithms_enabled()` and whether it is warn-only" in runs
+            continue
+        shown = name.replace("os.environ.get('", "").replace("')", "")
+        assert f"`{shown}`" in runs, name
+    assert mf.EARLIER_STARTS_MAX == 8 and "up to eight earlier starts, always the first" in runs
+    assert "`<run_id>.rank<N>.settings.json`" in runs and "`<run_id>.rank<N>.<pid>.settings.json`" in runs
+    assert mf.RANK_SETTINGS_SUFFIX == ".settings.json"
+    assert "the `pinned_flush` switch as `init` was given it" in runs and mf.PINNED_FLUSH_KEY == "pinned_flush"
+
+
+def test_the_readme_says_the_pinned_flush_is_off_until_measured_and_the_lock_is_posix_only():
+    import inspect
+
+    from tensorquill import capture
+
+    assert inspect.signature(capture.init).parameters["pinned_flush"].default is False
+    assert (SDK / "examples" / "pinned_flush_check.py").is_file() and (SDK / "examples" / "overhead_harness.py").is_file()
+    not_built = _flat(_section(README, "What is not built or not verified"))
+    assert "**The pinned flush is off by default.**" in not_built
+    things = _flat(_section(README, "Things to know"))
+    assert "**One records file per writer, locked on POSIX only.**" in things
+    assert "Where Python has no `fcntl` (Windows) the file is written unlocked and nothing is said" in things
+    gpus = _flat(_section(GUIDE, "4. Add TensorQuill to the training loop").split("### Several GPUs")[1])
+    assert "The lock is POSIX only" in gpus and "`SLURM_STEP_NUM_TASKS` set" in gpus
+    from tensorquill import tracker
+
+    assert ("SLURM_PROCID", "SLURM_STEP_NUM_TASKS") in tracker._LAUNCHERS
+
+
+def test_the_readme_names_the_harness_as_gate_2s_overhead_instrument():
+    profile = _flat(_section(README, "Where the A100 router-only overhead goes"))
+    assert "three paired rounds of 200 steps" not in profile
+    assert "the verdict of `examples/overhead_harness.py` on a GPU shown to be unshared" in profile
+    assert "`--model toy --device cpu` checks the script itself" in profile
