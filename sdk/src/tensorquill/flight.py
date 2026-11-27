@@ -29,7 +29,7 @@ from .identity import (
     BOUNDS, MAX_EXPECTED_RANKS, SCALAR_VERSION, SCHEMA_VERSIONS, MalformedRecordError, _shown, check, is_scalar_record,
 )
 from .manifest import METADATA_KEY as MANIFEST_KEY, _say, manifest_to_send
-from .sink import _finite
+from .sink import _finite, records_file_of
 
 # The numbers of `WAVE_AL_CONTRACT.md` section 3, kept apart. `SCHEMA_VERSION` is the batch metadata's
 # (`app_metadata`): 2 for protocol 5's layout. A server that reads only 1 refuses the stream with
@@ -981,7 +981,7 @@ def parse_lines(
 SENDER_FIELDS = ("rank", "attempt", "step")
 # A line of record version 2, which this package reads as the scalar-only record alone, is checked
 # with its `schema_version` too (wave AO, BUG-02): `identity.check` then refuses one with no
-# `"record": "scalars"`, and one whose `seq` is not an integer of 0 or more. Sent, such a line was a
+# `"record": "scalars"`, and one whose `seq` is not an integer of 0 or more that Int64 holds. Sent, such a line was a
 # step row of `record_version` 2 with a null `seq`, which a server stored as a training step in a
 # part every Python reader then refused.
 _SCALAR_FIELDS = ("schema_version", *SENDER_FIELDS)
@@ -2428,7 +2428,11 @@ def attach(
              "the server on its own later: tensorquill.flight.send_file would store its rows in the same run and "
              "rank as the first writer's, as another attempt of that rank.", stacklevel=3)
         return sink
-    path = getattr(sink, "path", None)
+    # The sink's file as the capture reads it (`sink.records_file_of`, wave AS): None also for a `path`
+    # that is no file's (an int, bytes, an `__fspath__` that raises, no file name), which is refused by
+    # name as a sink with no `path` is, where `pathlib` raised a TypeError out of `init` or a sender
+    # was started on a path with no file name.
+    path = records_file_of(sink)
     if path is None:
         raise ValueError(
             "endpoint= streams the local .jsonl file, so the sink must be a JsonlSink "
