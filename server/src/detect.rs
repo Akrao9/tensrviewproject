@@ -4503,11 +4503,21 @@ impl AttemptPass {
 
 /// Python's `scalar_context`: the values logged with `session.log` on an incident's step,
 /// each with the median of its finite values over the previous `SPIKE_WINDOW` records.
+///
+/// Both are taken at the step's first writing, as Python takes the first record with the step
+/// (AQ5-D4; the author, Nov 26, 2026: "Rust brought to Python: \"before\" leaves out the same
+/// step's earlier writing"). An incident first reported on a later writing of a step shows what the
+/// first writing logged, with the median of the records before it: before, it showed its own row's
+/// values, and the earlier writing counted among the records before them. Rows are read in step
+/// order (`in_step_order`), so the writings of one step are adjacent.
 #[derive(Default)]
 struct Scalars {
     names: Named<()>,
-    /// The scalars of the last `SPIKE_WINDOW` records, as (name, value).
-    recent: VecDeque<Vec<(usize, f64)>>,
+    /// The scalars of the last `SPIKE_WINDOW` records before the last step read, and of every
+    /// writing of that step, as (step, [(name, value)]).
+    recent: VecDeque<(i64, Vec<(usize, f64)>)>,
+    /// A list `recent` gave up, kept so that a row needs no new one.
+    spare: Vec<(usize, f64)>,
     scratch: Vec<f64>,
 }
 
@@ -4517,22 +4527,43 @@ impl Scalars {
         self.names.find(guess, name).expect("the name was just added")
     }
 
-    fn context(&mut self, columns: &Columns, row: usize) -> Option<Value> {
-        let scalars = columns.scalars.as_ref()?;
-        let entries = scalars.row(row);
-        let first_entry = entries.start;
-        let mut context = serde_json::Map::new();
-        for entry in entries {
-            if scalars.values.is_null(entry) {
-                continue;
+    /// The scalars a row logged, as (name, value), its nulls left out.
+    fn logged(&mut self, columns: &Columns, row: usize, out: &mut Vec<(usize, f64)>) {
+        if let Some(scalars) = &columns.scalars {
+            let entries = scalars.row(row);
+            let first_entry = entries.start;
+            for entry in entries {
+                if !scalars.values.is_null(entry) {
+                    let at = self.name_at(entry - first_entry, scalars.keys.value(entry));
+                    out.push((at, scalars.values.value(entry)));
+                }
             }
-            let name = scalars.keys.value(entry);
-            let at = self.name_at(entry - first_entry, name);
+        }
+    }
+
+    /// How many of the last rows read are writings of `step`.
+    fn writings(&self, step: i64) -> usize {
+        self.recent.iter().rev().take_while(|(known, _)| *known == step).count()
+    }
+
+    fn context(&mut self, columns: &Columns, row: usize) -> Option<Value> {
+        let step = columns.steps.value(row);
+        let writings = self.writings(step);
+        let end = self.recent.len() - writings; // the step's first writing, or none yet
+        let start = end.saturating_sub(SPIKE_WINDOW);
+        let mut logged = Vec::new();
+        if writings == 0 {
+            self.logged(columns, row, &mut logged);
+        } else {
+            logged.clone_from(&self.recent[end].1);
+        }
+        let mut context = serde_json::Map::new();
+        for (at, value) in logged {
             self.scratch.clear();
             self.scratch.extend(
                 self.recent
-                    .iter()
-                    .flatten()
+                    .range(start..end)
+                    .flat_map(|(_, logged)| logged)
                     .filter(|(known, value)| *known == at && value.is_finite())
                     .map(|(_, value)| *value),
             );
@@ -4542,31 +4573,26 @@ impl Scalars {
                 json!(median(&mut self.scratch))
             };
             context.insert(
-                name.to_owned(),
-                json!({"value": scalars.values.value(entry), "median_before": before}),
+                self.names.items[at].0.clone(),
+                json!({"value": value, "median_before": before}),
             );
         }
         (!context.is_empty()).then_some(Value::Object(context))
     }
 
     fn row(&mut self, columns: &Columns, row: usize) {
-        let mut logged = if self.recent.len() >= SPIKE_WINDOW {
-            self.recent.pop_front().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let step = columns.steps.value(row);
+        let mut logged = std::mem::take(&mut self.spare);
         logged.clear();
-        if let Some(scalars) = &columns.scalars {
-            let entries = scalars.row(row);
-            let first_entry = entries.start;
-            for entry in entries {
-                if !scalars.values.is_null(entry) {
-                    let at = self.name_at(entry - first_entry, scalars.keys.value(entry));
-                    logged.push((at, scalars.values.value(entry)));
-                }
+        self.logged(columns, row, &mut logged);
+        self.recent.push_back((step, logged));
+        // Kept: the step's writings, and the `SPIKE_WINDOW` records before its first one.
+        let keep = SPIKE_WINDOW + self.writings(step);
+        while self.recent.len() > keep {
+            if let Some((_, given_up)) = self.recent.pop_front() {
+                self.spare = given_up;
             }
         }
-        self.recent.push_back(logged);
     }
 }
 

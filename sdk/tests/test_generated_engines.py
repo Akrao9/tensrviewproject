@@ -315,12 +315,6 @@ def _stall(grad_norm: Any) -> list[dict[str, Any]]:
             _record(37, grad_norms={"p0.weight": 0.51}, weights_unchanged=["p0.weight"])]
 
 
-def _written_twice() -> list[dict[str, Any]]:
-    starved = {"r0": [256, 128, 127, 1]}
-    last = _record(48, moe=starved, scalars={"loss": 2.0})
-    return [_record(step, moe=starved) for step in range(48)] + [last, dict(last)]
-
-
 # Each disagreement found, at the smallest input shrinking reached (or a shorter one made from it by
 # hand), with the seed it was found at. Each must still disagree: a strict expected failure.
 HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
@@ -363,18 +357,6 @@ HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
     "AQ5-D3 a grad_norm of the wrong type hides a stall from Python, a bool": (
         "as above, for true",
         _stall(True),
-    ),
-    # Seed 1863, two records.
-    "AQ5-D4 a MoE incident at a step written twice": (
-        "Rust's scalar context of the moe_imbalance incident takes the step's first writing as a value "
-        "before it (median_before 2.4); Python's has none before it (None), and so has repeated_steps' "
-        "in both engines",
-        [_record(26, scalars={"loss": 2.4}), _record(26, scalars={"loss": 2.4}, moe={"r0": [1, 1, 10_000, 1]})],
-    ),
-    # Seed 41, starved_experts: the same with 50 records.
-    "AQ5-D4 a MoE incident at a step written twice, starved_experts": (
-        "as above, for the starved_experts incident (median_before 2.0 in Rust, None in Python)",
-        _written_twice(),
     ),
     # Seeds 13, 210, 357, 376, 413, 542, 563, 592, 653, 674, 753, 1032, 1281, 1379.
     "AQ5-D5 a router count above 2**53": (
