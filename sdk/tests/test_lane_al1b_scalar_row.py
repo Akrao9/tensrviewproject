@@ -1,7 +1,7 @@
 """Wave AL step 2, lane AL-1': the scalar-only record's row (`WAVE_AL_CONTRACT.md` sections 3, 4.4 and 4.5).
 
 - The row of case `scalar_record_keys`: `seq` set, `record_version` 2, row `schema_version` 2, `scalars`
-  in the `scalars` column under wave W3's rule, nothing in `extra_json` (`record` comes back from `seq`).
+  in the `scalars` column entry by entry (AQ5-D7, Nov 26, 2026; before, wave W3's rule), nothing in `extra_json` (`record` comes back from `seq`).
 - `row_to_record(record_to_row(r)) == r` for every record of every section 4 case, scalar-only and step
   records alike, in a plain row and through a real Arrow batch; a step row's `seq` is null.
 - A store holding `scalars-<first_seq:08>-<last_seq:08>.parquet` objects beside its parts (section 4.5's
@@ -74,9 +74,10 @@ def test_the_schema_has_seq_as_a_nullable_int64_before_record_version():
     assert names.index("seq") + 1 == names.index("record_version") and names[-1] == "extra_json"
 
 
-def test_scalars_follow_wave_w3_s_rule_in_a_scalar_only_row():
-    """A logged bool is left out of the column, as on a step row; any other value the column cannot hold
-    moves the whole map to `extra_json`, and the row reads back as the record."""
+def test_scalars_are_held_entry_by_entry_in_a_scalar_only_row():
+    """A logged bool is left out of the column, as on a step row; so is any other value the column cannot
+    hold, alone, which travels in `extra_json` while its siblings stay in the column (AQ5-D7, the author,
+    Nov 26, 2026; under wave W3's rule it moved the whole map), and the row reads back as the record."""
     record = _scalar_record()
     step = {k: v for k, v in record.items() if k not in ("record", "seq")} | {"schema_version": 1}
     with_bool = {**record, "scalars": {"eval_loss": 1.8, "flag": True}}
@@ -84,7 +85,11 @@ def test_scalars_follow_wave_w3_s_rule_in_a_scalar_only_row():
         == [("eval_loss", 1.8)]
     with_text = {**record, "scalars": {"eval_loss": 1.8, "note": "high"}}
     row = flight._row(with_text)
-    assert row["scalars"] is None and json.loads(row["extra_json"]) == {"scalars": with_text["scalars"]}
+    assert row["scalars"] == [("eval_loss", 1.8)] and json.loads(row["extra_json"]) == {"scalars": {"note": "high"}}
+    only_text = {**record, "scalars": {"note": "high"}}  # no entry held: the whole map, the column null
+    assert flight._row(only_text)["scalars"] is None
+    assert json.loads(flight._row(only_text)["extra_json"]) == {"scalars": {"note": "high"}}
+    assert flight.row_to_record(flight._row(only_text)) == only_text
     assert row["seq"] == 0
     assert flight.row_to_record(row) == with_text
     non_finite = {**record, "scalars": {"eval_loss": "nan", "eval_ppl": "inf"}}

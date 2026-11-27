@@ -309,8 +309,8 @@ def _row(
     A scalar-only record (`identity.is_scalar_record`: version 2 and `"record": "scalars"`, the one rule
     every reader asks; section 4.4) converts like any line, with its `seq` in the
     `seq` column (null on every other row) and its `record` key in no column: `row_to_record` restores
-    it from the non-null `seq`. Its `scalars` follow wave W3's rule, as a step record's. A null travels
-    in its row's columns only as an absent key: an explicit `null`, even for `ts` or `grad_norm`
+    it from the non-null `seq`. Its `scalars` are held entry by entry (`_scalars`), as a step
+    record's. A null travels in its row's columns only as an absent key: an explicit `null`, even for `ts` or `grad_norm`
     (`_ALWAYS`, which a step row reads back as present), travels in `extra_json`, so its row gives the
     record back exactly. A `seq` the column cannot hold raises `MalformedRecordError` (`_seq`)."""
     row: dict[str, Any] = dict.fromkeys(_COLUMNS)
@@ -388,8 +388,8 @@ def _row(
 
 def _past_float(value: Any) -> bool:
     """Whether `value` is an integer (not a bool) that a float64 holds only rounded, such as
-    `2**53 + 1`. An integer too large for any float is not: `float()` refuses it, and its map
-    travels in `extra_json` whole, as before."""
+    `2**53 + 1`. An integer too large for any float is not: `float()` refuses it, and it travels in
+    `extra_json` alone, as any refused entry of `scalars` does (`_scalars`)."""
     if isinstance(value, bool) or not isinstance(value, int):
         return False
     try:
@@ -400,7 +400,7 @@ def _past_float(value: Any) -> bool:
 
 def _scalars(value: Mapping[str, Any], map_type: Any) -> tuple[Any, dict[str, Any], bool]:
     """The `scalars` map as its column's pairs (`_UNHELD` for none), what travels in `extra_json`
-    under `scalars`, and whether the map was refused by an overflow or by Arrow (`map_type`, when
+    under `scalars`, and whether an entry was refused by an overflow or by Arrow (`map_type`, when
     given), not by a type.
 
     - A logged bool is not a number in either engine (lane W3, DET-16): that one value is left out of
@@ -411,22 +411,49 @@ def _scalars(value: Mapping[str, Any], map_type: Any) -> tuple[Any, dict[str, An
       as it is, and the `.jsonl` holds it exactly; wave AO, BUG-24 a) stays in the column as the
       nearest float, which the Rust detectors judge, and travels exactly in `extra_json` too, so
       `row_to_record` gives the record back as the file holds it, in its order.
-    - Any other value the column refuses moves the whole map to `extra_json`, its bools with it, and
-      the column is null, as before (lane W3)."""
-    column = {k: v for k, v in value.items() if not isinstance(v, bool)}
-    try:
-        converted = _map(_float)(column)
-    except (TypeError, ValueError):
-        return _UNHELD, dict(value), False
-    except Exception:  # noqa: BLE001  OverflowError and the like: the value's, not the step's
-        return _UNHELD, dict(value), True
-    if map_type is not None and not _fits(converted, map_type):
-        return _UNHELD, dict(value), True
-    return converted, {k: v for k, v in value.items() if isinstance(v, bool) or _past_float(v)}, False
+    - Any other entry the column refuses (a text other than the sink's "nan", "inf" and "-inf", an
+      integer too large for a float, a list, a name Arrow cannot encode) is left out of the column
+      alone and travels in `extra_json`, as a bool does; the rest of the map stays in the column
+      (AQ5-D7, the author, Nov 26, 2026; `WAVE_AJ_CONTRACT.md` section 3). Before, one such entry
+      moved the whole map to `extra_json` (lane W3), and the Rust detectors lost its siblings.
+    - A map in which such an entry is refused and no entry is held travels whole in `extra_json`,
+      its bools with it, and the column is null, as before. A map held whole (bools and integers past
+      2**53 aside) is converted as before, so its row is unchanged."""
+    held: list[tuple[str, Any]] = []
+    aside: dict[str, Any] = {}
+    refused, counted = False, False
+    for name, entry in value.items():
+        if isinstance(entry, bool):
+            aside[name] = entry
+            continue
+        try:
+            held.append((_str(name), _float(entry)))
+        except (TypeError, ValueError):
+            aside[name], refused = entry, True
+            continue
+        except Exception:  # noqa: BLE001  OverflowError and the like: the value's, not the step's
+            aside[name], refused, counted = entry, True, True
+            continue
+        if _past_float(entry):
+            aside[name] = entry
+    if map_type is not None and not _fits(held, map_type):
+        # Arrow refuses the map: find the entries it refuses alone (a name with a lone surrogate).
+        kept = []
+        for pair in held:
+            if _fits([pair], map_type):
+                kept.append(pair)
+            else:
+                aside[pair[0]], refused, counted = value[pair[0]], True, True
+        if len(kept) == len(held):  # no one entry to blame: the whole map, as before
+            return _UNHELD, dict(value), True
+        held = kept
+    if refused and not held:
+        return _UNHELD, dict(value), counted
+    return held, aside, counted
 
 
-# The maps held entry by entry (wave AJ, A3), each with its entries' converter. `scalars` keeps
-# lane W3's rule (a bool dropped, any other refusal moving the whole map) and is not among them.
+# The maps held entry by entry (wave AJ, A3), each with its entries' converter. `scalars` is held
+# entry by entry too (AQ5-D7), by `_scalars`, which also keeps a bool and an integer past 2**53 aside.
 _SPLIT: dict[str, Callable[[Any], Any]] = {
     "grad_norms": _float,
     "weight_norms": _float,
@@ -726,9 +753,9 @@ def row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
             record[key] = _plain(value)
     if extra:
         for key in (*_SPLIT, "scalars"):
-            # The entries the column could not hold, beside those it did (wave AJ, A3), and the
-            # scalars it holds only rounded, exactly (`_scalars`): an entry of the column's own name
-            # is replaced where it stands, so the record keeps its order.
+            # The entries the column could not hold, beside those it did (wave AJ, A3; `scalars`
+            # too since AQ5-D7), and the scalars it holds only rounded, exactly (`_scalars`): an entry
+            # of the column's own name is replaced where it stands, so the record keeps its order.
             if key in record and isinstance(extra.get(key), dict):
                 record[key] = {**record[key], **extra.pop(key)}
         record.update(extra)

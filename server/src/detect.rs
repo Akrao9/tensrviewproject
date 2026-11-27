@@ -103,6 +103,8 @@ mod lane_aj3_tests;
 #[cfg(test)]
 mod lane_al3_tests;
 #[cfg(test)]
+mod lane_ar1_tests;
+#[cfg(test)]
 mod lane_v7_tests;
 #[cfg(test)]
 mod lane_w3_tests;
@@ -4501,11 +4503,24 @@ impl AttemptPass {
 
 /// Python's `scalar_context`: the values logged with `session.log` on an incident's step,
 /// each with the median of its finite values over the previous `SPIKE_WINDOW` records.
+///
+/// Both are taken at the step's first writing, as Python takes the first record with the step
+/// (AQ5-D4; the author, Nov 26, 2026: "Rust brought to Python: \"before\" leaves out the same
+/// step's earlier writing"). An incident first reported on a later writing of a step shows what the
+/// first writing logged, with the median of the records before it: before, it showed its own row's
+/// values, and the earlier writing counted among the records before them. Rows are read in step
+/// order (`in_step_order`), so the writings of one step are adjacent.
 #[derive(Default)]
 struct Scalars {
     names: Named<()>,
-    /// The scalars of the last `SPIKE_WINDOW` records, as (name, value).
-    recent: VecDeque<Vec<(usize, f64)>>,
+    /// The scalars of the last `SPIKE_WINDOW` records before the last step read, and of every
+    /// writing of that step, as (step, [(name, value)]).
+    recent: VecDeque<(i64, Vec<(usize, f64)>)>,
+    /// The last step read and how many of its writings `recent` holds: its first and at most the
+    /// last `SPIKE_WINDOW` (only those are ever read), so a step written many times costs no more.
+    current: Option<(i64, usize)>,
+    /// A list `recent` gave up, kept so that a row needs no new one.
+    spare: Vec<(usize, f64)>,
     scratch: Vec<f64>,
 }
 
@@ -4515,22 +4530,62 @@ impl Scalars {
         self.names.find(guess, name).expect("the name was just added")
     }
 
-    fn context(&mut self, columns: &Columns, row: usize) -> Option<Value> {
-        let scalars = columns.scalars.as_ref()?;
-        let entries = scalars.row(row);
-        let first_entry = entries.start;
-        let mut context = serde_json::Map::new();
-        for entry in entries {
-            if scalars.values.is_null(entry) {
-                continue;
+    /// The scalars a row logged, as (name, value), its nulls left out.
+    ///
+    /// A row whose column is null may be one a sender built before AQ5-D7 (`WAVE_AJ_CONTRACT.md`
+    /// section 3; the author, Nov 26, 2026): lane W3's rule moved the whole map to `extra_json` for
+    /// one refused entry. Its entries the column would hold are read from there, as Python reads the
+    /// record back (`aside_scalars`), so its siblings are kept in both engines. A row of today's
+    /// sender with a null column holds no such entry there, and reads as before.
+    fn logged(&mut self, columns: &Columns, row: usize, out: &mut Vec<(usize, f64)>) {
+        if let Some(scalars) = columns.scalars.as_ref().filter(|scalars| !scalars.map.is_null(row)) {
+            let entries = scalars.row(row);
+            let first_entry = entries.start;
+            for entry in entries {
+                if !scalars.values.is_null(entry) {
+                    let at = self.name_at(entry - first_entry, scalars.keys.value(entry));
+                    out.push((at, scalars.values.value(entry)));
+                }
             }
-            let name = scalars.keys.value(entry);
-            let at = self.name_at(entry - first_entry, name);
+            return;
+        }
+        let Some(Value::Object(aside)) = aside_scalars(columns, row) else {
+            return;
+        };
+        for (guess, (name, value)) in aside.iter().enumerate() {
+            if let Some(value) = held_scalar(value) {
+                let at = self.name_at(guess, name);
+                out.push((at, value));
+            }
+        }
+    }
+
+    /// How many writings of `step` end `recent`: none unless it is the last step read.
+    fn writings(&self, step: i64) -> usize {
+        match self.current {
+            Some((known, writings)) if known == step => writings,
+            _ => 0,
+        }
+    }
+
+    fn context(&mut self, columns: &Columns, row: usize) -> Option<Value> {
+        let step = columns.steps.value(row);
+        let writings = self.writings(step);
+        let end = self.recent.len() - writings; // the step's first writing, or none yet
+        let start = end.saturating_sub(SPIKE_WINDOW);
+        let mut logged = Vec::new();
+        if writings == 0 {
+            self.logged(columns, row, &mut logged);
+        } else {
+            logged.clone_from(&self.recent[end].1);
+        }
+        let mut context = serde_json::Map::new();
+        for (at, value) in logged {
             self.scratch.clear();
             self.scratch.extend(
                 self.recent
-                    .iter()
-                    .flatten()
+                    .range(start..end)
+                    .flat_map(|(_, logged)| logged)
                     .filter(|(known, value)| *known == at && value.is_finite())
                     .map(|(_, value)| *value),
             );
@@ -4540,31 +4595,61 @@ impl Scalars {
                 json!(median(&mut self.scratch))
             };
             context.insert(
-                name.to_owned(),
-                json!({"value": scalars.values.value(entry), "median_before": before}),
+                self.names.items[at].0.clone(),
+                json!({"value": value, "median_before": before}),
             );
         }
         (!context.is_empty()).then_some(Value::Object(context))
     }
 
     fn row(&mut self, columns: &Columns, row: usize) {
-        let mut logged = if self.recent.len() >= SPIKE_WINDOW {
-            self.recent.pop_front().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let step = columns.steps.value(row);
+        let mut logged = std::mem::take(&mut self.spare);
         logged.clear();
-        if let Some(scalars) = &columns.scalars {
-            let entries = scalars.row(row);
-            let first_entry = entries.start;
-            for entry in entries {
-                if !scalars.values.is_null(entry) {
-                    let at = self.name_at(entry - first_entry, scalars.keys.value(entry));
-                    logged.push((at, scalars.values.value(entry)));
-                }
+        self.logged(columns, row, &mut logged);
+        self.recent.push_back((step, logged));
+        let mut writings = self.writings(step) + 1;
+        if writings > SPIKE_WINDOW + 1 {
+            // A writing between the first and the last `SPIKE_WINDOW` is never read again.
+            if let Some((_, given_up)) = self.recent.remove(self.recent.len() - writings + 1) {
+                self.spare = given_up;
+            }
+            writings -= 1;
+        }
+        self.current = Some((step, writings));
+        // Kept: the step's writings, and the `SPIKE_WINDOW` records before its first one.
+        while self.recent.len() > SPIKE_WINDOW + writings {
+            if let Some((_, given_up)) = self.recent.pop_front() {
+                self.spare = given_up;
             }
         }
-        self.recent.push_back(logged);
+    }
+}
+
+/// The `scalars` a row's `extra_json` holds, or None when it holds none. `extra_json` is parsed only
+/// on a row that names the key; a number too large for a float in it reads as unreadable
+/// (`extra_json::parse`), so the other entries are kept.
+fn aside_scalars(columns: &Columns, row: usize) -> Option<Value> {
+    let extra = text(columns.extra, row).filter(|extra| extra.contains("\"scalars\""))?;
+    match extra_json::parse(extra)? {
+        Value::Object(mut extra) => extra.remove("scalars"),
+        _ => None,
+    }
+}
+
+/// One `scalars` entry from JSON as the column would hold it (`flight.py`'s `_float`): a number, or
+/// the sink's "nan", "inf" and "-inf". A null is no value, as in the column; a bool, any other text
+/// (the unreadable number among them), a list and an object are refused, and absent.
+fn held_scalar(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => match text.as_str() {
+            "nan" => Some(f64::NAN),
+            "inf" => Some(f64::INFINITY),
+            "-inf" => Some(f64::NEG_INFINITY),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
