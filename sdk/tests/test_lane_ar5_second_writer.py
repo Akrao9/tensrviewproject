@@ -143,6 +143,25 @@ def test_a_second_writer_with_an_endpoint_starts_no_sender_and_no_heartbeat(here
     assert _steps(out / "same.rank0.jsonl") == [0, 1]
 
 
+def test_two_writers_of_one_rank_both_given_an_endpoint_make_one_stream_of_that_rank(here):
+    """No server. Fail-before: two senders and two heartbeats of rank 0 ran, one of each per writer,
+    the second's sender tailing the pid file under the first's run ID and rank."""
+    before = _stream_threads()
+    one, _, _, _ = _init("same", endpoint=NOWHERE)
+    two, said, _, _ = _init("same", endpoint=NOWHERE)
+    try:
+        assert isinstance(one._sink, flight.StreamingSink) and not _streams(two)
+        now = _stream_threads()
+        assert {kind: now[kind] - before[kind] for kind in now} == {"flight": 1, "heartbeat": 1}
+        assert len(said) == 2, said
+    finally:
+        for session in (two, one):
+            sender = getattr(session._sink, "sender", None)
+            if sender is not None:
+                sender.close(0.0)  # nothing listens: do not wait the close's five seconds
+            session.close()
+
+
 def test_a_third_writer_in_this_process_does_not_stream_either(here):
     """The third writer writes into the second's pid file, unlocked (lane AQ-2's choice 6): it is
     still not the rank's first writer, so it streams nothing."""
