@@ -301,6 +301,15 @@ def _weight_check(record: Mapping[str, Any]) -> bool:
     return isinstance(norms, Mapping) and any(_wire_float(v) is not _UNCARRIED for v in norms.values())
 
 
+def _held_update_sizes(record: Mapping[str, Any]) -> bool:
+    """Whether a record carries `update_rms` as both engines count it: a map with at least one entry
+    its column holds (`_wire_float`; a null counts, as Rust's map column keeps the entry). A map whose
+    every entry is refused (a text that is not the sink's spelling, a bool, an integer too large for
+    a float) is an absent key (WAVE_AJ_CONTRACT.md section 2; AQ5-D1): the column is null in Rust."""
+    sizes = record.get("update_rms")
+    return isinstance(sizes, Mapping) and any(_wire_float(v) is not _UNCARRIED for v in sizes.values())
+
+
 def effective_overload_threshold(
     n_experts: int,
     routed_tokens: int,
@@ -3614,10 +3623,9 @@ def input_counts(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         norms, layers = bool(_object(record, "grad_norms")), bool(layer_entries(record))
         counts["grad_total"] += total
         # A step the loss scaler skipped is no update history (RUST-12): the update rule skips it.
-        counts["update"] += (
-            total and isinstance(record.get("update_rms"), Mapping) and bool(record["update_rms"])
-            and not record.get("step_skipped")
-        )
+        # A map with no entry its column holds is an absent key (WAVE_AJ_CONTRACT.md section 2;
+        # AQ5-D1, the author: "Python brought to Rust"), as `_weight_check` reads `weight_norms`.
+        counts["update"] += total and _held_update_sizes(record) and not record.get("step_skipped")
         counts["weight_check"] += _unchanged_names(record) is not None and norms
         # A skip only the caller reported is not the loss scale's to judge unless the scaler was seen
         # to apply that update (`detect_loss_scale_trouble`).

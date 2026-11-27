@@ -286,7 +286,6 @@ def test_a_corpus_is_written_with_its_index(tmp_path):
 # Seeds of the default range that disagree, by the finding of `HELD` that holds their smallest input.
 KNOWN: dict[int, str] = {
     13: "AQ5-D5: a router count above 2**53 rounds the MoE sample's shares differently",
-    23: "AQ5-D1: an update_rms map with no held entry is counted by Python, absent to Rust",
 }
 
 
@@ -324,16 +323,6 @@ def _written_twice() -> list[dict[str, Any]]:
 # Each disagreement found, at the smallest input shrinking reached (or a shorter one made from it by
 # hand), with the seed it was found at. Each must still disagree: a strict expected failure.
 HELD: dict[str, tuple[str, list[dict[str, Any]]]] = {
-    # Seeds 23, 294, 1096, 1368 (a string that is not the sink's spelling, or a bool) and 266 (10**400).
-    "AQ5-D1 update_rms with no held entry, a string": (
-        "Python counts the record toward update_spike (checked, 1 record); Rust reads no update_rms "
-        "(not_configured). WAVE_AJ_CONTRACT.md section 2: a map with no held entry reads as absent",
-        [_record(47, grad_norm=1.048992069, update_rms={"p0.weight": "nan "})],
-    ),
-    "AQ5-D1 update_rms with no held entry, an oversized integer": (
-        "as above, for 10**400",
-        [_record(112, grad_norm=1.036979024, update_rms={"p0.weight": 10**400})],
-    ),
     # Seeds 93, 340, 731, 750, 1490.
     "AQ5-D2 system with an oversized integer": (
         "Python reads the system block (memory_growth, memory_pressure, allocator_retries checked); Rust "
@@ -423,5 +412,29 @@ def test_a_known_seed_still_disagrees_as_its_finding_says(seed, tmp_path):
     # The sweep marks these seeds as expected failures; here, what they give is held to the finding named.
     found = case_differences(gen.generate(seed), tmp_path)
     finding = KNOWN[seed].split(":", 1)[0]
-    expected = {"AQ5-D1": "kind_checks.update_spike", "AQ5-D5": "sample"}[finding]
+    expected = {"AQ5-D5": "sample"}[finding]
     assert found and all(expected in line for line in found), found[:5]
+
+
+# --- the disagreements settled since, each held at its smallest input as an agreement ------------
+
+# Lane AR-2 of wave AR: AQ5-D1, AQ5-D3 and AQ5-D6, settled in the Python engine. Each input is the one
+# `HELD` held as a disagreement, with the seeds it was found at.
+SETTLED_AR2: dict[str, tuple[str, list[dict[str, Any]]]] = {
+    # Seeds 23, 294, 1096, 1368 (a string that is not the sink's spelling, or a bool) and 266 (10**400).
+    "AQ5-D1 update_rms with no held entry, a string": (
+        "a refused update_rms map is an absent key in both engines (the author: Python brought to Rust)",
+        [_record(47, grad_norm=1.048992069, update_rms={"p0.weight": "nan "})],
+    ),
+    "AQ5-D1 update_rms with no held entry, an oversized integer": (
+        "as above, for 10**400",
+        [_record(112, grad_norm=1.036979024, update_rms={"p0.weight": 10**400})],
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SETTLED_AR2))
+def test_a_disagreement_settled_by_lane_ar2_now_agrees(name, tmp_path):
+    reason, records = SETTLED_AR2[name]
+    found = records_differences(records, tmp_path)
+    assert found == [], f"{reason}:\n" + "\n".join(found[:10])
