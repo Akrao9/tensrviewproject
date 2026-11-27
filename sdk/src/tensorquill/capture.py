@@ -61,7 +61,7 @@ from .distributed import (
 )
 from .flight import _without_traceback
 from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks, probe_callable, run_probe
-from .sink import JsonlSink, Sink, clear_end_marker, records_file_name, write_end_marker
+from .sink import JsonlSink, Sink, clear_end_marker, records_file_name, records_file_of, write_end_marker
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
 from .tracker import LaunchRead, RunInfo, _world_size, resolve_run, tracker_labels
@@ -2115,7 +2115,7 @@ class Session:
         if data_wait:
             self.watch_loaders()
             undo.append(lambda: datawait.unwatch(self))
-        path = getattr(self._sink, "path", None)
+        path = records_file_of(self._sink)  # None: a sink with no records file (`sink.records_file_of`)
         if path is not None:
             clear_end_marker(path)  # the file is being written again (see `sink.write_end_marker`)
 
@@ -4988,10 +4988,11 @@ class Session:
             self._launch_read.cancel()  # no step ended: the parked reader ends without reading
         if not self._worker.is_alive():
             self._drop_launch_source()
-        if self._stopped or getattr(self._sink, "path", None) is None:
+        records_file = records_file_of(self._sink)
+        if self._stopped or records_file is None:
             return
         try:
-            write_end_marker(self._sink.path, run_id=self.run.run_id, rank=self.run.rank, attempt=self.attempt,
+            write_end_marker(records_file, run_id=self.run.run_id, rank=self.run.rank, attempt=self.attempt,
                              exception=_exception)
         except Exception:  # noqa: BLE001
             pass  # no marker: the file reads as cut off, which is less than it is, never more
@@ -6017,7 +6018,8 @@ def init(
         # of the run: at rank 0 it writes no run manifest (item 8, lane AR-7), and its settings go
         # beside its own file, as a second writer's of any rank.
         second_writer = getattr(sink, "other_writer", None) is not None
-        _manifest.write_rank_settings(getattr(sink, "path", None), run.run_id, run.rank, undo,
+        records_file = records_file_of(sink, say=True)  # None: no records file; a `path` that is none, said once
+        _manifest.write_rank_settings(records_file, run.run_id, run.rank, undo,
                                       second_writer=second_writer)  # ranks above 0 (AR-6), a second writer
         # The project and the name are facts of the run, and a tracker's run exists on rank 0
         # only, so rank 0 alone resolves and writes them: no collective call is needed.
@@ -6031,7 +6033,6 @@ def init(
                 group=group or labels.get("group"), tags=tags, config=config, world_size=_world_size(),
                 pinned_flush=pinned_flush,
             )
-            records_file = getattr(sink, "path", None)
             if records_file is not None and run.run_id:
                 manifest_file = _manifest.local_manifest_path(records_file, run.run_id)
                 undo.append(_restore_file(manifest_file))

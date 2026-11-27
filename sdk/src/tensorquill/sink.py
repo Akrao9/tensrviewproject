@@ -322,6 +322,58 @@ END_SUFFIX = ".end.json"
 END_MARKER = "tensorquill_run_end"
 
 
+def records_file_of(sink: Any, *, say: bool = False) -> Path | None:
+    """The records file `sink` writes, read from its `path` attribute, or None for a sink without one.
+    The capture path reads a sink's file through this alone (the end marker, the rank settings file,
+    the run manifest), so a caller's sink is judged by one rule. None for a sink with no `path` or a
+    `path` of None (a `MemorySink`), and for a `path` that is no file's: one `pathlib.Path` does not
+    take (an int, bytes, any other object, an `os.PathLike` whose `__fspath__` raises or gives bytes),
+    one whose reading raises, or one with no file name (`""`, `"."`, `"/"`), beside which no end
+    marker can be put. A sink given None is taken as one with no records file: nothing is written
+    beside it, and its records still go to its `write` (wave AS, lane AS-7).
+
+    With `say`, a `path` that is set and is no file's is said once, by its type and why (`init`
+    asks, so each session says it once, on every rank); a sink with no `path` or a `path` of None
+    is not, since having no file is what such a sink is. Never raises, also under `python -W error`
+    (`manifest._say`)."""
+    try:
+        given = getattr(sink, "path", None)
+    except Exception as error:  # noqa: BLE001  a `path` property that raises
+        given, found, why = None, None, f"reading it raised {_brief(error)}"
+    else:
+        if given is None:
+            return None
+        found, why = _as_records_file(given)
+    if found is not None:
+        return found
+    if say:
+        try:
+            kind = "" if given is None else f" ({type(given).__name__})"
+            _say(f"tensorquill.init: the sink's path{kind} is not a records file ({why}), so this session takes "
+                 f"{type(sink).__name__} as a sink with no records file, as one with no path: no end marker, rank "
+                 "settings file or run manifest is written for it, and its records still go to its write().",
+                 stacklevel=3)
+        except Exception:  # noqa: BLE001  nothing here may stop a run
+            pass
+    return None
+
+
+def _as_records_file(given: Any) -> tuple[Path | None, str]:
+    """`given` as a records file's path, or None with why it is not one. Never raises."""
+    try:
+        found = Path(given)
+    except TypeError:
+        return None, f"pathlib.Path takes a str or an os.PathLike that gives one, not {type(given).__name__}"
+    except Exception as error:  # noqa: BLE001  an `__fspath__` that raises
+        return None, f"reading it as a path raised {_brief(error)}"
+    try:
+        if not found.name:
+            return None, f"{given if isinstance(given, str) else str(found)!r} has no file name"
+    except Exception as error:  # noqa: BLE001
+        return None, f"reading it as a path raised {_brief(error)}"
+    return found, ""
+
+
 def end_marker_path(records_file: str | Path) -> Path:
     """`<name>.end.json` beside `<name>.jsonl`."""
     path = Path(records_file)
@@ -329,10 +381,11 @@ def end_marker_path(records_file: str | Path) -> Path:
 
 
 def clear_end_marker(records_file: str | Path) -> None:
-    """Called as a session opens the file: from now on the file is being written again."""
+    """Called as a session opens the file: from now on the file is being written again. Never
+    raises: a `records_file` that is no file's path (`records_file_of`) has no marker to remove."""
     try:
         end_marker_path(records_file).unlink(missing_ok=True)
-    except OSError:
+    except Exception:  # noqa: BLE001
         pass  # a marker that cannot be removed is caught by its size: the file grows past it
 
 
@@ -344,10 +397,11 @@ def write_end_marker(
     The failure is said by `manifest._say` (lane Z6, L23), so under `python -W error` it is
     logged on the `tensorquill` logger rather than raised and lost; a scratch file the failed
     write or rename left is removed, and a removal that fails is let be."""
-    records = Path(records_file)
-    path = end_marker_path(records)
+    path: Any = records_file  # what the warning names if the path itself cannot be made
     scratch: Path | None = None
     try:
+        records = Path(records_file)
+        path = end_marker_path(records)
         document = {
             "marker": END_MARKER,
             "version": 1,
