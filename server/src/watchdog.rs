@@ -39,6 +39,20 @@
 //! (sent by the SDK) or by gaps below the highest rank seen. The thresholds are not
 //! calibrated: set `--silent-seconds` above the longest evaluation or checkpoint pause.
 //!
+//! # The limit of ranks a run
+//!
+//! A run has at most [`MAX_RANKS`] (100,000) ranks, numbered 0 to 99,999: the one limit of the
+//! server, and the SDK's `MAX_EXPECTED_RANKS`. `ingest` refuses a stream or a heartbeat of a rank at
+//! or over it and a batch that names a world size over it, with `INVALID_ARGUMENT` (lane AR-4; until
+//! Nov 27, 2026 they were taken, and a world size of 2,147,483,647 made every status of its run walk
+//! two thousand million ranks and build a list of about 8 GB). The watchdog holds to the same limit
+//! whatever it is given, for a status a store already holds and for any caller: a world size over it
+//! is not taken (the status writes none, as for a rank that sent none), and a rank at or over it
+//! names no rank below it as expected. A status lists at most [`LISTED_RANKS`] (1,000) missing
+//! ranks, the lowest, and counts the others in `missing_ranks_omitted`, a key written only when some
+//! are left out; the verdict counts them all. The run state's `ranks_unknown` is listed and counted
+//! the same way (`ranks_omitted`).
+//!
 //! # A stopped rank whose stream drops
 //!
 //! A rank that reads `silent` or `unresponsive` when its stream drops was already stopped, and a
@@ -195,6 +209,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::storage::AttemptOrder;
+
+/// The most ranks a run has that this server takes: ranks 0 to 99,999, and a world size of at most
+/// 100,000 (see the module notes). The SDK's `MAX_EXPECTED_RANKS` is the same number.
+pub const MAX_RANKS: i32 = 100_000;
+/// The most rank numbers a status lists in `missing_ranks`, and the run state in `ranks_unknown`:
+/// the lowest; the others are counted (`missing_ranks_omitted`, `ranks_omitted`).
+pub const LISTED_RANKS: usize = 1_000;
+
+/// A world size this server takes: at most [`MAX_RANKS`].
+pub fn world_size_taken(world_size: i64) -> bool {
+    world_size <= i64::from(MAX_RANKS)
+}
+
+/// A rank this server takes: 0 to [`MAX_RANKS`] - 1.
+pub fn rank_taken(rank: i64) -> bool {
+    (0..i64::from(MAX_RANKS)).contains(&rank)
+}
 
 pub const DEFAULT_SILENT_FLOOR: Duration = Duration::from_secs(300);
 pub const DEFAULT_SILENT_FACTOR: f64 = 5.0;
@@ -988,9 +1019,10 @@ impl Watchdog {
 
     /// Takes up the ranks of `run_id` from a status this server (or an earlier one) wrote, as
     /// described in the module notes. `Ok(true)` when the run was taken up, `Ok(false)` when
-    /// there was nothing to take: a finished or abandoned run, a status without `restart`.
-    /// All of a run's ranks are taken up or none. A rank that has already connected is left
-    /// alone.
+    /// there was nothing to take: a finished or abandoned run, a status without `restart`, or one
+    /// whose every rank is over the limit. All of a run's ranks within the limit are taken up or
+    /// none; a rank at or over it is one this server refuses (module notes), and is left out. A
+    /// world size over the limit is not taken. A rank that has already connected is left alone.
     pub fn restore(&self, run_id: &str, status: &Value, now: Instant) -> Result<bool, String> {
         if status["run_id"] != run_id || status["schema_version"] != 1 {
             return Err("not a version 1 status of this run".to_string());
@@ -1004,7 +1036,12 @@ impl Watchdog {
         if entries.is_empty() {
             return Ok(false);
         }
-        let world_size = status["world_size"].as_i64().and_then(|size| i32::try_from(size).ok());
+        // Within the limit (module notes): a store written before it may hold a world size or a rank
+        // over it, which this server takes as it would from a sender now: not at all.
+        let world_size = status["world_size"]
+            .as_i64()
+            .filter(|size| world_size_taken(*size))
+            .and_then(|size| i32::try_from(size).ok());
         // Each rank's first carry, found once: a search per entry is quadratic in the world size.
         let mut carries: HashMap<i64, &Value> = HashMap::new();
         for carry in carried {
@@ -1015,16 +1052,20 @@ impl Watchdog {
         let mut restored = Vec::new();
         for entry in entries {
             let bad = || format!("the entry of rank {} cannot be read", entry["rank"]);
-            let rank = entry["rank"]
-                .as_i64()
-                .and_then(|rank| i32::try_from(rank).ok())
-                .filter(|rank| *rank >= 0);
-            let rank = rank.ok_or_else(bad)?;
+            let rank = entry["rank"].as_i64().ok_or_else(bad)?;
+            if rank >= i64::from(MAX_RANKS) {
+                // A rank whose stream and heartbeats this server refuses: not taken up.
+                continue;
+            }
+            let rank = i32::try_from(rank).ok().filter(|rank| *rank >= 0).ok_or_else(bad)?;
             let carry = carries.get(&i64::from(rank)).copied();
             let progress = carry
                 .and_then(|carry| Progress::restored(entry, carry, world_size, now, &self.config))
                 .ok_or_else(bad)?;
             restored.push(((run_id.to_string(), rank), progress));
+        }
+        if restored.is_empty() {
+            return Ok(false);
         }
         let mut ranks = self.ranks.lock().unwrap();
         for (key, progress) in restored {
@@ -1483,8 +1524,19 @@ pub fn run_status(
     config: &WatchdogConfig,
     running: bool,
 ) -> Value {
-    let world_size = members.iter().filter_map(|(_, p)| p.world_size).max();
-    let highest = members.iter().map(|(rank, _)| *rank).max().unwrap_or(-1);
+    // Within the limit (module notes): a world size over it is not taken, and a rank at or over it
+    // names no rank below it as expected, so `expected` is at most `MAX_RANKS` and never overflows.
+    let world_size = members
+        .iter()
+        .filter_map(|(_, p)| p.world_size)
+        .filter(|size| world_size_taken(i64::from(*size)))
+        .max();
+    let highest = members
+        .iter()
+        .map(|(rank, _)| *rank)
+        .filter(|rank| rank_taken(i64::from(*rank)))
+        .max()
+        .unwrap_or(-1);
     let expected = world_size.map_or(highest + 1, |size| size.max(highest + 1));
     // A set: a search of the ranks seen for every expected rank is quadratic in the world size.
     let seen: std::collections::HashSet<i32> = members.iter().map(|(rank, _)| *rank).collect();
@@ -1496,8 +1548,19 @@ pub fn run_status(
     // raised for it, but a run is not finished while one has not been seen (decided Nov 19, 2026;
     // until then a rank that finished inside the grace finished a run whose other ranks had not
     // connected yet, and a restarted server did not take it up).
-    let unseen: Vec<i32> = (0..expected).filter(|rank| !seen.contains(rank)).collect();
-    let missing: Vec<i32> = if settled { unseen.clone() } else { Vec::new() };
+    // Counted, and the lowest `LISTED_RANKS` of them listed: the walk stops there, so it takes at most
+    // as many steps as the list's length and the ranks seen.
+    let unseen_count = usize::try_from(expected.max(0)).unwrap_or(0)
+        - seen.iter().filter(|rank| (0..expected).contains(*rank)).count();
+    let missing: Vec<i32> = if settled {
+        (0..expected)
+            .filter(|rank| !seen.contains(rank))
+            .take(LISTED_RANKS)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let missing_count = if settled { unseen_count } else { 0 };
     let states: Vec<RankState> = members.iter().map(|(_, p)| p.state(now, config)).collect();
     let count = |wanted: &[RankState]| states.iter().filter(|state| wanted.contains(state)).count();
     // A rank that was stopped when its stream dropped is stopped while it reconnects, not active
@@ -1518,15 +1581,15 @@ pub fn run_status(
     let capture_stopped = count(&[RankState::CaptureStopped]);
     let summary = if !running {
         "server_stopped"
-    } else if all_finished && unseen.is_empty() {
+    } else if all_finished && unseen_count == 0 {
         "finished"
-    } else if all_finished && !missing.is_empty() {
+    } else if all_finished && missing_count > 0 {
         "degraded"
     } else if all_finished {
         "active" // inside the grace, waiting for the ranks not seen yet
     } else if active == 0 && stopped > 0 {
         "stalled"
-    } else if stopped > 0 || !missing.is_empty() || (capture_stopped > 0 && active > 0) {
+    } else if stopped > 0 || missing_count > 0 || (capture_stopped > 0 && active > 0) {
         "degraded"
     } else if active == 0 && capture_stopped > 0 {
         // Every rank's capture stopped or finished, and one at least stopped (contract 3): the
@@ -1653,6 +1716,11 @@ pub fn run_status(
         "summary": summary,
         "ranks": ranks,
     });
+    // Only when some are left out, so the status of a run with at most `LISTED_RANKS` missing is
+    // written as before.
+    if missing_count > missing.len() {
+        status["missing_ranks_omitted"] = json!(missing_count - missing.len());
+    }
     status["incidents"] = json!(incidents(&status));
     status["abandoned"] = json!(
         !config.abandon.is_zero()
@@ -1801,14 +1869,25 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
             .filter_map(|rank| rank.as_i64().and_then(|rank| i32::try_from(rank).ok())),
     );
     // A rank below `world_size` that has not connected: the status calls it missing only after
-    // the silence floor, and until then one connected rank of four must not read healthy.
-    if let Some(world_size) = status["world_size"]
+    // the silence floor, and until then one connected rank of four must not read healthy. And the
+    // missing ranks a status counts and does not list (`missing_ranks_omitted`): every rank not seen
+    // below the larger of the world size and the highest rank plus one, as `run_status` found them.
+    // Both within the limit, so this walks at most `MAX_RANKS` ranks.
+    let listed: std::collections::HashSet<i32> = ranks.iter().copied().collect();
+    let mut below = status["world_size"]
         .as_i64()
-        .filter(|size| (1..=100_000).contains(size))
-    {
-        let listed: std::collections::HashSet<i32> = ranks.iter().copied().collect();
-        unknown.extend((0..world_size as i32).filter(|rank| !listed.contains(rank)));
+        .filter(|size| (1..=i64::from(MAX_RANKS)).contains(size))
+        .unwrap_or(0);
+    if status.get("missing_ranks_omitted").is_some() {
+        let after_highest = ranks
+            .iter()
+            .map(|rank| i64::from(*rank))
+            .filter(|rank| rank_taken(*rank))
+            .max()
+            .map_or(0, |rank| rank + 1);
+        below = below.max(after_highest);
     }
+    unknown.extend((0..below as i32).filter(|rank| !listed.contains(rank)));
     unknown.sort_unstable();
     unknown.dedup();
     if !unknown.is_empty() {
@@ -1817,11 +1896,18 @@ pub fn run_state(status: &Value, reports: &BTreeMap<i32, RankReport>, detect: bo
         } else {
             " (this server runs with --no-detect)"
         };
-        reasons.push(json!({
+        // The lowest `LISTED_RANKS` listed, the others counted, and the detail gives them all.
+        let count = unknown.len();
+        unknown.truncate(LISTED_RANKS);
+        let mut reason = json!({
             "state": "unknown", "code": "ranks_unknown", "ranks": unknown,
-            "detail": format!("{} rank{} without a current report from this server{why}: nothing is said about incidents on them",
-                unknown.len(), if unknown.len() == 1 { "" } else { "s" }),
-        }));
+            "detail": format!("{count} rank{} without a current report from this server{why}: nothing is said about incidents on them",
+                if count == 1 { "" } else { "s" }),
+        });
+        if count > LISTED_RANKS {
+            reason["ranks_omitted"] = json!(count - LISTED_RANKS);
+        }
+        reasons.push(reason);
     }
     let summary = status["summary"].as_str().unwrap_or_default();
     if summary == "server_stopped" {
@@ -2005,6 +2091,9 @@ fn progress_incidents(status: &Value) -> Vec<Value> {
         "world_size": status["world_size"],
         "missing_ranks": status["missing_ranks"],
     });
+    if let Some(omitted) = status.get("missing_ranks_omitted") {
+        incident["missing_ranks_omitted"] = omitted.clone();
+    }
     if !lost.is_empty() {
         incident["lost_ranks"] = json!(lost);
     }

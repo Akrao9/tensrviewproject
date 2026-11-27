@@ -8,7 +8,7 @@
 //! build a list of about 8 GB; a lone rank 2,147,483,647 overflowed `highest + 1`. These tests show
 //! the fault with a few hundred thousand ranks, which the base walks in well under a second: each
 //! asserts what the status holds and how large it is, and only then, with a generous bound, how long
-//! it took. `i32::MAX` is used once the walk is bounded.
+//! it took. `i32::MAX` was added to them once the walk was bounded.
 //!
 //! The clock: a silence floor of 60 s. The rank stores a step at 1 s and at 70 s, and the status is
 //! written at 71 s, past the floor, so every rank expected and not seen is missing.
@@ -93,7 +93,7 @@ fn ranks(status: &Value) -> Vec<i64> {
 /// for it, and reads the run as one with no world size. On the base, 399,999 missing ranks.
 #[test]
 fn a_world_size_over_the_limit_is_not_taken_and_its_ranks_are_not_walked() {
-    let worlds = [400_000, 100_001];
+    let worlds = [400_000, 100_001, i32::MAX];
     for world in worlds {
         let (status, took) = settled(&[0], Some(world));
         let seen = format!(
@@ -115,21 +115,24 @@ fn a_world_size_over_the_limit_is_not_taken_and_its_ranks_are_not_walked() {
 /// it and walks nothing for it. On the base, 400,000 missing ranks.
 #[test]
 fn a_rank_over_the_limit_with_no_world_size_is_not_walked() {
-    let (status, took) = settled(&[400_000], None);
-    let seen = format!(
-        "{} bytes, missing_ranks of {} entries",
-        size(&status),
-        status["missing_ranks"].as_array().map_or(0, Vec::len)
-    );
-    assert!(size(&status) < SMALL, "{seen}");
-    assert_eq!(ranks(&status), [400_000], "{seen}");
-    assert_eq!(status["missing_ranks"], json!([]), "{seen}");
-    assert_eq!(status["summary"], "active", "{seen}");
-    // Beside a rank below the limit, it names no gap either: rank 0 alone is expected.
-    let (status, _) = settled(&[0, 400_000], None);
-    assert_eq!(status["missing_ranks"], json!([]));
-    assert_eq!(status["summary"], "active");
-    assert!(took < QUICK, "{seen}: {took:?}");
+    // `i32::MAX`: on the base `highest + 1` overflowed (a panic in a debug build).
+    for rank in [400_000, i32::MAX] {
+        let (status, took) = settled(&[rank], None);
+        let seen = format!(
+            "rank {rank}: {} bytes, missing_ranks of {} entries",
+            size(&status),
+            status["missing_ranks"].as_array().map_or(0, Vec::len)
+        );
+        assert!(size(&status) < SMALL, "{seen}");
+        assert_eq!(ranks(&status), [i64::from(rank)], "{seen}");
+        assert_eq!(status["missing_ranks"], json!([]), "{seen}");
+        assert_eq!(status["summary"], "active", "{seen}");
+        // Beside a rank below the limit, it names no gap either: rank 0 alone is expected.
+        let (status, _) = settled(&[0, rank], None);
+        assert_eq!(status["missing_ranks"], json!([]), "{seen}");
+        assert_eq!(status["summary"], "active", "{seen}");
+        assert!(took < QUICK, "{seen}: {took:?}");
+    }
 }
 
 /// At the limit the world size is taken: its first 1,000 missing ranks are listed and the rest
@@ -249,26 +252,41 @@ const PINNED: &str =
 /// its status small. On the base both were taken up and 399,998 ranks listed missing.
 #[test]
 fn a_restored_status_over_the_limit_is_taken_up_without_its_world_size_or_its_rank() {
+    // 2^40: a rank no `i32` holds, which the base could not read, so it took up none of the run.
+    for (world, rank) in [
+        (400_000, 400_000),
+        (i64::from(i32::MAX), i64::from(i32::MAX)),
+        (1 << 40, 1 << 40),
+    ] {
+        let t0 = Instant::now();
+        let dog = watched(t0, &[0, 1], Some(2));
+        let mut before = dog.statuses(at(t0, 71), true).remove(RUN).unwrap();
+        over_the_limit(&mut before, world, rank);
+        let fresh = Watchdog::new(config());
+        let now = Instant::now();
+        assert_eq!(fresh.restore(RUN, &before, now), Ok(true), "world {world}, rank {rank}");
+        let started = Instant::now();
+        let status = fresh.statuses(now, true).remove(RUN).unwrap();
+        let took = started.elapsed();
+        let seen = format!(
+            "world {world}, rank {rank}: {} bytes, missing_ranks of {} entries",
+            size(&status),
+            status["missing_ranks"].as_array().map_or(0, Vec::len)
+        );
+        assert!(size(&status) < SMALL, "{seen}");
+        assert_eq!(status["world_size"], Value::Null, "{seen}");
+        assert_eq!(ranks(&status), [0], "{seen}");
+        assert_eq!(status["missing_ranks"], json!([]), "{seen}");
+        assert!(took < QUICK, "{seen}: {took:?}");
+    }
+    // A run whose every rank is over the limit has nothing to take up.
     let t0 = Instant::now();
-    let dog = watched(t0, &[0, 1], Some(2));
+    let dog = watched(t0, &[1], None);
     let mut before = dog.statuses(at(t0, 71), true).remove(RUN).unwrap();
-    over_the_limit(&mut before, 400_000, 400_000);
+    over_the_limit(&mut before, 2, i64::from(i32::MAX));
     let fresh = Watchdog::new(config());
-    let now = Instant::now();
-    assert_eq!(fresh.restore(RUN, &before, now), Ok(true));
-    let started = Instant::now();
-    let status = fresh.statuses(now, true).remove(RUN).unwrap();
-    let took = started.elapsed();
-    let seen = format!(
-        "{} bytes, missing_ranks of {} entries",
-        size(&status),
-        status["missing_ranks"].as_array().map_or(0, Vec::len)
-    );
-    assert!(size(&status) < SMALL, "{seen}");
-    assert_eq!(status["world_size"], Value::Null, "{seen}");
-    assert_eq!(ranks(&status), [0], "{seen}");
-    assert_eq!(status["missing_ranks"], json!([]), "{seen}");
-    assert!(took < QUICK, "{seen}: {took:?}");
+    assert_eq!(fresh.restore(RUN, &before, Instant::now()), Ok(false));
+    assert!(fresh.statuses(Instant::now(), true).is_empty());
 }
 
 /// Makes `status` name `world_size` and makes its rank 1 rank `rank`, in its entries and its carries.

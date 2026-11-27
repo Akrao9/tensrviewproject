@@ -2345,6 +2345,7 @@ impl Ingest {
                 "summary": status["summary"],
                 "running": status["server_running"],
                 "missing": status["missing_ranks"],
+                "missing_omitted": status["missing_ranks_omitted"],
                 "pauses": status["pauses"],
                 "abandoned": status["abandoned"],
                 "duplicates": status["duplicate_batches"],
@@ -2439,7 +2440,24 @@ fn parse_descriptor(descriptor: &FlightDescriptor) -> Result<Key, Status> {
             "run_id may hold only letters, digits, '-', '_' and '.'",
         ));
     }
+    if !crate::watchdog::rank_taken(i64::from(rank)) {
+        return Err(Status::invalid_argument(over_the_limit(
+            rank,
+            "nothing of this stream is stored",
+        )));
+    }
     Ok((run_id.clone(), rank))
+}
+
+/// The refusal of a rank at or over the server's limit of ranks a run (`watchdog::MAX_RANKS`), at
+/// its stream's first message or at a heartbeat, with what is not taken (lane AR-4). A sender reads
+/// the words "over this server's limit of".
+fn over_the_limit(rank: i32, not_taken: &str) -> String {
+    let limit = crate::watchdog::MAX_RANKS;
+    format!(
+        "rank {rank} is over this server's limit of {limit} ranks a run (ranks 0 to {}); {not_taken}",
+        limit - 1
+    )
 }
 
 /// Rows dropped from a batch, by the key column that was null.
@@ -2801,6 +2819,17 @@ fn batch_metadata(key: &Key, app_metadata: &[u8]) -> Result<BatchMetadata, Statu
             "app_metadata names another run or rank than the descriptor",
         ));
     }
+    // A world size over the limit would name ranks the watchdog cannot walk (lane AR-4): the batch is
+    // refused before anything of it is placed, counted or kept.
+    if let Some(world_size) = metadata
+        .world_size
+        .filter(|size| !crate::watchdog::world_size_taken(i64::from(*size)))
+    {
+        return Err(Status::invalid_argument(format!(
+            "world_size {world_size} is over this server's limit of {} ranks a run; nothing of this batch is stored",
+            crate::watchdog::MAX_RANKS
+        )));
+    }
     Ok(metadata)
 }
 
@@ -3160,6 +3189,12 @@ impl FlightService for IngestService {
             .map_err(|error| Status::invalid_argument(format!("bad heartbeat: {error}")))?;
         if !plain_run_id(&beat.run_id) || beat.rank < 0 {
             return Err(Status::invalid_argument("bad run_id or rank in the heartbeat"));
+        }
+        if !crate::watchdog::rank_taken(i64::from(beat.rank)) {
+            return Err(Status::invalid_argument(over_the_limit(
+                beat.rank,
+                "the heartbeat is not taken",
+            )));
         }
         // A stack is what the sender says it is, so it is kept only as a JSON object of a
         // bounded size: it goes into the status file as it came.

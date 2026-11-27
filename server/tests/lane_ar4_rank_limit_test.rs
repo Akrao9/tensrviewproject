@@ -14,7 +14,7 @@
 //! On `ce9da4a` all three were taken: AR-2 stored a run with `rank=2147483647`, and a world size of
 //! 2,147,483,647 made every status of its run walk two thousand million ranks. The tests here use
 //! values a few times the limit, which the base takes without a long walk, and `i32::MAX` once the
-//! walk is bounded.
+//! walk is bounded (added once it was).
 
 use std::io::{BufRead, Cursor, Read};
 use std::path::Path;
@@ -287,7 +287,7 @@ fn status_ranks(ingest: &Ingest, run: &str) -> Vec<i64> {
 async fn a_stream_from_a_rank_over_the_limit_is_refused_and_one_below_it_taken() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path()).await;
-    for rank in [100_000, 400_000] {
+    for rank in [100_000, 400_000, i64::from(i32::MAX)] {
         let run = format!("ar4_rank_{rank}");
         let (acks, ended) = put(&server.address, stream(&run, rank, None).await).await;
         let seen = format!(
@@ -311,7 +311,7 @@ async fn a_stream_from_a_rank_over_the_limit_is_refused_and_one_below_it_taken()
 async fn a_batch_naming_a_world_size_over_the_limit_is_refused_and_one_at_it_taken() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path()).await;
-    for world in [100_001, 400_000] {
+    for world in [100_001, 400_000, i64::from(i32::MAX)] {
         let run = format!("ar4_world_{world}");
         let (acks, ended) = put(&server.address, stream(&run, 0, Some(world)).await).await;
         let seen = format!(
@@ -524,4 +524,9 @@ async fn restart_over(world_size: i64, rank: i64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_server_takes_up_a_stored_run_over_the_limit_in_bounded_time() {
     restart_over(400_000, 400_000).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_server_takes_up_a_stored_run_of_world_size_and_rank_i32_max_in_bounded_time() {
+    restart_over(i64::from(i32::MAX), i64::from(i32::MAX)).await;
 }

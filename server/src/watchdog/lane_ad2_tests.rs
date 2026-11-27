@@ -228,6 +228,13 @@ fn held_for_status(dog: &Watchdog, _now: Instant) -> usize {
 /// their stream then drops, so they now read `reconnecting` with the warning they had and
 /// `stopped_as`, and are listed as stopped (P1-1). Checked rank by rank when they were retaken: no
 /// other rank's entry carries `stopped_as`. The other 26 are the base's.
+///
+/// Seven more (two statuses and five run states, all five cases of world 4,096) were taken again
+/// at lane AR-4, Nov 27, 2026: a status lists at most 1,000 missing ranks and counts the others in
+/// `missing_ranks_omitted`, and the run state's `ranks_unknown` lists at most 1,000 and counts the
+/// others in `ranks_omitted`. Checked when they were retaken: each of the seven cuts a list of more
+/// than 1,000 ranks (2,584 or 2,582 missing ranks counted, 1,448 to 2,830 unknown ones), and none of
+/// the other 27, every case of world 512 or less among them, cuts any.
 const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
     (1, true, 1, true, 400, "1223:e003d7fce7c72736", "371:a1d2652f4b8bc9c9"),
     (1, false, 0, true, 400, "331:15179483c82d6405", "108:3f785a961528264b"),
@@ -268,7 +275,7 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         true,
         400,
         "2164038:1bbe9d6b7460e2e0",
-        "12918:853269510235a058",
+        "5699:bc7a326935e704e1",
     ),
     (
         4096,
@@ -276,8 +283,8 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         512,
         true,
         400,
-        "343070:00c26a2e7a9f6a4b",
-        "18866:3d969ddfc13886fd",
+        "317288:355b8e288a420fab",
+        "4737:0c9803a3efbd4099",
     ),
     (
         64,
@@ -313,8 +320,8 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         512,
         false,
         400,
-        "343050:c44fd70bf876ebc9",
-        "18856:443572dbae681243",
+        "317288:9f2846b3511a0607",
+        "4737:784261886b830bcb",
     ),
     (
         4096,
@@ -323,7 +330,7 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         true,
         200,
         "303791:02a67843428ed4d9",
-        "18866:3d969ddfc13886fd",
+        "4737:0c9803a3efbd4099",
     ),
     (
         4096,
@@ -332,7 +339,7 @@ const AT_BASE: &[(i32, bool, usize, bool, u64, &str, &str)] = &[
         true,
         200,
         "2123513:2742447490cf087d",
-        "12918:853269510235a058",
+        "5699:bc7a326935e704e1",
     ),
 ];
 
