@@ -187,6 +187,17 @@ def _open_local(run: Mapping[str, Any], rank: int | None) -> dict[str, Any]:
     from .evidence import build_evidence
 
     files: Mapping[int, Path] = run.get("files") or {}
+    # A rank two processes wrote at once (`runs.discover_runs`' `other_writers`): its files are not
+    # one rank's records, so it is not compared, as the listing claims nothing for it.
+    others = {n: paths for n, paths in (run.get("other_writers") or {}).items() if rank is None or n == rank}
+    if others:
+        number = min(others)
+        names = [p.name for p in ([files[number]] if number in files else []) + list(others[number])]
+        raise _runs.RunLookupError(
+            f"run {run['run_id']}: rank {number} was written by two processes at once, each in a file of its own "
+            f"({', '.join(names)}), so its records are not one rank's and are not compared. Give each process its "
+            "own rank (start it under torchrun or srun, or set RANK and WORLD_SIZE) or its own run_id="
+        )
     if not files:
         raise _runs.RunLookupError(f"run {run['run_id']} has a manifest and no records yet: nothing to compare")
     key = rank if rank is not None and rank in files else min(files)

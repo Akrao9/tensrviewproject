@@ -212,15 +212,119 @@ def read_launch_again(run: RunInfo, timeout: float | None = None) -> str | None:
         return None
 
 
+# Where a launcher names a process's rank, with the variable that names the world size beside it,
+# read in this order when no process group is initialised (OG4). `RANK` comes first: under
+# `torchrun` started by `srun`, `SLURM_PROCID` is the node's task and `RANK` the global rank. The
+# world size is the same launcher's, never another's: `srun -N2 torchrun --nproc-per-node 4` would
+# otherwise read rank 5 of 2. Accelerate reads the same names, in its own order
+# (`utils/environment.py`, `get_cpu_distributed_information`); Lightning reads `SLURM_PROCID`
+# with `SLURM_NTASKS` (`plugins/environments/slurm.py`).
+_LAUNCHERS = (
+    ("RANK", "WORLD_SIZE"),  # torchrun, and anything that sets what it sets
+    ("SLURM_PROCID", "SLURM_STEP_NUM_TASKS"),  # srun: see `_slurm_step_tasks`
+    ("OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"),  # Open MPI's mpirun
+    ("PMI_RANK", "PMI_SIZE"),  # PMI: MPICH's Hydra, Intel MPI (not checked against their pages)
+)
+
+
+@dataclass(frozen=True)
+class _Placement:
+    """Where this process is, read from the environment alone: its rank and the world size, and the
+    variables they were read from (None: not read, so the rank is 0 or the world size 1)."""
+
+    rank: int
+    world_size: int
+    rank_from: str | None
+    world_from: str | None
+
+
+def _count(name: str, *, positive: bool = False) -> int | None:
+    """The variable `name` as a whole number written in ASCII digits, or None when it is not set
+    or is not one (an empty value, a sign, a digit of another script); with `positive`, None for 0."""
+    value = os.environ.get(name)
+    if value is None or not value.isascii() or not value.isdigit():
+        return None
+    number = int(value)
+    return None if positive and number == 0 else number
+
+
+def _slurm_step_tasks() -> int | None:
+    """How many tasks `srun` started in this step: `SLURM_STEP_NUM_TASKS`, which srun sets for
+    each task it starts ("Number of processes in the job step", srun(1), OUTPUT ENVIRONMENT
+    VARIABLES) and which sbatch and salloc do not set (their OUTPUT ENVIRONMENT VARIABLES do not
+    list it). Never `SLURM_NTASKS`: in a batch script or salloc's shell that is the job's task
+    count, so one plain `python` started in an allocation of four tasks would read itself as one
+    rank of four, and a reader would wait for three ranks that never come."""
+    return _count("SLURM_STEP_NUM_TASKS", positive=True)
+
+
+def _placement() -> _Placement:
+    """This process's rank and world size from the launchers' variables (`_LAUNCHERS`), for when
+    no process group is initialised. The first launcher that names a rank decides, and its own
+    variable names the world size (1 when it has none). `SLURM_PROCID` counts only inside an
+    `srun` step (`_slurm_step_tasks`): a batch script has it too (sbatch(1) lists it), and an
+    `mpirun` started from that script would hand the script's value to every process it starts.
+    The same holds for an `mpirun` started inside a step's task, which inherits the step's
+    variables too, so where `OMPI_COMM_WORLD_RANK` or `PMI_RANK` names another rank, that one is
+    read.
+    With none of them, `LOCAL_RANK` alone is read, as before: it is the rank within one node, so
+    `init` says so when the world size is above 1 or not known (`_placement_warning`). Pure: it
+    reads the environment and says nothing."""
+    for rank_name, size_name in _LAUNCHERS:
+        rank = _count(rank_name)
+        if rank is None:
+            continue
+        if rank_name == "SLURM_PROCID":
+            size = _slurm_step_tasks()
+            if size is None:
+                continue
+            # An `mpirun` started from inside a step's task inherits that task's SLURM variables;
+            # an MPI rank that differs from them is the process's own. (srun's own MPI launch sets
+            # the two alike, from recall, not checked.)
+            if any(other is not None and other != rank for other in
+                   (_count("OMPI_COMM_WORLD_RANK"), _count("PMI_RANK"))):
+                continue
+        else:
+            size = _count(size_name, positive=True)
+        return _Placement(rank, size or 1, rank_name, size_name if size else None)
+    world = _count("WORLD_SIZE", positive=True)
+    local = _count("LOCAL_RANK")
+    return _Placement(0 if local is None else local, world or 1, None if local is None else "LOCAL_RANK",
+                      "WORLD_SIZE" if world else None)
+
+
+def _placement_warning() -> str | None:
+    """What `init` says of the rank it read, with no process group, or None: one sentence at most.
+    `LOCAL_RANK` alone, in a world above 1 or of a size not known; else a rank that is not below
+    the world size."""
+    where = _placement()
+    size_name = dict(_LAUNCHERS).get(where.rank_from or "", "WORLD_SIZE")
+    world = (f"{where.world_from}={where.world_size}" if where.world_from is not None
+             else f"no {size_name}, so a world size of 1")
+    if where.rank_from == "LOCAL_RANK" and (where.world_from is None or where.world_size > 1):
+        return (
+            f"tensorquill.init took this process's rank, {where.rank}, from LOCAL_RANK, which is its rank within "
+            f"one node, not in the job: no process group is initialized and none of RANK, SLURM_PROCID (in an srun "
+            f"step), OMPI_COMM_WORLD_RANK or PMI_RANK is set, and it read {world}. On several nodes two processes "
+            "read the same rank and a records file holds both. Set RANK and WORLD_SIZE, start the job under torchrun "
+            "or srun, or call tensorquill.init after init_process_group."
+        )
+    if where.rank >= where.world_size:
+        return (
+            f"tensorquill.init read rank {where.rank} from {where.rank_from} and {world}: the rank is not below the "
+            "world size, so a reader may count ranks that are not there or miss this one. Set the launcher's world "
+            "size beside its rank, or call tensorquill.init after init_process_group."
+        )
+    return None
+
+
 def _rank() -> int:
+    """This process's rank: the process group's when one is initialised, else the launchers'
+    variables' (`_placement`)."""
     dist = sys.modules.get("torch.distributed")
     if dist is not None and dist.is_available() and dist.is_initialized():
         return dist.get_rank()
-    for name in ("RANK", "LOCAL_RANK"):
-        value = os.environ.get(name)
-        if value is not None and value.isdigit():
-            return int(value)
-    return 0
+    return _placement().rank
 
 
 def resolve_run(run_id: str | None = None) -> RunInfo:
@@ -253,6 +357,11 @@ def resolve_run(run_id: str | None = None) -> RunInfo:
         # Whether to exchange depends only on what every rank sees alike (the process group and
         # its size), never on `run_id`, a tracker or the environment, so every rank takes it.
         return _shared_run(dist, rank, run_id)
+    # No process group of several ranks: what the launchers' variables said of the rank, said once.
+    if not (dist is not None and dist.is_available() and dist.is_initialized()):
+        said = _placement_warning()
+        if said is not None:
+            _say(said, stacklevel=4)
     # One process, or several ranks with no process group: the same guarded lookup as rank 0's,
     # so a tracker that raises is passed over here too.
     found = _resolve_here(rank, run_id, stacklevel=4)
@@ -528,11 +637,12 @@ def generate_run_id() -> str:
 
 
 def _world_size() -> int:
+    """The world size: the process group's when one is initialised, else the launcher's that
+    named the rank (`_placement`), else `WORLD_SIZE`, else 1."""
     dist = sys.modules.get("torch.distributed")
     if dist is not None and dist.is_available() and dist.is_initialized():
         return dist.get_world_size()
-    value = os.environ.get("WORLD_SIZE")
-    return int(value) if value is not None and value.isdigit() and int(value) > 0 else 1
+    return _placement().world_size
 
 
 def _warn_generated_unshared(run_id: str) -> None:

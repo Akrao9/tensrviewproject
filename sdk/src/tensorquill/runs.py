@@ -73,6 +73,14 @@ run state, last step or incident, and an evidence file beside it is not read (WA
 section 5). The run ID of every line is read for it by what the listing reads anyway: the last
 megabyte, parsed, and the scan of the part before it, whose keys are each line's run ID and attempt.
 
+A rank that two processes wrote at once (the second found the first's file locked and wrote
+`<run_id>.rank<N>.<pid>.jsonl` beside it, `sink.JsonlSink`) is not one rank's records either: its
+run's row has `evidence.state` `several_writers`, with each such rank's files, no run state, last
+step or incident, and no evidence file beside them is read. The second file is never read as a
+restart of the rank (`more_files`), which would have kept one process's attempt and hidden the
+other's. Its name is read from the right, the pid in ASCII digits, so `x.rank0.bak.jsonl` is not a
+writer's; a copy named `x.rank0.<digits>.jsonl` cannot be told from one by its name.
+
 How many ranks: a file named `<run_id>.rank<N>.jsonl` holds the ranks its lines name. Every
 line of it is read for that: the last megabyte parsed, and the part before it scanned for each
 line's rank and attempt (`_attempts_in_file`, which runs anyway for L21), so a file over a
@@ -138,7 +146,7 @@ from typing import Any, Iterable, Mapping
 
 from . import manifest as _manifest
 from .identity import is_scalar_record
-from .sink import read_end_marker
+from .sink import read_end_marker, records_file_parts, writers_of
 
 DEFAULT_SOURCE = "tensorquill-out"  # where `tensorquill.init` writes without a sink
 VERBS = ("runs", "compare")
@@ -617,8 +625,17 @@ def _local_runs(folder: Path, files: Iterable[Path] | None = None) -> list[dict[
         return by_id.setdefault(run_id, {"run_id": run_id, "source": "local", "path": None, "files": {},
                                          "manifest": None, **({"files_given": True} if files is not None else {})})
 
-    for path in sorted(folder.glob("*.jsonl")) if files is None else files:
+    # A file given alone brings its rank's other writers' files with it (`sink.writers_of`), so a
+    # rank of two writers is never read as the one file given.
+    given = None if files is None else list(dict.fromkeys(p for path in files for p in writers_of(path)))
+    for path in sorted(folder.glob("*.jsonl")) if given is None else given:
         if not path.is_file():
+            continue
+        parts = records_file_parts(path)
+        if parts is not None and parts[2] is not None:
+            # `<run_id>.rank<N>.<pid>.jsonl`: a second process that wrote rank N of the run at once
+            # with the first (`sink.JsonlSink`). Kept apart, never read as a restart of the rank.
+            entry(parts[0]).setdefault("other_writers", {}).setdefault(parts[1], []).append(path)
             continue
         first = None
         run_id = _manifest.run_id_of_file(path)
@@ -669,7 +686,9 @@ def discover_runs(source: str | Path) -> list[dict[str, Any]]:
 
     `files` keeps one file a rank. A rank whose records are in several files (a restart that
     wrote a file of a name of its own) has the others in `more_files`, by rank, so no file is
-    left out (lane V4, CLI-13)."""
+    left out (lane V4, CLI-13). A rank that two processes wrote at once has the second
+    process's `<run_id>.rank<N>.<pid>.jsonl` files in `other_writers`, by rank (`sink.JsonlSink`),
+    never in `more_files`: they are not a restart of the rank. A file given alone brings them."""
     source = Path(source)
     if not source.exists():
         raise FileNotFoundError(f"{source} does not exist: nothing to list")
@@ -1018,14 +1037,17 @@ def _rank_list(ranks: list[int]) -> str:
 
 
 def _named_rank(path: Path) -> int | None:
-    """N for a file named `<anything>.rank<N>.jsonl`, as `tensorquill.init` names them."""
-    _, _, rank = path.name[: -len(".jsonl")].rpartition(".rank")
-    return int(rank) if rank.isdecimal() else None
+    """N for a file named `<anything>.rank<N>.jsonl` (or a second writer's
+    `<anything>.rank<N>.<pid>.jsonl`), as `tensorquill.init` names them (`sink.records_file_parts`)."""
+    parts = records_file_parts(path)
+    return None if parts is None else parts[1]
 
 
 def _local_row(run: Mapping[str, Any], known: Mapping[str, Any] | None) -> dict[str, Any]:
     files: Mapping[int, Path] = run.get("files") or {}
     row: dict[str, Any] = {"ranks": sorted(files)}
+    if run.get("other_writers"):
+        return _several_writers_row(files, run["other_writers"], known, row)
     if not files or known is None:
         row["evidence"] = {"state": "no_records", "detail": "the manifest is written and no rank has written a record yet"}
         return row
@@ -1090,6 +1112,31 @@ def _several_run_ids_row(several: list[Mapping[str, Any]], row: dict[str, Any]) 
                   "claimed for it, and an evidence file beside it is not read. Read each run's records on their own: "
                   "python -m tensorquill compare gives no divergence answer for such a file, and python -m tensorquill "
                   "refuses it when its training records are of more than one run",
+    }
+    return row
+
+
+def _several_writers_row(files: Mapping[int, Path], others: Mapping[int, list[Path]],
+                         known: Mapping[str, Any] | None, row: dict[str, Any]) -> dict[str, Any]:
+    """A run of which a rank was written by two processes at once, each in a file of its own: the
+    first's `<run_id>.rank<N>.jsonl` and the second's `<run_id>.rank<N>.<pid>.jsonl` (`sink.JsonlSink`,
+    which writes the second when it finds the first locked). Neither file is the rank's whole, and
+    read together they would be one rank that repeated its steps, or, by attempts, a restart that
+    hid the other process: so, as for `several_run_ids`, the row claims no run state, last step or
+    incident, and no evidence file beside them is read. `evidence.state` is `several_writers`, with
+    each such rank's files, the first writer's first."""
+    ranks = sorted(set(known["ranks"] if known is not None else files) | set(others))
+    row["ranks"] = ranks
+    writers = [{"rank": number, "files": [p.name for p in ([files[number]] if number in files else []) + others[number]]}
+               for number in sorted(others)]
+    first = writers[0]
+    more = f" (and {len(writers) - 1} more rank{'s' if len(writers) > 2 else ''} like it)" if len(writers) > 1 else ""
+    row["evidence"] = {
+        "state": "several_writers", "writers": writers,
+        "detail": f"rank {first['rank']}{more} was written by {len(first['files'])} processes at once, each in a file of "
+                  f"its own ({', '.join(first['files'])}): they are not one rank's records, so no run state, last step "
+                  "or incident is claimed for the run, and an evidence file beside them is not read. Give each process "
+                  "its own rank (start it under torchrun or srun, or set RANK and WORLD_SIZE) or its own run_id=",
     }
     return row
 

@@ -51,8 +51,9 @@ from . import compare as _compare
 from . import manifest as _manifest
 from . import runs as _runs
 from .identity import MalformedRecordError, check as check_identity, in_file, is_scalar_record
-from .sink import read_end_marker
+from .sink import read_end_marker, writers_block
 from .evidence import (
+    with_writers,
     ALL_RANKS_VIEW,
     ATTN_KINDS,
     HEAD_NUMBERS,
@@ -356,7 +357,11 @@ class Source:
         evidence = {**evidence, "run": _manifest.run_block(run_id, _manifest.find_manifest(path, run_id))}
         # Read at every call, not kept: the marker is written after the last record, so the file's
         # stamp does not move when it appears.
-        return {**evidence, "run_end": read_end_marker(path)} if path.suffix == ".jsonl" else evidence
+        if path.suffix != ".jsonl":
+            return evidence
+        # Another process's file of the same run ID and rank beside it (`sink.writers_block`), read at
+        # every call as the marker is: this file is then one of the rank's writers, not its whole.
+        return with_writers({**evidence, "run_end": read_end_marker(path)}, writers_block(path))
 
     # One rank's step records, for series ------------------------------------------------
 
@@ -1225,6 +1230,8 @@ def list_incidents(source: Source, arguments: Mapping[str, Any]) -> dict[str, An
         answer["detection"] = evidence["detection"]
     if isinstance(evidence.get("run_end"), dict):
         answer["run_end"] = evidence["run_end"]  # a local file: whether its session closed it
+    if isinstance(evidence.get("writers"), dict):
+        answer["writers"] = evidence["writers"]  # a local file of a rank another process wrote too
     if isinstance(evidence.get("head_trends"), dict):
         # The probe's head numbers over the run (`evidence.head_logit_trends`, with the positions
         # whose sums overflow), wherever the evidence has them (L15, lane Y3): one rank's evidence
@@ -2154,6 +2161,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
             + _NOT_NEWER_WORDS.format(where="rank.rows_not_newer", whose="that rank") +
             " For a local .jsonl file, `run_end` says whether its session closed it: any state but `closed` means not"
             " known to have finished (still running, killed or never closed look the same)."
+            " `writers`, only when another process wrote the same run ID and rank at once in a file of its own beside"
+            " it (`<run_id>.rank<N>.<pid>.jsonl`), names those files: this file is one of the rank's writers, not the"
+            " rank's whole, whatever its run state says."
             " Where one rank's evidence has them, `head_trends` gives the probe's language-model head numbers over"
             " the run: values with no threshold, never an incident (get_series with kind head gives each probe's). "
             + _SKIPS_WORDS + _TENSORS_WORDS + _BY_RANK_WORDS + _KIND_KEYS_WORDS + _MEASUREMENTS_WORDS + _RULES_WORDS
@@ -2302,7 +2312,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
             " `evidence.state` \"several_run_ids\" is a run one of whose .jsonl files holds, for a rank, the records"
             " of more than one run ID (`evidence.run_ids`, and `evidence.files` with each file's ranks and IDs): its"
             " rows are not one run's, so the row gives no run state, last step or incident, whatever evidence file"
-            " lies beside it, and compare_runs on another of those IDs names the file. A run"
+            " lies beside it, and compare_runs on another of those IDs names the file."
+            " `evidence.state` \"several_writers\" is a run of which a rank was written by two processes at once, each"
+            " in a file of its own (`evidence.writers`, each rank's files): the row gives no run state, last step or"
+            " incident, and compare_runs refuses that rank. A run"
             " with `has_manifest` false was recorded before runs had a project, and is listed under"
             " `uncategorized` with its run ID as its name. `rank_count` is how many ranks the run has, or null when the"
             " listing cannot count them without reading every record (`rank_count_not_known` says why). For a run of"
