@@ -24,8 +24,11 @@ tensorlens-out/
 /*.evidence.json
 
 # The planning records (plans, bug list, failure list, research review, archived reviews): a git repository
-# of their own in this folder since Nov 23, 2026. The contract pages and the GPU run sheet stay tracked here.
+# of their own in this folder since Nov 23, 2026. The GPU run sheet stays tracked here. The contract pages
+# (*_CONTRACT.md) are kept with the planning records since Nov 27, 2026 and are not tracked: a test reads one
+# through conftest.contract_page, from the folder TENSORQUILL_CONTRACT_PAGES names, and is skipped without it.
 /planning/
+/*_CONTRACT.md
 
 # Working documents kept beside the repository, not in it: the task list and code reviews
 /PENDING_CODING_TASKS.md

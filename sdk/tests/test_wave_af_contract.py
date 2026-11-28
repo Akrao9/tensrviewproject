@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import conftest
 import pytest
 
 from tensorquill import evidence as ev
@@ -38,12 +39,14 @@ def test_the_cases_are_those_of_the_page_and_its_base():
     assert DOCUMENT["contract"] == "WAVE_AF_CONTRACT.md"
     assert len(DOCUMENT["base"]) == 40
     assert len(CASES) == 33 and len(PINS) == 6 and len(NEW) == 27
-    page = (ROOT / DOCUMENT["contract"]).read_text()
     for name, body in CASES.items():
         assert body["section"] in (1, 2), name
         if body["section"] == 1:
-            assert f"`{body['field']}`" in page, name
             assert set(body["expected"]) == set(body["today"]) <= BOUNDARIES, name
+    page = conftest.contract_page(DOCUMENT["contract"])  # last: with no page here, the checks above have run
+    for name, body in CASES.items():
+        if body["section"] == 1:
+            assert f"`{body['field']}`" in page, name
     assert "divergence_provenance_keys_are_not_series" in page
 
 

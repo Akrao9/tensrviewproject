@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import conftest
 import pytest
 
 from tensorquill import divergence as dv
@@ -70,7 +71,7 @@ def matches(found: dict, expected: dict) -> bool:
 
 
 def test_the_file_holds_the_cases_the_page_names():
-    page = (ROOT / "WAVE_AE_CONTRACT.md").read_text()
+    page = conftest.contract_page("WAVE_AE_CONTRACT.md")
     assert len(CASES) == 36 and len(PINS) == 21 and len(NEW) == 15
     assert DOCUMENT["base"] == "265311c"
     for name, body in CASES.items():

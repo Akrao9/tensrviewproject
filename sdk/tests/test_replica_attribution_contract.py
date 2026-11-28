@@ -18,6 +18,7 @@ import json
 import math
 from pathlib import Path
 
+import conftest
 import pytest
 
 from test_replica_contract import ALL as EARLIER
@@ -116,7 +117,7 @@ def test_each_case_has_the_coverage_attribution_and_incident_count_the_contract_
 
 def test_the_file_holds_the_cases_the_page_names():
     assert len(NEW) == 27
-    page = (Path(__file__).parents[2] / "REPLICA_OBSERVATION_CONTRACT.md").read_text()
+    page = conftest.contract_page("REPLICA_OBSERVATION_CONTRACT.md")
     for case, _ in NEW:
         assert f"`{case}`" in page, f"{case} is not named in section 4a"
 

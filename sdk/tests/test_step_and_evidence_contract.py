@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import conftest
 import pytest
 
 from tensorquill import evidence as ev
@@ -33,7 +34,7 @@ def _numbers(value):
 
 
 def test_the_file_holds_the_cases_the_page_names():
-    page = (ROOT / "STEP_AND_EVIDENCE_CONTRACT.md").read_text()
+    page = conftest.contract_page("STEP_AND_EVIDENCE_CONTRACT.md")
     assert len(CASES) == 45 and len(PINS) == 12
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"

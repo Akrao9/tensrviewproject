@@ -6,7 +6,9 @@ import torch
 from torch import nn
 
 SERVER_BIN_ENV = "TENSORQUILL_SERVER_BIN"
-_TARGET = Path(__file__).resolve().parents[2] / "server" / "target"
+_ROOT = Path(__file__).resolve().parents[2]
+_TARGET = _ROOT / "server" / "target"
+CONTRACT_PAGES_ENV = "TENSORQUILL_CONTRACT_PAGES"
 
 
 def built_server_binary(target: Path = _TARGET) -> Path | None:
@@ -31,6 +33,23 @@ def name_built_server(environ=os.environ, target: Path = _TARGET) -> Path | None
 
 # Before any test module is imported, so the tests' skip decision and the Rust detectors agree for the run.
 name_built_server()
+
+
+def contract_page(name: str) -> str:
+    """The text of the contract page `name` (a `*_CONTRACT.md`), for a test that holds the page to the code.
+
+    The contract pages are kept outside this repository since Nov 27, 2026, so a checkout holds none of
+    them. When the variable TENSORQUILL_CONTRACT_PAGES names a folder, the page is read from it, and a page
+    missing there is an error, never a skip: a run that was told where the pages are must read them. With
+    the variable unset, a page at the repository's root is read, and with none there the calling test is
+    skipped. Call it inside the test, after the checks that need no page, so that those still run."""
+    folder = os.environ.get(CONTRACT_PAGES_ENV)
+    if folder:
+        return (Path(folder) / name).read_text(encoding="utf-8")
+    page = _ROOT / name
+    if page.is_file():
+        return page.read_text(encoding="utf-8")
+    pytest.skip(f"the contract page {name} is kept outside this repository; {CONTRACT_PAGES_ENV} names its folder")
 
 
 class ToyMoE(nn.Module):

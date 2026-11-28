@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import conftest
 import pytest
 
 from tensorquill import evidence as ev
@@ -29,7 +30,7 @@ def of(part):
 
 
 def test_the_file_holds_the_cases_the_page_names():
-    page = (ROOT / "DETECTOR_RULES_CONTRACT.md").read_text()
+    page = conftest.contract_page("DETECTOR_RULES_CONTRACT.md")
     assert {part: len(of(part)) for part in PARTS} == PARTS and len(CASES) == sum(PARTS.values())
     for name, body in CASES.items():
         assert f"`{name}`" in page, f"{name} is not named on the page"

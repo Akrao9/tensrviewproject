@@ -48,6 +48,7 @@ import json
 import math
 from pathlib import Path
 
+import conftest
 import pytest
 
 from tensorquill import evidence
@@ -55,7 +56,6 @@ from tensorquill import evidence
 ROOT = Path(__file__).parents[2]
 DOCUMENT = json.loads((Path(__file__).parent / "fixtures" / "wave_al" / "cases.json").read_text())
 CASES = DOCUMENT["cases"]
-PAGE = (ROOT / DOCUMENT["contract"]).read_text()
 EXPERIMENTS = ROOT / "experiments" / "protocol-v5"
 ROWS = [c for c in CASES if c["section"] in (1, 2)]
 SCALAR = [c for c in CASES if c["section"] == 4]
@@ -90,14 +90,16 @@ def test_the_document_and_the_page():
     names = [c["name"] for c in CASES]
     assert len(names) == len(set(names))
     for case in CASES:
-        assert f"`{case['name']}`" in PAGE, case["name"]
         assert case["section"] in (1, 2, 4), case["name"]
         assert case["paths"], case["name"]
         if case["section"] in (1, 2):
             assert {"row", "expect", "today", "records"} <= set(case), case["name"]
         else:
             assert {"expect", "records"} <= set(case), case["name"]
-    assert "Where each decision stands" in PAGE
+    page = conftest.contract_page(DOCUMENT["contract"])  # last: with no page here, the checks above have run
+    for case in CASES:
+        assert f"`{case['name']}`" in page, case["name"]
+    assert "Where each decision stands" in page
 
 
 def test_the_measurements_the_page_cites_are_recorded():

@@ -22,6 +22,7 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 
+import conftest
 import pytest
 import torch
 from torch import nn
@@ -103,17 +104,18 @@ def test_the_pages_say_identity_check_bounds_seq_at_int64_as_it_does():
         check({**scalar, "seq": BOUNDS["seq"][0] + 1})
     reason = "a scalar-only record needs a seq, an integer of 0 or more that Int64 holds"
     assert reason in str(refused.value)
-    contract = (ROOT / "WAVE_AF_CONTRACT.md").read_text(encoding="utf-8")
-    assert "`seq` is not bounded by `identity.check`" not in contract
-    assert ("a scalar-only record's `seq` is bounded by `identity.check` at Int64 too, with the reason "
-            f'"{reason}"') in contract
-    assert "- `seq` is an integer of 0 or more that Int64 holds, counted per session" in (
-        ROOT / "WAVE_AL_CONTRACT.md").read_text(encoding="utf-8")
     for words in ('`"record": "scalars"` and a `seq` that is an integer of 0 or more that Int64 holds |',
                   "or without a `seq` that is an integer of 0 or more that Int64 holds, is not valid",
                   "So is one whose `seq` is past Int64, the column's type; a reader of the local file refuses the "
                   "whole file on such a line, as on a negative step (`identity.check`, Nov 27, 2026)."):
         assert words in README, words
+    # The two contract pages last: with no page in the checkout, the checks above have run.
+    contract = conftest.contract_page("WAVE_AF_CONTRACT.md")
+    assert "`seq` is not bounded by `identity.check`" not in contract
+    assert ("a scalar-only record's `seq` is bounded by `identity.check` at Int64 too, with the reason "
+            f'"{reason}"') in contract
+    assert "- `seq` is an integer of 0 or more that Int64 holds, counted per session" in conftest.contract_page(
+        "WAVE_AL_CONTRACT.md")
 
 
 # --- Lane AS-1's seam: the README on Python's `ranks_unknown` ------------------------------------------

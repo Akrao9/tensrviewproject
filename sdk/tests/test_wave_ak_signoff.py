@@ -8,13 +8,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import conftest
+
 ROOT = Path(__file__).resolve().parents[2]
-CONTRACT = (ROOT / "CHECKPOINT_TENSOR_CONTRACT.md").read_text()
 README = (ROOT / "sdk" / "README.md").read_text()
 
 
 def section(number: int) -> str:
-    """One numbered section of the contract, heading included."""
+    """One numbered section of the contract, heading included. Read at the call, so that with no page in the
+    checkout the test that asked is skipped and the README's test still runs."""
+    CONTRACT = conftest.contract_page("CHECKPOINT_TENSOR_CONTRACT.md")
     start = CONTRACT.index(f"\n## {number}. ")
     end = CONTRACT.find("\n## ", start + 1)
     return CONTRACT[start : end if end != -1 else len(CONTRACT)]

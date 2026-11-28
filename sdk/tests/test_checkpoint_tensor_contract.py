@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import conftest
 import pytest
 import torch
 
@@ -30,7 +31,7 @@ LISTS = ("missing", "missing_frozen", "missing_buffers", "unexpected", "shape_di
 
 
 def test_the_file_holds_the_cases_the_page_names():
-    page = (ROOT / "CHECKPOINT_TENSOR_CONTRACT.md").read_text()
+    page = conftest.contract_page("CHECKPOINT_TENSOR_CONTRACT.md")
     assert len(COVERAGE) == 39 and len(RECORDS) == 17
     assert sum(body["status"] == "pin" for body in CASES.values()) == 4
     for name, body in CASES.items():
