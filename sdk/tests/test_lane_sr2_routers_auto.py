@@ -215,8 +215,9 @@ def test_a_class_not_in_the_registry_finds_no_router_and_says_so_once_under_moe_
     assert "not in TensorQuill's router registry" in records[0]["moe_refused"][key]
     assert not any("moe_refused" in r for r in records[1:])
     assert not any("moe" in r or "moe_top_k" in r for r in records)
-    # No hook beyond what a router-only session with no router registers.
-    assert len(model.net._forward_hooks) == hooks_before
+    # With no router found the model is captured in the full mode, as with no routers= at all (the
+    # owner, Nov 27, 2026): its layer is hooked, and the refusal above is still written.
+    assert len(model.net._forward_hooks) == hooks_before + 1
     evidence = build_evidence(records)
     router = [entry for entry in evidence["not_checked"] if entry.get("check") == "router"]
     assert router and router[0]["routers"] == [key] and router[0]["kinds"] == list(MOE_KINDS)
@@ -241,6 +242,26 @@ def test_auto_takes_the_router_only_mode_as_a_hand_given_map_does():
         watched.append(list(session.layer_names))
         session.close()
     assert watched[0] == watched[1] == [] != watched[2]
+
+
+def test_auto_that_finds_no_router_takes_the_full_mode_as_no_routers_does():
+    """The owner's answer of Nov 27, 2026: "auto" takes the router-only mode only when a router is found.
+    A class not in the registry, and a registered class none of whose routers fits, are captured as a
+    run with no routers= is; `capture="routers"` given by hand still holds."""
+    def watched(model, **kwargs):
+        session = tensorquill.init(model, run_id="mode", sink=tensorquill.MemorySink(), **kwargs)
+        try:
+            return list(session.layer_names)
+        finally:
+            session.close()
+
+    dense = lambda: nn.Sequential(nn.Linear(H, H), nn.Linear(H, 1))  # noqa: E731
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert watched(dense(), routers="auto") == watched(dense()) != []
+        unfit = lambda: _mixtral_4x(num_experts_per_tok=None)  # noqa: E731  # every router refused
+        assert watched(unfit(), routers="auto") == watched(unfit()) != []
+        assert watched(dense(), routers="auto", capture="routers") == []
 
 
 class _Router5(nn.Module):

@@ -5930,8 +5930,9 @@ def init(
             `moe_refused`, named by the class. A router the entry names that does not fit the model (a
             module missing, a configuration value absent, a class or a weight shape other than the
             entry's) is refused by name under `moe_refused`, as a hand-given router is. Nothing is
-            guessed. `"auto"` takes the router-only mode, as a map does. Without it, nothing reads the
-            registry.
+            guessed. `"auto"` takes the router-only mode, as a map does, when it finds a router to count;
+            when it finds none the model is captured in the full mode, as with no `routers=`. Without
+            it, nothing reads the registry.
         grads: True to record gradient norms every step, False or 0 to disable automatic
             gradient norm capture, or a positive integer N to record every Nth captured step.
         weights: check each parameter's norm after the optimizer step every N steps
@@ -6087,7 +6088,15 @@ def init(
     """
     if not isinstance(pinned_flush, bool):
         raise ValueError(f"pinned_flush must be True or False, not {pinned_flush!r}")
-    mode = capture if capture is not None else ("routers" if routers else "full")
+    if capture is not None:
+        mode = capture
+    elif isinstance(routers, str) and routers == "auto":
+        # routers="auto" takes the router-only mode only when the registry finds a router to count (the
+        # owner, Nov 27, 2026): a class not in it, or one none of whose routers fits, is captured as a
+        # run with no routers= is, and the refusal is still written under `moe_refused`.
+        mode = "routers" if _router_registry.resolve(model).routers else "full"
+    else:
+        mode = "routers" if routers else "full"
     if mode not in CAPTURE_MODES:
         raise ValueError(f"capture must be one of {sorted(CAPTURE_MODES)}, got {capture!r}")
     if mode == "routers" and not routers:
