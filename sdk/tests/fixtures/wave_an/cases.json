@@ -1700,7 +1700,7 @@
    "paths": [
     "rule"
    ],
-   "lane": "AN-2, AN-5",
+   "lane": "AN-2, FR-4",
    "release": "0.1.0",
    "why": "Parts through step 99, steps 100 to 120 held: a read returns through 99 and names both.",
    "input": {
