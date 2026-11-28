@@ -64,6 +64,7 @@ from .probe import ProbeState, find_head, install_head_hook, install_probe_hooks
 from .sink import JsonlSink, Sink, clear_end_marker, records_file_name, records_file_of, write_end_marker
 from .system import SystemPart, SystemReadings
 from . import manifest as _manifest
+from . import router_registry as _router_registry
 from .tracker import LaunchRead, RunInfo, _world_size, resolve_run, tracker_labels
 
 STATS = ("mean", "std", "abs_max", "zero_frac")
@@ -426,14 +427,31 @@ def _index_range_problem(spec: Router, counts: torch.Tensor, n: int, steps: Sequ
     )
 
 
-def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: Any = None) -> str:
+def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: Any = None,
+             auto: str | None = None) -> str:
     """Why a router is not counted and the two ways to have it counted, as one text: the
     session's warning and the value of `moe_refused` (so the evidence and the server print
     the same words). The fixes depend on how the router was named, which only the capture
     knows, and for two reasons on the reason itself (`fix`, set by `_router_hook`): output on
     another device than the counts (`device`), where the inner module's output would be too,
     and a `top_k` above the number of experts. No "; ": the evidence joins several routers'
-    reasons with it."""
+    reasons with it.
+
+    `auto`, for a router `routers="auto"` chose (lane SR2), names the class and entry that chose it.
+    Its reason then says how the registry reads the router (an `indices=` of TensorQuill's, `_AutoIndices`,
+    not the user's), and the fix is the one way left: the router given by hand."""
+    if auto is not None:
+        why = why.replace(
+            "its indices= function returned",
+            'routers="auto" reads the chosen experts as the first integer tensor of its output, and found', 1,
+        )
+        hand = (
+            f"pass routers={{{name!r}: tensorquill.Router({spec.n_experts}, {spec.top_k}, indices=...)}} by hand "
+            f"with a function that returns the chosen expert indices from its output"
+        )
+        if fix == "device":
+            hand += f" on {device}, where the counts are"
+        return f'{why}. routers="auto" chose this router for {auto}. To count it, {hand}'
     inner = "name the module inside it whose output is the router's logits"
     if fix is not None and fix.startswith("top_k=") and int(fix.removeprefix("top_k=")) > spec.n_experts:
         fix = None  # more ids a token than experts: no top_k would count them, so the usual two fixes
@@ -478,6 +496,48 @@ def _refusal(name: str, spec: Router, why: str, fix: str | None = None, device: 
             f"{spec.n_experts - 1}, one or {spec.top_k} for each token, or drop indices= and {inner}"
         )
     return f"{why}. To count it, {fix}"
+
+
+class _AutoIndices:
+    """The `indices=` of a router `routers="auto"` chose in the registry's `INDICES` form
+    (`router_registry`): the first integer tensor at the top level of the router's output, which the
+    entry's source was read to hold the chosen expert ids. With none, it returns the first
+    floating-point tensor, or else the output as it is, which `_router_hook` refuses by its type (and
+    `_refusal` words for `routers="auto"`): never the top-k of logits, which for a router that leaves
+    the choice to its parent (DeepSeek-V3's on transformers 5.0 to 5.12) would count other experts
+    with no refusal. Reads types only and never raises, so it is the same under `torch.compile`."""
+
+    __slots__ = ("family",)
+
+    def __init__(self, family: str) -> None:
+        self.family = family
+
+    def __call__(self, output: Any) -> Any:
+        found = _first_tensor(output, integer=True)
+        if found is not None:
+            return found
+        other = _first_tensor(output, integer=False)
+        return other if other is not None else output
+
+    def __repr__(self) -> str:
+        return f'<routers="auto" indices of {self.family}>'
+
+
+def _auto_refusal(name: str, why: str, auto: Any) -> str:
+    """The `moe_refused` text of a router `routers="auto"` refused before any hook (`router_registry.resolve`):
+    the registry's reason and how to count it by hand. Under the model class's own name when no router
+    could be named (a class not in the registry, a configuration that does not say where routers are).
+    The fix names no numbers: a router refused for its width or its top_k does not route with the
+    configuration's, and one given those by hand would be counted wrongly; a name that is no module of
+    the model cannot be given at all."""
+    hand = "tensorquill.Router(n_experts, top_k) with the number of experts and the top_k it routes with"
+    if name == auto.model_class:
+        return f"{why}. To count its routers, pass routers= by hand, each router module's name mapped to {hand}"
+    if name in auto.missing:
+        return (f"{why}. To count the router of that layer, pass routers= by hand with the name of the module "
+                f"that routes it, mapped to {hand}")
+    return (f"{why}. To count it, pass routers={{{name!r}: {hand}}} by hand, with indices= if the first "
+            f"integer tensor of its output is not the chosen expert ids")
 
 
 _log = logging.getLogger("tensorquill")
@@ -1459,6 +1519,7 @@ class _Plan:
     head: tuple[str | None, str | None, str | None]
     scaler: Any
     mirror_scalars: bool = False  # wrap the trackers' logging calls (`mirror.py`)
+    auto: Any = None  # what `routers="auto"` resolved (`router_registry.Resolution`), or None without it
 
 
 def _plan_session(
@@ -1466,7 +1527,7 @@ def _plan_session(
     *,
     every: int,
     layers: LayerFilter | Sequence[str] | str | None,
-    routers: Mapping[str, Router | int] | None,
+    routers: Mapping[str, Router | int] | str | None,
     grads: bool | int,
     weights: bool | int,
     replica_every: int,
@@ -1540,6 +1601,17 @@ def _plan_session(
     replicas = _select_replica_params(params, replica_params)
     selected = _select_layers(model, layers, root=True)
     modules = dict(model.named_modules())
+    auto = None
+    if isinstance(routers, str) and routers == "auto":
+        # Lane SR2: the routers from the registry, an exact class and the model's configuration, here,
+        # before any hook is registered; nothing is called in the model. Only this option reads the
+        # registry, so a run that does not pass it plans what it planned before.
+        auto = _router_registry.resolve(model)
+        family = auto.entry.family if auto.entry is not None else auto.model_class
+        routers = {
+            name: Router(n, k, indices=_AutoIndices(family) if form == _router_registry.INDICES else None)
+            for name, (n, k, form) in auto.routers.items()
+        }
     planned_routers = {
         name: spec if isinstance(spec, Router) else Router(int(spec))
         for name, spec in (routers or {}).items()
@@ -1557,7 +1629,7 @@ def _plan_session(
         replicas=replicas,
         selected=selected, routers=planned_routers, probe_blocks=probe_blocks, head=head,
         scaler=scaler if scaler is not None and scaler.is_enabled() else None,
-        mirror_scalars=mirror_scalars,
+        mirror_scalars=mirror_scalars, auto=auto,
     )
 
 
@@ -1621,7 +1693,7 @@ class Session:
         every: int,
         sink: Sink,
         layers: LayerFilter | Sequence[str] | str | None,
-        routers: Mapping[str, Router | int] | None,
+        routers: Mapping[str, Router | int] | str | None,
         grads: bool | int = True,
         weights: bool | int = True,
         auto_step: bool,
@@ -1730,6 +1802,14 @@ class Session:
         # ranges there (`_settle`); the hook's own list stays the training thread's.
         self._router_first: dict[str, tuple[str, str | None]] = {}
         self._router_refusals_written: set[str] = set()
+        # `routers="auto"` (lane SR2): the class and entry that chose each router, for its refusal's words
+        # (`_refusal`), and the routers the registry refused before any hook, written under `moe_refused`
+        # with the first block (`_router_refusals`, `_settle_refusals`) and said once, here. Both empty
+        # without the option.
+        self._auto_chosen: dict[str, str] = {}
+        self._auto_refused: dict[str, str] = {}
+        if plan.auto is not None:
+            self._say_auto(plan.auto)
         # Each router's `moe_source` once it is known and written (`_moe_forms`, contract part 7).
         self._moe_source_written: set[str] = set()
 
@@ -3609,12 +3689,32 @@ class Session:
     def _router_refusals(self) -> dict[str, str]:
         """Each refused router's reason: why, and the fixes for how it was named (`_refusal`). On the
         pinned path a router's first reason may be one the writer found (`_router_first`)."""
-        out: dict[str, str] = {}
+        out: dict[str, str] = dict(self._auto_refused)
         for name, found in self._router_problems.items():
             first = self._router_first.get(name) or (found[0] if found else None)
             if first:
-                out[name] = _refusal(name, self._routers[name], *first, device=self._counts[name].device)
+                out[name] = _refusal(name, self._routers[name], *first, device=self._counts[name].device,
+                                     auto=self._auto_chosen.get(name))
         return out
+
+    def _say_auto(self, auto: Any) -> None:
+        """What `routers="auto"` chose, logged once on the `tensorquill` logger at INFO, and each router it
+        refused before any hook, said once in a warning as a refused router is (`_say_router_problems`,
+        which then leaves it alone). A class not in the registry is said as such."""
+        label = f"{auto.model_class} ({auto.entry.family})" if auto.entry is not None else auto.model_class
+        self._auto_chosen = {name: label for name in self._routers}
+        self._auto_refused = {name: _auto_refusal(name, why, auto) for name, why in auto.refused.items()}
+        if auto.layout is not None:
+            try:
+                _log.info("%s", _router_registry.chosen_line(auto))
+            except Exception:  # noqa: BLE001  # the line is lost, never the session
+                pass
+        for name, reason in self._auto_refused.items():
+            self._router_problems_said.add(name)
+            if name == auto.model_class:
+                _warn(f"TensorQuill is counting no router: {reason}. No expert load is recorded.")
+            else:
+                _warn(f"TensorQuill is not counting the router {name!r}: {reason}. Its expert loads are not recorded.")
 
     def _moe_forms(self, counts: torch.Tensor, n: int, refused: Mapping[str, str]) -> dict[str, dict[str, str]]:
         """`moe_source` for each router counted in this block and not said before (contract part 7):
@@ -4407,7 +4507,7 @@ class Session:
                          hook_refusals: Mapping[str, tuple[str, str | None]]) -> dict[str, str]:
         """Each router's refusal for this block, as `_judge_index_ranges` and `_router_refusals` make it on
         the blocking path: its first problem ever; the index ranges judged when the hooks had found none."""
-        refused: dict[str, str] = {}
+        refused: dict[str, str] = dict(self._auto_refused)
         offset = 0
         for name, spec in self._routers.items():
             size = n * _count_width(spec)
@@ -4419,7 +4519,8 @@ class Session:
                 if first is not None:
                     self._router_first[name] = first
             if first is not None:
-                refused[name] = _refusal(name, spec, *first, device=self._counts[name].device)
+                refused[name] = _refusal(name, spec, *first, device=self._counts[name].device,
+                                         auto=self._auto_chosen.get(name))
             offset += size
         return refused
 
@@ -5734,7 +5835,7 @@ def init(
     sink: Sink | None = None,
     capture: str | None = None,
     layers: LayerFilter | Sequence[str] | str | None = None,
-    routers: Mapping[str, Router | int] | None = None,
+    routers: Mapping[str, Router | int] | str | None = None,
     grads: bool | int | None = None,
     weights: bool | int | None = None,
     auto_step: bool = True,
@@ -5820,7 +5921,17 @@ def init(
             which costs several times more. Under both, a model that is itself one leaf module
             (an `nn.Linear` alone) is summarized under its class name (`"Linear"`). Or module
             names, or a `(name, module) -> bool` filter; `()` for none.
-        routers: MoE router module names mapped to their expert count or a `Router`.
+        routers: MoE router module names mapped to their expert count or a `Router`. Or `"auto"`
+            (opt-in): the routers of a Hugging Face model class in TensorQuill's router registry
+            (`router_registry`: Mixtral, OLMoE, Qwen2-MoE, Qwen3-MoE, DeepSeek-V3, Granite-MoE), matched
+            exactly by the class's module and name, with `n_experts` and `top_k` read from
+            `model.config`. Worked out here, before any hook, and logged once on the `tensorquill` logger
+            at INFO. A class not in the registry finds no router: said once in a warning and under
+            `moe_refused`, named by the class. A router the entry names that does not fit the model (a
+            module missing, a configuration value absent, a class or a weight shape other than the
+            entry's) is refused by name under `moe_refused`, as a hand-given router is. Nothing is
+            guessed. `"auto"` takes the router-only mode, as a map does. Without it, nothing reads the
+            registry.
         grads: True to record gradient norms every step, False or 0 to disable automatic
             gradient norm capture, or a positive integer N to record every Nth captured step.
         weights: check each parameter's norm after the optimizer step every N steps
