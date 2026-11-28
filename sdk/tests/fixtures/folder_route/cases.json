@@ -1,0 +1,1835 @@
+{
+ "contract": "WAVE_AS_CONTRACT.md",
+ "base": "1dddcce262373c1b3a552b53dff6ec639a8c2cb7",
+ "how_to_read": "Each case is data the folder route must make true. Conversion cases (section 2) hold a line and the row today's sender stores for it; the others hold what the page's rules give. Values are written as make_cases.py says.",
+ "names": {
+  "beat_file": "{stem}.beat.json",
+  "stop_notice": "{stem}.stop.json",
+  "end_marker": "{stem}.end.json",
+  "end_version_key": "end_version",
+  "end_key": "rank_end",
+  "ended_key": "ended",
+  "beat_marker": "tensorquill_beat",
+  "stop_marker": "tensorquill_capture_stopped"
+ },
+ "rules": {
+  "silent_floor_seconds": 300,
+  "beat_stale_intervals": 3,
+  "beat_stale_min_seconds": 30,
+  "store_key_hex_digits": 16
+ },
+ "cases": [
+  {
+   "name": "convert_a_plain_step",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a version 1 step record with the two keys capture always writes",
+   "run_id": "fr-convert-a-plain-step",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-plain-step\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"lr\":[0.001,0.0005],\"clip_grad_norm\":1.0,\"step_skipped\":false}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-plain-step",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "lr": [
+     0.001,
+     0.0005
+    ],
+    "grad_norm": 0.25,
+    "clip_grad_norm": 1.0,
+    "step_skipped": false,
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_grad_norm_null_is_a_null_column",
+   "section": 2,
+   "kind": "conversion",
+   "about": "capture writes grad_norm as null when it has none: a null column",
+   "run_id": "fr-convert-grad-norm-null-is-a-null-column",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-grad-norm-null-is-a-null-column\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":null}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-grad-norm-null-is-a-null-column",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_record_with_no_version",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a record written before schema_version existed: record_version is null",
+   "run_id": "fr-convert-a-record-with-no-version",
+   "line": "{\"run_id\":\"fr-convert-a-record-with-no-version\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-record-with-no-version",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_layers_keep_the_model_order",
+   "section": 2,
+   "kind": "conversion",
+   "about": "layers as a map of structs, in the record's order (10 after 2)",
+   "run_id": "fr-convert-layers-keep-the-model-order",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-layers-keep-the-model-order\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"layers\":{\"model.layers.2\":{\"mean\":0.1,\"std\":1.0,\"abs_max\":3.5,\"zero_frac\":0.0},\"model.layers.10\":{\"mean\":-0.2,\"std\":0.9,\"abs_max\":2.5,\"zero_frac\":0.01},\"model.layers.3\":{\"mean\":0.0,\"std\":1.1,\"abs_max\":4.0,\"zero_frac\":0.0}}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-layers-keep-the-model-order",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "layers": [
+     [
+      "model.layers.2",
+      {
+       "mean": 0.1,
+       "std": 1.0,
+       "abs_max": 3.5,
+       "zero_frac": 0.0
+      }
+     ],
+     [
+      "model.layers.10",
+      {
+       "mean": -0.2,
+       "std": 0.9,
+       "abs_max": 2.5,
+       "zero_frac": 0.01
+      }
+     ],
+     [
+      "model.layers.3",
+      {
+       "mean": 0.0,
+       "std": 1.1,
+       "abs_max": 4.0,
+       "zero_frac": 0.0
+      }
+     ]
+    ],
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_layer_field_the_struct_cannot_hold",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a bool in a float field: null in the struct, the field in extra_json",
+   "run_id": "fr-convert-a-layer-field-the-struct-cannot-hold",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-layer-field-the-struct-cannot-hold\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"layers\":{\"blocks.0\":{\"mean\":true,\"std\":1.0,\"abs_max\":2.0,\"zero_frac\":0.0}}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-layer-field-the-struct-cannot-hold",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "layers": [
+     [
+      "blocks.0",
+      {
+       "std": 1.0,
+       "abs_max": 2.0,
+       "zero_frac": 0.0
+      }
+     ]
+    ],
+    "record_version": 1,
+    "extra_json": "{\"layers\":{\"blocks.0\":{\"mean\":true}}}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_layer_entry_that_is_not_an_object",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a null struct keeps the entry's place; the entry travels in extra_json",
+   "run_id": "fr-convert-a-layer-entry-that-is-not-an-object",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-layer-entry-that-is-not-an-object\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"layers\":{\"blocks.0\":{\"mean\":0.0,\"std\":1.0,\"abs_max\":1.0,\"zero_frac\":0.0},\"blocks.1\":\"unreadable\"}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-layer-entry-that-is-not-an-object",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "layers": [
+     [
+      "blocks.0",
+      {
+       "mean": 0.0,
+       "std": 1.0,
+       "abs_max": 1.0,
+       "zero_frac": 0.0
+      }
+     ],
+     [
+      "blocks.1",
+      null
+     ]
+    ],
+    "record_version": 1,
+    "extra_json": "{\"layers\":{\"blocks.1\":\"unreadable\"}}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_moe_counts_stats_and_top_k",
+   "section": 2,
+   "kind": "conversion",
+   "about": "the router's maps: counts, stats (two Int64 fields) and top_k",
+   "run_id": "fr-convert-moe-counts-stats-and-top-k",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-moe-counts-stats-and-top-k\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"moe\":{\"router\":[5,3,0,8]},\"moe_top_k\":{\"router\":2},\"moe_stats\":{\"router\":{\"routed_tokens\":16,\"entropy\":1.2,\"diversity\":0.75,\"dead_experts\":1,\"dead_frac\":0.25}}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-moe-counts-stats-and-top-k",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "moe_top_k": [
+     [
+      "router",
+      2
+     ]
+    ],
+    "moe_counts": [
+     [
+      "router",
+      [
+       5,
+       3,
+       0,
+       8
+      ]
+     ]
+    ],
+    "moe_stats": [
+     [
+      "router",
+      {
+       "routed_tokens": 16,
+       "entropy": 1.2,
+       "diversity": 0.75,
+       "dead_experts": 1,
+       "dead_frac": 0.25
+      }
+     ]
+    ],
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_the_probe_split_by_column",
+   "section": 2,
+   "kind": "conversion",
+   "about": "an attention map of exact float32 values and histograms leave probe_json",
+   "run_id": "fr-convert-the-probe-split-by-column",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-the-probe-split-by-column\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"probe\":{\"step\":0,\"histograms\":{\"blocks.0\":{\"lo\":-1.0,\"hi\":1.0,\"counts\":[1,2,3],\"nonfinite\":0}},\"attention\":{\"blocks.0.attn\":{\"heads\":2,\"map\":[[0.5,0.25],[0.125,1.0]]}}}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-the-probe-split-by-column",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "probe_json": "{\"step\":0,\"attention\":{\"blocks.0.attn\":{\"heads\":2}}}",
+    "probe_maps": [
+     [
+      "blocks.0.attn",
+      [
+       [
+        0.5,
+        0.25
+       ],
+       [
+        0.125,
+        1.0
+       ]
+      ]
+     ]
+    ],
+    "probe_histograms": [
+     [
+      "blocks.0",
+      {
+       "lo": -1.0,
+       "hi": 1.0,
+       "counts": [
+        1,
+        2,
+        3
+       ],
+       "nonfinite": 0
+      }
+     ]
+    ],
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_scalars_with_a_bool_and_an_integer_past_2_53",
+   "section": 2,
+   "kind": "conversion",
+   "about": "the bool and the exact integer travel in extra_json too",
+   "run_id": "fr-convert-scalars-with-a-bool-and-an-integer-past-2-53",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-scalars-with-a-bool-and-an-integer-past-2-53\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"scalars\":{\"loss\":2.5,\"flag\":true,\"tokens\":9007199254740993}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-scalars-with-a-bool-and-an-integer-past-2-53",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "scalars": [
+     [
+      "loss",
+      2.5
+     ],
+     [
+      "tokens",
+      9007199254740992.0
+     ]
+    ],
+    "record_version": 1,
+    "extra_json": "{\"scalars\":{\"flag\":true,\"tokens\":9007199254740993}}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_scalar_only_record",
+   "section": 2,
+   "kind": "conversion",
+   "about": "record version 2: seq in its column, record_version 2, nothing in extra_json",
+   "run_id": "fr-convert-a-scalar-only-record",
+   "line": "{\"schema_version\":2,\"record\":\"scalars\",\"run_id\":\"fr-convert-a-scalar-only-record\",\"rank\":0,\"attempt\":1764201600000,\"step\":3,\"seq\":0,\"scalars\":{\"eval_loss\":1.25}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-scalar-only-record",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 3,
+    "scalars": [
+     [
+      "eval_loss",
+      1.25
+     ]
+    ],
+    "seq": 0,
+    "record_version": 2
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_key_with_no_column",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a key no column names travels in extra_json, as sorted JSON text",
+   "run_id": "fr-convert-a-key-with-no-column",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-key-with-no-column\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"custom\":{\"z\":1,\"a\":[1,2]},\"data_wait\":0.004}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-key-with-no-column",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "data_wait": 0.004,
+    "record_version": 1,
+    "extra_json": "{\"custom\":{\"a\":[1,2],\"z\":1}}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_an_explicit_null_of_another_key",
+   "section": 2,
+   "kind": "conversion",
+   "about": "null for a key other than ts and grad_norm travels in extra_json",
+   "run_id": "fr-convert-an-explicit-null-of-another-key",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-an-explicit-null-of-another-key\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"clip_grad_norm\":null}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-an-explicit-null-of-another-key",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 1,
+    "extra_json": "{\"clip_grad_norm\":null}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_nan_and_infinity_literals",
+   "section": 2,
+   "kind": "conversion",
+   "about": "bare NaN, Infinity and -Infinity, which Python's json reads",
+   "run_id": "fr-convert-nan-and-infinity-literals",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-nan-and-infinity-literals\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":NaN,\"grad_norm\":Infinity,\"lr\":[-Infinity]}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-nan-and-infinity-literals",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": {
+     "$float": "nan"
+    },
+    "lr": [
+     {
+      "$float": "-inf"
+     }
+    ],
+    "grad_norm": {
+     "$float": "inf"
+    },
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_number_past_the_float_range",
+   "section": 2,
+   "kind": "conversion",
+   "about": "1e400 reads as infinity, as Python's json reads it",
+   "run_id": "fr-convert-a-number-past-the-float-range",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-number-past-the-float-range\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1e400,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-number-past-the-float-range",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": {
+     "$float": "inf"
+    },
+    "grad_norm": 0.25,
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_an_integer_past_64_bits",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a scalar of 30 digits: the nearest float in the column, the exact digits in extra_json",
+   "run_id": "fr-convert-an-integer-past-64-bits",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-an-integer-past-64-bits\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"scalars\":{\"big\":123456789012345678901234567890}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-an-integer-past-64-bits",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "scalars": [
+     [
+      "big",
+      1.2345678901234568e+29
+     ]
+    ],
+    "record_version": 1,
+    "extra_json": "{\"scalars\":{\"big\":123456789012345678901234567890}}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_duplicate_key",
+   "section": 2,
+   "kind": "conversion",
+   "about": "the last value wins, at the place of the first: ts and a layers entry",
+   "run_id": "fr-convert-a-duplicate-key",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-duplicate-key\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1,\"grad_norm\":0.5,\"ts\":2,\"layers\":{\"b\":{\"mean\":1},\"a\":{\"mean\":2},\"b\":{\"mean\":3}}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-duplicate-key",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 2.0,
+    "grad_norm": 0.5,
+    "layers": [
+     [
+      "b",
+      {
+       "mean": 3.0
+      }
+     ],
+     [
+      "a",
+      {
+       "mean": 2.0
+      }
+     ]
+    ],
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_lone_surrogate_in_a_list",
+   "section": 2,
+   "kind": "conversion",
+   "about": "Arrow cannot hold a lone surrogate: the list travels in extra_json",
+   "run_id": "fr-convert-a-lone-surrogate-in-a-list",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-lone-surrogate-in-a-list\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"weights_unchanged\":[\"\\ud800\"]}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [
+    "weights_unchanged"
+   ],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-lone-surrogate-in-a-list",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 1,
+    "extra_json": "{\"weights_unchanged\":[\"\\ud800\"]}"
+   },
+   "arrow_moves": true,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_top_k_past_int32",
+   "section": 2,
+   "kind": "conversion",
+   "about": "moe_top_k is Int32: 3000000000 travels in extra_json and the key is counted as moved",
+   "run_id": "fr-convert-top-k-past-int32",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-top-k-past-int32\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"moe_top_k\":{\"router\":3000000000}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [
+    "moe_top_k"
+   ],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-top-k-past-int32",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 1,
+    "extra_json": "{\"moe_top_k\":{\"router\":3000000000}}"
+   },
+   "arrow_moves": true,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_whole_float_where_an_integer_is_read",
+   "section": 2,
+   "kind": "conversion",
+   "about": "2.0 in moe_top_k is not an integer: the map travels in extra_json",
+   "run_id": "fr-convert-a-whole-float-where-an-integer-is-read",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-whole-float-where-an-integer-is-read\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"moe_top_k\":{\"router\":2.0}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-whole-float-where-an-integer-is-read",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 1,
+    "extra_json": "{\"moe_top_k\":{\"router\":2.0}}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_float_text_in_a_json_column",
+   "section": 2,
+   "kind": "conversion",
+   "about": "data_json is Python's text (1e+16, 1e-07): the Rust text is compared as JSON values",
+   "run_id": "fr-convert-float-text-in-a-json-column",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-float-text-in-a-json-column\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"data\":{\"z\":1e-07,\"a\":1e+16,\"b\":0.1}}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-float-text-in-a-json-column",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "data_json": "{\"a\":1e+16,\"b\":0.1,\"z\":1e-07}",
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_non_ascii_text",
+   "section": 2,
+   "kind": "conversion",
+   "about": "UTF-8 and an escape in a key with no column: extra_json escapes them (ensure_ascii)",
+   "run_id": "fr-convert-non-ascii-text",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-non-ascii-text\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25,\"note\":\"caf\\u00e9\",\"label\":\"caf\\u00e9\"}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-non-ascii-text",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 1,
+    "extra_json": "{\"label\":\"caf\\u00e9\",\"note\":\"caf\\u00e9\"}"
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_line_ending_in_a_carriage_return",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a CRLF line: the carriage return is whitespace to the JSON reader",
+   "run_id": "fr-convert-a-line-ending-in-a-carriage-return",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-line-ending-in-a-carriage-return\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\r",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-line-ending-in-a-carriage-return",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_line_with_a_byte_order_mark",
+   "section": 2,
+   "kind": "conversion",
+   "about": "Python's json reads a line that starts with a UTF-8 byte order mark",
+   "run_id": "fr-convert-a-line-with-a-byte-order-mark",
+   "line": "\ufeff{\"schema_version\":1,\"run_id\":\"fr-convert-a-line-with-a-byte-order-mark\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 2,
+    "run_id": "fr-convert-a-line-with-a-byte-order-mark",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 1
+   },
+   "arrow_moves": false,
+   "record_to_row": "same"
+  },
+  {
+   "name": "convert_a_line_that_is_not_utf8",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a byte that is not UTF-8: not a record, skipped and counted",
+   "run_id": "fr-convert-a-line-that-is-not-utf8",
+   "line_hex": "7b22736368656d615f76657273696f6e223a312c2272756e5f6964223a2266722d636f6e766572742d612d6c696e652d746861742d69732d6e6f742d75746638222c2272616e6b223a302c22617474656d7074223a313736343230313630303030302c2273746570223a302c227473223a312e352c22677261645f6e6f726d223a302e32352c2278223a22ff227d",
+   "skipped": 1,
+   "left_out": 0,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": null
+  },
+  {
+   "name": "convert_a_line_that_is_not_an_object",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a JSON array: skipped and counted",
+   "run_id": "fr-convert-a-line-that-is-not-an-object",
+   "line": "[1,2]",
+   "skipped": 1,
+   "left_out": 0,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": null
+  },
+  {
+   "name": "convert_a_line_of_spaces",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a blank line: passed over and not counted",
+   "run_id": "fr-convert-a-line-of-spaces",
+   "line": "   ",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": null
+  },
+  {
+   "name": "convert_a_line_that_is_not_json",
+   "section": 2,
+   "kind": "conversion",
+   "about": "half a record, as a killed process leaves it: skipped and counted",
+   "run_id": "fr-convert-a-line-that-is-not-json",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-line-that-is-not-json\",\"st",
+   "skipped": 1,
+   "left_out": 0,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": null
+  },
+  {
+   "name": "convert_a_line_of_another_run",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a record of another run ID than the file's: skipped and counted",
+   "run_id": "fr-convert-a-line-of-another-run",
+   "line": "{\"schema_version\":1,\"run_id\":\"another-run\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 1,
+   "left_out": 0,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": null
+  },
+  {
+   "name": "convert_a_line_with_no_run_id",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a record with no run_id: skipped and counted",
+   "run_id": "fr-convert-a-line-with-no-run-id",
+   "line": "{\"schema_version\":1,\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 1,
+   "left_out": 0,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": null
+  },
+  {
+   "name": "convert_a_negative_step",
+   "section": 2,
+   "kind": "conversion",
+   "about": "an identity field the sender cannot send: left out and counted",
+   "run_id": "fr-convert-a-negative-step",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-negative-step\",\"rank\":0,\"attempt\":1764201600000,\"step\":-1,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 1,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": {
+    "refuses": "step"
+   }
+  },
+  {
+   "name": "convert_a_whole_float_step",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a step of 1.0 is not an integer: left out and counted",
+   "run_id": "fr-convert-a-whole-float-step",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-whole-float-step\",\"rank\":0,\"attempt\":1764201600000,\"step\":1.0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 1,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": {
+    "refuses": "step"
+   }
+  },
+  {
+   "name": "convert_a_step_past_int64",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a step past Int64: left out and counted",
+   "run_id": "fr-convert-a-step-past-int64",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-step-past-int64\",\"rank\":0,\"attempt\":1764201600000,\"step\":9223372036854775808,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 1,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": {
+    "refuses": "step"
+   }
+  },
+  {
+   "name": "convert_a_rank_past_int32",
+   "section": 2,
+   "kind": "conversion",
+   "about": "a rank past Int32: left out and counted",
+   "run_id": "fr-convert-a-rank-past-int32",
+   "line": "{\"schema_version\":1,\"run_id\":\"fr-convert-a-rank-past-int32\",\"rank\":2147483648,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 1,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": {
+    "refuses": "rank"
+   }
+  },
+  {
+   "name": "convert_a_record_version_this_package_does_not_read",
+   "section": 2,
+   "kind": "conversion",
+   "about": "schema_version 7 is sent with row version 7, for the server to drop and count",
+   "run_id": "fr-convert-a-record-version-this-package-does-not-read",
+   "line": "{\"schema_version\":7,\"run_id\":\"fr-convert-a-record-version-this-package-does-not-read\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 0,
+   "moved": [],
+   "row": {
+    "schema_version": 7,
+    "run_id": "fr-convert-a-record-version-this-package-does-not-read",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 0,
+    "ts": 1.5,
+    "grad_norm": 0.25,
+    "record_version": 7
+   },
+   "arrow_moves": false,
+   "record_to_row": {
+    "refuses": "schema_version"
+   }
+  },
+  {
+   "name": "convert_a_version_2_record_that_is_not_scalar_only",
+   "section": 2,
+   "kind": "conversion",
+   "about": "record version 2 without record: scalars is left out and counted",
+   "run_id": "fr-convert-a-version-2-record-that-is-not-scalar-only",
+   "line": "{\"schema_version\":2,\"run_id\":\"fr-convert-a-version-2-record-that-is-not-scalar-only\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}",
+   "skipped": 0,
+   "left_out": 1,
+   "moved": [],
+   "row": null,
+   "arrow_moves": false,
+   "record_to_row": {
+    "refuses": "schema_version"
+   }
+  },
+  {
+   "name": "lines_a_last_line_with_no_newline",
+   "section": 2,
+   "kind": "lines",
+   "about": "a last line with no newline is not read until its newline comes; the offset stops before it",
+   "run_id": "fr-lines",
+   "max_bytes": 4194304,
+   "reads": [
+    {
+     "file": "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\n{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"ts\":1.5,\"grad_norm\":0.25}",
+     "lines": [
+      "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}"
+     ],
+     "offset": 109
+    },
+    {
+     "file": "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\n{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"ts\":1.5,\"grad_norm\":0.25}\n",
+     "lines": [
+      "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"ts\":1.5,\"grad_norm\":0.25}"
+     ],
+     "offset": 218
+    }
+   ]
+  },
+  {
+   "name": "lines_blank_lines_and_crlf",
+   "section": 2,
+   "kind": "lines",
+   "about": "a blank line is read past and not counted; a CRLF line is one line",
+   "run_id": "fr-lines",
+   "max_bytes": 4194304,
+   "reads": [
+    {
+     "file": "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\r\n\n{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"ts\":1.5,\"grad_norm\":0.25}\n",
+     "lines": [
+      "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\r",
+      "",
+      "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"ts\":1.5,\"grad_norm\":0.25}"
+     ],
+     "offset": 220
+    }
+   ]
+  },
+  {
+   "name": "lines_one_line_longer_than_a_batch",
+   "section": 2,
+   "kind": "lines",
+   "about": "a line longer than the batch's byte cap is read alone, whole",
+   "run_id": "fr-lines",
+   "max_bytes": 16,
+   "reads": [
+    {
+     "file": "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\n{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"ts\":1.5,\"grad_norm\":0.25}\n",
+     "lines": [
+      "{\"schema_version\":1,\"run_id\":\"fr-lines\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}"
+     ],
+     "offset": 109
+    }
+   ]
+  },
+  {
+   "name": "lines_a_file_of_step_and_scalar_only_records",
+   "section": 2,
+   "kind": "mixed",
+   "about": "step records of versions 0 and 1 and a scalar-only record in one file, in one batch",
+   "run_id": "fr-mixed",
+   "file": "{\"run_id\":\"fr-mixed\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\n{\"schema_version\":1,\"run_id\":\"fr-mixed\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"ts\":1.5,\"grad_norm\":0.25}\n{\"schema_version\":2,\"record\":\"scalars\",\"run_id\":\"fr-mixed\",\"rank\":0,\"attempt\":1764201600000,\"step\":1,\"seq\":0,\"scalars\":{\"eval_loss\":1.25}}\n{\"schema_version\":1,\"run_id\":\"fr-mixed\",\"rank\":0,\"attempt\":1764201600000,\"step\":2,\"ts\":1.5,\"grad_norm\":0.25}\n",
+   "training_steps": [
+    0,
+    1,
+    2
+   ],
+   "rows": [
+    {
+     "step": 0,
+     "seq": null,
+     "record_version": null
+    },
+    {
+     "step": 1,
+     "seq": null,
+     "record_version": 1
+    },
+    {
+     "step": 1,
+     "seq": 0,
+     "record_version": 2
+    },
+    {
+     "step": 2,
+     "seq": null,
+     "record_version": 1
+    }
+   ],
+   "skipped": 0,
+   "left_out": 0
+  },
+  {
+   "name": "killed_job_torn_tail_then_a_new_session",
+   "section": 6,
+   "kind": "torn",
+   "about": "a killed process left half a line; the next session's sink gives it a newline first, so the fragment is a line of its own that is skipped and counted, and the new record is read",
+   "run_id": "fr-torn",
+   "file": "{\"schema_version\":1,\"run_id\":\"fr-torn\",\"rank\":0,\"attempt\":1764201600000,\"step\":0,\"ts\":1.5,\"grad_norm\":0.25}\n{\"schema_version\":1,\"run_id\":\"fr-torn\",\"st",
+   "appended": {
+    "schema_version": 1,
+    "run_id": "fr-torn",
+    "rank": 0,
+    "attempt": 1764201600000,
+    "step": 1,
+    "ts": 1.5,
+    "grad_norm": 0.25
+   },
+   "expect": {
+    "records": [
+     0,
+     1
+    ],
+    "skipped": 1
+   }
+  },
+  {
+   "name": "names_records_and_second_writer",
+   "section": 7,
+   "kind": "names",
+   "about": "the two names a rank's records take, read from the right; a copy is not a records file",
+   "files": {
+    "run-slurm1234.0.rank3.jsonl": [
+     "run-slurm1234.0",
+     3,
+     null
+    ],
+    "run-slurm1234.0.rank3.4242.jsonl": [
+     "run-slurm1234.0",
+     3,
+     4242
+    ],
+    "run-slurm1234.0.rank3.bak.jsonl": null,
+    "run-slurm1234.0.rank3.x.jsonl": null
+   }
+  },
+  {
+   "name": "names_beat_file_and_stop_notice_are_no_records_file",
+   "section": 5,
+   "kind": "names",
+   "about": "the proposed beat file and stop notice names match no name a reader takes for something else",
+   "run_id": "run-slurm1234.0",
+   "rank": 3,
+   "pid": 4242,
+   "proposed": [
+    "run-slurm1234.0.rank3.beat.json",
+    "run-slurm1234.0.rank3.stop.json",
+    "run-slurm1234.0.rank3.4242.beat.json",
+    "run-slurm1234.0.rank3.4242.stop.json"
+   ],
+   "taken": [
+    "run-slurm1234.0.rank3.jsonl",
+    "run-slurm1234.0.rank3.end.json",
+    "run-slurm1234.0.rank3.offset",
+    "run-slurm1234.0.run.json"
+   ]
+  },
+  {
+   "name": "folder_closed_reads_finished",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "marker": "closed"
+   },
+   "expect": {
+    "state": "finished",
+    "ended": {
+     "state": "closed",
+     "outcome": "closed"
+    }
+   }
+  },
+  {
+   "name": "folder_closed_by_an_exception_reads_finished",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "marker": "raised"
+   },
+   "expect": {
+    "state": "finished",
+    "ended": {
+     "state": "closed",
+     "outcome": "raised",
+     "exception": "RuntimeError"
+    }
+   }
+  },
+  {
+   "name": "folder_stop_notice_reads_capture_stopped",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "stop": "present"
+   },
+   "expect": {
+    "state": "capture_stopped",
+    "ended": {
+     "state": "capture_stopped",
+     "reason": "sink_error",
+     "step": 7
+    }
+   }
+  },
+  {
+   "name": "folder_stop_notice_and_marker_reads_capture_stopped",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "marker": "closed",
+    "stop": "present"
+   },
+   "expect": {
+    "state": "capture_stopped",
+    "ended": {
+     "state": "capture_stopped",
+     "reason": "sink_error",
+     "step": 7
+    }
+   }
+  },
+  {
+   "name": "folder_marker_written_after_close_is_no_end",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "marker": "written_after_close",
+    "beat": "fresh"
+   },
+   "expect": {
+    "state": "active"
+   }
+  },
+  {
+   "name": "folder_stop_notice_of_another_size_is_no_end",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "stop": "stale",
+    "beat": "fresh"
+   },
+   "expect": {
+    "state": "active"
+   }
+  },
+  {
+   "name": "folder_beat_fresh_and_working_reads_active",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "fresh",
+    "work_still_for": 10
+   },
+   "expect": {
+    "state": "active"
+   }
+  },
+  {
+   "name": "folder_beat_fresh_and_work_still_reads_silent",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "fresh",
+    "work_still_for": 400
+   },
+   "expect": {
+    "state": "silent"
+   }
+  },
+  {
+   "name": "killed_job_beat_stale_inside_the_floor_reads_reconnecting",
+   "section": 6,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "stale",
+    "stale_for": 60
+   },
+   "expect": {
+    "state": "reconnecting"
+   }
+  },
+  {
+   "name": "killed_job_beat_stale_past_the_floor_reads_lost",
+   "section": 6,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "stale",
+    "stale_for": 400
+   },
+   "expect": {
+    "state": "lost"
+   }
+  },
+  {
+   "name": "killed_job_never_reads_finished",
+   "section": 6,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "stale",
+    "stale_for": 100000
+   },
+   "expect": {
+    "state": "lost"
+   }
+  },
+  {
+   "name": "folder_no_beat_file_is_not_checked",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "none"
+   },
+   "expect": {
+    "state": "active",
+    "liveness": "not_checked"
+   }
+  },
+  {
+   "name": "folder_no_beat_file_and_closed_reads_finished",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "none",
+    "marker": "closed"
+   },
+   "expect": {
+    "state": "finished",
+    "ended": {
+     "state": "closed",
+     "outcome": "closed"
+    }
+   }
+  },
+  {
+   "name": "folder_network_filesystem_is_not_checked",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "beat": "stale",
+    "stale_for": 400,
+    "fs": "network"
+   },
+   "expect": {
+    "state": "active",
+    "liveness": "not_checked"
+   }
+  },
+  {
+   "name": "folder_network_filesystem_stop_notice_still_reads",
+   "section": 5,
+   "kind": "end_state",
+   "about": "what the folder holds, and the beat file by the server's clock",
+   "folder": {
+    "stop": "present",
+    "fs": "network"
+   },
+   "expect": {
+    "state": "capture_stopped",
+    "ended": {
+     "state": "capture_stopped",
+     "reason": "sink_error",
+     "step": 7
+    }
+   }
+  },
+  {
+   "name": "beat_a_counter_that_moves_is_fresh",
+   "section": 5,
+   "kind": "beat",
+   "about": "the beat file's freshness at each look",
+   "interval_seconds": 15,
+   "looks": [
+    {
+     "at": 0,
+     "beat": 1
+    },
+    {
+     "at": 15,
+     "beat": 2
+    },
+    {
+     "at": 30,
+     "beat": 3
+    },
+    {
+     "at": 45,
+     "beat": 4
+    }
+   ],
+   "expect": [
+    "fresh",
+    "fresh",
+    "fresh",
+    "fresh"
+   ]
+  },
+  {
+   "name": "beat_a_counter_that_stops_goes_stale_after_three_intervals",
+   "section": 5,
+   "kind": "beat",
+   "about": "the beat file's freshness at each look",
+   "interval_seconds": 15,
+   "looks": [
+    {
+     "at": 0,
+     "beat": 1
+    },
+    {
+     "at": 15,
+     "beat": 2
+    },
+    {
+     "at": 30,
+     "beat": 2
+    },
+    {
+     "at": 59,
+     "beat": 2
+    },
+    {
+     "at": 60,
+     "beat": 2
+    },
+    {
+     "at": 90,
+     "beat": 2
+    }
+   ],
+   "expect": [
+    "fresh",
+    "fresh",
+    "fresh",
+    "fresh",
+    "stale",
+    "stale"
+   ]
+  },
+  {
+   "name": "beat_the_first_look_counts_as_a_beat",
+   "section": 5,
+   "kind": "beat",
+   "about": "the beat file's freshness at each look",
+   "interval_seconds": 15,
+   "looks": [
+    {
+     "at": 0,
+     "beat": 9
+    },
+    {
+     "at": 44,
+     "beat": 9
+    },
+    {
+     "at": 45,
+     "beat": 9
+    }
+   ],
+   "expect": [
+    "fresh",
+    "fresh",
+    "stale"
+   ]
+  },
+  {
+   "name": "beat_a_short_interval_is_stale_after_30_seconds",
+   "section": 5,
+   "kind": "beat",
+   "about": "the beat file's freshness at each look",
+   "interval_seconds": 1,
+   "looks": [
+    {
+     "at": 0,
+     "beat": 1
+    },
+    {
+     "at": 10,
+     "beat": 1
+    },
+    {
+     "at": 29,
+     "beat": 1
+    },
+    {
+     "at": 30,
+     "beat": 1
+    }
+   ],
+   "expect": [
+    "fresh",
+    "fresh",
+    "fresh",
+    "stale"
+   ]
+  },
+  {
+   "name": "beat_a_wall_time_in_the_file_is_never_read",
+   "section": 5,
+   "kind": "beat",
+   "about": "the beat file's freshness at each look",
+   "interval_seconds": 15,
+   "looks": [
+    {
+     "at": 0,
+     "beat": 1,
+     "written_at": 4102444800.0
+    },
+    {
+     "at": 30,
+     "beat": 2,
+     "written_at": 0.0
+    },
+    {
+     "at": 60,
+     "beat": 2,
+     "written_at": 4102444800.0
+    },
+    {
+     "at": 75,
+     "beat": 2,
+     "written_at": 1.0
+    }
+   ],
+   "expect": [
+    "fresh",
+    "fresh",
+    "fresh",
+    "stale"
+   ]
+  },
+  {
+   "name": "beat_a_counter_that_comes_back_is_fresh_again",
+   "section": 5,
+   "kind": "beat",
+   "about": "the beat file's freshness at each look",
+   "interval_seconds": 15,
+   "looks": [
+    {
+     "at": 0,
+     "beat": 1
+    },
+    {
+     "at": 50,
+     "beat": 1
+    },
+    {
+     "at": 55,
+     "beat": 2
+    }
+   ],
+   "expect": [
+    "fresh",
+    "stale",
+    "fresh"
+   ]
+  },
+  {
+   "name": "store_one_folder_is_one_store",
+   "section": 3,
+   "kind": "store_key",
+   "about": "whether two opens share a default store",
+   "first": {
+    "real": "/data/runs/exp1",
+    "fs": "local",
+    "host": "gpu-a"
+   },
+   "second": {
+    "real": "/data/runs/exp1",
+    "fs": "local",
+    "host": "gpu-a"
+   },
+   "same": true
+  },
+  {
+   "name": "store_two_folders_are_two_stores",
+   "section": 3,
+   "kind": "store_key",
+   "about": "whether two opens share a default store",
+   "first": {
+    "real": "/data/runs/exp1",
+    "fs": "local",
+    "host": "gpu-a"
+   },
+   "second": {
+    "real": "/data/runs/exp2",
+    "fs": "local",
+    "host": "gpu-a"
+   },
+   "same": false
+  },
+  {
+   "name": "store_network_cache_two_machines_are_two_stores",
+   "section": 3,
+   "kind": "store_key",
+   "about": "whether two opens share a default store",
+   "first": {
+    "real": "/home/u/runs/exp1",
+    "fs": "network",
+    "host": "login-1"
+   },
+   "second": {
+    "real": "/home/u/runs/exp1",
+    "fs": "network",
+    "host": "login-2"
+   },
+   "same": false
+  },
+  {
+   "name": "store_unknown_type_two_machines_are_two_stores",
+   "section": 3,
+   "kind": "store_key",
+   "about": "whether two opens share a default store",
+   "first": {
+    "real": "/home/u/runs/exp1",
+    "fs": "unknown",
+    "host": "a"
+   },
+   "second": {
+    "real": "/home/u/runs/exp1",
+    "fs": "unknown",
+    "host": "b"
+   },
+   "same": false
+  },
+  {
+   "name": "store_network_cache_one_machine_is_one_store",
+   "section": 3,
+   "kind": "store_key",
+   "about": "whether two opens share a default store",
+   "first": {
+    "real": "/home/u/runs/exp1",
+    "fs": "network",
+    "host": "login-1"
+   },
+   "second": {
+    "real": "/home/u/runs/exp1",
+    "fs": "network",
+    "host": "login-1"
+   },
+   "same": true
+  },
+  {
+   "name": "restart_before_the_first_part",
+   "section": 10,
+   "kind": "restart",
+   "about": "a server stopped and started again during a run",
+   "lines": 30,
+   "flush": 10,
+   "kill": {
+    "after_lines": 5,
+    "parts": 0,
+    "offset_parts": 0
+   },
+   "expect": {
+    "each_step_once": true,
+    "lost": []
+   }
+  },
+  {
+   "name": "restart_after_a_part_before_its_offset",
+   "section": 10,
+   "kind": "restart",
+   "about": "a server stopped and started again during a run",
+   "lines": 30,
+   "flush": 10,
+   "kill": {
+    "after_lines": 15,
+    "parts": 1,
+    "offset_parts": 0
+   },
+   "expect": {
+    "each_step_once": true,
+    "lost": []
+   }
+  },
+  {
+   "name": "restart_after_a_part_and_its_offset",
+   "section": 10,
+   "kind": "restart",
+   "about": "a server stopped and started again during a run",
+   "lines": 30,
+   "flush": 10,
+   "kill": {
+    "after_lines": 25,
+    "parts": 2,
+    "offset_parts": 2
+   },
+   "expect": {
+    "each_step_once": true,
+    "lost": []
+   }
+  },
+  {
+   "name": "restart_lines_written_while_the_server_was_down",
+   "section": 10,
+   "kind": "restart",
+   "about": "a server stopped and started again during a run",
+   "lines": 50,
+   "flush": 10,
+   "written_while_down": 20,
+   "kill": {
+    "after_lines": 20,
+    "parts": 2,
+    "offset_parts": 1
+   },
+   "expect": {
+    "each_step_once": true,
+    "lost": []
+   }
+  },
+  {
+   "name": "restart_a_resumed_job_rewrites_steps_under_a_new_attempt",
+   "section": 10,
+   "kind": "restart",
+   "about": "a server stopped and started again during a run",
+   "attempts": [
+    [
+     1,
+     0,
+     10
+    ],
+    [
+     2,
+     5,
+     15
+    ]
+   ],
+   "flush": 4,
+   "kill": {
+    "after_lines": 12,
+    "parts": 3,
+    "offset_parts": 2
+   },
+   "expect": {
+    "each_step_once": true,
+    "lost": []
+   }
+  },
+  {
+   "name": "end_closed",
+   "section": 9,
+   "kind": "end_message",
+   "about": "a rank's end on today's stream",
+   "stream": {
+    "end_version": true,
+    "rank_end": {
+     "state": "closed",
+     "outcome": "closed"
+    },
+    "close": "clean"
+   },
+   "expect": {
+    "state": "finished",
+    "ended": {
+     "state": "closed",
+     "outcome": "closed"
+    }
+   }
+  },
+  {
+   "name": "end_closed_raised",
+   "section": 9,
+   "kind": "end_message",
+   "about": "a rank's end on today's stream",
+   "stream": {
+    "end_version": true,
+    "rank_end": {
+     "state": "closed",
+     "outcome": "raised",
+     "exception": "RuntimeError"
+    },
+    "close": "clean"
+   },
+   "expect": {
+    "state": "finished",
+    "ended": {
+     "state": "closed",
+     "outcome": "raised",
+     "exception": "RuntimeError"
+    }
+   }
+  },
+  {
+   "name": "end_capture_stopped_every_beat_lost",
+   "section": 9,
+   "kind": "end_message",
+   "about": "a rank's end on today's stream",
+   "stream": {
+    "end_version": true,
+    "beats_said_stop": false,
+    "close": "clean",
+    "rank_end": {
+     "state": "capture_stopped",
+     "reason": "sink_error",
+     "step": 7
+    }
+   },
+   "expect": {
+    "state": "capture_stopped",
+    "ended": {
+     "state": "capture_stopped",
+     "reason": "sink_error",
+     "step": 7
+    }
+   }
+  },
+  {
+   "name": "end_capture_stopped_before_any_row",
+   "section": 9,
+   "kind": "end_message",
+   "about": "a rank's end on today's stream",
+   "stream": {
+    "end_version": true,
+    "rows": 0,
+    "close": "clean",
+    "rank_end": {
+     "state": "capture_stopped",
+     "reason": "sink_error",
+     "step": null
+    }
+   },
+   "expect": {
+    "state": "capture_stopped",
+    "ended": {
+     "state": "capture_stopped",
+     "reason": "sink_error",
+     "step": null
+    }
+   }
+  },
+  {
+   "name": "end_declared_but_missing",
+   "section": 9,
+   "kind": "end_message",
+   "about": "a rank's end on today's stream",
+   "stream": {
+    "end_version": true,
+    "rank_end": null,
+    "close": "clean"
+   },
+   "expect": {
+    "state": "reconnecting",
+    "then": "lost",
+    "ended": {
+     "state": "without_notice",
+     "seen": "clean_close_without_end"
+    }
+   }
+  },
+  {
+   "name": "end_from_an_older_sender",
+   "section": 9,
+   "kind": "end_message",
+   "about": "a rank's end on today's stream",
+   "stream": {
+    "end_version": false,
+    "rank_end": null,
+    "close": "clean"
+   },
+   "expect": {
+    "state": "finished"
+   }
+  },
+  {
+   "name": "end_a_dropped_stream_is_no_end",
+   "section": 9,
+   "kind": "end_message",
+   "about": "a rank's end on today's stream",
+   "stream": {
+    "end_version": true,
+    "rank_end": null,
+    "close": "error"
+   },
+   "expect": {
+    "state": "reconnecting",
+    "then": "lost"
+   }
+  },
+  {
+   "name": "first_open_figure",
+   "section": 8,
+   "kind": "figure",
+   "about": "the owner's figure (Nov 27): the page within 5 s, 50 MB of lines a second per core",
+   "page_seconds": 5,
+   "mb_per_second_per_core": 50,
+   "folders": [
+    {
+     "mb": 31000,
+     "seconds_one_core": 620
+    },
+    {
+     "mb": 7000,
+     "seconds_one_core": 140
+    }
+   ]
+  }
+ ]
+}
