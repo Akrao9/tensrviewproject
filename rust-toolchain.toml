@@ -1,0 +1,11 @@
+# The Rust toolchain of the server's builds (step 2's pin, D2 and Q19 of the read API's contract):
+# the one CI and the wheel builder use. It sits at the repository root because rustup reads this file
+# from the folder cargo runs in and its parents, and CI runs cargo from `sdk/` with
+# `--manifest-path ../server/Cargo.toml`. maturin-action's source (its main branch, read on Nov 27,
+# 2026; no wheel build was run with this file) looks for it from `server/` up to the checkout's root,
+# in its Linux container and on a macOS host alike. A folder with its own file
+# (`experiments/moe-bakeoff/`) keeps it; `cargo +nightly` (the fuzz targets) overrides it. `clippy` and `rustfmt` are named so a runner whose rustup installs
+# the minimal profile still has them.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]

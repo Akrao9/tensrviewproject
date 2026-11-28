@@ -5,6 +5,7 @@
 pub mod decode_guard;
 pub mod detect;
 pub mod ingest;
+mod lock;
 pub mod server;
 pub mod storage;
 pub mod watchdog;
