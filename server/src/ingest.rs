@@ -69,7 +69,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, BooleanArray, BooleanBuilder, Int32Array, Int64Array, StringArray};
@@ -91,6 +91,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::detect::RankDetectors;
+use crate::lock::locked;
 
 /// A rank's last batch hashes: step -> (data rank, hash).
 type DataWindow = BTreeMap<i64, (Option<i64>, String)>;
@@ -767,9 +768,7 @@ impl Ingest {
     /// (`run_id`, `rank`, `step`, `attempt`, `schema_version`), for the first null key of each row,
     /// and because their `schema_version` is not one this server reads (`unsupported_schema_version`).
     pub fn dropped_rows(&self) -> BTreeMap<String, u64> {
-        self.dropped_rows
-            .lock()
-            .unwrap()
+        locked(&self.dropped_rows)
             .iter()
             .map(|(key, rows)| (key.to_string(), *rows))
             .collect()
@@ -781,16 +780,13 @@ impl Ingest {
     /// second rank's drop inside the interval showed only in a later line's total.)
     fn rows_dropped(&self, key: &Key, dropped: &[(&'static str, u64)]) {
         let totals = {
-            let mut totals = self.dropped_rows.lock().unwrap();
+            let mut totals = locked(&self.dropped_rows);
             for (column, rows) in dropped {
                 *totals.entry(column).or_default() += rows;
             }
             totals.values().sum::<u64>()
         };
-        let due = self
-            .dropped_log
-            .lock()
-            .unwrap()
+        let due = locked(&self.dropped_log)
             .entry(key.clone())
             .or_default()
             .due(Instant::now());
@@ -943,14 +939,11 @@ impl Ingest {
         }
         let now = Instant::now();
         let due = match key {
-            Some(key) => self
-                .end_log
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            Some(key) => locked(&self.end_log)
                 .entry((key.clone(), status.is_some()))
                 .or_default()
                 .due(now),
-            None => self.error_log.lock().unwrap_or_else(PoisonError::into_inner).due(now),
+            None => locked(&self.error_log).due(now),
         };
         let Some(held) = due else {
             return;
@@ -1013,27 +1006,15 @@ impl Ingest {
     /// How many runs anything is held in memory for.
     pub fn runs_held(&self) -> usize {
         let mut runs: std::collections::BTreeSet<String> = self.watchdog.run_ids();
-        runs.extend(
-            self.buffers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .keys()
-                .map(|key| key.0.clone()),
-        );
-        runs.extend(self.reports.lock().unwrap().keys().map(|key| key.0.clone()));
-        runs.extend(self.stored.lock().unwrap().keys().map(|key| key.0.clone()));
-        runs.extend(self.data_windows.lock().unwrap().keys().cloned());
-        runs.extend(self.replicas.lock().unwrap().keys().cloned());
-        runs.extend(self.manifests.lock().unwrap().keys().cloned());
-        runs.extend(self.written.lock().unwrap().keys().cloned());
-        runs.extend(self.dropped_log.lock().unwrap().keys().map(|key| key.0.clone()));
-        runs.extend(
-            self.end_log
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .keys()
-                .map(|(key, _)| key.0.clone()),
-        );
+        runs.extend(locked(&self.buffers).keys().map(|key| key.0.clone()));
+        runs.extend(locked(&self.reports).keys().map(|key| key.0.clone()));
+        runs.extend(locked(&self.stored).keys().map(|key| key.0.clone()));
+        runs.extend(locked(&self.data_windows).keys().cloned());
+        runs.extend(locked(&self.replicas).keys().cloned());
+        runs.extend(locked(&self.manifests).keys().cloned());
+        runs.extend(locked(&self.written).keys().cloned());
+        runs.extend(locked(&self.dropped_log).keys().map(|key| key.0.clone()));
+        runs.extend(locked(&self.end_log).keys().map(|(key, _)| key.0.clone()));
         runs.len()
     }
 
@@ -1043,12 +1024,7 @@ impl Ingest {
     /// waits for the rank's buffer, so a flush of the rank in progress finishes first.
     pub async fn trend_computations(&self, run_id: &str, rank: i32) -> Option<u64> {
         let key = (run_id.to_string(), rank);
-        let buffer = self
-            .buffers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-            .cloned()?;
+        let buffer = locked(&self.buffers).get(&key).cloned()?;
         let buffer = buffer.lock().await;
         buffer
             .detectors
@@ -1062,16 +1038,11 @@ impl Ingest {
     }
 
     fn buffer(&self, key: &Key) -> Arc<tokio::sync::Mutex<RankBuffer>> {
-        self.buffers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(key.clone())
-            .or_default()
-            .clone()
+        locked(&self.buffers).entry(key.clone()).or_default().clone()
     }
 
     fn all_buffers(&self) -> Vec<(Key, Arc<tokio::sync::Mutex<RankBuffer>>)> {
-        let buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
+        let buffers = locked(&self.buffers);
         buffers
             .iter()
             .map(|(key, buffer)| (key.clone(), buffer.clone()))
@@ -1441,8 +1412,8 @@ impl Ingest {
             {
                 let part = (buffer.attempt, buffer.max_step);
                 let owner = self.watchdog.owner(key);
-                let report = self.reports.lock().unwrap().get(key).map(reported);
-                let mut stored = self.stored.lock().unwrap();
+                let report = locked(&self.reports).get(key).map(reported);
+                let mut stored = locked(&self.stored);
                 let entry = stored.entry(key.clone()).or_insert(Stored {
                     newest: part,
                     behind_since: None,
@@ -1517,7 +1488,7 @@ impl Ingest {
         self.replica_loaded(&key.0).await;
         let order = self.watchdog.order(key);
         let place = |_rank: i64, attempt: i64| order.position(attempt);
-        let mut runs = self.replicas.lock().unwrap();
+        let mut runs = locked(&self.replicas);
         let Some(run) = runs.get_mut(&key.0) else {
             return;
         };
@@ -1542,7 +1513,7 @@ impl Ingest {
     /// taken up, so what was written before is not lost; the next part or status tries again. The
     /// observations of a part stored meanwhile are not compared (a gap the report names).
     async fn replica_loaded(&self, run_id: &str) -> bool {
-        if self.replicas.lock().unwrap().contains_key(run_id) {
+        if locked(&self.replicas).contains_key(run_id) {
             return true;
         }
         let written = match self.storage.read_status(run_id).await {
@@ -1560,7 +1531,7 @@ impl Ingest {
 
     /// Holds a comparison for the run, from the `replica` object written before when there is one.
     fn take_up_replica(&self, run_id: &str, written: Option<&serde_json::Value>) {
-        let mut runs = self.replicas.lock().unwrap();
+        let mut runs = locked(&self.replicas);
         runs.entry(run_id.to_string()).or_insert_with(|| {
             let mut comparison = crate::detect::replica::Comparison::new(
                 self.config.thresholds.drift_tolerance,
@@ -1670,7 +1641,7 @@ impl Ingest {
         };
         {
             let window = detectors.data_window();
-            let mut windows = self.data_windows.lock().unwrap();
+            let mut windows = locked(&self.data_windows);
             let run = windows.entry(key.0.clone()).or_default();
             if window.is_empty() {
                 run.remove(&key.1);
@@ -1706,8 +1677,8 @@ impl Ingest {
                 buffer.report_failures = 0;
                 buffer.report_after = None;
                 let at = reported(&report);
-                self.reports.lock().unwrap().insert(key.clone(), report);
-                if let Some(stored) = self.stored.lock().unwrap().get_mut(key) {
+                locked(&self.reports).insert(key.clone(), report);
+                if let Some(stored) = locked(&self.stored).get_mut(key) {
                     if !behind(at, stored.newest) {
                         stored.behind_since = None;
                     }
@@ -1716,7 +1687,7 @@ impl Ingest {
             Err(error) => {
                 // What the store holds is now behind what was judged: a reader finds the report
                 // behind, and the run state does not call the rank judged either.
-                self.reports.lock().unwrap().remove(key);
+                locked(&self.reports).remove(key);
                 buffer.report_failures = buffer.report_failures.saturating_add(1);
                 let wait = replay_wait(self.config.replay_backoff, buffer.report_failures);
                 buffer.report_after = Instant::now().checked_add(wait);
@@ -1734,8 +1705,8 @@ impl Ingest {
     /// are dropped, since both came from rows before the ones just stored. (Until Nov 19, 2026 the
     /// hashes stayed, and the status still said the rank's batches were compared.)
     fn forget_report(&self, key: &Key) {
-        self.reports.lock().unwrap().remove(key);
-        if let Some(run) = self.data_windows.lock().unwrap().get_mut(&key.0) {
+        locked(&self.reports).remove(key);
+        if let Some(run) = locked(&self.data_windows).get_mut(&key.0) {
             run.remove(&key.1);
         }
     }
@@ -1931,7 +1902,7 @@ impl Ingest {
                 if let Some(descriptor) = &message.inner.flight_descriptor {
                     let parsed = parse_descriptor(descriptor)?;
                     self.watchdog.stream_opened(&parsed, Instant::now());
-                    let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+                    let mut streams = locked(&self.streams);
                     streams.entry(parsed.clone()).or_default().push(OpenStream {
                         id: stream_id,
                         attempt: None,
@@ -1955,10 +1926,7 @@ impl Ingest {
             if let (false, Some(sender)) = (named, metadata.sender_attempt) {
                 // The first batch names the attempt whose process sends the stream: a claim.
                 self.place(key, Some(sender), &[]).await?;
-                if let Some(open) = self
-                    .streams
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
+                if let Some(open) = locked(&self.streams)
                     .get_mut(key)
                     .and_then(|streams| streams.iter_mut().find(|open| open.id == stream_id))
                 {
@@ -2022,12 +1990,12 @@ impl Ingest {
             );
             return;
         }
-        if self.manifests.lock().unwrap().get(run_id) == Some(&text) {
+        if locked(&self.manifests).get(run_id) == Some(&text) {
             return;
         }
         match self.storage.write_manifest(run_id, &manifest).await {
             Ok(()) => {
-                self.manifests.lock().unwrap().insert(run_id.to_string(), text);
+                locked(&self.manifests).insert(run_id.to_string(), text);
             }
             Err(error) => eprintln!("tensorquill-server: cannot write the run manifest of {run_id}: {error}"),
         }
@@ -2065,7 +2033,7 @@ impl Ingest {
     /// nothing (contract 1).
     fn stream_ended(&self, key: &Key, stream_id: u64, clean: bool) {
         let counted = {
-            let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut streams = locked(&self.streams);
             let open = streams.get_mut(key);
             let counted = open
                 .as_ref()
@@ -2090,7 +2058,7 @@ impl Ingest {
             return;
         };
         let now = Instant::now();
-        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut streams = locked(&self.streams);
         for open in streams.get_mut(key).into_iter().flatten() {
             if open.counted && open.attempt.is_some_and(|attempt| attempt != owner) {
                 open.counted = false;
@@ -2130,7 +2098,7 @@ impl Ingest {
     /// refused with `UNAVAILABLE`, which its sender retries (decided Nov 19, 2026). The order the
     /// server acknowledged is then always the one a restarted server reads.
     async fn place(&self, key: &Key, claim: Option<i64>, rows: &[i64]) -> Result<(), Status> {
-        let lock = self.order_locks.lock().unwrap().entry(key.clone()).or_default().clone();
+        let lock = locked(&self.order_locks).entry(key.clone()).or_default().clone();
         let _held = lock.lock().await;
         self.load_order(key).await?;
         let mut order = self.watchdog.order(key);
@@ -2204,8 +2172,8 @@ impl Ingest {
     /// batch, are compared; the others are not known to be clean, and `ranks_compared` lets a
     /// reader tell "compared, none found" from "not compared", after a restart too.
     fn with_data(&self, mut statuses: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, serde_json::Value> {
-        let windows = self.data_windows.lock().unwrap();
-        let mut replicas = self.replicas.lock().unwrap();
+        let windows = locked(&self.data_windows);
+        let mut replicas = locked(&self.replicas);
         for (run_id, status) in statuses.iter_mut() {
             // The run's replica result (contract 8), once a result written before has been taken up:
             // a run whose last status could not be read has none in this status.
@@ -2307,7 +2275,7 @@ impl Ingest {
     /// Notes whether a run's status, written (or with the file off, read) as of `now`, is settled:
     /// finished or abandoned, with the server running.
     fn note_settled(&self, run_id: &str, status: &serde_json::Value, now: Instant) {
-        let mut settled = self.settled.lock().unwrap();
+        let mut settled = locked(&self.settled);
         if status["server_running"] == true && (status["summary"] == "finished" || status["abandoned"] == true) {
             settled.entry(run_id.to_string()).or_insert(now);
         } else {
@@ -2326,17 +2294,14 @@ impl Ingest {
     /// back are not in its new status.
     fn evict_settled(&self) {
         let now = Instant::now();
-        let due: Vec<String> = self
-            .settled
-            .lock()
-            .unwrap()
+        let due: Vec<String> = locked(&self.settled)
             .iter()
             .filter(|(_, since)| now.saturating_duration_since(**since) >= self.config.evict_after)
             .map(|(run_id, _)| run_id.clone())
             .collect();
         for run_id in due {
             if self.evict_run(&run_id, now) {
-                self.settled.lock().unwrap().remove(&run_id);
+                locked(&self.settled).remove(&run_id);
             }
         }
     }
@@ -2347,7 +2312,7 @@ impl Ingest {
     /// buffer no flush would ever find. The map stays locked until every trace of the run is gone,
     /// so a stream of it that starts meanwhile finds nothing and starts afresh.
     fn evict_run(&self, run_id: &str, now: Instant) -> bool {
-        let mut buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut buffers = locked(&self.buffers);
         let keys: Vec<Key> = buffers.keys().filter(|key| key.0 == run_id).cloned().collect();
         for key in &keys {
             let buffer = &buffers[key];
@@ -2376,18 +2341,15 @@ impl Ingest {
         for key in &keys {
             buffers.remove(key);
         }
-        self.reports.lock().unwrap().retain(|key, _| key.0 != run_id);
-        self.stored.lock().unwrap().retain(|key, _| key.0 != run_id);
-        self.data_windows.lock().unwrap().remove(run_id);
-        self.replicas.lock().unwrap().remove(run_id);
-        self.manifests.lock().unwrap().remove(run_id);
-        self.written.lock().unwrap().remove(run_id);
-        self.order_locks.lock().unwrap().retain(|key, _| key.0 != run_id);
-        self.dropped_log.lock().unwrap().retain(|key, _| key.0 != run_id);
-        self.end_log
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|(key, _), _| key.0 != run_id);
+        locked(&self.reports).retain(|key, _| key.0 != run_id);
+        locked(&self.stored).retain(|key, _| key.0 != run_id);
+        locked(&self.data_windows).remove(run_id);
+        locked(&self.replicas).remove(run_id);
+        locked(&self.manifests).remove(run_id);
+        locked(&self.written).remove(run_id);
+        locked(&self.order_locks).retain(|key, _| key.0 != run_id);
+        locked(&self.dropped_log).retain(|key, _| key.0 != run_id);
+        locked(&self.end_log).retain(|(key, _), _| key.0 != run_id);
         drop(buffers);
         true
     }
@@ -2407,12 +2369,12 @@ impl Ingest {
         let now = Instant::now();
         // The reports first and the parts stored after: a part stored in between can only make a
         // report read behind, never current.
-        let all_reports = self.reports.lock().unwrap().clone();
-        let stored = self.stored.lock().unwrap().clone();
+        let all_reports = locked(&self.reports).clone();
+        let stored = locked(&self.stored).clone();
         for (run_id, mut status) in statuses {
             // A run whose replica result written before has not been taken up (its status could not
             // be read) is not written: the file would lose that result (lane Z3).
-            if self.config.detect && !self.replicas.lock().unwrap().contains_key(&run_id) {
+            if self.config.detect && !locked(&self.replicas).contains_key(&run_id) {
                 continue;
             }
             // The comparison's version is for the signature below, not for readers.
@@ -2461,7 +2423,7 @@ impl Ingest {
                 }),
             })
             .to_string();
-            let fresh = self.written.lock().unwrap().get(&run_id).is_some_and(|(written, at)| {
+            let fresh = locked(&self.written).get(&run_id).is_some_and(|(written, at)| {
                 *written == signature
                     && (status["summary"] == "finished"
                         || status["abandoned"] == true
@@ -2475,7 +2437,7 @@ impl Ingest {
             match self.storage.write_status(&run_id, &status).await {
                 Ok(()) => {
                     self.note_settled(&run_id, &status, started);
-                    self.written.lock().unwrap().insert(run_id, (signature, started));
+                    locked(&self.written).insert(run_id, (signature, started));
                 }
                 Err(error) => eprintln!("tensorquill-server: cannot write the watchdog status of {run_id}: {error}"),
             }
@@ -3385,7 +3347,9 @@ impl FlightService for IngestService {
 /// `server/tests/` holds it or its calls.
 #[cfg(test)]
 mod injected {
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::Mutex;
+
+    use crate::lock::locked;
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Point {
@@ -3405,14 +3369,11 @@ mod injected {
     /// The next stream task of `run` to reach `point` panics there, once. Keyed by run, so tests
     /// that run at once do not set off each other's.
     pub(super) fn arm(run: &str, point: Point) {
-        ARMED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((run.to_string(), point));
+        locked(&ARMED).push((run.to_string(), point));
     }
 
     pub(super) fn here(run: &str, point: Point) {
-        let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut armed = locked(&ARMED);
         if let Some(at) = armed.iter().position(|(armed, at)| armed == run && *at == point) {
             armed.remove(at);
             drop(armed);
@@ -3423,6 +3384,9 @@ mod injected {
 
 #[cfg(test)]
 mod lane_ar4_tests;
+
+#[cfg(test)]
+mod lane_an_t_tests;
 
 /// Returns whether a cached watchdog status older than `elapsed` should be rewritten.
 ///

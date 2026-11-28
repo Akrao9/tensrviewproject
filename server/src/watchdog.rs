@@ -203,11 +203,12 @@
 //! `rows_not_newer`, which counts step rows only.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::lock::locked;
 use crate::storage::AttemptOrder;
 
 /// The most ranks a run has that this server takes: ranks 0 to 99,999, and a world size of at most
@@ -1072,7 +1073,7 @@ impl Watchdog {
         if restored.is_empty() {
             return Ok(false);
         }
-        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ranks = locked(&self.ranks);
         for (key, progress) in restored {
             ranks.entry(key).or_insert(progress);
         }
@@ -1080,15 +1081,10 @@ impl Watchdog {
     }
 
     fn with<R>(&self, key: &Key, now: Instant, f: impl FnOnce(&mut Progress) -> R) -> R {
-        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ranks = locked(&self.ranks);
         f(ranks.entry(key.clone()).or_insert_with(|| {
             let mut progress = Progress::new(now);
-            if let Some(order) = self
-                .pending_orders
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(key)
-            {
+            if let Some(order) = locked(&self.pending_orders).remove(key) {
                 progress.attempt = order.newest().unwrap_or(0);
                 progress.order = order;
                 progress.order_loaded = true;
@@ -1158,37 +1154,25 @@ impl Watchdog {
 
     /// Whether the rank's order has been read from the store since this server took it up.
     pub fn order_loaded(&self, key: &Key) -> bool {
-        let ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
+        let ranks = locked(&self.ranks);
         match ranks.get(key) {
             Some(p) => p.order_loaded,
-            None => self
-                .pending_orders
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains_key(key),
+            None => locked(&self.pending_orders).contains_key(key),
         }
     }
 
     /// The rank's order of attempts, as the watchdog holds it (empty for a rank it does not hold).
     pub fn order(&self, key: &Key) -> AttemptOrder {
-        let ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
+        let ranks = locked(&self.ranks);
         match ranks.get(key) {
             Some(p) => p.order.clone(),
-            None => self
-                .pending_orders
-                .lock()
-                .unwrap()
-                .get(key)
-                .cloned()
-                .unwrap_or_default(),
+            None => locked(&self.pending_orders).get(key).cloned().unwrap_or_default(),
         }
     }
 
     /// The attempt a held rank shows, when it has shown one (to read a store kept before contract 1).
     pub fn shown_attempt(&self, key: &Key) -> Option<i64> {
-        self.ranks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        locked(&self.ranks)
             .get(key)
             .filter(|p| p.attempt != 0 || p.last_step.is_some() || p.attempt_since.is_some())
             .map(|p| p.attempt)
@@ -1196,15 +1180,11 @@ impl Watchdog {
 
     /// The attempt that owns the rank, none for a rank not held or with no attempt known.
     pub fn owner(&self, key: &Key) -> Option<i64> {
-        self.ranks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
-            .and_then(|p| {
-                p.order
-                    .newest()
-                    .or((p.attempt != 0 || p.last_step.is_some()).then_some(p.attempt))
-            })
+        locked(&self.ranks).get(key).and_then(|p| {
+            p.order
+                .newest()
+                .or((p.attempt != 0 || p.last_step.is_some()).then_some(p.attempt))
+        })
     }
 
     /// The order the store holds for the rank, read since this server took it up (at a restart, or
@@ -1214,12 +1194,9 @@ impl Watchdog {
     /// every few seconds).
     pub fn load_order(&self, key: &Key, order: AttemptOrder, now: Instant) {
         let window = self.config.start_limit;
-        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ranks = locked(&self.ranks);
         let Some(p) = ranks.get_mut(key) else {
-            self.pending_orders
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(key.clone(), order);
+            locked(&self.pending_orders).insert(key.clone(), order);
             return;
         };
         {
@@ -1236,17 +1213,14 @@ impl Watchdog {
     /// The rank's order after `Ingest` stored it with a new attempt placed. Who owns the rank
     /// changes at the claim (`attempt_seen`) or the owner's rows (`batch`), not here.
     pub fn set_order(&self, key: &Key, order: AttemptOrder, _now: Instant) {
-        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ranks = locked(&self.ranks);
         match ranks.get_mut(key) {
             Some(p) => {
                 p.order = order;
                 p.order_loaded = true;
             }
             None => {
-                self.pending_orders
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(key.clone(), order);
+                locked(&self.pending_orders).insert(key.clone(), order);
             }
         }
     }
@@ -1349,9 +1323,7 @@ impl Watchdog {
 
     /// The ranks of `run_id` held.
     pub fn rank_keys(&self, run_id: &str) -> Vec<Key> {
-        self.ranks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        locked(&self.ranks)
             .keys()
             .filter(|(run, _)| run == run_id)
             .cloned()
@@ -1470,7 +1442,7 @@ impl Watchdog {
     /// lock a stream takes to open, so a rank that comes back meanwhile keeps the run. True when
     /// it was let go of, or nothing of it was held.
     pub fn evict(&self, run_id: &str, now: Instant) -> bool {
-        let mut ranks = self.ranks.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ranks = locked(&self.ranks);
         let settled = {
             let mut members: Vec<(i32, &Progress)> = ranks
                 .iter()
@@ -1486,22 +1458,14 @@ impl Watchdog {
         };
         if settled {
             ranks.retain(|(run, _), _| run != run_id);
-            self.pending_orders
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .retain(|(run, _), _| run != run_id);
+            locked(&self.pending_orders).retain(|(run, _), _| run != run_id);
         }
         settled
     }
 
     /// The runs any rank is held for.
     pub fn run_ids(&self) -> std::collections::BTreeSet<String> {
-        self.ranks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .map(|(run_id, _)| run_id.clone())
-            .collect()
+        locked(&self.ranks).keys().map(|(run_id, _)| run_id.clone()).collect()
     }
 
     /// One status document per run, as of `now`. `running` is false for the last write at
@@ -1533,9 +1497,7 @@ impl Watchdog {
 
     /// Every rank held, copied under the progress lock: all a status pass does while it holds it.
     fn snapshot(&self) -> Vec<(Key, Progress)> {
-        self.ranks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        locked(&self.ranks)
             .iter()
             .map(|(key, progress)| (key.clone(), progress.clone()))
             .collect()
@@ -2191,6 +2153,68 @@ mod lane_ar4_tests;
 mod lane_as1_tests;
 #[cfg(test)]
 mod wave_ah_tests;
+
+/// Lane AN-T (SV10 a, the lock rule of `WAVE_AN_CONTRACT.md` section 11): a panic while either of
+/// the watchdog's mutexes is held poisons it, and every call after it is still answered. The mutex is
+/// poisoned by the test (a thread that holds it panics); no input reaches a panic under it. On the
+/// base (`ddcb0a0`), `order` of a rank not held took `pending_orders` with `.lock().unwrap()`, and
+/// the `pending_orders` test failed there; the `ranks` test passed and is held so that it stays so.
+#[cfg(test)]
+mod lane_an_t_tests {
+    use super::*;
+    use crate::storage::AttemptOrder;
+
+    fn poison<T: Send>(mutex: &Mutex<T>) {
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                let _held = mutex.lock();
+                panic!("a panic while the lock was held, from a lane AN-T test");
+            });
+            assert!(holder.join().is_err(), "the holding thread did not panic");
+        });
+        assert!(mutex.is_poisoned(), "the mutex was not poisoned");
+    }
+
+    /// The calls that take `ranks` and `pending_orders`, for a rank held and a rank not held.
+    fn serves(watchdog: &Watchdog) {
+        let now = Instant::now();
+        let held: Key = ("an_t".to_string(), 0);
+        let waiting: Key = ("an_t".to_string(), 1);
+        watchdog.load_order(&waiting, AttemptOrder::default(), now);
+        assert!(watchdog.order_loaded(&waiting));
+        assert_eq!(watchdog.order(&waiting), AttemptOrder::default());
+        watchdog.set_order(&waiting, AttemptOrder::default(), now);
+        watchdog.stream_opened(&held, now);
+        assert!(watchdog.attempt_seen(&held, 1, now));
+        watchdog.batch(&held, 1, Some(4), Some(1), now);
+        watchdog.stream_ended(&held, true, now);
+        assert_eq!(watchdog.shown_attempt(&held), Some(1));
+        assert_eq!(watchdog.owner(&held), Some(1));
+        assert_eq!(watchdog.rank_keys("an_t"), std::slice::from_ref(&held));
+        assert!(watchdog.run_ids().contains("an_t"));
+        assert!(watchdog.statuses(now, true).contains_key("an_t"));
+        let _ = watchdog.evict("an_t", now);
+    }
+
+    #[test]
+    fn served_after_a_panic_under_ranks() {
+        let watchdog = Watchdog::new(WatchdogConfig::default());
+        poison(&watchdog.ranks);
+        serves(&watchdog);
+    }
+
+    #[test]
+    fn served_after_a_panic_under_pending_orders() {
+        let watchdog = Watchdog::new(WatchdogConfig::default());
+        poison(&watchdog.pending_orders);
+        serves(&watchdog);
+    }
+
+    #[test]
+    fn served_with_nothing_poisoned() {
+        serves(&Watchdog::new(WatchdogConfig::default()));
+    }
+}
 
 #[cfg(test)]
 mod tests {
