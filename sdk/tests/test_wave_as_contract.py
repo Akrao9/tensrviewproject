@@ -9,8 +9,9 @@ The page states how `tensorquill-server` reads a folder of the SDK's rank files 
   stores today for a file sent with `send_file`: without pyarrow for the rows Arrow does not touch, with it for
   all. The line cases on `flight.read_lines`, a torn tail on `sink.JsonlSink`, the names on `sink.py`'s and
   `manifest.py`'s rules. These are pins: today's Python, which the Rust converter is held to.
-- Every hand-written case (end states, beats, store keys, restarts, the end message, the first-open figure)
-  against the page's rules, written plainly below as functions. They are the page in code, not product code.
+- Every hand-written case (end states, beats, store keys, the store's folder and its lock, restarts, the end
+  message, the first-open figure and its cores, the restart's and the live folder's figures) against the page's
+  rules, written plainly below as functions. They are the page in code, not product code.
 - Targets, strict expected failures that name their lane and check the product path they name: the server's
   `--records` and what it stores, the restart through it and the folder never written into (lanes FR-1 and
   FR-2); the stop notice, the beat file, the end batch on the stream and the `atexit` close (lane FR-3). The
@@ -511,6 +512,58 @@ def test_one_folder_by_two_paths_has_one_real_path(tmp_path):
     assert os.path.realpath(alias) == os.path.realpath(folder)
 
 
+def test_the_store_folder_is_the_records_folder_s_name_then_the_key():
+    """Section 3.2 as the owner answered Q5: under `stores/` the folder is the records folder's own name, a
+    hyphen, the key. Two folders of one name keep one name in front and differ by the key. The names are plain
+    letters and digits: which characters of a name are kept is lane FR-2's, and no case rests on it."""
+    (case,) = of("store_folder")
+    folders = []
+    for spec in case["opens"]:
+        name = spec["real"].rsplit("/", 1)[1]
+        assert name.isascii() and name.isalnum(), name
+        assert spec["folder"] == f"{name}-{store_key(spec)}", spec["real"]
+        folders.append(spec["folder"])
+    assert len(set(folders)) == len(folders) > 1
+    assert {folder.rsplit("-", 1)[0] for folder in folders} == {"exp1"}
+
+
+# --- Section 4: one ingest server a store ----------------------------------------------------------------------
+
+
+def store_lock(case):
+    """Section 4 as the owner answered Q6. The lock taken: the ingest server. Held by another server: read-only,
+    said. A filesystem with no locks: with the default store the server stops at start, naming `--store`; with a
+    store given by `--store` it runs and says once that one ingest server a store is not enforced there, as on
+    `s3://` and `gs://`. It never runs read-only for want of locks."""
+    if case["lock"] == "taken":
+        return {"mode": "ingest", "says": None}
+    if case["lock"] == "held":
+        return {"mode": "read_only", "says": "read_only"}
+    if case["lock"] == "no_locks" and case["chosen"] == "default":
+        return {"mode": "stopped", "says": "names_store_flag"}
+    return {"mode": "ingest", "says": "not_enforced"}
+
+
+STORE_LOCKS = of("store_lock")
+
+
+@pytest.mark.parametrize("case", STORE_LOCKS, ids=ids(STORE_LOCKS))
+def test_each_store_lock_case_follows_the_page_s_rules(case):
+    assert case["chosen"] in ("default", "flag") and case["lock"] in ("taken", "held", "no_locks", "object_store")
+    assert store_lock(case) == case["expect"]
+
+
+def test_no_server_runs_read_only_for_want_of_locks():
+    """The change the owner made to the page's first rule: read-only is for a lock another server holds, never for
+    a filesystem or a store with no locks, where no server would then convert the folder."""
+    seen = {(case["chosen"], case["lock"]) for case in STORE_LOCKS}
+    assert {("default", "held"), ("flag", "held"), ("default", "no_locks"), ("flag", "no_locks")} <= seen
+    for case in STORE_LOCKS:
+        assert (case["expect"]["mode"] == "read_only") is (case["lock"] == "held"), case["name"]
+        if case["lock"] == "object_store":
+            assert case["chosen"] == "flag", "the default store is a folder of the cache, never an object store"
+
+
 # --- Section 10: a restart ---------------------------------------------------------------------------------------
 
 
@@ -668,6 +721,34 @@ def test_the_first_open_figure():
     text = section_text(8)
     assert f"**{case['page_seconds']} seconds**" in text
     assert f"**{case['mb_per_second_per_core']} MB of lines a second per core**" in text
+
+
+def test_the_first_conversion_takes_at_most_half_the_cores():
+    """Section 8 as the owner answered Q14: one worker a rank, on at most half the cores the process may use and
+    at least one. Half of an odd count is rounded down, since the answer says at most half."""
+    (case,) = of("cores")
+    for row in case["rows"]:
+        assert row["workers"] == min(row["ranks"], max(1, row["cores"] // 2)), row
+        assert row["workers"] == 1 or 2 * row["workers"] <= row["cores"], row
+    assert {row["workers"] < row["ranks"] for row in case["rows"]} == {True, False}
+    assert "on at most half the cores the process may use and at least one" in section_text(8)
+
+
+# --- Section 10: the restart's first answer and the live folder's lag ---------------------------------------------
+
+
+def test_the_restart_s_first_answer_and_the_live_lag():
+    """F5 and F6 as the owner answered Q16: no threshold on the catch-up, and a line stored within the flush
+    interval plus one poll. The flush interval is today's default `--flush-seconds`, read from main.rs."""
+    (case,) = of("lag_figure")
+    assert case["catch_up_threshold_seconds"] is None
+    assert case["stored_within_seconds"] == case["flush_seconds"] + case["poll_seconds"]
+    main = (ROOT / "server" / "src" / "main.rs").read_text()
+    assert f"default_value_t = {case['flush_seconds']}.0, value_parser = seconds)]\n    flush_seconds: f64" in main
+    text = section_text(10)
+    assert f"within {case['restart_page_seconds']} s of a restart" in text
+    assert f"(`--flush-seconds`, {case['flush_seconds']} s) plus one poll" in text
+    assert f"every {case['poll_seconds']} s" in text
 
 
 # --- Targets through the server: `--records` (lanes FR-1 and FR-2) --------------------------------------------------

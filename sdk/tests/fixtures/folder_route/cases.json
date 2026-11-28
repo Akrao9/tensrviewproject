@@ -1577,6 +1577,110 @@
    "same": true
   },
   {
+   "name": "store_folder_is_the_records_folder_s_name_then_the_key",
+   "section": 3,
+   "kind": "store_folder",
+   "about": "the default store's folder under stores/: the records folder's own name, a hyphen, the key (the owner's answer to Q5); names of plain letters and digits only",
+   "opens": [
+    {
+     "real": "/data/runs/exp1",
+     "fs": "local",
+     "host": "gpu-a",
+     "folder": "exp1-4b944f0c987dabfe"
+    },
+    {
+     "real": "/data/other/exp1",
+     "fs": "local",
+     "host": "gpu-a",
+     "folder": "exp1-586188408a336c75"
+    },
+    {
+     "real": "/home/u/runs/exp1",
+     "fs": "network",
+     "host": "login-1",
+     "folder": "exp1-67a4e91f2c3df49e"
+    },
+    {
+     "real": "/home/u/runs/exp1",
+     "fs": "network",
+     "host": "login-2",
+     "folder": "exp1-364effe09cc285b5"
+    }
+   ]
+  },
+  {
+   "name": "store_lock_taken_is_the_ingest_server",
+   "section": 4,
+   "kind": "store_lock",
+   "about": "what a server does by who chose the store and what taking ingest.lock gave (the owner's answer to Q6)",
+   "chosen": "default",
+   "lock": "taken",
+   "expect": {
+    "mode": "ingest",
+    "says": null
+   }
+  },
+  {
+   "name": "store_lock_held_on_the_default_store_is_read_only",
+   "section": 4,
+   "kind": "store_lock",
+   "about": "what a server does by who chose the store and what taking ingest.lock gave (the owner's answer to Q6)",
+   "chosen": "default",
+   "lock": "held",
+   "expect": {
+    "mode": "read_only",
+    "says": "read_only"
+   }
+  },
+  {
+   "name": "store_lock_held_on_a_given_store_is_read_only",
+   "section": 4,
+   "kind": "store_lock",
+   "about": "what a server does by who chose the store and what taking ingest.lock gave (the owner's answer to Q6)",
+   "chosen": "flag",
+   "lock": "held",
+   "expect": {
+    "mode": "read_only",
+    "says": "read_only"
+   }
+  },
+  {
+   "name": "store_lock_no_locks_on_the_default_store_stops_at_start",
+   "section": 4,
+   "kind": "store_lock",
+   "about": "what a server does by who chose the store and what taking ingest.lock gave (the owner's answer to Q6)",
+   "chosen": "default",
+   "lock": "no_locks",
+   "expect": {
+    "mode": "stopped",
+    "says": "names_store_flag"
+   }
+  },
+  {
+   "name": "store_lock_no_locks_on_a_given_store_runs_and_says_so",
+   "section": 4,
+   "kind": "store_lock",
+   "about": "what a server does by who chose the store and what taking ingest.lock gave (the owner's answer to Q6)",
+   "chosen": "flag",
+   "lock": "no_locks",
+   "expect": {
+    "mode": "ingest",
+    "says": "not_enforced"
+   }
+  },
+  {
+   "name": "store_lock_on_an_object_store_runs_and_says_so",
+   "section": 4,
+   "kind": "store_lock",
+   "about": "what a server does by who chose the store and what taking ingest.lock gave (the owner's answer to Q6)",
+   "chosen": "flag",
+   "lock": "object_store",
+   "expect": {
+    "mode": "ingest",
+    "says": "not_enforced"
+   }
+  },
+  {
    "name": "restart_before_the_first_part",
    "section": 10,
    "kind": "restart",
@@ -1830,6 +1934,60 @@
      "seconds_one_core": 140
     }
    ]
+  },
+  {
+   "name": "first_open_cores_are_at_most_half",
+   "section": 8,
+   "kind": "cores",
+   "about": "how many ranks are converted side by side: at most half the cores the process may use, at least one, and never more than there are ranks (the owner's answer to Q14)",
+   "rows": [
+    {
+     "cores": 8,
+     "ranks": 8,
+     "workers": 4
+    },
+    {
+     "cores": 8,
+     "ranks": 2,
+     "workers": 2
+    },
+    {
+     "cores": 64,
+     "ranks": 8,
+     "workers": 8
+    },
+    {
+     "cores": 3,
+     "ranks": 8,
+     "workers": 1
+    },
+    {
+     "cores": 2,
+     "ranks": 8,
+     "workers": 1
+    },
+    {
+     "cores": 1,
+     "ranks": 8,
+     "workers": 1
+    },
+    {
+     "cores": 16,
+     "ranks": 1,
+     "workers": 1
+    }
+   ]
+  },
+  {
+   "name": "live_lag_figure",
+   "section": 10,
+   "kind": "lag_figure",
+   "about": "the figures of F5 and F6 as the owner answered Q16: the page's first answer within 5 s of a restart, the catch-up reported with no threshold, and a line stored within the flush interval plus one poll",
+   "restart_page_seconds": 5,
+   "catch_up_threshold_seconds": null,
+   "flush_seconds": 10,
+   "poll_seconds": 1,
+   "stored_within_seconds": 11
   }
  ]
 }

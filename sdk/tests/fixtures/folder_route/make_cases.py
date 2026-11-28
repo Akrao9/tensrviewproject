@@ -318,6 +318,44 @@ STORE_KEYS = [
      {"real": "/home/u/runs/exp1", "fs": "network", "host": "login-1"}, True),
 ]
 
+# The default derived store's folder (section 3.2, Q5 as the owner answered it): the records folder's own name, a
+# hyphen, the key. The names here are plain letters and digits, since which characters of a name are kept is lane
+# FR-2's to state. The keys are written out, not computed here: the test computes each from the rule.
+STORE_FOLDERS = [
+    {"real": "/data/runs/exp1", "fs": "local", "host": "gpu-a", "folder": "exp1-4b944f0c987dabfe"},
+    {"real": "/data/other/exp1", "fs": "local", "host": "gpu-a", "folder": "exp1-586188408a336c75"},
+    {"real": "/home/u/runs/exp1", "fs": "network", "host": "login-1", "folder": "exp1-67a4e91f2c3df49e"},
+    {"real": "/home/u/runs/exp1", "fs": "network", "host": "login-2", "folder": "exp1-364effe09cc285b5"},
+]
+
+# One ingest server a store (section 4, Q6 as the owner answered it). "chosen" is who chose the store: "default"
+# (no --store given, the derived store) or "flag" (--store). "lock" is what taking ingest.lock gave: "taken",
+# "held" (another server has it), "no_locks" (the filesystem has none) or "object_store" (s3:// or gs://, where no
+# such lock exists). "mode" is "ingest", "read_only" or "stopped" (at start); "says" is the one thing said at start.
+STORE_LOCKS = [
+    ("store_lock_taken_is_the_ingest_server", "default", "taken", {"mode": "ingest", "says": None}),
+    ("store_lock_held_on_the_default_store_is_read_only", "default", "held", {"mode": "read_only", "says": "read_only"}),
+    ("store_lock_held_on_a_given_store_is_read_only", "flag", "held", {"mode": "read_only", "says": "read_only"}),
+    ("store_lock_no_locks_on_the_default_store_stops_at_start", "default", "no_locks",
+     {"mode": "stopped", "says": "names_store_flag"}),
+    ("store_lock_no_locks_on_a_given_store_runs_and_says_so", "flag", "no_locks",
+     {"mode": "ingest", "says": "not_enforced"}),
+    ("store_lock_on_an_object_store_runs_and_says_so", "flag", "object_store",
+     {"mode": "ingest", "says": "not_enforced"}),
+]
+
+# The cores of the first conversion (section 8, Q14 as the owner answered it): each rank is read in file order by
+# one worker, ranks side by side, on at most half the cores the process may use and at least one.
+FIRST_OPEN_CORES = [
+    {"cores": 8, "ranks": 8, "workers": 4},
+    {"cores": 8, "ranks": 2, "workers": 2},
+    {"cores": 64, "ranks": 8, "workers": 8},
+    {"cores": 3, "ranks": 8, "workers": 1},
+    {"cores": 2, "ranks": 8, "workers": 1},
+    {"cores": 1, "ranks": 8, "workers": 1},
+    {"cores": 16, "ranks": 1, "workers": 1},
+]
+
 # A server stopped and started again during a run (section 10). Lines are one attempt's steps 0 to n-1 unless
 # "attempts" says otherwise ([attempt, first step, last step + 1], in file order); a part is stored every
 # "flush" lines; "kill" says how far the first server got: lines read, parts stored, parts whose offset it wrote.
@@ -368,6 +406,13 @@ def main():
                                                 for a, b, w in looks], "expect": e} for n, i, looks, e in BEATS]
     cases += [{"name": n, "section": 3, "kind": "store_key", "about": "whether two opens share a default store",
                "first": a, "second": b, "same": s} for n, a, b, s in STORE_KEYS]
+    cases.append({"name": "store_folder_is_the_records_folder_s_name_then_the_key", "section": 3, "kind": "store_folder",
+                  "about": ("the default store's folder under stores/: the records folder's own name, a hyphen, the key "
+                            "(the owner's answer to Q5); names of plain letters and digits only"),
+                  "opens": STORE_FOLDERS})
+    cases += [{"name": n, "section": 4, "kind": "store_lock",
+               "about": "what a server does by who chose the store and what taking ingest.lock gave (the owner's answer to Q6)",
+               "chosen": c, "lock": k, "expect": e} for n, c, k, e in STORE_LOCKS]
     cases += [{"name": n, "section": 10, "kind": "restart", "about": "a server stopped and started again during a run",
                **spec, "expect": {"each_step_once": True, "lost": []}} for n, spec in RESTARTS]
     cases += [{"name": n, "section": 9, "kind": "end_message", "about": "a rank's end on today's stream",
@@ -376,6 +421,16 @@ def main():
                   "about": "the owner's figure (Nov 27): the page within 5 s, 50 MB of lines a second per core",
                   "page_seconds": 5, "mb_per_second_per_core": 50,
                   "folders": [{"mb": 31000, "seconds_one_core": 620}, {"mb": 7000, "seconds_one_core": 140}]})
+    cases.append({"name": "first_open_cores_are_at_most_half", "section": 8, "kind": "cores",
+                  "about": ("how many ranks are converted side by side: at most half the cores the process may use, "
+                            "at least one, and never more than there are ranks (the owner's answer to Q14)"),
+                  "rows": FIRST_OPEN_CORES})
+    cases.append({"name": "live_lag_figure", "section": 10, "kind": "lag_figure",
+                  "about": ("the figures of F5 and F6 as the owner answered Q16: the page's first answer within 5 s of a "
+                            "restart, the catch-up reported with no threshold, and a line stored within the flush "
+                            "interval plus one poll"),
+                  "restart_page_seconds": 5, "catch_up_threshold_seconds": None,
+                  "flush_seconds": 10, "poll_seconds": 1, "stored_within_seconds": 11})
     document = {
         "contract": "WAVE_AS_CONTRACT.md",
         "base": BASE,
