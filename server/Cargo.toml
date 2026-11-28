@@ -38,6 +38,17 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["tls-aws-lc"] }
 url = "2"
+# The catalog (lane AN-1): a SQLite index of the store, rebuilt from it, on the server's local disk.
+# `bundled` compiles SQLite into the binary, so no system library is needed. Nothing uses it until
+# that lane lands.
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+# The read API's HTTP side (lane AN-2), with HTTP/1 on Tokio only: no `json` or `query` feature,
+# which would add crates the lock does not hold. Already compiled into the binary through tonic.
+# Nothing uses it until that lane lands.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# Reads a filesystem's type (`statfs`), to keep the catalog off a network filesystem (lane AN-1).
+# Already in the lock. Nothing uses it until that lane lands.
+libc = "0.2"
 
 [features]
 # Cloud stores are on by default: the server's job is to write to S3, GCS or local disk. A build
