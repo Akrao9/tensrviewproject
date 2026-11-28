@@ -1,0 +1,4639 @@
+{
+ "contract": "WAVE_AN_CONTRACT.md",
+ "base": "1dddcce262373c1b3a552b53dff6ec639a8c2cb7",
+ "how_to_read": "Each case names the rows of the page's decision table it rests on (`rests_on`) and its release (`release`): `0.1.0` for what step 2 of the local-first 0.1.0 builds, `0.2.0` for a part the owner moved to 0.2.0, kept as written on Nov 24. A case on an open Q row holds the recommended option. `rule` names the rule of the page that gives `expect` from `input`, written plainly in sdk/tests/test_wave_an_contract.py; a case with no rule is a requirement its paths' targets test. `paths`: `rule` (checked here on every tree), `http` (the read API, a target), `server` (the server's start or a restart, a target), `python` (the SDK's readers: a pin or a target). Keys in a listing are relative to the rank folder `runs/<run_id>/rank=<rank>/`. Ages are hours before the rules' clock.",
+ "cases": [
+  {
+   "name": "catalog_rebuild_reasons",
+   "section": 1,
+   "rests_on": [
+    "Q1"
+   ],
+   "rule": "catalog_start",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-1",
+   "release": "0.1.0",
+   "why": "Section 1.5's table: what a server does with the catalog file it finds at start.",
+   "input": [
+    {
+     "file": false,
+     "user_version_ok": true,
+     "quick_check_ok": true,
+     "store_id_ok": true,
+     "clean_stop": true
+    },
+    {
+     "file": true,
+     "user_version_ok": false,
+     "quick_check_ok": true,
+     "store_id_ok": true,
+     "clean_stop": true
+    },
+    {
+     "file": true,
+     "user_version_ok": true,
+     "quick_check_ok": false,
+     "store_id_ok": true,
+     "clean_stop": true
+    },
+    {
+     "file": true,
+     "user_version_ok": true,
+     "quick_check_ok": true,
+     "store_id_ok": false,
+     "clean_stop": true
+    },
+    {
+     "file": true,
+     "user_version_ok": true,
+     "quick_check_ok": true,
+     "store_id_ok": true,
+     "clean_stop": false
+    },
+    {
+     "file": true,
+     "user_version_ok": true,
+     "quick_check_ok": true,
+     "store_id_ok": true,
+     "clean_stop": true
+    },
+    {
+     "file": false,
+     "user_version_ok": false,
+     "quick_check_ok": false,
+     "store_id_ok": false,
+     "clean_stop": false
+    }
+   ],
+   "expect": [
+    {
+     "action": "build",
+     "why": "missing"
+    },
+    {
+     "action": "build",
+     "why": "version"
+    },
+    {
+     "action": "build",
+     "why": "damaged"
+    },
+    {
+     "action": "build",
+     "why": "store_replaced"
+    },
+    {
+     "action": "resync",
+     "why": "unclean_stop"
+    },
+    {
+     "action": "open",
+     "why": null
+    },
+    {
+     "action": "build",
+     "why": "missing"
+    }
+   ]
+  },
+  {
+   "name": "catalog_never_ahead_of_store",
+   "section": 1,
+   "rests_on": [
+    "Q1"
+   ],
+   "rule": "catalog_events",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-1",
+   "release": "0.1.0",
+   "why": "An event is sent only after its object is stored, so a crash leaves the catalog behind the store, never ahead of it, and the resync at the next start brings it level.",
+   "input": {
+    "puts": [
+     "attempt=1732400000000/part-00000000-00000049.parquet",
+     "attempt=1732400000000/part-00000050-00000099.parquet",
+     "incidents.json"
+    ],
+    "committed": [
+     "attempt=1732400000000/part-00000000-00000049.parquet"
+    ]
+   },
+   "expect": {
+    "after_crash": [
+     "attempt=1732400000000/part-00000000-00000049.parquet"
+    ],
+    "ahead_of_store": [],
+    "behind_store": [
+     "attempt=1732400000000/part-00000050-00000099.parquet",
+     "incidents.json"
+    ],
+    "after_resync": [
+     "attempt=1732400000000/part-00000000-00000049.parquet",
+     "attempt=1732400000000/part-00000050-00000099.parquet",
+     "incidents.json"
+    ]
+   }
+  },
+  {
+   "name": "catalog_place",
+   "section": 1,
+   "rests_on": [
+    "Q2",
+    "D24",
+    "Q27"
+   ],
+   "rule": "catalog_place",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-1",
+   "release": "0.1.0",
+   "why": "Section 1.2: the state folder on a local disk; the per-user temporary folder when the state folder is on a network filesystem or its type cannot be read; off, and said, when neither can be used; --catalog off; a named path refused under the store root or on a network filesystem.",
+   "input": {
+    "store_id": "s-1",
+    "schema": 1,
+    "uid": 501,
+    "state": "/home/u/.local/state",
+    "tmp": "/tmp",
+    "store_root": "/data/store",
+    "rows": [
+     {
+      "state_fs": "local",
+      "tmp_fs": "local"
+     },
+     {
+      "state_fs": "network",
+      "tmp_fs": "local"
+     },
+     {
+      "state_fs": "unknown",
+      "tmp_fs": "local"
+     },
+     {
+      "state_fs": "network",
+      "tmp_fs": "network"
+     },
+     {
+      "state_fs": "network",
+      "tmp_fs": "unknown"
+     },
+     {
+      "state_fs": "network",
+      "tmp_fs": "local",
+      "tmp_usable": false
+     },
+     {
+      "state_fs": "local",
+      "tmp_fs": "local",
+      "flag": "off"
+     },
+     {
+      "state_fs": "network",
+      "tmp_fs": "local",
+      "flag": "/scratch/c.sqlite3",
+      "flag_fs": "local"
+     },
+     {
+      "state_fs": "local",
+      "tmp_fs": "local",
+      "flag": "/data/store/c.sqlite3",
+      "flag_fs": "local"
+     },
+     {
+      "state_fs": "local",
+      "tmp_fs": "local",
+      "flag": "/home/u/c.sqlite3",
+      "flag_fs": "network"
+     },
+     {
+      "state_fs": "local",
+      "tmp_fs": "local",
+      "flag": "/home/u/c.sqlite3",
+      "flag_fs": "unknown"
+     }
+    ]
+   },
+   "expect": [
+    {
+     "catalog": "/home/u/.local/state/tensorquill/catalog-s-1-v1.sqlite3"
+    },
+    {
+     "catalog": "/tmp/tensorquill-501/catalog-s-1-v1.sqlite3"
+    },
+    {
+     "catalog": "/tmp/tensorquill-501/catalog-s-1-v1.sqlite3"
+    },
+    {
+     "catalog": null,
+     "said": "no_local_folder"
+    },
+    {
+     "catalog": null,
+     "said": "no_local_folder"
+    },
+    {
+     "catalog": null,
+     "said": "no_local_folder"
+    },
+    {
+     "catalog": null,
+     "said": "flag_off"
+    },
+    {
+     "catalog": "/scratch/c.sqlite3"
+    },
+    {
+     "refused": "under_store_root"
+    },
+    {
+     "refused": "network_filesystem"
+    },
+    {
+     "refused": "network_filesystem"
+    }
+   ]
+  },
+  {
+   "name": "api_runs_page",
+   "section": 2,
+   "rests_on": [
+    "Q1"
+   ],
+   "rule": "runs_pages",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "/v1/runs pages, newest status first, then run ID; the last page has no token.",
+   "input": {
+    "limit": 2,
+    "runs": [
+     {
+      "run_id": "r-a",
+      "project": "p",
+      "status_written_ms": 1000
+     },
+     {
+      "run_id": "r-b",
+      "project": "p",
+      "status_written_ms": 3000
+     },
+     {
+      "run_id": "r-c",
+      "project": "q",
+      "status_written_ms": 3000
+     },
+     {
+      "run_id": "r-d",
+      "project": "p",
+      "status_written_ms": 2000
+     },
+     {
+      "run_id": "r-e",
+      "project": "q",
+      "status_written_ms": 500
+     }
+    ]
+   },
+   "expect": [
+    [
+     "r-b",
+     "r-c"
+    ],
+    [
+     "r-d",
+     "r-a"
+    ],
+    [
+     "r-e"
+    ]
+   ]
+  },
+  {
+   "name": "api_errors",
+   "section": 2,
+   "rests_on": [
+    "Q7",
+    "Q35",
+    "D15"
+   ],
+   "rule": "api_errors",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Section 2.5's errors in 0.1.0, where reads have no token (D15): /healthz and /v1/status answer; an unknown run or rank, a rank outside 0 to 99,999, a limit or page size out of range and an unknown column are refused as named.",
+   "input": {
+    "run_id": "an-run",
+    "ranks": [
+     0
+    ],
+    "token_set": false,
+    "columns": [
+     "grad_norm",
+     "weight_norm",
+     "lr",
+     "scalars",
+     "ts"
+    ],
+    "requests": [
+     {
+      "path": "/healthz"
+     },
+     {
+      "path": "/v1/status"
+     },
+     {
+      "path": "/v1/runs"
+     },
+     {
+      "path": "/v1/runs/nope"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/7/report"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/100000/report"
+     },
+     {
+      "path": "/v1/runs?limit=0"
+     },
+     {
+      "path": "/v1/runs?limit=1001"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/0/rows?page_size=10001"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/0/rows?columns=no_such"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/0/rows?columns=grad_norm"
+     }
+    ]
+   },
+   "expect": [
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 404,
+     "code": "run_not_found"
+    },
+    {
+     "status": 404,
+     "code": "rank_not_found"
+    },
+    {
+     "status": 400,
+     "code": "bad_parameter"
+    },
+    {
+     "status": 400,
+     "code": "bad_parameter"
+    },
+    {
+     "status": 400,
+     "code": "bad_parameter"
+    },
+    {
+     "status": 400,
+     "code": "bad_parameter"
+    },
+    {
+     "status": 400,
+     "code": "unknown_column"
+    },
+    {
+     "status": 200,
+     "code": null
+    }
+   ]
+  },
+  {
+   "name": "http_listen_flags",
+   "section": 2,
+   "rests_on": [
+    "D16",
+    "D17",
+    "Q26"
+   ],
+   "rule": "http_listen",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Section 2.1: the listener is off unless asked for; --ui turns on 127.0.0.1:50052 when no address is given and serves the page; an address given wins; an address that is not loopback is refused in 0.1.0 whatever the token or --allow-unauthenticated.",
+   "input": [
+    {
+     "args": []
+    },
+    {
+     "args": [
+      "--http-listen",
+      "127.0.0.1:0"
+     ]
+    },
+    {
+     "args": [
+      "--ui"
+     ]
+    },
+    {
+     "args": [
+      "--ui",
+      "--http-listen",
+      "127.0.0.1:8000"
+     ]
+    },
+    {
+     "args": [
+      "--http-listen",
+      "[::1]:50052"
+     ]
+    },
+    {
+     "args": [
+      "--http-listen",
+      "127.0.0.2:50052"
+     ]
+    },
+    {
+     "args": [
+      "--http-listen",
+      "0.0.0.0:50052"
+     ]
+    },
+    {
+     "args": [
+      "--http-listen",
+      "192.168.1.5:50052"
+     ],
+     "token": true
+    },
+    {
+     "args": [
+      "--http-listen",
+      "0.0.0.0:50052",
+      "--allow-unauthenticated"
+     ]
+    }
+   ],
+   "expect": [
+    {
+     "http": null,
+     "page": false
+    },
+    {
+     "http": "127.0.0.1:0",
+     "page": false
+    },
+    {
+     "http": "127.0.0.1:50052",
+     "page": true
+    },
+    {
+     "http": "127.0.0.1:8000",
+     "page": true
+    },
+    {
+     "http": "[::1]:50052",
+     "page": false
+    },
+    {
+     "http": "127.0.0.2:50052",
+     "page": false
+    },
+    {
+     "refused": "loopback_only"
+    },
+    {
+     "refused": "loopback_only"
+    },
+    {
+     "refused": "loopback_only"
+    }
+   ]
+  },
+  {
+   "name": "port_taken",
+   "section": 2,
+   "rests_on": [
+    "D20"
+   ],
+   "rule": "http_listen",
+   "paths": [
+    "rule",
+    "server"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Section 2.1: when its port is in use the server stops, exit 1, with a line that names the address and --http-listen 127.0.0.1:0, for the default port and for one given.",
+   "input": [
+    {
+     "args": [
+      "--ui"
+     ],
+     "taken": true
+    },
+    {
+     "args": [
+      "--http-listen",
+      "127.0.0.1:41234"
+     ],
+     "taken": true
+    }
+   ],
+   "expect": [
+    {
+     "stops": true,
+     "exit": 1,
+     "names": [
+      "127.0.0.1:50052",
+      "--http-listen 127.0.0.1:0"
+     ]
+    },
+    {
+     "stops": true,
+     "exit": 1,
+     "names": [
+      "127.0.0.1:41234",
+      "--http-listen 127.0.0.1:0"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "start_lines",
+   "section": 2,
+   "rests_on": [
+    "D18",
+    "D19",
+    "Q33"
+   ],
+   "rule": "start_lines",
+   "paths": [
+    "rule",
+    "server"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Section 2.1: on standard output after Flight's line, the bound address for scripts, the URL with its scheme, and under it the tunnel hint only when SSH_CONNECTION or SSH_TTY is set and not empty.",
+   "input": [
+    {
+     "bound": "127.0.0.1:50052",
+     "env": {}
+    },
+    {
+     "bound": "127.0.0.1:41234",
+     "env": {
+      "SSH_CONNECTION": "10.0.0.2 52000 10.0.0.9 22"
+     }
+    },
+    {
+     "bound": "[::1]:50052",
+     "env": {
+      "SSH_TTY": "/dev/pts/3"
+     }
+    },
+    {
+     "bound": "127.0.0.1:50052",
+     "env": {
+      "SSH_CONNECTION": ""
+     }
+    }
+   ],
+   "expect": [
+    [
+     "tensorquill-server http on 127.0.0.1:50052",
+     "http://127.0.0.1:50052"
+    ],
+    [
+     "tensorquill-server http on 127.0.0.1:41234",
+     "http://127.0.0.1:41234",
+     "on your own machine: ssh -N -L 41234:127.0.0.1:41234 <user>@<server>"
+    ],
+    [
+     "tensorquill-server http on [::1]:50052",
+     "http://[::1]:50052",
+     "on your own machine: ssh -N -L 50052:[::1]:50052 <user>@<server>"
+    ],
+    [
+     "tensorquill-server http on 127.0.0.1:50052",
+     "http://127.0.0.1:50052"
+    ]
+   ]
+  },
+  {
+   "name": "relative_urls",
+   "section": 2,
+   "rests_on": [
+    "D21"
+   ],
+   "rule": "relative_urls",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Section 2.2: the page's relative paths stay under a proxy's prefix; a path from the root leaves it.",
+   "input": {
+    "bases": [
+     "http://127.0.0.1:50052/",
+     "https://nb.example/proxy/50052/"
+    ],
+    "paths": [
+     "./v1/runs",
+     "./healthz",
+     "./v1/runs/an-run/ranks/0/series?kind=grad_norm",
+     "/v1/runs"
+    ]
+   },
+   "expect": {
+    "http://127.0.0.1:50052/": [
+     "http://127.0.0.1:50052/v1/runs",
+     "http://127.0.0.1:50052/healthz",
+     "http://127.0.0.1:50052/v1/runs/an-run/ranks/0/series?kind=grad_norm",
+     "http://127.0.0.1:50052/v1/runs"
+    ],
+    "https://nb.example/proxy/50052/": [
+     "https://nb.example/proxy/50052/v1/runs",
+     "https://nb.example/proxy/50052/healthz",
+     "https://nb.example/proxy/50052/v1/runs/an-run/ranks/0/series?kind=grad_norm",
+     "https://nb.example/v1/runs"
+    ]
+   }
+  },
+  {
+   "name": "series_keeps_spikes",
+   "section": 3,
+   "rests_on": [
+    "Q8"
+   ],
+   "rule": "series",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "A spike of 50 at step 517 and a NaN at step 800 among 1,000 points of 1.0, cut to at most 100 points: both kept.",
+   "input": {
+    "series": {
+     "steps": 1000,
+     "value": 1.0,
+     "set": {
+      "517": 50.0,
+      "800": "nan"
+     }
+    },
+    "points": 100
+   },
+   "expect": {
+    "points": [
+     [
+      0,
+      1.0
+     ],
+     [
+      31,
+      1.0
+     ],
+     [
+      62,
+      1.0
+     ],
+     [
+      93,
+      1.0
+     ],
+     [
+      125,
+      1.0
+     ],
+     [
+      156,
+      1.0
+     ],
+     [
+      187,
+      1.0
+     ],
+     [
+      218,
+      1.0
+     ],
+     [
+      250,
+      1.0
+     ],
+     [
+      281,
+      1.0
+     ],
+     [
+      312,
+      1.0
+     ],
+     [
+      343,
+      1.0
+     ],
+     [
+      375,
+      1.0
+     ],
+     [
+      406,
+      1.0
+     ],
+     [
+      437,
+      1.0
+     ],
+     [
+      468,
+      1.0
+     ],
+     [
+      500,
+      1.0
+     ],
+     [
+      517,
+      50.0
+     ],
+     [
+      531,
+      1.0
+     ],
+     [
+      562,
+      1.0
+     ],
+     [
+      593,
+      1.0
+     ],
+     [
+      625,
+      1.0
+     ],
+     [
+      656,
+      1.0
+     ],
+     [
+      687,
+      1.0
+     ],
+     [
+      718,
+      1.0
+     ],
+     [
+      750,
+      1.0
+     ],
+     [
+      781,
+      1.0
+     ],
+     [
+      800,
+      "nan"
+     ],
+     [
+      812,
+      1.0
+     ],
+     [
+      843,
+      1.0
+     ],
+     [
+      875,
+      1.0
+     ],
+     [
+      906,
+      1.0
+     ],
+     [
+      937,
+      1.0
+     ],
+     [
+      968,
+      1.0
+     ],
+     [
+      999,
+      1.0
+     ]
+    ],
+    "downsampled": true,
+    "of": 1000,
+    "buckets": 32
+   }
+  },
+  {
+   "name": "series_short_is_whole",
+   "section": 3,
+   "rests_on": [
+    "Q8"
+   ],
+   "rule": "series",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "A series no longer than the points asked for is returned whole, not downsampled.",
+   "input": {
+    "series": {
+     "steps": 40,
+     "value": 1.0,
+     "set": {
+      "10": 3.0
+     }
+    },
+    "points": 100
+   },
+   "expect": {
+    "points": [
+     [
+      0,
+      1.0
+     ],
+     [
+      1,
+      1.0
+     ],
+     [
+      2,
+      1.0
+     ],
+     [
+      3,
+      1.0
+     ],
+     [
+      4,
+      1.0
+     ],
+     [
+      5,
+      1.0
+     ],
+     [
+      6,
+      1.0
+     ],
+     [
+      7,
+      1.0
+     ],
+     [
+      8,
+      1.0
+     ],
+     [
+      9,
+      1.0
+     ],
+     [
+      10,
+      3.0
+     ],
+     [
+      11,
+      1.0
+     ],
+     [
+      12,
+      1.0
+     ],
+     [
+      13,
+      1.0
+     ],
+     [
+      14,
+      1.0
+     ],
+     [
+      15,
+      1.0
+     ],
+     [
+      16,
+      1.0
+     ],
+     [
+      17,
+      1.0
+     ],
+     [
+      18,
+      1.0
+     ],
+     [
+      19,
+      1.0
+     ],
+     [
+      20,
+      1.0
+     ],
+     [
+      21,
+      1.0
+     ],
+     [
+      22,
+      1.0
+     ],
+     [
+      23,
+      1.0
+     ],
+     [
+      24,
+      1.0
+     ],
+     [
+      25,
+      1.0
+     ],
+     [
+      26,
+      1.0
+     ],
+     [
+      27,
+      1.0
+     ],
+     [
+      28,
+      1.0
+     ],
+     [
+      29,
+      1.0
+     ],
+     [
+      30,
+      1.0
+     ],
+     [
+      31,
+      1.0
+     ],
+     [
+      32,
+      1.0
+     ],
+     [
+      33,
+      1.0
+     ],
+     [
+      34,
+      1.0
+     ],
+     [
+      35,
+      1.0
+     ],
+     [
+      36,
+      1.0
+     ],
+     [
+      37,
+      1.0
+     ],
+     [
+      38,
+      1.0
+     ],
+     [
+      39,
+      1.0
+     ]
+    ],
+    "downsampled": false,
+    "of": 40,
+    "buckets": null
+   }
+  },
+  {
+   "name": "scan_pages_by_step_range",
+   "section": 3,
+   "rests_on": [
+    "Q9"
+   ],
+   "rule": "scan",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Every row of [5, 20), the named column with the identity keys, six rows a page; no token after the last.",
+   "input": {
+    "rows": [
+     {
+      "attempt": 1732400000000,
+      "steps": [
+       0,
+       24
+      ],
+      "columns": {
+       "grad_norm": "step/10"
+      }
+     }
+    ],
+    "columns": [
+     "grad_norm"
+    ],
+    "from_step": 5,
+    "to_step": 20,
+    "page_size": 6
+   },
+   "expect": {
+    "pages": [
+     {
+      "rows": [
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 5,
+        "grad_norm": 0.5
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 6,
+        "grad_norm": 0.6
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 7,
+        "grad_norm": 0.7
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 8,
+        "grad_norm": 0.8
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 9,
+        "grad_norm": 0.9
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 10,
+        "grad_norm": 1.0
+       }
+      ],
+      "next": true
+     },
+     {
+      "rows": [
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 11,
+        "grad_norm": 1.1
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 12,
+        "grad_norm": 1.2
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 13,
+        "grad_norm": 1.3
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 14,
+        "grad_norm": 1.4
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 15,
+        "grad_norm": 1.5
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 16,
+        "grad_norm": 1.6
+       }
+      ],
+      "next": true
+     },
+     {
+      "rows": [
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 17,
+        "grad_norm": 1.7
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 18,
+        "grad_norm": 1.8
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 19,
+        "grad_norm": 1.9
+       }
+      ],
+      "next": false
+     }
+    ]
+   }
+  },
+  {
+   "name": "scan_named_columns_only",
+   "section": 3,
+   "rests_on": [
+    "D14"
+   ],
+   "rule": "scan",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Only the columns named; a column some parts lack (an older part) is null in their rows.",
+   "input": {
+    "rows": [
+     {
+      "attempt": 1732400000000,
+      "steps": [
+       0,
+       4
+      ],
+      "columns": {
+       "grad_norm": "step/10"
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "steps": [
+       5,
+       9
+      ],
+      "columns": {
+       "grad_norm": "step/10",
+       "clip_grad_norm": 0.5
+      }
+     }
+    ],
+    "columns": [
+     "clip_grad_norm"
+    ],
+    "page_size": 100
+   },
+   "expect": {
+    "pages": [
+     {
+      "rows": [
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 0,
+        "clip_grad_norm": null
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 1,
+        "clip_grad_norm": null
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 2,
+        "clip_grad_norm": null
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 3,
+        "clip_grad_norm": null
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 4,
+        "clip_grad_norm": null
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 5,
+        "clip_grad_norm": 0.5
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 6,
+        "clip_grad_norm": 0.5
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 7,
+        "clip_grad_norm": 0.5
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 8,
+        "clip_grad_norm": 0.5
+       },
+       {
+        "run_id": "an-run",
+        "rank": 0,
+        "attempt": 1732400000000,
+        "step": 9,
+        "clip_grad_norm": 0.5
+       }
+      ],
+      "next": false
+     }
+    ]
+   }
+  },
+  {
+   "name": "scan_resolved_attempts",
+   "section": 3,
+   "rests_on": [
+    "D7"
+   ],
+   "rule": "scan",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Attempt B resumed at step 6: the resolved scan leaves out A's steps 6 to 9; attempts=all keeps them, in the rank's attempt order.",
+   "input": [
+    {
+     "rows": [
+      {
+       "attempt": 1732400000000,
+       "steps": [
+        0,
+        9
+       ]
+      },
+      {
+       "attempt": 1732500000000,
+       "steps": [
+        6,
+        12
+       ]
+      }
+     ],
+     "order": [
+      1732400000000,
+      1732500000000
+     ],
+     "columns": [],
+     "page_size": 100,
+     "attempts": "resolved"
+    },
+    {
+     "rows": [
+      {
+       "attempt": 1732400000000,
+       "steps": [
+        0,
+        9
+       ]
+      },
+      {
+       "attempt": 1732500000000,
+       "steps": [
+        6,
+        12
+       ]
+      }
+     ],
+     "order": [
+      1732400000000,
+      1732500000000
+     ],
+     "columns": [],
+     "page_size": 100,
+     "attempts": "all"
+    }
+   ],
+   "expect": [
+    {
+     "pages": [
+      {
+       "rows": [
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 0
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 1
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 2
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 3
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 4
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 5
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 6
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 7
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 8
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 9
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 10
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 11
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 12
+        }
+       ],
+       "next": false
+      }
+     ]
+    },
+    {
+     "pages": [
+      {
+       "rows": [
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 0
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 1
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 2
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 3
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 4
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 5
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 6
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 7
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 8
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732400000000,
+         "step": 9
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 6
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 7
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 8
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 9
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 10
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 11
+        },
+        {
+         "run_id": "an-run",
+         "rank": 0,
+         "attempt": 1732500000000,
+         "step": 12
+        }
+       ],
+       "next": false
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "scan_view_changed",
+   "section": 3,
+   "rests_on": [
+    "D7"
+   ],
+   "rule": "scan_view",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "A token after step 3: a new attempt that starts at or below it refuses the token; one that starts above it does not, and the next page reads the new resolved rows.",
+   "input": {
+    "before": [
+     {
+      "attempt": 1732400000000,
+      "steps": [
+       0,
+       9
+      ]
+     }
+    ],
+    "order_before": [
+     1732400000000
+    ],
+    "page_size": 4,
+    "changes": [
+     {
+      "added": [
+       {
+        "attempt": 1732500000000,
+        "steps": [
+         2,
+         5
+        ]
+       }
+      ],
+      "order": [
+       1732400000000,
+       1732500000000
+      ]
+     },
+     {
+      "added": [
+       {
+        "attempt": 1732500000000,
+        "steps": [
+         12,
+         14
+        ]
+       }
+      ],
+      "order": [
+       1732400000000,
+       1732500000000
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "first_page_steps": [
+     0,
+     1,
+     2,
+     3
+    ],
+    "boundary": 3,
+    "after": [
+     {
+      "status": 409,
+      "code": "view_changed"
+     },
+     {
+      "status": 200,
+      "steps": [
+       [
+        1732400000000,
+        4
+       ],
+       [
+        1732400000000,
+        5
+       ],
+       [
+        1732400000000,
+        6
+       ],
+       [
+        1732400000000,
+        7
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "read_stops_at_stored",
+   "section": 4,
+   "rests_on": [
+    "Q9"
+   ],
+   "rule": "stored_cutoff",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-2, AN-5",
+   "release": "0.1.0",
+   "why": "Parts through step 99, steps 100 to 120 held: a read returns through 99 and names both.",
+   "input": {
+    "attempt": 1732400000000,
+    "parts": [
+     [
+      0,
+      49
+     ],
+     [
+      50,
+      99
+     ]
+    ],
+    "held": {
+     "rows": 21,
+     "first_step": 100,
+     "last_step": 120
+    }
+   },
+   "expect": {
+    "returned_last_step": 99,
+    "stored_through": {
+     "attempt": 1732400000000,
+     "step": 99
+    },
+    "held": {
+     "rows": 21,
+     "first_step": 100,
+     "last_step": 120
+    }
+   }
+  },
+  {
+   "name": "scalar_series_merge",
+   "section": 5,
+   "rests_on": [
+    "D13"
+   ],
+   "rule": "scalar_series",
+   "paths": [
+    "rule",
+    "python",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "WAVE_AL_CONTRACT.md section 4.6 in a read: at step 2 the scalar-only record of the highest seq wins; step 7 has no training record and is a point of its own; another name is not this series. On the base, today's evidence.scalar_series gives the resolved points (a pin); the read API must give the same.",
+   "input": {
+    "name": "loss",
+    "order": [
+     1732400000000
+    ],
+    "training": [
+     {
+      "attempt": 1732400000000,
+      "step": 0,
+      "scalars": {
+       "loss": 2.0
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "step": 1,
+      "scalars": {
+       "loss": 1.9
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "step": 2,
+      "scalars": {
+       "loss": 1.8
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "step": 3,
+      "scalars": {
+       "loss": 1.7
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "step": 4,
+      "scalars": {
+       "loss": 1.6
+      }
+     }
+    ],
+    "scalar_only": [
+     {
+      "attempt": 1732400000000,
+      "step": 2,
+      "seq": 0,
+      "scalars": {
+       "loss": 9.0
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "step": 7,
+      "seq": 1,
+      "scalars": {
+       "loss": 7.0
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "step": 2,
+      "seq": 3,
+      "scalars": {
+       "loss": 8.0
+      }
+     },
+     {
+      "attempt": 1732400000000,
+      "step": 3,
+      "seq": 2,
+      "scalars": {
+       "eval_loss": 3.3
+      }
+     }
+    ]
+   },
+   "expect": {
+    "points": [
+     [
+      0,
+      2.0
+     ],
+     [
+      1,
+      1.9
+     ],
+     [
+      2,
+      8.0
+     ],
+     [
+      3,
+      1.7
+     ],
+     [
+      4,
+      1.6
+     ],
+     [
+      7,
+      7.0
+     ]
+    ]
+   }
+  },
+  {
+   "name": "scalar_series_rolled_back",
+   "section": 5,
+   "rests_on": [
+    "D13"
+   ],
+   "rule": "scalar_series",
+   "paths": [
+    "rule",
+    "python",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "B resumed at step 6: A's scalar-only point at step 8 is rolled back with A's training rows in the default read, and kept with attempts=all. On the base, today's evidence.scalar_series gives the resolved points (a pin); the read API must give the same.",
+   "input": [
+    {
+     "name": "loss",
+     "order": [
+      1732400000000,
+      1732500000000
+     ],
+     "training": [
+      {
+       "attempt": 1732400000000,
+       "step": 0,
+       "scalars": {
+        "loss": 10.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 1,
+       "scalars": {
+        "loss": 11.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 2,
+       "scalars": {
+        "loss": 12.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 3,
+       "scalars": {
+        "loss": 13.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 4,
+       "scalars": {
+        "loss": 14.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 5,
+       "scalars": {
+        "loss": 15.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 6,
+       "scalars": {
+        "loss": 16.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 7,
+       "scalars": {
+        "loss": 17.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 8,
+       "scalars": {
+        "loss": 18.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 9,
+       "scalars": {
+        "loss": 19.0
+       }
+      },
+      {
+       "attempt": 1732500000000,
+       "step": 6,
+       "scalars": {
+        "loss": 26.0
+       }
+      },
+      {
+       "attempt": 1732500000000,
+       "step": 7,
+       "scalars": {
+        "loss": 27.0
+       }
+      },
+      {
+       "attempt": 1732500000000,
+       "step": 8,
+       "scalars": {
+        "loss": 28.0
+       }
+      }
+     ],
+     "scalar_only": [
+      {
+       "attempt": 1732400000000,
+       "step": 8,
+       "seq": 0,
+       "scalars": {
+        "loss": 5.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "loss",
+     "order": [
+      1732400000000,
+      1732500000000
+     ],
+     "training": [
+      {
+       "attempt": 1732400000000,
+       "step": 0,
+       "scalars": {
+        "loss": 10.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 1,
+       "scalars": {
+        "loss": 11.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 2,
+       "scalars": {
+        "loss": 12.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 3,
+       "scalars": {
+        "loss": 13.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 4,
+       "scalars": {
+        "loss": 14.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 5,
+       "scalars": {
+        "loss": 15.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 6,
+       "scalars": {
+        "loss": 16.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 7,
+       "scalars": {
+        "loss": 17.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 8,
+       "scalars": {
+        "loss": 18.0
+       }
+      },
+      {
+       "attempt": 1732400000000,
+       "step": 9,
+       "scalars": {
+        "loss": 19.0
+       }
+      },
+      {
+       "attempt": 1732500000000,
+       "step": 6,
+       "scalars": {
+        "loss": 26.0
+       }
+      },
+      {
+       "attempt": 1732500000000,
+       "step": 7,
+       "scalars": {
+        "loss": 27.0
+       }
+      },
+      {
+       "attempt": 1732500000000,
+       "step": 8,
+       "scalars": {
+        "loss": 28.0
+       }
+      }
+     ],
+     "scalar_only": [
+      {
+       "attempt": 1732400000000,
+       "step": 8,
+       "seq": 0,
+       "scalars": {
+        "loss": 5.0
+       }
+      }
+     ],
+     "attempts": "all"
+    }
+   ],
+   "expect": [
+    {
+     "points": [
+      [
+       0,
+       10.0
+      ],
+      [
+       1,
+       11.0
+      ],
+      [
+       2,
+       12.0
+      ],
+      [
+       3,
+       13.0
+      ],
+      [
+       4,
+       14.0
+      ],
+      [
+       5,
+       15.0
+      ],
+      [
+       6,
+       26.0
+      ],
+      [
+       7,
+       27.0
+      ],
+      [
+       8,
+       28.0
+      ]
+     ]
+    },
+    {
+     "points": [
+      [
+       1732400000000,
+       0,
+       10.0
+      ],
+      [
+       1732400000000,
+       1,
+       11.0
+      ],
+      [
+       1732400000000,
+       2,
+       12.0
+      ],
+      [
+       1732400000000,
+       3,
+       13.0
+      ],
+      [
+       1732400000000,
+       4,
+       14.0
+      ],
+      [
+       1732400000000,
+       5,
+       15.0
+      ],
+      [
+       1732400000000,
+       6,
+       16.0
+      ],
+      [
+       1732400000000,
+       7,
+       17.0
+      ],
+      [
+       1732400000000,
+       8,
+       5.0
+      ],
+      [
+       1732400000000,
+       9,
+       19.0
+      ],
+      [
+       1732500000000,
+       6,
+       26.0
+      ],
+      [
+       1732500000000,
+       7,
+       27.0
+      ],
+      [
+       1732500000000,
+       8,
+       28.0
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "name": "seq_watermark_after_compaction",
+   "section": 5,
+   "rests_on": [
+    "D5",
+    "D3"
+   ],
+   "rule": "watermarks",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "The seq watermark is the highest of the scalars-* names and the manifest's through_seq, so it survives an operator's delete of retired scalars-* objects.",
+   "input": [
+    {
+     "names": [
+      "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet",
+      "attempt=1732400000000/scalars-00000020-00000024.parquet"
+     ],
+     "through_seq": 19
+    },
+    {
+     "names": [
+      "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet"
+     ],
+     "through_seq": 19
+    },
+    {
+     "names": [
+      "attempt=1732400000000/scalars-00000000-00000009.parquet",
+      "attempt=1732400000000/scalars-00000010-00000019.parquet",
+      "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet"
+     ],
+     "through_seq": 19
+    }
+   ],
+   "expect": [
+    {
+     "step": null,
+     "seq": 24,
+     "today_step": null,
+     "today_seq": 24
+    },
+    {
+     "step": null,
+     "seq": 19,
+     "today_step": null,
+     "today_seq": null
+    },
+    {
+     "step": null,
+     "seq": 19,
+     "today_step": null,
+     "today_seq": 19
+    }
+   ]
+  },
+  {
+   "name": "api_read_tokens",
+   "section": 6,
+   "rests_on": [
+    "Q6",
+    "Q7",
+    "D15"
+   ],
+   "rule": "api_errors",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-2",
+   "release": "0.2.0",
+   "why": "0.2.0, kept as written on Nov 24: with a token set, every path but /healthz is behind it, /metrics too; the errors behind a right token are 0.1.0's.",
+   "input": {
+    "run_id": "an-run",
+    "ranks": [
+     0
+    ],
+    "token_set": true,
+    "columns": [
+     "grad_norm",
+     "weight_norm",
+     "lr",
+     "scalars",
+     "ts"
+    ],
+    "requests": [
+     {
+      "path": "/healthz",
+      "token": null
+     },
+     {
+      "path": "/metrics",
+      "token": null
+     },
+     {
+      "path": "/v1/runs",
+      "token": null
+     },
+     {
+      "path": "/v1/runs",
+      "token": "wrong"
+     },
+     {
+      "path": "/v1/runs",
+      "token": "right"
+     },
+     {
+      "path": "/v1/runs/nope",
+      "token": "right"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/7/report",
+      "token": "right"
+     },
+     {
+      "path": "/v1/runs?limit=0",
+      "token": "right"
+     },
+     {
+      "path": "/v1/runs?limit=1001",
+      "token": "right"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/0/rows?page_size=10001",
+      "token": "right"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/0/rows?columns=no_such",
+      "token": "right"
+     },
+     {
+      "path": "/v1/runs/an-run/ranks/0/rows?columns=grad_norm",
+      "token": "right"
+     },
+     {
+      "path": "/metrics",
+      "token": "right"
+     }
+    ]
+   },
+   "expect": [
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 401,
+     "code": "unauthenticated"
+    },
+    {
+     "status": 401,
+     "code": "unauthenticated"
+    },
+    {
+     "status": 401,
+     "code": "unauthenticated"
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 404,
+     "code": "run_not_found"
+    },
+    {
+     "status": 404,
+     "code": "rank_not_found"
+    },
+    {
+     "status": 400,
+     "code": "bad_parameter"
+    },
+    {
+     "status": 400,
+     "code": "bad_parameter"
+    },
+    {
+     "status": 400,
+     "code": "bad_parameter"
+    },
+    {
+     "status": 400,
+     "code": "unknown_column"
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    }
+   ]
+  },
+  {
+   "name": "host_allowlist",
+   "section": 6,
+   "rests_on": [
+    "D23",
+    "Q23",
+    "Q24"
+   ],
+   "rule": "allowlist",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Section 6.2.1: the loopback names with any port, without regard to case, and a name given with --allow-host; any other name is refused, and a missing Host or one that does not parse is a bad request (RFC 9112, section 3.2); an Origin must name an allowed host, Origin: null is refused, and a request with none passes; /healthz is not checked.",
+   "input": {
+    "allow_host": [
+     "box.lan"
+    ],
+    "requests": [
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "localhost:8080"
+     },
+     {
+      "path": "/v1/status",
+      "host": "[::1]:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "LocalHost"
+     },
+     {
+      "path": "/v1/status",
+      "host": "box.lan:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "evil.example:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1.nip.io:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "localhost.:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "0.0.0.0:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "localhost:http"
+     },
+     {
+      "path": "/v1/status",
+      "host": null
+     },
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1:50052",
+      "origin": "http://localhost:3000"
+     },
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1:50052",
+      "origin": "http://[::1]:50052"
+     },
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1:50052",
+      "origin": "https://box.lan"
+     },
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1:50052",
+      "origin": "http://evil.example"
+     },
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1:50052",
+      "origin": "null"
+     },
+     {
+      "path": "/v1/status",
+      "host": "127.0.0.1:50052",
+      "origin": "file://"
+     },
+     {
+      "path": "/healthz",
+      "host": "evil.example:50052",
+      "origin": "http://evil.example"
+     }
+    ]
+   },
+   "expect": [
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 403,
+     "code": "host_not_allowed"
+    },
+    {
+     "status": 403,
+     "code": "host_not_allowed"
+    },
+    {
+     "status": 403,
+     "code": "host_not_allowed"
+    },
+    {
+     "status": 403,
+     "code": "host_not_allowed"
+    },
+    {
+     "status": 400,
+     "code": "bad_request"
+    },
+    {
+     "status": 400,
+     "code": "bad_request"
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 200,
+     "code": null
+    },
+    {
+     "status": 403,
+     "code": "origin_not_allowed"
+    },
+    {
+     "status": 403,
+     "code": "origin_not_allowed"
+    },
+    {
+     "status": 403,
+     "code": "origin_not_allowed"
+    },
+    {
+     "status": 200,
+     "code": null
+    }
+   ]
+  },
+  {
+   "name": "framing_refused",
+   "section": 6,
+   "rests_on": [
+    "D22",
+    "Q25"
+   ],
+   "rule": "frame_headers",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-2",
+   "release": "0.1.0",
+   "why": "Section 6.2.1: until tensorquill.ui() exists every answer refuses to be framed, the refusals and errors included.",
+   "input": {
+    "requests": [
+     {
+      "path": "/healthz"
+     },
+     {
+      "path": "/v1/status"
+     },
+     {
+      "path": "/v1/runs/nope"
+     },
+     {
+      "path": "/v1/status",
+      "host": "evil.example:50052"
+     }
+    ]
+   },
+   "expect": [
+    {
+     "X-Frame-Options": "DENY",
+     "Content-Security-Policy": "frame-ancestors 'none'"
+    },
+    {
+     "X-Frame-Options": "DENY",
+     "Content-Security-Policy": "frame-ancestors 'none'"
+    },
+    {
+     "X-Frame-Options": "DENY",
+     "Content-Security-Policy": "frame-ancestors 'none'"
+    },
+    {
+     "X-Frame-Options": "DENY",
+     "Content-Security-Policy": "frame-ancestors 'none'"
+    }
+   ]
+  },
+  {
+   "name": "snapshot_name",
+   "section": 7,
+   "rests_on": [
+    "Q10",
+    "Q11"
+   ],
+   "rule": "names",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-3",
+   "release": "0.2.0",
+   "why": "A snapshot's key: the attempt, then the last step it read, at least eight digits.",
+   "input": [
+    {
+     "kind": "snapshot",
+     "attempt": 1732400000000,
+     "through_step": 499
+    },
+    {
+     "kind": "snapshot",
+     "attempt": 1732400000000,
+     "through_step": 123456789
+    }
+   ],
+   "expect": [
+    "checkpoints/state-1732400000000-00000499.json.zst",
+    "checkpoints/state-1732400000000-123456789.json.zst"
+   ]
+  },
+  {
+   "name": "snapshot_usable",
+   "section": 7,
+   "rests_on": [
+    "Q10"
+   ],
+   "rule": "snapshot_usable",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-3",
+   "release": "0.2.0",
+   "why": "Section 7.4, step 3: when the newest snapshot is used, with its tail, and why it is not.",
+   "input": [
+    {
+     "snapshot": {
+      "v": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "through_step": 499,
+        "parts": 10
+       }
+      ]
+     },
+     "store": {
+      "state_version": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "order": [
+       1732400000000
+      ],
+      "parts": {
+       "1732400000000": [
+        [
+         0,
+         49
+        ],
+        [
+         50,
+         99
+        ],
+        [
+         100,
+         149
+        ],
+        [
+         150,
+         199
+        ],
+        [
+         200,
+         249
+        ],
+        [
+         250,
+         299
+        ],
+        [
+         300,
+         349
+        ],
+        [
+         350,
+         399
+        ],
+        [
+         400,
+         449
+        ],
+        [
+         450,
+         499
+        ],
+        [
+         500,
+         549
+        ],
+        [
+         550,
+         599
+        ]
+       ]
+      }
+     }
+    },
+    {
+     "snapshot": {
+      "v": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "through_step": 499,
+        "parts": 10
+       }
+      ]
+     },
+     "store": {
+      "state_version": 2,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "order": [
+       1732400000000
+      ],
+      "parts": {
+       "1732400000000": [
+        [
+         0,
+         49
+        ],
+        [
+         50,
+         99
+        ],
+        [
+         100,
+         149
+        ],
+        [
+         150,
+         199
+        ],
+        [
+         200,
+         249
+        ],
+        [
+         250,
+         299
+        ],
+        [
+         300,
+         349
+        ],
+        [
+         350,
+         399
+        ],
+        [
+         400,
+         449
+        ],
+        [
+         450,
+         499
+        ],
+        [
+         500,
+         549
+        ],
+        [
+         550,
+         599
+        ]
+       ]
+      }
+     }
+    },
+    {
+     "snapshot": {
+      "v": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "through_step": 499,
+        "parts": 10
+       }
+      ]
+     },
+     "store": {
+      "state_version": 1,
+      "thresholds": {
+       "overload_threshold": 0.5
+      },
+      "order": [
+       1732400000000
+      ],
+      "parts": {
+       "1732400000000": [
+        [
+         0,
+         49
+        ],
+        [
+         50,
+         99
+        ],
+        [
+         100,
+         149
+        ],
+        [
+         150,
+         199
+        ],
+        [
+         200,
+         249
+        ],
+        [
+         250,
+         299
+        ],
+        [
+         300,
+         349
+        ],
+        [
+         350,
+         399
+        ],
+        [
+         400,
+         449
+        ],
+        [
+         450,
+         499
+        ],
+        [
+         500,
+         549
+        ],
+        [
+         550,
+         599
+        ]
+       ]
+      }
+     }
+    },
+    {
+     "snapshot": {
+      "v": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "through_step": 499,
+        "parts": 10
+       }
+      ]
+     },
+     "store": {
+      "state_version": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "order": [
+       1732400000000,
+       1732500000000
+      ],
+      "parts": {
+       "1732400000000": [
+        [
+         0,
+         49
+        ],
+        [
+         50,
+         99
+        ],
+        [
+         100,
+         149
+        ],
+        [
+         150,
+         199
+        ],
+        [
+         200,
+         249
+        ],
+        [
+         250,
+         299
+        ],
+        [
+         300,
+         349
+        ],
+        [
+         350,
+         399
+        ],
+        [
+         400,
+         449
+        ],
+        [
+         450,
+         499
+        ],
+        [
+         500,
+         549
+        ],
+        [
+         550,
+         599
+        ]
+       ],
+       "1732500000000": [
+        [
+         300,
+         349
+        ]
+       ]
+      }
+     }
+    },
+    {
+     "snapshot": {
+      "v": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "through_step": 499,
+        "parts": 10
+       }
+      ]
+     },
+     "store": {
+      "state_version": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "order": [
+       1732400000000
+      ],
+      "parts": {
+       "1732400000000": [
+        [
+         0,
+         49
+        ],
+        [
+         50,
+         99
+        ],
+        [
+         100,
+         149
+        ],
+        [
+         150,
+         199
+        ],
+        [
+         200,
+         249
+        ],
+        [
+         250,
+         299
+        ],
+        [
+         300,
+         349
+        ],
+        [
+         350,
+         399
+        ],
+        [
+         400,
+         449
+        ],
+        [
+         450,
+         499
+        ],
+        [
+         500,
+         549
+        ],
+        [
+         550,
+         599
+        ],
+        [
+         490,
+         499
+        ]
+       ]
+      }
+     }
+    },
+    {
+     "snapshot": {
+      "v": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "through_step": 299,
+        "parts": 6
+       },
+       {
+        "attempt": 1732500000000,
+        "through_step": 449,
+        "parts": 3
+       }
+      ]
+     },
+     "store": {
+      "state_version": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "order": [
+       1732500000000,
+       1732400000000
+      ],
+      "parts": {}
+     }
+    },
+    {
+     "snapshot": {
+      "v": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "through_step": 299,
+        "parts": 6
+       },
+       {
+        "attempt": 1732500000000,
+        "through_step": 449,
+        "parts": 3
+       }
+      ]
+     },
+     "store": {
+      "state_version": 1,
+      "thresholds": {
+       "overload_threshold": 0.35
+      },
+      "order": [
+       1732400000000,
+       1732500000000
+      ],
+      "parts": {
+       "1732400000000": [
+        [
+         0,
+         49
+        ],
+        [
+         50,
+         99
+        ],
+        [
+         100,
+         149
+        ],
+        [
+         150,
+         199
+        ],
+        [
+         200,
+         249
+        ],
+        [
+         250,
+         299
+        ],
+        [
+         300,
+         349
+        ]
+       ],
+       "1732500000000": [
+        [
+         300,
+         349
+        ],
+        [
+         350,
+         399
+        ],
+        [
+         400,
+         449
+        ],
+        [
+         450,
+         499
+        ]
+       ]
+      }
+     }
+    }
+   ],
+   "expect": [
+    {
+     "use": true,
+     "why": null,
+     "tail": [
+      [
+       500,
+       549
+      ],
+      [
+       550,
+       599
+      ]
+     ]
+    },
+    {
+     "use": false,
+     "why": "state_version"
+    },
+    {
+     "use": false,
+     "why": "thresholds"
+    },
+    {
+     "use": false,
+     "why": "new_attempt"
+    },
+    {
+     "use": false,
+     "why": "parts_below"
+    },
+    {
+     "use": false,
+     "why": "attempt_order"
+    },
+    {
+     "use": false,
+     "why": "not_a_continuation"
+    }
+   ]
+  },
+  {
+   "name": "snapshot_restart_equals_replay",
+   "section": 7,
+   "rests_on": [
+    "Q10",
+    "Q11"
+   ],
+   "rule": null,
+   "paths": [
+    "server"
+   ],
+   "lane": "AN-3, AN-5",
+   "release": "0.2.0",
+   "why": "The requirement of section 7.4: 300 steps stored with a snapshot after every part, a restart, 50 more; the report equals, byte for byte, the one a server with no snapshot gives on a copy of the same parts.",
+   "input": {
+    "steps": 350,
+    "steps_before_restart": 300,
+    "flush_steps": 50,
+    "snapshot_every_parts": 1
+   },
+   "expect": {
+    "reports_equal": true
+   }
+  },
+  {
+   "name": "compact_names",
+   "section": 8,
+   "rests_on": [
+    "D3",
+    "D4",
+    "Q13"
+   ],
+   "rule": "names",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "Section 8.2's names, relative to the rank folder: never a part- name (D6).",
+   "input": [
+    {
+     "kind": "compact",
+     "attempt": 1732400000000,
+     "first_step": 0,
+     "last_step": 4999,
+     "gen": 1
+    },
+    {
+     "kind": "compact",
+     "attempt": 1732400000000,
+     "first_step": 5000,
+     "last_step": 9999,
+     "gen": 12
+    },
+    {
+     "kind": "compact-scalars",
+     "attempt": 1732400000000,
+     "first_seq": 0,
+     "last_seq": 19,
+     "gen": 1
+    },
+    {
+     "kind": "manifest",
+     "number": 1
+    },
+    {
+     "kind": "manifest",
+     "number": 12
+    }
+   ],
+   "expect": [
+    "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+    "attempt=1732400000000/compact-00005000-00009999-0000000012.parquet",
+    "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet",
+    "manifests/0000000001.json",
+    "manifests/0000000012.json"
+   ]
+  },
+  {
+   "name": "manifest_content",
+   "section": 8,
+   "rests_on": [
+    "D3",
+    "D4"
+   ],
+   "rule": "compaction",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "6,000 steps in 50-step parts: one compacted file of steps 0 to 4,999 from 100 inputs in manifest 1, the 20 parts above it the tail.",
+   "input": {
+    "run_id": "an-run",
+    "rank": 0,
+    "attempt": 1732400000000,
+    "runs": [
+     {
+      "first": 0,
+      "last": 5999,
+      "every": 50,
+      "layout": 5
+     }
+    ],
+    "rows_per_file": 5000,
+    "number": 1,
+    "written_at_ms": 1732450000000,
+    "compact_bytes": [
+     4000000
+    ]
+   },
+   "expect": {
+    "key": "manifests/0000000001.json",
+    "manifest": {
+     "format": "tensorquill-manifest",
+     "v": 1,
+     "run_id": "an-run",
+     "rank": 0,
+     "number": 1,
+     "previous": null,
+     "written_at_ms": 1732450000000,
+     "attempts": [
+      {
+       "attempt": 1732400000000,
+       "steps": {
+        "through": 4999,
+        "files": [
+         {
+          "key": "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+          "first_step": 0,
+          "last_step": 4999,
+          "rows": 5000,
+          "bytes": 4000000,
+          "layout": 5,
+          "listed_since": 1,
+          "listed_since_ms": 1732450000000,
+          "inputs": [
+           "attempt=1732400000000/part-00000000-00000049.parquet",
+           "attempt=1732400000000/part-00000050-00000099.parquet",
+           "attempt=1732400000000/part-00000100-00000149.parquet",
+           "attempt=1732400000000/part-00000150-00000199.parquet",
+           "attempt=1732400000000/part-00000200-00000249.parquet",
+           "attempt=1732400000000/part-00000250-00000299.parquet",
+           "attempt=1732400000000/part-00000300-00000349.parquet",
+           "attempt=1732400000000/part-00000350-00000399.parquet",
+           "attempt=1732400000000/part-00000400-00000449.parquet",
+           "attempt=1732400000000/part-00000450-00000499.parquet",
+           "attempt=1732400000000/part-00000500-00000549.parquet",
+           "attempt=1732400000000/part-00000550-00000599.parquet",
+           "attempt=1732400000000/part-00000600-00000649.parquet",
+           "attempt=1732400000000/part-00000650-00000699.parquet",
+           "attempt=1732400000000/part-00000700-00000749.parquet",
+           "attempt=1732400000000/part-00000750-00000799.parquet",
+           "attempt=1732400000000/part-00000800-00000849.parquet",
+           "attempt=1732400000000/part-00000850-00000899.parquet",
+           "attempt=1732400000000/part-00000900-00000949.parquet",
+           "attempt=1732400000000/part-00000950-00000999.parquet",
+           "attempt=1732400000000/part-00001000-00001049.parquet",
+           "attempt=1732400000000/part-00001050-00001099.parquet",
+           "attempt=1732400000000/part-00001100-00001149.parquet",
+           "attempt=1732400000000/part-00001150-00001199.parquet",
+           "attempt=1732400000000/part-00001200-00001249.parquet",
+           "attempt=1732400000000/part-00001250-00001299.parquet",
+           "attempt=1732400000000/part-00001300-00001349.parquet",
+           "attempt=1732400000000/part-00001350-00001399.parquet",
+           "attempt=1732400000000/part-00001400-00001449.parquet",
+           "attempt=1732400000000/part-00001450-00001499.parquet",
+           "attempt=1732400000000/part-00001500-00001549.parquet",
+           "attempt=1732400000000/part-00001550-00001599.parquet",
+           "attempt=1732400000000/part-00001600-00001649.parquet",
+           "attempt=1732400000000/part-00001650-00001699.parquet",
+           "attempt=1732400000000/part-00001700-00001749.parquet",
+           "attempt=1732400000000/part-00001750-00001799.parquet",
+           "attempt=1732400000000/part-00001800-00001849.parquet",
+           "attempt=1732400000000/part-00001850-00001899.parquet",
+           "attempt=1732400000000/part-00001900-00001949.parquet",
+           "attempt=1732400000000/part-00001950-00001999.parquet",
+           "attempt=1732400000000/part-00002000-00002049.parquet",
+           "attempt=1732400000000/part-00002050-00002099.parquet",
+           "attempt=1732400000000/part-00002100-00002149.parquet",
+           "attempt=1732400000000/part-00002150-00002199.parquet",
+           "attempt=1732400000000/part-00002200-00002249.parquet",
+           "attempt=1732400000000/part-00002250-00002299.parquet",
+           "attempt=1732400000000/part-00002300-00002349.parquet",
+           "attempt=1732400000000/part-00002350-00002399.parquet",
+           "attempt=1732400000000/part-00002400-00002449.parquet",
+           "attempt=1732400000000/part-00002450-00002499.parquet",
+           "attempt=1732400000000/part-00002500-00002549.parquet",
+           "attempt=1732400000000/part-00002550-00002599.parquet",
+           "attempt=1732400000000/part-00002600-00002649.parquet",
+           "attempt=1732400000000/part-00002650-00002699.parquet",
+           "attempt=1732400000000/part-00002700-00002749.parquet",
+           "attempt=1732400000000/part-00002750-00002799.parquet",
+           "attempt=1732400000000/part-00002800-00002849.parquet",
+           "attempt=1732400000000/part-00002850-00002899.parquet",
+           "attempt=1732400000000/part-00002900-00002949.parquet",
+           "attempt=1732400000000/part-00002950-00002999.parquet",
+           "attempt=1732400000000/part-00003000-00003049.parquet",
+           "attempt=1732400000000/part-00003050-00003099.parquet",
+           "attempt=1732400000000/part-00003100-00003149.parquet",
+           "attempt=1732400000000/part-00003150-00003199.parquet",
+           "attempt=1732400000000/part-00003200-00003249.parquet",
+           "attempt=1732400000000/part-00003250-00003299.parquet",
+           "attempt=1732400000000/part-00003300-00003349.parquet",
+           "attempt=1732400000000/part-00003350-00003399.parquet",
+           "attempt=1732400000000/part-00003400-00003449.parquet",
+           "attempt=1732400000000/part-00003450-00003499.parquet",
+           "attempt=1732400000000/part-00003500-00003549.parquet",
+           "attempt=1732400000000/part-00003550-00003599.parquet",
+           "attempt=1732400000000/part-00003600-00003649.parquet",
+           "attempt=1732400000000/part-00003650-00003699.parquet",
+           "attempt=1732400000000/part-00003700-00003749.parquet",
+           "attempt=1732400000000/part-00003750-00003799.parquet",
+           "attempt=1732400000000/part-00003800-00003849.parquet",
+           "attempt=1732400000000/part-00003850-00003899.parquet",
+           "attempt=1732400000000/part-00003900-00003949.parquet",
+           "attempt=1732400000000/part-00003950-00003999.parquet",
+           "attempt=1732400000000/part-00004000-00004049.parquet",
+           "attempt=1732400000000/part-00004050-00004099.parquet",
+           "attempt=1732400000000/part-00004100-00004149.parquet",
+           "attempt=1732400000000/part-00004150-00004199.parquet",
+           "attempt=1732400000000/part-00004200-00004249.parquet",
+           "attempt=1732400000000/part-00004250-00004299.parquet",
+           "attempt=1732400000000/part-00004300-00004349.parquet",
+           "attempt=1732400000000/part-00004350-00004399.parquet",
+           "attempt=1732400000000/part-00004400-00004449.parquet",
+           "attempt=1732400000000/part-00004450-00004499.parquet",
+           "attempt=1732400000000/part-00004500-00004549.parquet",
+           "attempt=1732400000000/part-00004550-00004599.parquet",
+           "attempt=1732400000000/part-00004600-00004649.parquet",
+           "attempt=1732400000000/part-00004650-00004699.parquet",
+           "attempt=1732400000000/part-00004700-00004749.parquet",
+           "attempt=1732400000000/part-00004750-00004799.parquet",
+           "attempt=1732400000000/part-00004800-00004849.parquet",
+           "attempt=1732400000000/part-00004850-00004899.parquet",
+           "attempt=1732400000000/part-00004900-00004949.parquet",
+           "attempt=1732400000000/part-00004950-00004999.parquet"
+          ]
+         }
+        ]
+       },
+       "scalars": {
+        "through_seq": null,
+        "files": []
+       }
+      }
+     ]
+    },
+    "tail": [
+     "attempt=1732400000000/part-00005000-00005049.parquet",
+     "attempt=1732400000000/part-00005050-00005099.parquet",
+     "attempt=1732400000000/part-00005100-00005149.parquet",
+     "attempt=1732400000000/part-00005150-00005199.parquet",
+     "attempt=1732400000000/part-00005200-00005249.parquet",
+     "attempt=1732400000000/part-00005250-00005299.parquet",
+     "attempt=1732400000000/part-00005300-00005349.parquet",
+     "attempt=1732400000000/part-00005350-00005399.parquet",
+     "attempt=1732400000000/part-00005400-00005449.parquet",
+     "attempt=1732400000000/part-00005450-00005499.parquet",
+     "attempt=1732400000000/part-00005500-00005549.parquet",
+     "attempt=1732400000000/part-00005550-00005599.parquet",
+     "attempt=1732400000000/part-00005600-00005649.parquet",
+     "attempt=1732400000000/part-00005650-00005699.parquet",
+     "attempt=1732400000000/part-00005700-00005749.parquet",
+     "attempt=1732400000000/part-00005750-00005799.parquet",
+     "attempt=1732400000000/part-00005800-00005849.parquet",
+     "attempt=1732400000000/part-00005850-00005899.parquet",
+     "attempt=1732400000000/part-00005900-00005949.parquet",
+     "attempt=1732400000000/part-00005950-00005999.parquet"
+    ]
+   }
+  },
+  {
+   "name": "compact_layout_change",
+   "section": 8,
+   "rests_on": [
+    "D8",
+    "Q14"
+   ],
+   "rule": "compaction",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "Protocol 4 parts then protocol 5 parts: the layout change closes the first group early, and the two are never one file.",
+   "input": {
+    "run_id": "an-run",
+    "rank": 0,
+    "attempt": 1732400000000,
+    "runs": [
+     {
+      "first": 0,
+      "last": 99,
+      "every": 50,
+      "layout": 4
+     },
+     {
+      "first": 100,
+      "last": 5199,
+      "every": 50,
+      "layout": 5
+     }
+    ],
+    "rows_per_file": 5000,
+    "number": 1,
+    "written_at_ms": 1732450000000,
+    "compact_bytes": [
+     80000,
+     4100000
+    ]
+   },
+   "expect": {
+    "key": "manifests/0000000001.json",
+    "manifest": {
+     "format": "tensorquill-manifest",
+     "v": 1,
+     "run_id": "an-run",
+     "rank": 0,
+     "number": 1,
+     "previous": null,
+     "written_at_ms": 1732450000000,
+     "attempts": [
+      {
+       "attempt": 1732400000000,
+       "steps": {
+        "through": 5099,
+        "files": [
+         {
+          "key": "attempt=1732400000000/compact-00000000-00000099-0000000001.parquet",
+          "first_step": 0,
+          "last_step": 99,
+          "rows": 100,
+          "bytes": 80000,
+          "layout": 4,
+          "listed_since": 1,
+          "listed_since_ms": 1732450000000,
+          "inputs": [
+           "attempt=1732400000000/part-00000000-00000049.parquet",
+           "attempt=1732400000000/part-00000050-00000099.parquet"
+          ]
+         },
+         {
+          "key": "attempt=1732400000000/compact-00000100-00005099-0000000001.parquet",
+          "first_step": 100,
+          "last_step": 5099,
+          "rows": 5000,
+          "bytes": 4100000,
+          "layout": 5,
+          "listed_since": 1,
+          "listed_since_ms": 1732450000000,
+          "inputs": [
+           "attempt=1732400000000/part-00000100-00000149.parquet",
+           "attempt=1732400000000/part-00000150-00000199.parquet",
+           "attempt=1732400000000/part-00000200-00000249.parquet",
+           "attempt=1732400000000/part-00000250-00000299.parquet",
+           "attempt=1732400000000/part-00000300-00000349.parquet",
+           "attempt=1732400000000/part-00000350-00000399.parquet",
+           "attempt=1732400000000/part-00000400-00000449.parquet",
+           "attempt=1732400000000/part-00000450-00000499.parquet",
+           "attempt=1732400000000/part-00000500-00000549.parquet",
+           "attempt=1732400000000/part-00000550-00000599.parquet",
+           "attempt=1732400000000/part-00000600-00000649.parquet",
+           "attempt=1732400000000/part-00000650-00000699.parquet",
+           "attempt=1732400000000/part-00000700-00000749.parquet",
+           "attempt=1732400000000/part-00000750-00000799.parquet",
+           "attempt=1732400000000/part-00000800-00000849.parquet",
+           "attempt=1732400000000/part-00000850-00000899.parquet",
+           "attempt=1732400000000/part-00000900-00000949.parquet",
+           "attempt=1732400000000/part-00000950-00000999.parquet",
+           "attempt=1732400000000/part-00001000-00001049.parquet",
+           "attempt=1732400000000/part-00001050-00001099.parquet",
+           "attempt=1732400000000/part-00001100-00001149.parquet",
+           "attempt=1732400000000/part-00001150-00001199.parquet",
+           "attempt=1732400000000/part-00001200-00001249.parquet",
+           "attempt=1732400000000/part-00001250-00001299.parquet",
+           "attempt=1732400000000/part-00001300-00001349.parquet",
+           "attempt=1732400000000/part-00001350-00001399.parquet",
+           "attempt=1732400000000/part-00001400-00001449.parquet",
+           "attempt=1732400000000/part-00001450-00001499.parquet",
+           "attempt=1732400000000/part-00001500-00001549.parquet",
+           "attempt=1732400000000/part-00001550-00001599.parquet",
+           "attempt=1732400000000/part-00001600-00001649.parquet",
+           "attempt=1732400000000/part-00001650-00001699.parquet",
+           "attempt=1732400000000/part-00001700-00001749.parquet",
+           "attempt=1732400000000/part-00001750-00001799.parquet",
+           "attempt=1732400000000/part-00001800-00001849.parquet",
+           "attempt=1732400000000/part-00001850-00001899.parquet",
+           "attempt=1732400000000/part-00001900-00001949.parquet",
+           "attempt=1732400000000/part-00001950-00001999.parquet",
+           "attempt=1732400000000/part-00002000-00002049.parquet",
+           "attempt=1732400000000/part-00002050-00002099.parquet",
+           "attempt=1732400000000/part-00002100-00002149.parquet",
+           "attempt=1732400000000/part-00002150-00002199.parquet",
+           "attempt=1732400000000/part-00002200-00002249.parquet",
+           "attempt=1732400000000/part-00002250-00002299.parquet",
+           "attempt=1732400000000/part-00002300-00002349.parquet",
+           "attempt=1732400000000/part-00002350-00002399.parquet",
+           "attempt=1732400000000/part-00002400-00002449.parquet",
+           "attempt=1732400000000/part-00002450-00002499.parquet",
+           "attempt=1732400000000/part-00002500-00002549.parquet",
+           "attempt=1732400000000/part-00002550-00002599.parquet",
+           "attempt=1732400000000/part-00002600-00002649.parquet",
+           "attempt=1732400000000/part-00002650-00002699.parquet",
+           "attempt=1732400000000/part-00002700-00002749.parquet",
+           "attempt=1732400000000/part-00002750-00002799.parquet",
+           "attempt=1732400000000/part-00002800-00002849.parquet",
+           "attempt=1732400000000/part-00002850-00002899.parquet",
+           "attempt=1732400000000/part-00002900-00002949.parquet",
+           "attempt=1732400000000/part-00002950-00002999.parquet",
+           "attempt=1732400000000/part-00003000-00003049.parquet",
+           "attempt=1732400000000/part-00003050-00003099.parquet",
+           "attempt=1732400000000/part-00003100-00003149.parquet",
+           "attempt=1732400000000/part-00003150-00003199.parquet",
+           "attempt=1732400000000/part-00003200-00003249.parquet",
+           "attempt=1732400000000/part-00003250-00003299.parquet",
+           "attempt=1732400000000/part-00003300-00003349.parquet",
+           "attempt=1732400000000/part-00003350-00003399.parquet",
+           "attempt=1732400000000/part-00003400-00003449.parquet",
+           "attempt=1732400000000/part-00003450-00003499.parquet",
+           "attempt=1732400000000/part-00003500-00003549.parquet",
+           "attempt=1732400000000/part-00003550-00003599.parquet",
+           "attempt=1732400000000/part-00003600-00003649.parquet",
+           "attempt=1732400000000/part-00003650-00003699.parquet",
+           "attempt=1732400000000/part-00003700-00003749.parquet",
+           "attempt=1732400000000/part-00003750-00003799.parquet",
+           "attempt=1732400000000/part-00003800-00003849.parquet",
+           "attempt=1732400000000/part-00003850-00003899.parquet",
+           "attempt=1732400000000/part-00003900-00003949.parquet",
+           "attempt=1732400000000/part-00003950-00003999.parquet",
+           "attempt=1732400000000/part-00004000-00004049.parquet",
+           "attempt=1732400000000/part-00004050-00004099.parquet",
+           "attempt=1732400000000/part-00004100-00004149.parquet",
+           "attempt=1732400000000/part-00004150-00004199.parquet",
+           "attempt=1732400000000/part-00004200-00004249.parquet",
+           "attempt=1732400000000/part-00004250-00004299.parquet",
+           "attempt=1732400000000/part-00004300-00004349.parquet",
+           "attempt=1732400000000/part-00004350-00004399.parquet",
+           "attempt=1732400000000/part-00004400-00004449.parquet",
+           "attempt=1732400000000/part-00004450-00004499.parquet",
+           "attempt=1732400000000/part-00004500-00004549.parquet",
+           "attempt=1732400000000/part-00004550-00004599.parquet",
+           "attempt=1732400000000/part-00004600-00004649.parquet",
+           "attempt=1732400000000/part-00004650-00004699.parquet",
+           "attempt=1732400000000/part-00004700-00004749.parquet",
+           "attempt=1732400000000/part-00004750-00004799.parquet",
+           "attempt=1732400000000/part-00004800-00004849.parquet",
+           "attempt=1732400000000/part-00004850-00004899.parquet",
+           "attempt=1732400000000/part-00004900-00004949.parquet",
+           "attempt=1732400000000/part-00004950-00004999.parquet",
+           "attempt=1732400000000/part-00005000-00005049.parquet",
+           "attempt=1732400000000/part-00005050-00005099.parquet"
+          ]
+         }
+        ]
+       },
+       "scalars": {
+        "through_seq": null,
+        "files": []
+       }
+      }
+     ]
+    },
+    "tail": [
+     "attempt=1732400000000/part-00005100-00005149.parquet",
+     "attempt=1732400000000/part-00005150-00005199.parquet"
+    ]
+   }
+  },
+  {
+   "name": "replay_manifest_first_order",
+   "section": 8,
+   "rests_on": [
+    "D3",
+    "D4"
+   ],
+   "rule": "replay_plan",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "Manifest 2 cannot be read, so manifest 1 is the newest: A's compacted file, then A's parts above it, then B's parts; the compacted file no manifest lists, the scalar rows and the snapshot are not read.",
+   "input": {
+    "listing": [
+     "manifests/0000000001.json",
+     "manifests/0000000002.json",
+     "attempt=1732400000000/part-00000000-00000049.parquet",
+     "attempt=1732400000000/part-00000050-00000099.parquet",
+     "attempt=1732400000000/part-00000100-00000149.parquet",
+     "attempt=1732400000000/part-00000150-00000199.parquet",
+     "attempt=1732400000000/part-00000200-00000249.parquet",
+     "attempt=1732400000000/part-00000250-00000299.parquet",
+     "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet",
+     "attempt=1732400000000/compact-00000200-00000299-0000000002.parquet",
+     "attempt=1732400000000/scalars-00000000-00000009.parquet",
+     "attempt=1732400000000/compact-scalars-00000000-00000009-0000000001.parquet",
+     "checkpoints/state-1732400000000-00000249.json.zst",
+     "attempt=1732500000000/part-00000100-00000149.parquet",
+     "attempt=1732500000000/part-00000150-00000199.parquet"
+    ],
+    "order": [
+     1732400000000,
+     1732500000000
+    ],
+    "manifests": {
+     "1": {
+      "format": "tensorquill-manifest",
+      "v": 1,
+      "run_id": "an-run",
+      "rank": 0,
+      "number": 1,
+      "previous": null,
+      "written_at_ms": 1732450000000,
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "steps": {
+         "through": 199,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet",
+           "first_step": 0,
+           "last_step": 199,
+           "rows": 200,
+           "bytes": 400000,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_ms": 1732450000000,
+           "inputs": [
+            "attempt=1732400000000/part-00000000-00000049.parquet",
+            "attempt=1732400000000/part-00000050-00000099.parquet",
+            "attempt=1732400000000/part-00000100-00000149.parquet",
+            "attempt=1732400000000/part-00000150-00000199.parquet"
+           ]
+          }
+         ]
+        },
+        "scalars": {
+         "through_seq": null,
+         "files": []
+        }
+       }
+      ]
+     },
+     "2": {}
+    },
+    "unreadable": [
+     2
+    ]
+   },
+   "expect": {
+    "read": [
+     "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet",
+     "attempt=1732400000000/part-00000200-00000249.parquet",
+     "attempt=1732400000000/part-00000250-00000299.parquet",
+     "attempt=1732500000000/part-00000100-00000149.parquet",
+     "attempt=1732500000000/part-00000150-00000199.parquet"
+    ]
+   }
+  },
+  {
+   "name": "replay_compacted_file_missing",
+   "section": 8,
+   "rests_on": [
+    "D3"
+   ],
+   "rule": "replay_plan",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "A compacted file the manifest lists and the listing lacks is replaced by its inputs.",
+   "input": {
+    "listing": [
+     "manifests/0000000001.json",
+     "manifests/0000000002.json",
+     "attempt=1732400000000/part-00000000-00000049.parquet",
+     "attempt=1732400000000/part-00000050-00000099.parquet",
+     "attempt=1732400000000/part-00000100-00000149.parquet",
+     "attempt=1732400000000/part-00000150-00000199.parquet",
+     "attempt=1732400000000/part-00000200-00000249.parquet",
+     "attempt=1732400000000/part-00000250-00000299.parquet",
+     "attempt=1732400000000/compact-00000200-00000299-0000000002.parquet",
+     "attempt=1732400000000/scalars-00000000-00000009.parquet",
+     "attempt=1732400000000/compact-scalars-00000000-00000009-0000000001.parquet",
+     "checkpoints/state-1732400000000-00000249.json.zst",
+     "attempt=1732500000000/part-00000100-00000149.parquet",
+     "attempt=1732500000000/part-00000150-00000199.parquet"
+    ],
+    "order": [
+     1732400000000,
+     1732500000000
+    ],
+    "manifests": {
+     "1": {
+      "format": "tensorquill-manifest",
+      "v": 1,
+      "run_id": "an-run",
+      "rank": 0,
+      "number": 1,
+      "previous": null,
+      "written_at_ms": 1732450000000,
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "steps": {
+         "through": 199,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet",
+           "first_step": 0,
+           "last_step": 199,
+           "rows": 200,
+           "bytes": 400000,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_ms": 1732450000000,
+           "inputs": [
+            "attempt=1732400000000/part-00000000-00000049.parquet",
+            "attempt=1732400000000/part-00000050-00000099.parquet",
+            "attempt=1732400000000/part-00000100-00000149.parquet",
+            "attempt=1732400000000/part-00000150-00000199.parquet"
+           ]
+          }
+         ]
+        },
+        "scalars": {
+         "through_seq": null,
+         "files": []
+        }
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "read": [
+     "attempt=1732400000000/part-00000000-00000049.parquet",
+     "attempt=1732400000000/part-00000050-00000099.parquet",
+     "attempt=1732400000000/part-00000100-00000149.parquet",
+     "attempt=1732400000000/part-00000150-00000199.parquet",
+     "attempt=1732400000000/part-00000200-00000249.parquet",
+     "attempt=1732400000000/part-00000250-00000299.parquet",
+     "attempt=1732500000000/part-00000100-00000149.parquet",
+     "attempt=1732500000000/part-00000150-00000199.parquet"
+    ]
+   }
+  },
+  {
+   "name": "manifest_race",
+   "section": 8,
+   "rests_on": [
+    "D4"
+   ],
+   "rule": "manifest_race",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "Two writers planned on manifest 1: the same group is written once and listed once; two groups end in manifests 2 and 3; a group manifest 1 already covers leaves its file unreferenced.",
+   "input": [
+    {
+     "start": 1,
+     "start_files": {
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet": [
+       "attempt=1732400000000/part-00000000-00004999.parquet"
+      ]
+     },
+     "writers": [
+      {
+       "file": "attempt=1732400000000/compact-00005000-00009999-{gen}.parquet",
+       "inputs": [
+        "attempt=1732400000000/part-00005000-00009999.parquet"
+       ]
+      },
+      {
+       "file": "attempt=1732400000000/compact-00005000-00009999-{gen}.parquet",
+       "inputs": [
+        "attempt=1732400000000/part-00005000-00009999.parquet"
+       ]
+      }
+     ]
+    },
+    {
+     "start": 1,
+     "start_files": {
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet": [
+       "attempt=1732400000000/part-00000000-00004999.parquet"
+      ]
+     },
+     "writers": [
+      {
+       "file": "attempt=1732400000000/compact-00005000-00009999-{gen}.parquet",
+       "inputs": [
+        "attempt=1732400000000/part-00005000-00009999.parquet"
+       ]
+      },
+      {
+       "file": "attempt=1732500000000/compact-00000000-00004999-{gen}.parquet",
+       "inputs": [
+        "attempt=1732500000000/part-00000000-00004999.parquet"
+       ]
+      }
+     ]
+    },
+    {
+     "start": 1,
+     "start_files": {
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet": [
+       "attempt=1732400000000/part-00000000-00004999.parquet"
+      ]
+     },
+     "writers": [
+      {
+       "file": "attempt=1732400000000/compact-00000000-00004999-{gen}.parquet",
+       "inputs": [
+        "attempt=1732400000000/part-00000000-00004999.parquet"
+       ]
+      }
+     ]
+    }
+   ],
+   "expect": [
+    {
+     "written": [
+      2
+     ],
+     "newest": 2,
+     "newest_lists": [
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+      "attempt=1732400000000/compact-00005000-00009999-0000000002.parquet"
+     ],
+     "unreferenced": []
+    },
+    {
+     "written": [
+      2,
+      3
+     ],
+     "newest": 3,
+     "newest_lists": [
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+      "attempt=1732400000000/compact-00005000-00009999-0000000002.parquet",
+      "attempt=1732500000000/compact-00000000-00004999-0000000002.parquet"
+     ],
+     "unreferenced": []
+    },
+    {
+     "written": [],
+     "newest": 1,
+     "newest_lists": [
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet"
+     ],
+     "unreferenced": [
+      "attempt=1732400000000/compact-00000000-00004999-0000000002.parquet"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "orphan_after_crash",
+   "section": 8,
+   "rests_on": [
+    "D4",
+    "D5"
+   ],
+   "rule": "orphan",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "A compacted file left by a crash before its manifest is never read; the next compaction reuses it when its inputs are the same, takes the next name when they are not, and writes its own when the groups differ.",
+   "input": [
+    {
+     "attempt": 1732400000000,
+     "first_step": 0,
+     "last_step": 4999,
+     "number": 1,
+     "orphan": "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+     "orphan_inputs": [
+      "attempt=1732400000000/part-00000000-00000499.parquet",
+      "attempt=1732400000000/part-00000500-00000999.parquet",
+      "attempt=1732400000000/part-00001000-00001499.parquet",
+      "attempt=1732400000000/part-00001500-00001999.parquet",
+      "attempt=1732400000000/part-00002000-00002499.parquet",
+      "attempt=1732400000000/part-00002500-00002999.parquet",
+      "attempt=1732400000000/part-00003000-00003499.parquet",
+      "attempt=1732400000000/part-00003500-00003999.parquet",
+      "attempt=1732400000000/part-00004000-00004499.parquet",
+      "attempt=1732400000000/part-00004500-00004999.parquet"
+     ],
+     "planned_inputs": [
+      "attempt=1732400000000/part-00000000-00000499.parquet",
+      "attempt=1732400000000/part-00000500-00000999.parquet",
+      "attempt=1732400000000/part-00001000-00001499.parquet",
+      "attempt=1732400000000/part-00001500-00001999.parquet",
+      "attempt=1732400000000/part-00002000-00002499.parquet",
+      "attempt=1732400000000/part-00002500-00002999.parquet",
+      "attempt=1732400000000/part-00003000-00003499.parquet",
+      "attempt=1732400000000/part-00003500-00003999.parquet",
+      "attempt=1732400000000/part-00004000-00004499.parquet",
+      "attempt=1732400000000/part-00004500-00004999.parquet"
+     ]
+    },
+    {
+     "attempt": 1732400000000,
+     "first_step": 0,
+     "last_step": 4999,
+     "number": 1,
+     "orphan": "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+     "orphan_inputs": [
+      "attempt=1732400000000/part-00000000-00000999.parquet",
+      "attempt=1732400000000/part-00001000-00001999.parquet",
+      "attempt=1732400000000/part-00002000-00002999.parquet",
+      "attempt=1732400000000/part-00003000-00003999.parquet",
+      "attempt=1732400000000/part-00004000-00004999.parquet"
+     ],
+     "planned_inputs": [
+      "attempt=1732400000000/part-00000000-00000499.parquet",
+      "attempt=1732400000000/part-00000500-00000999.parquet",
+      "attempt=1732400000000/part-00001000-00001499.parquet",
+      "attempt=1732400000000/part-00001500-00001999.parquet",
+      "attempt=1732400000000/part-00002000-00002499.parquet",
+      "attempt=1732400000000/part-00002500-00002999.parquet",
+      "attempt=1732400000000/part-00003000-00003499.parquet",
+      "attempt=1732400000000/part-00003500-00003999.parquet",
+      "attempt=1732400000000/part-00004000-00004499.parquet",
+      "attempt=1732400000000/part-00004500-00004999.parquet"
+     ]
+    },
+    {
+     "attempt": 1732400000000,
+     "first_step": 0,
+     "last_step": 5499,
+     "number": 1,
+     "orphan": "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+     "orphan_inputs": [
+      "attempt=1732400000000/part-00000000-00000499.parquet",
+      "attempt=1732400000000/part-00000500-00000999.parquet",
+      "attempt=1732400000000/part-00001000-00001499.parquet",
+      "attempt=1732400000000/part-00001500-00001999.parquet",
+      "attempt=1732400000000/part-00002000-00002499.parquet",
+      "attempt=1732400000000/part-00002500-00002999.parquet",
+      "attempt=1732400000000/part-00003000-00003499.parquet",
+      "attempt=1732400000000/part-00003500-00003999.parquet",
+      "attempt=1732400000000/part-00004000-00004499.parquet",
+      "attempt=1732400000000/part-00004500-00004999.parquet"
+     ],
+     "planned_inputs": [
+      "attempt=1732400000000/part-00000000-00000499.parquet",
+      "attempt=1732400000000/part-00000500-00000999.parquet",
+      "attempt=1732400000000/part-00001000-00001499.parquet",
+      "attempt=1732400000000/part-00001500-00001999.parquet",
+      "attempt=1732400000000/part-00002000-00002499.parquet",
+      "attempt=1732400000000/part-00002500-00002999.parquet",
+      "attempt=1732400000000/part-00003000-00003499.parquet",
+      "attempt=1732400000000/part-00003500-00003999.parquet",
+      "attempt=1732400000000/part-00004000-00004499.parquet",
+      "attempt=1732400000000/part-00004500-00004999.parquet",
+      "attempt=1732400000000/part-00005000-00005499.parquet"
+     ]
+    }
+   ],
+   "expect": [
+    {
+     "replay_reads_it": false,
+     "action": "reuse",
+     "key": "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet"
+    },
+    {
+     "replay_reads_it": false,
+     "action": "new_name",
+     "key": "attempt=1732400000000/compact-00000000-00004999-0000000002.parquet"
+    },
+    {
+     "replay_reads_it": false,
+     "action": "write",
+     "key": "attempt=1732400000000/compact-00000000-00005499-0000000001.parquet"
+    }
+   ]
+  },
+  {
+   "name": "watermark_after_operator_delete",
+   "section": 8,
+   "rests_on": [
+    "D5"
+   ],
+   "rule": "watermarks",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "The step watermark is the highest of the part- names and the manifest's through, so a store whose retired parts were deleted does not take steps 0 to 4,999 again; today's rule (`today_step`) would.",
+   "input": [
+    {
+     "names": [
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet",
+      "attempt=1732400000000/part-00005000-00005049.parquet"
+     ],
+     "through": 4999
+    },
+    {
+     "names": [
+      "attempt=1732400000000/compact-00000000-00004999-0000000001.parquet"
+     ],
+     "through": 4999
+    },
+    {
+     "names": [
+      "attempt=1732400000000/part-00000000-00000049.parquet",
+      "attempt=1732400000000/part-00000050-00000099.parquet"
+     ],
+     "through": null
+    }
+   ],
+   "expect": [
+    {
+     "step": 5049,
+     "seq": null,
+     "today_step": 5049,
+     "today_seq": null
+    },
+    {
+     "step": 4999,
+     "seq": null,
+     "today_step": null,
+     "today_seq": null
+    },
+    {
+     "step": 99,
+     "seq": null,
+     "today_step": 99,
+     "today_seq": null
+    }
+   ]
+  },
+  {
+   "name": "load_records_reads_each_step_once",
+   "section": 8,
+   "rests_on": [
+    "D7"
+   ],
+   "rule": null,
+   "paths": [
+    "python"
+   ],
+   "lane": "AN-6",
+   "release": "0.2.0",
+   "why": "A pin: every input kept, today's load_records reads part- objects only, so each of steps 0 to 249 once.",
+   "input": {
+    "steps": 250,
+    "compacted": [
+     0,
+     199
+    ],
+    "inputs_deleted": false
+   },
+   "expect": {
+    "steps": [
+     0,
+     249
+    ],
+    "each": 1
+   }
+  },
+  {
+   "name": "load_records_after_operator_delete",
+   "section": 8,
+   "rests_on": [
+    "D5",
+    "D3"
+   ],
+   "rule": null,
+   "paths": [
+    "python"
+   ],
+   "lane": "AN-6",
+   "release": "0.2.0",
+   "why": "After an operator deletes the four retired inputs, load_records reads the manifest first and still gives each of steps 0 to 249 once; today it gives 200 to 249.",
+   "input": {
+    "steps": 250,
+    "compacted": [
+     0,
+     199
+    ],
+    "inputs_deleted": true
+   },
+   "expect": {
+    "steps": [
+     0,
+     249
+    ],
+    "each": 1
+   }
+  },
+  {
+   "name": "outside_reader_glob",
+   "section": 8,
+   "rests_on": [
+    "D6",
+    "D7"
+   ],
+   "rule": "globs",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-4",
+   "release": "0.2.0",
+   "why": "An outside reader's glob: part-* reads each step once; *.parquet reads the compacted steps twice and takes the scalar rows in.",
+   "input": {
+    "listing": {
+     "attempt=1732400000000/part-00000000-00000049.parquet": [
+      0,
+      49
+     ],
+     "attempt=1732400000000/part-00000050-00000099.parquet": [
+      50,
+      99
+     ],
+     "attempt=1732400000000/part-00000100-00000149.parquet": [
+      100,
+      149
+     ],
+     "attempt=1732400000000/part-00000150-00000199.parquet": [
+      150,
+      199
+     ],
+     "attempt=1732400000000/part-00000200-00000249.parquet": [
+      200,
+      249
+     ],
+     "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet": [
+      0,
+      199
+     ],
+     "attempt=1732400000000/scalars-00000000-00000009.parquet": null,
+     "attempt=1732400000000/compact-scalars-00000000-00000009-0000000001.parquet": null
+    },
+    "patterns": [
+     "part-*.parquet",
+     "*.parquet"
+    ]
+   },
+   "expect": {
+    "part-*.parquet": {
+     "times_read": {
+      "1": [
+       [
+        0,
+        249
+       ]
+      ]
+     },
+     "scalar_rows": false
+    },
+    "*.parquet": {
+     "times_read": {
+      "2": [
+       [
+        0,
+        199
+       ]
+      ],
+      "1": [
+       [
+        200,
+        249
+       ]
+      ]
+     },
+     "scalar_rows": true
+    }
+   }
+  },
+  {
+   "name": "retired_listing",
+   "section": 9,
+   "rests_on": [
+    "D5",
+    "Q15"
+   ],
+   "rule": "retired",
+   "paths": [
+    "rule",
+    "http"
+   ],
+   "lane": "AN-4, AN-2",
+   "release": "0.2.0",
+   "why": "Grace 168 hours: the inputs of files listed 300 and 200 hours ago, manifest 1 (its successor is 200 hours old), the two older snapshots (the newest is 170 hours old) and the unreferenced compacted file; never the tail, the files listed, manifest 3 or the inputs of a file listed an hour ago.",
+   "input": {
+    "grace_hours": 168,
+    "order": [
+     1732400000000
+    ],
+    "listing": {
+     "attempt=1732400000000/part-00000000-00000049.parquet": 400,
+     "attempt=1732400000000/part-00000050-00000099.parquet": 400,
+     "attempt=1732400000000/part-00000100-00000149.parquet": 400,
+     "attempt=1732400000000/part-00000150-00000199.parquet": 400,
+     "attempt=1732400000000/part-00000200-00000249.parquet": 250,
+     "attempt=1732400000000/part-00000250-00000299.parquet": 250,
+     "attempt=1732400000000/part-00000300-00000349.parquet": 150,
+     "attempt=1732400000000/part-00000350-00000399.parquet": 150,
+     "attempt=1732400000000/part-00000400-00000449.parquet": 1,
+     "attempt=1732400000000/scalars-00000000-00000009.parquet": 400,
+     "attempt=1732400000000/scalars-00000010-00000019.parquet": 400,
+     "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet": 300,
+     "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet": 300,
+     "attempt=1732400000000/compact-00000200-00000299-0000000002.parquet": 200,
+     "attempt=1732400000000/compact-00000300-00000399-0000000003.parquet": 1,
+     "attempt=1732400000000/compact-00000200-00000299-0000000001.parquet": 260,
+     "manifests/0000000001.json": 300,
+     "manifests/0000000002.json": 200,
+     "manifests/0000000003.json": 1,
+     "checkpoints/state-1732400000000-00000199.json.zst": 300,
+     "checkpoints/state-1732400000000-00000299.json.zst": 200,
+     "checkpoints/state-1732400000000-00000399.json.zst": 170
+    },
+    "manifests": {
+     "1": {
+      "format": "tensorquill-manifest",
+      "v": 1,
+      "run_id": "an-run",
+      "rank": 0,
+      "number": 1,
+      "previous": null,
+      "written_age_hours": 300,
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "steps": {
+         "through": 199,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_age_hours": 300,
+           "inputs": [
+            "attempt=1732400000000/part-00000000-00000049.parquet",
+            "attempt=1732400000000/part-00000050-00000099.parquet",
+            "attempt=1732400000000/part-00000100-00000149.parquet",
+            "attempt=1732400000000/part-00000150-00000199.parquet"
+           ],
+           "first_step": 0,
+           "last_step": 199
+          }
+         ]
+        },
+        "scalars": {
+         "through_seq": 19,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_age_hours": 300,
+           "inputs": [
+            "attempt=1732400000000/scalars-00000000-00000009.parquet",
+            "attempt=1732400000000/scalars-00000010-00000019.parquet"
+           ],
+           "first_seq": 0,
+           "last_seq": 19
+          }
+         ]
+        }
+       }
+      ]
+     },
+     "2": {
+      "format": "tensorquill-manifest",
+      "v": 1,
+      "run_id": "an-run",
+      "rank": 0,
+      "number": 2,
+      "previous": 1,
+      "written_age_hours": 200,
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "steps": {
+         "through": 299,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_age_hours": 300,
+           "inputs": [
+            "attempt=1732400000000/part-00000000-00000049.parquet",
+            "attempt=1732400000000/part-00000050-00000099.parquet",
+            "attempt=1732400000000/part-00000100-00000149.parquet",
+            "attempt=1732400000000/part-00000150-00000199.parquet"
+           ],
+           "first_step": 0,
+           "last_step": 199
+          },
+          {
+           "key": "attempt=1732400000000/compact-00000200-00000299-0000000002.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 2,
+           "listed_since_age_hours": 200,
+           "inputs": [
+            "attempt=1732400000000/part-00000200-00000249.parquet",
+            "attempt=1732400000000/part-00000250-00000299.parquet"
+           ],
+           "first_step": 200,
+           "last_step": 299
+          }
+         ]
+        },
+        "scalars": {
+         "through_seq": 19,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_age_hours": 300,
+           "inputs": [
+            "attempt=1732400000000/scalars-00000000-00000009.parquet",
+            "attempt=1732400000000/scalars-00000010-00000019.parquet"
+           ],
+           "first_seq": 0,
+           "last_seq": 19
+          }
+         ]
+        }
+       }
+      ]
+     },
+     "3": {
+      "format": "tensorquill-manifest",
+      "v": 1,
+      "run_id": "an-run",
+      "rank": 0,
+      "number": 3,
+      "previous": 2,
+      "written_age_hours": 1,
+      "attempts": [
+       {
+        "attempt": 1732400000000,
+        "steps": {
+         "through": 399,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-00000000-00000199-0000000001.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_age_hours": 300,
+           "inputs": [
+            "attempt=1732400000000/part-00000000-00000049.parquet",
+            "attempt=1732400000000/part-00000050-00000099.parquet",
+            "attempt=1732400000000/part-00000100-00000149.parquet",
+            "attempt=1732400000000/part-00000150-00000199.parquet"
+           ],
+           "first_step": 0,
+           "last_step": 199
+          },
+          {
+           "key": "attempt=1732400000000/compact-00000200-00000299-0000000002.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 2,
+           "listed_since_age_hours": 200,
+           "inputs": [
+            "attempt=1732400000000/part-00000200-00000249.parquet",
+            "attempt=1732400000000/part-00000250-00000299.parquet"
+           ],
+           "first_step": 200,
+           "last_step": 299
+          },
+          {
+           "key": "attempt=1732400000000/compact-00000300-00000399-0000000003.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 3,
+           "listed_since_age_hours": 1,
+           "inputs": [
+            "attempt=1732400000000/part-00000300-00000349.parquet",
+            "attempt=1732400000000/part-00000350-00000399.parquet"
+           ],
+           "first_step": 300,
+           "last_step": 399
+          }
+         ]
+        },
+        "scalars": {
+         "through_seq": 19,
+         "files": [
+          {
+           "key": "attempt=1732400000000/compact-scalars-00000000-00000019-0000000001.parquet",
+           "rows": 0,
+           "bytes": 0,
+           "layout": 5,
+           "listed_since": 1,
+           "listed_since_age_hours": 300,
+           "inputs": [
+            "attempt=1732400000000/scalars-00000000-00000009.parquet",
+            "attempt=1732400000000/scalars-00000010-00000019.parquet"
+           ],
+           "first_seq": 0,
+           "last_seq": 19
+          }
+         ]
+        }
+       }
+      ]
+     }
+    }
+   },
+   "expect": {
+    "retired": [
+     [
+      "attempt=1732400000000/compact-00000200-00000299-0000000001.parquet",
+      "unreferenced_compact"
+     ],
+     [
+      "attempt=1732400000000/part-00000000-00000049.parquet",
+      "input"
+     ],
+     [
+      "attempt=1732400000000/part-00000050-00000099.parquet",
+      "input"
+     ],
+     [
+      "attempt=1732400000000/part-00000100-00000149.parquet",
+      "input"
+     ],
+     [
+      "attempt=1732400000000/part-00000150-00000199.parquet",
+      "input"
+     ],
+     [
+      "attempt=1732400000000/part-00000200-00000249.parquet",
+      "input"
+     ],
+     [
+      "attempt=1732400000000/part-00000250-00000299.parquet",
+      "input"
+     ],
+     [
+      "attempt=1732400000000/scalars-00000000-00000009.parquet",
+      "input"
+     ],
+     [
+      "attempt=1732400000000/scalars-00000010-00000019.parquet",
+      "input"
+     ],
+     [
+      "checkpoints/state-1732400000000-00000199.json.zst",
+      "superseded_snapshot"
+     ],
+     [
+      "checkpoints/state-1732400000000-00000299.json.zst",
+      "superseded_snapshot"
+     ],
+     [
+      "manifests/0000000001.json",
+      "superseded_manifest"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "quota_scaled",
+   "section": 10,
+   "rests_on": [
+    "Q16"
+   ],
+   "rule": "quota",
+   "paths": [
+    "rule"
+   ],
+   "lane": "AN-5",
+   "release": "0.2.0",
+   "why": "min(max(quota, streams x share), ceiling) at the proposed numbers.",
+   "input": {
+    "quota_mib": 128,
+    "share_mib": 4,
+    "ceiling_mib": 1024,
+    "streams": [
+     1,
+     32,
+     64,
+     100,
+     300
+    ]
+   },
+   "expect": [
+    128,
+    128,
+    256,
+    400,
+    1024
+   ]
+  }
+ ]
+}
