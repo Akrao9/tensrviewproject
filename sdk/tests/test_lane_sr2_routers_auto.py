@@ -324,6 +324,18 @@ def test_a_router_module_missing_where_the_configuration_puts_one_is_refused_by_
     assert all(missing not in r.get("moe", {}) for r in sink.records)
     assert list(first["moe"]) == ["model.layers.0.block_sparse_moe.gate", "model.layers.2.block_sparse_moe.gate"]
     assert sum("not counting the router 'model.layers.1.block_sparse_moe.gate'" in t for t in said) == 1
+    # The fix does not tell the user to name a module that does not exist.
+    assert "with the name of the module that routes it" in first["moe_refused"][missing]
+    assert f"routers={{'{missing}'" not in first["moe_refused"][missing]
+
+
+def test_the_first_layer_not_fitting_is_refused_by_its_own_name_and_the_others_counted():
+    model = _mixtral_4x()
+    model.model.layers[0].block_sparse_moe.gate = nn.Sequential(nn.Linear(H, E, bias=False))
+    sink, _ = _train(model, routers="auto")
+    first = sink.records[0]
+    assert list(first["moe_refused"]) == ["model.layers.0.block_sparse_moe.gate"]
+    assert list(first["moe"]) == ["model.layers.1.block_sparse_moe.gate", "model.layers.2.block_sparse_moe.gate"]
 
 
 def test_a_configuration_value_absent_refuses_every_router_of_the_entry_by_name():
@@ -353,7 +365,10 @@ def test_a_block_whose_top_k_is_not_the_configurations_is_refused_by_name():
     sink, _ = _train(model, routers="auto")
     first = sink.records[0]
     assert list(first["moe_refused"]) == ["model.layers.1.block_sparse_moe.gate"]
-    assert "top_k" in first["moe_refused"]["model.layers.1.block_sparse_moe.gate"]
+    why = first["moe_refused"]["model.layers.1.block_sparse_moe.gate"]
+    assert "top_k" in why
+    # The fix names no numbers: the configuration's top_k (2) given by hand would count a top-3 block wrongly.
+    assert f"Router({E}, {K})" not in why and "the top_k it routes with" in why
 
 
 class _LogitsOnlyRouter(nn.Module):
@@ -712,6 +727,16 @@ def test_a_tiny_hugging_face_model_of_a_class_not_in_the_registry_finds_no_route
     key = "transformers.models.llama.modeling_llama.LlamaForCausalLM"
     assert list(sink.records[0]["moe_refused"]) == [key]
     assert sum("not in TensorQuill's router registry" in t for t in said) == 1
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_tiny_hugging_face_base_model_resolves_to_the_same_routers_without_the_heads_prefix(family):
+    cls, config, names, experts, top_k = _tiny(family)
+    base = getattr(_transformers(), cls.__name__.replace("ForCausalLM", "Model"))
+    torch.manual_seed(0)
+    found = router_registry.resolve(base(config))
+    assert not found.refused
+    assert found.routers == {name.removeprefix("model."): (experts, top_k, found.layout.form) for name in names}
 
 
 def test_a_tiny_hugging_face_router_of_another_width_is_refused_by_name():

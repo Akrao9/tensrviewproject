@@ -526,13 +526,18 @@ class _AutoIndices:
 def _auto_refusal(name: str, why: str, auto: Any) -> str:
     """The `moe_refused` text of a router `routers="auto"` refused before any hook (`router_registry.resolve`):
     the registry's reason and how to count it by hand. Under the model class's own name when no router
-    could be named (a class not in the registry, a configuration that does not say where routers are)."""
+    could be named (a class not in the registry, a configuration that does not say where routers are).
+    The fix names no numbers: a router refused for its width or its top_k does not route with the
+    configuration's, and one given those by hand would be counted wrongly; a name that is no module of
+    the model cannot be given at all."""
+    hand = "tensorquill.Router(n_experts, top_k) with the number of experts and the top_k it routes with"
     if name == auto.model_class:
-        return (f"{why}. To count its routers, pass routers= by hand, each router module's name mapped to "
-                f"tensorquill.Router(n_experts, top_k)")
-    shown = (f"{auto.n_experts}, {auto.top_k}" if auto.n_experts is not None and auto.top_k is not None
-             else "n_experts, top_k")
-    return f"{why}. To count it, pass routers={{{name!r}: tensorquill.Router({shown})}} by hand"
+        return f"{why}. To count its routers, pass routers= by hand, each router module's name mapped to {hand}"
+    if name in auto.missing:
+        return (f"{why}. To count the router of that layer, pass routers= by hand with the name of the module "
+                f"that routes it, mapped to {hand}")
+    return (f"{why}. To count it, pass routers={{{name!r}: {hand}}} by hand, with indices= if the first "
+            f"integer tensor of its output is not the chosen expert ids")
 
 
 _log = logging.getLogger("tensorquill")

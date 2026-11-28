@@ -23,7 +23,9 @@ Rules, each one there because the opposite would count wrong experts with no ref
   tensor of its output; an output with none is refused at its first training forward, never counted
   as the top-k of its logits. `LOGITS`: a plain `nn.Linear` gate whose owner (an exact class too) takes
   the top-k of a softmax of its logits, or of the logits, so the top-k TensorQuill takes of the same
-  logits is the model's choice (up to the order of exactly equal logits, which neither top-k defines).
+  logits is the model's choice, up to the order of tied values: two logits exactly equal, or two that
+  the model's float32 softmax rounds to one probability, are ordered by neither top-k's definition, and
+  the two may pick differently between them.
 
 This module imports nothing from transformers, at its top or anywhere: it reads class names,
 module paths, configuration attributes and weight shapes only.
@@ -102,6 +104,7 @@ class Resolution:
     top_k: int | None = None
     routers: dict[str, tuple[int, int, str]] = field(default_factory=dict)
     refused: dict[str, str] = field(default_factory=dict)
+    missing: set[str] = field(default_factory=set)  # refused names that are no module of the model
 
 
 class _Absent(Exception):
@@ -283,19 +286,21 @@ def resolve(model: Any) -> Resolution:
         found.refused[cls] = f"{matched} but its configuration puts a router in no layer ({entry.layers_from})"
         return found
     modules = dict(model.named_modules())
-    # The layout whose router in the first layer that has one is there, with the layout's exact class.
-    layout = next(
-        (lay for lay in entry.layouts
-         if prefix + lay.path.format(i=layers[0]) in modules
-         and qualified(type(modules[prefix + lay.path.format(i=layers[0])])) == lay.router),
-        None,
-    )
+
+    def fits(lay: Layout, i: int) -> bool:
+        path = prefix + lay.path.format(i=i)
+        return path in modules and qualified(type(modules[path])) == lay.router
+
+    # The newest layout that has its router, of its exact class, in some layer the configuration gives
+    # one: one layer that does not fit is then refused by its own name, whichever layer it is.
+    layout = next((lay for lay in entry.layouts if any(fits(lay, i) for i in layers)), None)
     if layout is None:
         looked = _looked_for(entry, prefix, layers[0])
         for i in layers:
-            found.refused[prefix + entry.layouts[0].path.format(i=i)] = (
-                f"{matched} and found no router where the entry puts one: it looked for {looked}"
-            )
+            name = prefix + entry.layouts[0].path.format(i=i)
+            found.refused[name] = f"{matched} and found no router where the entry puts one: it looked for {looked}"
+            if name not in modules:
+                found.missing.add(name)
         return found
     found.layout = layout
     names = [prefix + layout.path.format(i=i) for i in layers]
@@ -315,6 +320,8 @@ def resolve(model: Any) -> Resolution:
             found.routers[name] = (n_experts, top_k, layout.form)
         else:
             found.refused[name] = f"{matched} but {why}"
+            if name not in modules:
+                found.missing.add(name)
     if layout.router != LINEAR:
         # A router of the entry's class in a layer the configuration gives none is refused by name, not
         # left out unsaid.
