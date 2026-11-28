@@ -33,6 +33,7 @@ import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
+import conftest
 import pytest
 
 from tensorquill import evidence, server_detect
@@ -728,7 +729,7 @@ def test_the_server_detectors_module_note_says_both_engines_judge_experts_per_to
 
 
 def test_the_contract_turns_item_5_of_lane_al_4s_list_and_names_the_seq_drop_beside_s15():
-    text = _flat(_page("WAVE_AL_CONTRACT.md"))
+    text = _flat(conftest.contract_page("WAVE_AL_CONTRACT.md"))
     assert ("which matters only for an attempt that holds scalar-only records alone. **Goes beyond.** **Accepted as built "
             "by the owner, Nov 24 (row S14).** **Turned by the owner, Nov 26 (wave AO, accepting lane AO-6's BUG-22):** "
             "`compare` on a torn local file reads its whole lines in the file's order, the scalar-only records in their "
