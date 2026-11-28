@@ -25,6 +25,11 @@ defaults:
   run:
     working-directory: sdk
 
+# The actions below are at the major versions that run on Node 24 (checkout v7, setup-python v7; in
+# server-wheels.yml also upload-artifact v7 and download-artifact v8), set on Nov 27, 2026. The versions before
+# ran on Node 20, which GitHub has retired: each job carried a warning and was forced onto Node 24. Node 24 is
+# the newest runtime an action can declare on that date, so no later Node can be chosen here. A self-hosted
+# runner (the GPU job) needs runner version 2.327.1 or later for them.
 jobs:
   cpu:
     name: CPU, Python ${{ matrix.python }}, PyTorch ${{ matrix.torch }}
@@ -50,8 +55,8 @@ jobs:
           - python: "3.12"
             torch: "2.9"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -82,8 +87,8 @@ jobs:
     # at 30 minutes in the next step; the plain job on Python 3.11 with PyTorch 2.6 hit the same limit once on 981fe6c.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -121,8 +126,8 @@ jobs:
     # 5,978 tests, was at 87% after 37 minutes when the 50-minute limit ended the job: steady progress, no hang.
     timeout-minutes: 100
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -164,8 +169,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Build the sdist and wheel
@@ -189,7 +194,7 @@ jobs:
     runs-on: ${{ fromJSON(inputs.gpu_runner) }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install
         run: |
           python -c "import torch; assert torch.cuda.is_available(), 'this runner has no CUDA'; print(torch.__version__)"
