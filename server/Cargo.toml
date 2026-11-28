@@ -2,6 +2,11 @@
 name = "tensorquill-server"
 version = "0.0.1"
 edition = "2021"
+# The lowest Rust the crate's own code is written for: ingest.rs calls AtomicUsize::try_update, stable
+# since 1.95, and clippy's incompatible_msrv lint holds the code to this line. No resolved dependency
+# declares a higher floor (the highest is 1.89). Builds and CI use the 1.100.0 that rust-toolchain.toml
+# pins; nothing was built on a 1.95 compiler.
+rust-version = "1.95"
 description = "Self-hosted ingest server for TensorQuill: Arrow Flight DoPut in, partitioned Parquet out."
 license = "Apache-2.0 OR MIT"
 keywords = ["pytorch", "observability", "arrow-flight", "parquet", "training"]
